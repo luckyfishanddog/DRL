@@ -2,18 +2,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from collections.abc import Callable
 
 from .model import (
     CanonicalSolution,
     Operation,
     OperationKind,
+    ParentWeld,
     Rail,
     ScheduleResult,
     ScheduleStatus,
     ScientificConfig,
     SplitKind,
+    SplitPattern,
+    ScientificAmbiguityError,
     robot_rail,
 )
+
+XSplitValidator = Callable[[ParentWeld, SplitPattern, ScientificConfig], bool]
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,8 @@ def certify_schedule(
     solution: CanonicalSolution,
     schedule: ScheduleResult,
     config: ScientificConfig,
+    *,
+    x_split_validator: XSplitValidator | None = None,
 ) -> CertificationReport:
     """Independently reconstruct geometry and timing; scheduler helpers are not called."""
     errors: list[str] = []
@@ -167,6 +175,14 @@ def certify_schedule(
                     or max(parent.start[1], parent.end[1]) <= config.by[1] + config.numeric_epsilon
                 ):
                     errors.append(f"{parent.parent_id}: X split cannot replace mandatory Y handover")
+                if x_split_validator is None:
+                    raise ScientificAmbiguityError(
+                        "retained X_SPLIT requires an explicit formal XSplitValidator"
+                    )
+                if not x_split_validator(parent, pattern, config):
+                    errors.append(
+                        f"{pattern.pattern_id}: rejected by explicit XSplitValidator"
+                    )
             blocks[f"{parent.parent_id}::0"] = (
                 parent.parent_id, parent.start, point, first_length
             )
@@ -203,6 +219,16 @@ def certify_schedule(
             direction not in (0, 1) for direction in declared_directions
         ):
             errors.append(f"R{robot}: invalid declared direction vector")
+        expected_endpoints = {}
+        for block_index, block_id in enumerate(route.block_ids):
+            geometry = blocks.get(block_id)
+            if geometry is None or block_index >= len(declared_directions):
+                continue
+            expected_endpoints[block_id] = (
+                (geometry[1], geometry[2])
+                if declared_directions[block_index] == 0
+                else (geometry[2], geometry[1])
+            )
         non_wait = [operation for operation in operations if operation.kind is not OperationKind.WAIT]
         expected_kinds = []
         for index, block_id in enumerate(route.block_ids):
@@ -216,12 +242,17 @@ def certify_schedule(
             continue
         previous_end_time = 0.0
         previous_point = None
-        weld_rank = 0
         for operation in operations:
             if operation.start_time < previous_end_time - config.numeric_epsilon:
                 errors.append(f"R{robot}: operation overlap")
             if operation.start_time > previous_end_time + config.numeric_epsilon:
                 errors.append(f"R{robot}: uncovered idle gap; WAIT required")
+            if previous_point is not None and not _point_close(
+                previous_point, operation.start, config
+            ):
+                errors.append(
+                    f"R{robot}: spatial discontinuity before {operation.operation_id}"
+                )
             if operation.kind is OperationKind.WAIT:
                 if not _point_close(operation.start, operation.end, config):
                     errors.append(f"{operation.operation_id}: WAIT moves")
@@ -236,20 +267,27 @@ def certify_schedule(
             elif operation.kind is OperationKind.SETUP:
                 if not _point_close(operation.start, operation.end, config) or not _close(operation.duration, config.t_pre, config):
                     errors.append(f"{operation.operation_id}: bad SETUP")
+                expected = expected_endpoints.get(operation.block_id)
+                if expected is None or not _point_close(operation.start, expected[0], config):
+                    errors.append(
+                        f"{operation.operation_id}: SETUP is not at declared weld start"
+                    )
             elif operation.kind is OperationKind.POST:
                 if not _point_close(operation.start, operation.end, config) or not _close(operation.duration, config.t_post, config):
                     errors.append(f"{operation.operation_id}: bad POST")
+                expected = expected_endpoints.get(operation.block_id)
+                if expected is None or not _point_close(operation.start, expected[1], config):
+                    errors.append(
+                        f"{operation.operation_id}: POST is not at declared weld end"
+                    )
             elif operation.kind is OperationKind.WELD:
                 geometry = blocks.get(operation.block_id)
                 if geometry is None:
                     errors.append(f"{operation.operation_id}: unknown WELD block")
                 else:
-                    if weld_rank < len(declared_directions):
-                        expected_start, expected_end = (
-                            (geometry[1], geometry[2])
-                            if declared_directions[weld_rank] == 0
-                            else (geometry[2], geometry[1])
-                        )
+                    expected = expected_endpoints.get(operation.block_id)
+                    if expected is not None:
+                        expected_start, expected_end = expected
                         endpoints_ok = _point_close(operation.start, expected_start, config) and _point_close(
                             operation.end, expected_end, config
                         )
@@ -257,7 +295,6 @@ def certify_schedule(
                         endpoints_ok = False
                     if not endpoints_ok or not _close(operation.duration, geometry[3] / config.weld_speed, config):
                         errors.append(f"{operation.operation_id}: bad WELD geometry/duration")
-                weld_rank += 1
             previous_end_time = operation.end_time
             previous_point = operation.end
 

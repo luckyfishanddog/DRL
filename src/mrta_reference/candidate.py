@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from .geometry import XSplitValidator
 from .model import CandidateMove, CanonicalSolution, MoveType, Route, ScientificConfig, SplitKind, SplitPattern
 from .solution import canonicalize
 
@@ -19,7 +20,11 @@ def _require_affected(candidate: CandidateMove, actual_parent_ids) -> None:
 
 
 def apply_candidate(
-    solution: CanonicalSolution, candidate: CandidateMove, config: ScientificConfig
+    solution: CanonicalSolution,
+    candidate: CandidateMove,
+    config: ScientificConfig,
+    *,
+    x_split_validator: XSplitValidator | None = None,
 ) -> CanonicalSolution:
     if candidate.key.current_solution_revision != solution.revision:
         raise ValueError("candidate revision does not match current solution")
@@ -120,6 +125,7 @@ def apply_candidate(
         tuple(Route(robot, tuple(routes[robot])) for robot in range(4)),
         config,
         revision=solution.revision + 1,
+        x_split_validator=x_split_validator,
     )
 
 
@@ -127,6 +133,8 @@ def deduplicate_candidates(
     solution: CanonicalSolution,
     candidates: Iterable[CandidateMove],
     config: ScientificConfig,
+    *,
+    x_split_validator: XSplitValidator | None = None,
 ) -> tuple[tuple[CandidateMove, CanonicalSolution], ...]:
     seen_keys = set()
     seen_hashes = set()
@@ -135,7 +143,12 @@ def deduplicate_candidates(
         if candidate.key in seen_keys:
             continue
         seen_keys.add(candidate.key)
-        provisional = apply_candidate(solution, candidate, config)
+        provisional = apply_candidate(
+            solution,
+            candidate,
+            config,
+            x_split_validator=x_split_validator,
+        )
         if provisional.canonical_hash in seen_hashes:
             continue
         seen_hashes.add(provisional.canonical_hash)

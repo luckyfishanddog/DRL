@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from typing import Mapping, Sequence
 
-from .geometry import blocks_for_pattern, whole_eligible_rails
+from .geometry import XSplitValidator, blocks_for_pattern, whole_eligible_rails
 from .model import (
     CanonicalSolution,
     OfficialMetrics,
@@ -25,6 +25,7 @@ def canonicalize(
     config: ScientificConfig,
     *,
     revision: int = 0,
+    x_split_validator: XSplitValidator | None = None,
 ) -> CanonicalSolution:
     ordered_parents = tuple(sorted(parents, key=lambda parent: parent.parent_id))
     if len({parent.parent_id for parent in ordered_parents}) != len(ordered_parents):
@@ -84,7 +85,13 @@ def canonicalize(
     ordered_patterns = tuple(normalized_patterns)
     expected: dict[str, str] = {}
     for parent, pattern in zip(ordered_parents, ordered_patterns):
-        for block in blocks_for_pattern(parent, pattern, config):
+        for block in blocks_for_pattern(
+            parent,
+            pattern,
+            config,
+            x_split_validator=x_split_validator,
+            require_formal_x_validation=True,
+        ):
             if block.block_id in expected:
                 raise ValueError("non-unique canonical block id")
             expected[block.block_id] = parent.parent_id
@@ -101,11 +108,22 @@ def canonicalize(
     return CanonicalSolution(ordered_parents, ordered_patterns, result_routes, revision)
 
 
-def block_map(solution: CanonicalSolution, config: ScientificConfig):
+def block_map(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    *,
+    x_split_validator: XSplitValidator | None = None,
+):
     parents = {parent.parent_id: parent for parent in solution.parents}
     result = {}
     for pattern in solution.patterns:
-        for block in blocks_for_pattern(parents[pattern.parent_id], pattern, config):
+        for block in blocks_for_pattern(
+            parents[pattern.parent_id],
+            pattern,
+            config,
+            x_split_validator=x_split_validator,
+            require_formal_x_validation=True,
+        ):
             result[block.block_id] = block
     return result
 
@@ -114,10 +132,12 @@ def official_metrics(
     solution: CanonicalSolution,
     schedule: ScheduleResult,
     config: ScientificConfig,
+    *,
+    x_split_validator: XSplitValidator | None = None,
 ) -> OfficialMetrics:
     if not schedule.feasible or schedule.cmax is None:
         raise ValueError("official metrics require a feasible schedule")
-    blocks = block_map(solution, config)
+    blocks = block_map(solution, config, x_split_validator=x_split_validator)
     process_loads: list[float] = []
     total_empty = 0.0
     for route in solution.routes:

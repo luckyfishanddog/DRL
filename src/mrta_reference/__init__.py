@@ -4,6 +4,7 @@ from .candidate import apply_candidate, deduplicate_candidates
 from .certifier import CertificationReport, certify_schedule
 from .geometry import (
     DirectionResult,
+    XSplitValidator,
     continuous_interference,
     frozen_handover_centers,
     generate_x_split_patterns,
@@ -32,7 +33,11 @@ from .model import (
     SplitPattern,
     WeldingBlock,
 )
-from .oracle import TinyOracleResult, tiny_scheduler_oracle
+from .oracle import (
+    TinyOracleResult,
+    tiny_scheduler_oracle,
+    tiny_scheduler_oracle_from_templates,
+)
 from .solution import canonicalize, official_metrics
 from .scheduler import (
     build_operation_templates,
@@ -40,6 +45,7 @@ from .scheduler import (
     build_wait_for_graph,
     earliest_safe_start,
     reference_schedule,
+    reference_schedule_from_templates,
     wait_for_cycles,
 )
 
@@ -65,6 +71,7 @@ __all__ = [
     "SplitPattern",
     "TinyOracleResult",
     "WeldingBlock",
+    "XSplitValidator",
     "apply_candidate",
     "build_operation_templates",
     "build_robot_routes",
@@ -80,7 +87,9 @@ __all__ = [
     "official_metrics",
     "optimize_directions",
     "reference_schedule",
+    "reference_schedule_from_templates",
     "tiny_scheduler_oracle",
+    "tiny_scheduler_oracle_from_templates",
     "wait_for_cycles",
     "whole_eligible_rails",
     "x_split_relation",

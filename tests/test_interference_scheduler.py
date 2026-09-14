@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
+from mrta_reference.certifier import certify_schedule
 from mrta_reference.geometry import continuous_interference, operations_conflict, same_rail_order_violation
 from mrta_reference.model import (
     Operation,
@@ -19,6 +21,7 @@ from mrta_reference.scheduler import (
     build_robot_routes,
     earliest_safe_start,
     reference_schedule,
+    reference_schedule_from_templates,
     wait_for_cycles,
 )
 from mrta_reference.solution import canonicalize
@@ -85,6 +88,26 @@ def test_earliest_safe_start_is_finite_and_analytic() -> None:
     assert blocker_ids == ("fixed",)
 
 
+def test_reference_scheduler_inserts_explicit_wait_for_delayed_operation() -> None:
+    manual_config = replace(CONFIG, t_pre=5.0, empty_speed=1.0)
+    templates = {
+        0: (
+            _operation("R0:hold", 0, OperationKind.SETUP, (0.0, 5.0), (0.0, 0.0), (0.0, 0.0)),
+        ),
+        2: (
+            _operation("R2:move", 2, OperationKind.MOVE, (0.0, 2.0), (2.0, 0.0), (0.0, 0.0)),
+        ),
+    }
+    result = reference_schedule_from_templates(templates, manual_config)
+    assert result.status is ScheduleStatus.FEASIBLE
+    waits = [operation for operation in result.operations if operation.kind is OperationKind.WAIT]
+    assert len(waits) == 1
+    assert waits[0].robot_id == 2
+    assert waits[0].start == waits[0].end == (2.0, 0.0)
+    moved = next(operation for operation in result.operations if operation.operation_id == "R2:move")
+    assert waits[0].end_time == moved.start_time
+
+
 def _four_robot_solution(*, bad_order: bool = False):
     coordinates = {
         "u0": ((8.0 if bad_order else 1.0), 10.0),
@@ -147,18 +170,73 @@ def test_constructed_wait_for_cycle_detection_is_deterministic() -> None:
     assert wait_for_cycles(graph) == ((0, 1, 0), (2, 3, 2))
 
 
-def test_constructed_route_deadlock_reports_blockers_without_hidden_repair() -> None:
+def _deadlock_solution():
     parents = (
         ParentWeld("left-to-right", (1.0, 8.0), (9.0, 8.0)),
         ParentWeld("right-to-left", (10.0, 8.0), (2.0, 8.0)),
     )
-    solution = canonicalize(
+    return canonicalize(
         parents,
         tuple(SplitPattern(parent.parent_id, SplitKind.WHOLE) for parent in parents),
         {0: ("left-to-right::whole",), 1: ("right-to-left::whole",)},
         CONFIG,
     )
+
+
+def test_constructed_route_deadlock_reports_blockers_without_hidden_repair() -> None:
+    solution = _deadlock_solution()
     result = reference_schedule(solution, CONFIG, orientations={0: (0,), 1: (0,)})
     assert result.status is ScheduleStatus.DEADLOCK
     assert result.wait_for_graph
     assert any("blocked by" in item for item in result.diagnostics)
+
+
+def test_deadlock_repair_hook_receives_full_context_and_none_preserves_result() -> None:
+    solution = _deadlock_solution()
+    captured = {}
+
+    def no_repair(canonical, config, deadlock, graph, diagnostics):
+        captured.update(
+            canonical=canonical,
+            config=config,
+            deadlock=deadlock,
+            graph=graph,
+            diagnostics=diagnostics,
+        )
+        return None
+
+    result = reference_schedule(
+        solution,
+        CONFIG,
+        orientations={0: (0,), 1: (0,)},
+        deadlock_repair=no_repair,
+    )
+    assert result.status is ScheduleStatus.DEADLOCK
+    assert captured["canonical"].canonical_hash == solution.canonical_hash
+    assert captured["config"] == CONFIG
+    assert captured["deadlock"] == result
+    assert captured["graph"] == result.wait_for_graph
+    assert captured["diagnostics"] == result.diagnostics
+
+
+def test_caller_supplied_deadlock_repair_can_return_independently_certified_result() -> None:
+    solution = _deadlock_solution()
+
+    def caller_policy(canonical, config, deadlock, graph, diagnostics):
+        assert deadlock.status is ScheduleStatus.DEADLOCK
+        assert graph == deadlock.wait_for_graph
+        assert diagnostics == deadlock.diagnostics
+        return reference_schedule(
+            canonical,
+            config,
+            orientations={0: (0,), 1: (1,)},
+        )
+
+    repaired = reference_schedule(
+        solution,
+        CONFIG,
+        orientations={0: (0,), 1: (0,)},
+        deadlock_repair=caller_policy,
+    )
+    assert repaired.status is ScheduleStatus.FEASIBLE
+    assert certify_schedule(solution, repaired, CONFIG).certified

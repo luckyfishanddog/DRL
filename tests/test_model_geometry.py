@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import math
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -43,6 +44,17 @@ def test_scientific_defaults_and_whole_eligibility() -> None:
     assert whole_eligible_rails((0, 5.0), (2, 7.0), CONFIG) == frozenset()
 
 
+def test_scientific_config_serialization_and_hash_are_value_only_and_stable() -> None:
+    same = ScientificConfig()
+    changed = replace(CONFIG, t_pre=CONFIG.t_pre + 1.0)
+    assert same.canonical_json == CONFIG.canonical_json
+    assert same.scientific_hash == CONFIG.scientific_hash
+    assert changed.scientific_hash != CONFIG.scientific_hash
+    assert len(CONFIG.scientific_hash) == 64
+    assert "timestamp" not in CONFIG.canonical_json
+    assert "machine" not in CONFIG.canonical_json
+
+
 def test_y_candidates_are_only_boundaries_center_midpoint_and_deterministically_deduplicated() -> None:
     parent = ParentWeld("cross", (1.0, 5.0), (1.0, 7.0))
     candidates = generate_y_split_patterns(parent, CONFIG)
@@ -50,6 +62,15 @@ def test_y_candidates_are_only_boundaries_center_midpoint_and_deterministically_
     assert [candidate.t for candidate in candidates] == pytest.approx([0.4, 0.5, 0.6])
     assert all(candidate.mandatory for candidate in candidates)
     assert candidates == generate_y_split_patterns(parent, CONFIG)
+    # The geometric midpoint duplicates BY_CENTER here and is deterministically removed.
+    assert "MIDPOINT" not in {candidate.point_id for candidate in candidates}
+
+    with pytest.raises(ValueError, match="deterministic legal candidates"):
+        blocks_for_pattern(
+            parent,
+            SplitPattern("cross", SplitKind.Y_SPLIT, 0.5, "wrong-id"),
+            CONFIG,
+        )
 
 
 def test_split_length_conservation_and_lmin_validation() -> None:
@@ -61,6 +82,34 @@ def test_split_length_conservation_and_lmin_validation() -> None:
     assert min(block.length for block in blocks) >= CONFIG.min_child_length
     with pytest.raises(ValueError, match="Lmin"):
         blocks_for_pattern(parent, SplitPattern("p", SplitKind.X_SPLIT, 0.19, "short"), CONFIG)
+
+    exactly = blocks_for_pattern(
+        parent, SplitPattern("p", SplitKind.X_SPLIT, 0.2, "exact-lmin"), CONFIG
+    )
+    assert exactly[0].length == pytest.approx(CONFIG.min_child_length)
+    with pytest.raises(ValueError, match="Lmin"):
+        blocks_for_pattern(
+            parent,
+            SplitPattern(
+                "p",
+                SplitKind.X_SPLIT,
+                CONFIG.min_child_length - 2.0 * CONFIG.numeric_epsilon,
+                "just-below-lmin",
+            ),
+            CONFIG,
+        )
+
+
+def test_zero_and_near_zero_parent_lengths_are_handled_numerically() -> None:
+    with pytest.raises(ValueError, match="positive length"):
+        ParentWeld("zero", (1.0, 1.0), (1.0, 1.0))
+    near_zero = ParentWeld("near-zero", (1.0, 1.0), (1.0 + 1.0e-12, 1.0))
+    with pytest.raises(ValueError, match="Lmin"):
+        blocks_for_pattern(
+            near_zero,
+            SplitPattern("near-zero", SplitKind.X_SPLIT, 0.5, "mid"),
+            CONFIG,
+        )
 
 
 def test_x_split_given_point_relation_without_invented_candidate_enumeration() -> None:
@@ -131,3 +180,13 @@ def test_direction_dp_is_open_route_and_tie_breaks_forward() -> None:
     result = optimize_directions((block,), CONFIG)
     assert result.empty_travel_time == 0.0
     assert result.orientations == (0,)
+
+
+def test_direction_dp_exact_ties_reversed_geometry_and_zero_transition() -> None:
+    first = WeldingBlock("a", "a::whole", 0.0, 1.0, (0.0, 0.0), (1.0, 0.0))
+    second = WeldingBlock("b", "b::whole", 0.0, 1.0, (1.0, 0.0), (0.0, 0.0))
+    result = optimize_directions((first, second), CONFIG)
+    expected_cost, expected_vector = _brute_force((first, second))
+    assert result.empty_travel_time == pytest.approx(0.0)
+    assert result.empty_travel_time == pytest.approx(expected_cost)
+    assert result.orientations == expected_vector == (0, 0)

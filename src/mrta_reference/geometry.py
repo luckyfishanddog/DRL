@@ -20,6 +20,7 @@ from .model import (
 XSplitCandidateProvider = Callable[
     [ParentWeld, float, ScientificConfig], Iterable[tuple[float, str]]
 ]
+XSplitValidator = Callable[[ParentWeld, SplitPattern, ScientificConfig], bool]
 
 
 def whole_eligible_rails(
@@ -101,7 +102,12 @@ def generate_x_split_patterns(
 
 
 def validate_split_pattern(
-    parent: ParentWeld, pattern: SplitPattern, config: ScientificConfig
+    parent: ParentWeld,
+    pattern: SplitPattern,
+    config: ScientificConfig,
+    *,
+    x_split_validator: XSplitValidator | None = None,
+    require_formal_x_validation: bool = False,
 ) -> None:
     if pattern.parent_id != parent.parent_id:
         raise ValueError("split pattern parent mismatch")
@@ -123,18 +129,35 @@ def validate_split_pattern(
         ):
             raise ValueError("Y split is not one of the deterministic legal candidates")
     elif pattern.kind is SplitKind.X_SPLIT:
-        # Candidate enumeration is intentionally not invented. A supplied point is
-        # accepted after on-segment and Lmin validation; its Bx relation is queryable.
         if pattern.mandatory:
             raise ValueError("X split cannot satisfy mandatory upper/lower handover")
         if not whole_eligible_rails(parent.start, parent.end, config):
             raise ValueError("a parent crossing both rails requires Y_SPLIT, not X_SPLIT")
+        if require_formal_x_validation and x_split_validator is None:
+            raise ScientificAmbiguityError(
+                "retained X_SPLIT requires an explicit formal XSplitValidator"
+            )
+        if x_split_validator is not None and not x_split_validator(parent, pattern, config):
+            raise ValueError(
+                f"X_SPLIT {pattern.pattern_id} was rejected by the explicit validator"
+            )
 
 
 def blocks_for_pattern(
-    parent: ParentWeld, pattern: SplitPattern, config: ScientificConfig
+    parent: ParentWeld,
+    pattern: SplitPattern,
+    config: ScientificConfig,
+    *,
+    x_split_validator: XSplitValidator | None = None,
+    require_formal_x_validation: bool = False,
 ) -> tuple[WeldingBlock, ...]:
-    validate_split_pattern(parent, pattern, config)
+    validate_split_pattern(
+        parent,
+        pattern,
+        config,
+        x_split_validator=x_split_validator,
+        require_formal_x_validation=require_formal_x_validation,
+    )
     if pattern.kind is SplitKind.WHOLE:
         return (
             WeldingBlock(parent.parent_id, f"{parent.parent_id}::whole", 0.0, 1.0, parent.start, parent.end),

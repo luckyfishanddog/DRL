@@ -94,6 +94,36 @@ class ScientificConfig:
     def process_time(self, length: float) -> float:
         return self.t_pre + length / self.weld_speed + self.t_post
 
+    def scientific_mapping(self) -> dict[str, object]:
+        """Return only scientific parameter values used by the evaluator."""
+        return {
+            "delta_x": self.delta_x,
+            "delta_y": self.delta_y,
+            "empty_speed": self.empty_speed,
+            "interference_dx": self.interference_dx,
+            "interference_dy": self.interference_dy,
+            "min_child_length": self.min_child_length,
+            "numeric_epsilon": self.numeric_epsilon,
+            "t_post": self.t_post,
+            "t_pre": self.t_pre,
+            "weld_speed": self.weld_speed,
+            "workspace_x": list(self.workspace_x),
+            "workspace_y": list(self.workspace_y),
+        }
+
+    @property
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.scientific_mapping(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+    @property
+    def scientific_hash(self) -> str:
+        return hashlib.sha256(self.canonical_json.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True, order=True)
 class ParentWeld:
