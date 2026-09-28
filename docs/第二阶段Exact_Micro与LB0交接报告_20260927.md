@@ -5,6 +5,8 @@
 > 状态：PASS  
 > 当前 exact scope：`EXACT_Y_SCOPE_CURRENT_SEMANTICS`
 
+> Phase 2B0 核对（2026-09-28）：本报告保留 Phase 2A 实测记录；科学声明以主实验方案为准。文中 exact/OPTIMAL 是当前离散空间与 dispatch+ESS generator 的枚举结论，连续时间全局性仍须通过主方案的 EXACT_SCHEDULER_VALIDITY_GATE，不能仅由现有 tests 或 certifier 推出。
+
 ## A. Baseline commit 与测试
 
 外层仓库 baseline commit：
@@ -105,7 +107,7 @@ mrta_reference.scheduler.earliest_safe_start()
 
 它只复用公共 dataclass/config；连续冲突投影与 ESS 在 `mrta_exact.scheduler` 内独立实现，不使用 coarse time sampling。
 
-## F. Full exact micro solver 枚举层次
+## F. Current Y-scope exact micro solver 枚举层次
 
 `solve_exact_micro()` 完整枚举：
 
@@ -159,7 +161,7 @@ B&B 模式仅使用：
 | E3 | FEASIBLE | 15.5287634621 | 15.5287634621 | DEADLOCK / — | — |
 | E4 | INFEASIBLE | — | — | DEADLOCK / — | — |
 
-E1–E4 均与 independent tiny oracle 一致。E3 证明 reference DEADLOCK 不能当成 mathematical infeasibility；E4 证明 exact scheduler 不会伪造可行解。
+E1–E4 均与 independent tiny oracle 一致。E3 证明 reference DEADLOCK 不能当成 mathematical infeasibility；E4 中两种实现都未生成可行 schedule，其 INFEASIBLE 仅覆盖各自 dispatch+ESS 枚举域，不是一般连续时间不可行性证明。
 
 ## J. M1–M7 与受控 N=4 真实结果
 
@@ -197,6 +199,8 @@ runtime total          = 0.2906 s
 runtime scheduler      = 0.2067 s
 certified              = true
 ```
+
+2026-09-28 以 `tests/test_exact.py` 的 `_parallel_solution(4).parents`、`FAST_CONFIG` 和 `solve_exact_micro(..., exhaustive_mode=False)` 重新核对，全部离散计数与上述结果一致：dispatch states=5120、pruned states=2034；本次 runtime total=0.3393 s、scheduler=0.2381 s。上表时间仍保留原阶段测量值。
 
 ## K. LB0 检查
 
@@ -263,7 +267,7 @@ DRL 全量：
 
 ## N. 当前性能瓶颈
 
-主瓶颈是方向/route 组合数乘以 coordination interleaving 数。N=3 brute 已产生 24,912 个 dispatch states，而 B&B 为 1,392；N=4 受控 fixture 的 B&B 为 5,072。当前实现的目标是 correctness backbone，不适用于直接求 N=6 常规实例。
+主瓶颈是方向/route 组合数乘以 coordination interleaving 数。N=3 brute 已产生 24,912 个 dispatch states，而 B&B 为 1,392；N=4 受控 fixture 的 B&B 为 5,120。当前实现的目标是 correctness backbone，不适用于直接求 N=6 常规实例。
 
 下一步若优化，只能加入有证明的 dominance/lower bound 或 memoization；不得以 heuristic direction、reference priority 或 coarse time grid 删除 exact 分支。
 

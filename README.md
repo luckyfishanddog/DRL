@@ -1,6 +1,8 @@
-# MRTA Reference Evaluator
+# Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the frozen Phase 1.1 scientific core for multi-robot weld allocation and sequencing. It is intentionally isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator and Phase 2A exact micro validation backbone for multi-robot weld allocation and sequencing. Phase 2B0 closes the scientific plan; minimal deterministic SA-OI-ALNS is next. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+
+The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
 ## Current scope
 
@@ -16,9 +18,22 @@ Implemented:
 - deterministic reference list scheduler with explicit WAIT operations and DEADLOCK diagnostics;
 - independent schedule certifier;
 - independent tiny dispatch oracle for two active robots;
+- `mrta_exact`: Y-only pattern/assignment/route/full-direction micro enumeration, with exhaustive and branch-and-bound modes;
+- independent coordination scheduler using dispatch interleaving enumeration and earliest-safe-start placement;
+- analytical LB0, exact/reference comparison, and explicit enumeration limits;
 - adversarial and regression tests.
 
-Not included in this phase: initial-solution heuristics, bounded candidate pools, SA-OI-ALNS, GNN/GAT/rankers, PPO, HGA, WAG+VNS, exact MRTA, lower bounds, datasets, or formal experiments.
+Not implemented in this research: formal full-scope exact, LB_LP, initial-solution heuristics, the initial-orientation-constrained DP wrapper, bounded candidate pools, SA-OI-ALNS, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. Existing generic CandidateMove types do not imply an active search backbone.
+
+## Development and formal scope
+
+`DEVELOPMENT_SCOPE = EXACT_Y_SCOPE_CURRENT_SEMANTICS`: WHOLE plus all current legal Y_SPLIT patterns for whole-eligible parents, mandatory Y_SPLIT otherwise, no X_SPLIT. It is suitable for Phase 2B development, micro comparisons, debugging, and profiling. Current terminal/empty-route behavior and no default repair remain unchanged.
+
+Development optimum notation is `Cmax_OPT_Y_CURRENT`, qualified by the current dispatch+ESS enumeration domain. It is not final full-problem `Cmax_OPT`. A limit-hit result is not optimal. Tests and certification of returned schedules do not establish general continuous-time optimality; the plan's `EXACT_SCHEDULER_VALIDITY_GATE` requires a dominance proof or explicitly limited independent validation before final exact claims.
+
+`FORMAL_SCOPE_V1` is **not frozen**. `FORMAL_SCOPE_GATE` must resolve the four questions below before adapted HGA/WAG common-model work, final ranker labels, and formal VALIDATION/ID_TEST/OOD. Formal exact must use the same final feasible set. Development results cannot be silently relabelled as formal results.
+
+Reference statuses are `FEASIBLE`, `DEADLOCK`, `INFEASIBLE`, and `NUMERIC_FAILURE`. Only FEASIBLE has a reference Cmax; DEADLOCK is a failure of the deterministic scheduling policy, not mathematical infeasibility. Numeric failures are not normal negative training examples.
 
 ## Environment and installation
 
@@ -30,13 +45,13 @@ From `D:\pybullet_test\MRTA_GA\DRL`:
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -m pip install --no-build-isolation --no-deps -e .
 ```
 
-Run the Phase 1.1 suite:
+Run the complete DRL suite (Phase 1.1 + Phase 2A):
 
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -m pytest -q -p no:cacheprovider
 ```
 
-Run the repository and Phase 1.1 suites together from the repository root:
+Run the repository and DRL suites together from the repository root:
 
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -m pytest -q -p no:cacheprovider tests DRL/tests
@@ -51,6 +66,9 @@ Run the repository and Phase 1.1 suites together from the repository root:
 - `src/mrta_reference/scheduler.py`: operation templates, reference scheduling, WAIT insertion, and deadlock diagnostics/hook.
 - `src/mrta_reference/certifier.py`: independent reconstruction and certification.
 - `src/mrta_reference/oracle.py`: independent tiny exhaustive dispatch oracle and reference comparison.
+- `src/mrta_exact/lower_bounds.py`: analytical LB0.
+- `src/mrta_exact/scheduler.py`: independent dispatch+ESS coordination enumeration.
+- `src/mrta_exact/solver.py`: Y-only exact micro backbone, full directions, limits, and comparison metrics.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
 - `docs/`: scientific plan and detailed AI handoff report.
 
@@ -63,7 +81,7 @@ The evaluator deliberately does not choose rules for the following unresolved sc
 3. Terminal occupancy after a robot's final POST. Currently the robot stops participating in interference after that explicit POST ends; no terminal WAIT is inserted.
 4. Parking/occupancy for an empty robot route. Currently it generates no operation, has completion `0.0`, and does not participate in interference.
 
-These current terminal/empty-route behaviors describe the implementation; they are not claims that the scientific questions have been resolved.
+These current terminal/empty-route behaviors describe the implementation, including the absence of both TCP and rail-order occupancy after final POST and for empty routes. They are development scope boundaries, not final scientific conclusions. The plan assigns them to F1–F4 in FORMAL_SCOPE_GATE; Phase 2B may proceed without inventing rules for them.
 
 ## Reproducibility identity
 
@@ -73,4 +91,4 @@ These current terminal/empty-route behaviors describe the implementation; they a
 791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e
 ```
 
-See `docs/第一阶段公共科学模型与Reference_Evaluator_AI交接报告_20260914.md` for the closure details and test evidence.
+See the [Phase 1.1 handoff](docs/第一阶段公共科学模型与Reference_Evaluator_AI交接报告_20260914.md) and [Phase 2A handoff](docs/第二阶段Exact_Micro与LB0交接报告_20260927.md) for implementation evidence. The existing scientific config hash covers numeric parameters only; it does not mean FORMAL_SCOPE_V1 has been frozen.
