@@ -276,6 +276,7 @@ def evaluate_iteration(
                 directions=item.direction.directions,
             )
         scheduler_duration = time.perf_counter() - started
+        reference_ended = time.perf_counter()
         certification = None
         metrics = None
         effective_status = schedule.status
@@ -296,7 +297,17 @@ def evaluate_iteration(
                     directions=item.direction.directions,
                 )
         stats.record_reference(
-            effective_status, scheduler_duration, initialization=False
+            effective_status,
+            scheduler_duration,
+            initialization=False,
+            reference_start=(
+                None if stats.run_started is None else started - stats.run_started
+            ),
+            reference_end=(
+                None
+                if stats.run_started is None
+                else reference_ended - stats.run_started
+            ),
         )
         evaluated = ReferenceEvaluatedCandidate(
             item, schedule, certification, metrics, False
@@ -317,6 +328,8 @@ def run_bounded_sa_oi(
 ) -> SearchResult:
     started = time.perf_counter()
     stats = SearchStats(EXACT_Y_SCOPE_CURRENT_SEMANTICS, seed)
+    stats.run_started = started
+    stats.requested_budget = search_config.time_limit
     rng = random.Random(seed)
     initialization = build_initial_solution(
         parents,
@@ -328,6 +341,12 @@ def run_bounded_sa_oi(
     )
     if initialization.status is not InitializationStatus.SUCCESS:
         runtime = time.perf_counter() - started
+        stats.actual_runtime = runtime
+        stats.overshoot = (
+            None
+            if search_config.time_limit is None
+            else max(0.0, runtime - search_config.time_limit)
+        )
         status = (
             SearchStatus.NUMERIC_FAILURE
             if initialization.status is InitializationStatus.NUMERIC_FAILURE
@@ -379,6 +398,7 @@ def run_bounded_sa_oi(
         stats.iterations += 1
         proposal = result.proposal
         if proposal is None or proposal.metrics is None:
+            stats.proposal_trajectory.append((iteration, None, False, None))
             continue
         accepted, _, _ = sa_accept(
             current_metrics.cmax,
@@ -388,7 +408,23 @@ def run_bounded_sa_oi(
             rng=rng,
         )
         if not accepted:
+            stats.proposal_trajectory.append(
+                (
+                    iteration,
+                    proposal.direction_candidate.screened.solution.canonical_hash,
+                    False,
+                    proposal.metrics.cmax,
+                )
+            )
             continue
+        stats.proposal_trajectory.append(
+            (
+                iteration,
+                proposal.direction_candidate.screened.solution.canonical_hash,
+                True,
+                proposal.metrics.cmax,
+            )
+        )
         move_name = proposal.direction_candidate.screened.candidate.key.move_type.value
         stats.accepted_by_move[move_name] += 1
         current_solution = proposal.direction_candidate.screened.solution
@@ -401,12 +437,19 @@ def run_bounded_sa_oi(
             best_schedule = current_schedule
             best_metrics = current_metrics
             stats.best_improvement_by_move[move_name] += 1
+            stats.best_improvement_cmax.append(best_metrics.cmax)
             stats.record_best(time.perf_counter() - started, best_metrics.cmax)
 
     cert_started = time.perf_counter()
     final_certification = certify_schedule(best_solution, best_schedule, config)
     stats.certifier_time += time.perf_counter() - cert_started
     runtime = time.perf_counter() - started
+    stats.actual_runtime = runtime
+    stats.overshoot = (
+        None
+        if search_config.time_limit is None
+        else max(0.0, runtime - search_config.time_limit)
+    )
     status = (
         SearchStatus.COMPLETED
         if final_certification.certified

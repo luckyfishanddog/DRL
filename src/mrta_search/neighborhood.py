@@ -7,6 +7,7 @@ import time
 
 from mrta_reference.candidate import apply_candidate
 from mrta_reference.geometry import (
+    blocks_for_pattern,
     generate_y_split_patterns,
     oriented_endpoints,
     robot_is_eligible,
@@ -58,10 +59,15 @@ def candidate_key_order(key: CandidateKey) -> tuple[object, ...]:
     )
 
 
-def balanced_move_attempt_order(m: int, seed: int) -> tuple[MoveType, ...]:
+def balanced_move_attempt_order(
+    m: int,
+    seed: int,
+    moves: tuple[MoveType, ...] = ACTIVE_MOVE_TYPES,
+) -> tuple[MoveType, ...]:
     if m < 0:
         raise ValueError("M must be non-negative")
-    moves = ACTIVE_MOVE_TYPES
+    if not moves:
+        return ()
     base, remainder = divmod(m, len(moves))
     start = seed % len(moves)
     rotated = moves[start:] + moves[:start]
@@ -79,6 +85,82 @@ def balanced_move_attempt_order(m: int, seed: int) -> tuple[MoveType, ...]:
         if not progressed:
             break
     return tuple(result)
+
+
+def applicable_move_mask(
+    solution: CanonicalSolution, config: ScientificConfig
+) -> dict[MoveType, bool]:
+    routes = [route.block_ids for route in solution.routes]
+    blocks = block_map(solution, config)
+    parents = {parent.parent_id: parent for parent in solution.parents}
+    patterns = {pattern.parent_id: pattern for pattern in solution.patterns}
+    total_blocks = sum(len(route) for route in routes)
+
+    intra = any(len(route) >= 2 for route in routes)
+    inter = any(
+        robot_is_eligible(blocks[block_id], destination, config)
+        for source, route in enumerate(routes)
+        for block_id in route
+        for destination in range(4)
+        if destination != source
+    )
+    swap = intra
+    if not swap and total_blocks >= 2:
+        occurrences = [
+            (robot, block_id)
+            for robot, route in enumerate(routes)
+            for block_id in route
+        ]
+        swap = any(
+            first_robot != second_robot
+            and robot_is_eligible(blocks[first_block], second_robot, config)
+            and robot_is_eligible(blocks[second_block], first_robot, config)
+            for index, (first_robot, first_block) in enumerate(occurrences)
+            for second_robot, second_block in occurrences[index + 1 :]
+        )
+
+    activate = False
+    deactivate = False
+    switch = False
+    child_robots = {
+        block_id: robot
+        for robot, route in enumerate(routes)
+        for block_id in route
+    }
+    for parent_id, pattern in patterns.items():
+        legal = generate_y_split_patterns(parents[parent_id], config)
+        if pattern.kind is SplitKind.WHOLE and legal:
+            activate = True
+        elif pattern.kind is SplitKind.Y_SPLIT:
+            if not pattern.mandatory and whole_eligible_rails(
+                parents[parent_id].start, parents[parent_id].end, config
+            ):
+                deactivate = True
+            for alternative in legal:
+                if alternative.pattern_id == pattern.pattern_id:
+                    continue
+                alternative_blocks = blocks_for_pattern(
+                    parents[parent_id], alternative, config
+                )
+                if all(
+                    block.block_id in child_robots
+                    and robot_is_eligible(
+                        block, child_robots[block.block_id], config
+                    )
+                    for block in alternative_blocks
+                ):
+                    switch = True
+                    break
+
+    return {
+        MoveType.INTRA_RELOCATE: intra,
+        MoveType.INTER_RELOCATE: inter,
+        MoveType.SWAP: swap,
+        MoveType.TWO_OPT: intra,
+        MoveType.SPLIT_ACTIVATE: activate,
+        MoveType.SPLIT_DEACTIVATE: deactivate,
+        MoveType.SPLIT_POINT_SWITCH: switch,
+    }
 
 
 def _parent_id(block_id: str) -> str:
@@ -275,7 +357,13 @@ def generate_raw_attempts(
     stats: SearchStats,
 ) -> tuple[RawAttempt, ...]:
     started = time.perf_counter()
-    order = balanced_move_attempt_order(m, seed + solution.revision)
+    mask = applicable_move_mask(solution, config)
+    applicable = tuple(move for move in ACTIVE_MOVE_TYPES if mask[move])
+    for move in applicable:
+        stats.applicable_by_move[move.value] += 1
+    order = balanced_move_attempt_order(
+        m, seed + solution.revision, applicable
+    )
     ordinals = {move: 0 for move in ACTIVE_MOVE_TYPES}
     attempts = []
     for move in order:

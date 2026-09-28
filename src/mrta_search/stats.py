@@ -68,6 +68,7 @@ class SearchStats:
     certifier_time: float = 0.0
 
     attempted_by_move: dict[str, int] = field(default_factory=_move_counter)
+    applicable_by_move: dict[str, int] = field(default_factory=_move_counter)
     constructed_by_move: dict[str, int] = field(default_factory=_move_counter)
     cheap_valid_by_move: dict[str, int] = field(default_factory=_move_counter)
     duplicate_by_move: dict[str, int] = field(default_factory=_move_counter)
@@ -81,8 +82,20 @@ class SearchStats:
     raw_candidate_reference_calls: int = 0
     per_iteration_kdp: list[int] = field(default_factory=list)
     per_iteration_nref: list[int] = field(default_factory=list)
-    scheduler_durations: list[float] = field(default_factory=list)
+    init_scheduler_durations: list[float] = field(default_factory=list)
+    search_scheduler_durations: list[float] = field(default_factory=list)
     best_events: list[tuple[float, float]] = field(default_factory=list)
+    run_started: float | None = None
+    requested_budget: float | None = None
+    actual_runtime: float | None = None
+    overshoot: float | None = None
+    last_reference_start: float | None = None
+    last_reference_end: float | None = None
+    reference_status_sequence: list[str] = field(default_factory=list)
+    proposal_trajectory: list[tuple[int, str | None, bool, float | None]] = field(
+        default_factory=list
+    )
+    best_improvement_cmax: list[float] = field(default_factory=list)
 
     @property
     def valid_by_move(self) -> dict[str, int]:
@@ -93,18 +106,55 @@ class SearchStats:
         return self.best_improvement_by_move
 
     @property
-    def scheduler_mean(self) -> float | None:
-        if not self.scheduler_durations:
+    def all_scheduler_durations(self) -> list[float]:
+        return self.init_scheduler_durations + self.search_scheduler_durations
+
+    @property
+    def scheduler_durations(self) -> list[float]:
+        """Backward-compatible alias for all actual scheduler calls."""
+        return self.all_scheduler_durations
+
+    @staticmethod
+    def _mean(values: list[float]) -> float | None:
+        if not values:
             return None
-        return sum(self.scheduler_durations) / len(self.scheduler_durations)
+        return sum(values) / len(values)
+
+    @property
+    def scheduler_mean(self) -> float | None:
+        return self._mean(self.all_scheduler_durations)
 
     @property
     def scheduler_p50(self) -> float | None:
-        return _percentile(self.scheduler_durations, 0.50)
+        return _percentile(self.all_scheduler_durations, 0.50)
 
     @property
     def scheduler_p95(self) -> float | None:
-        return _percentile(self.scheduler_durations, 0.95)
+        return _percentile(self.all_scheduler_durations, 0.95)
+
+    @property
+    def init_scheduler_mean(self) -> float | None:
+        return self._mean(self.init_scheduler_durations)
+
+    @property
+    def init_scheduler_p50(self) -> float | None:
+        return _percentile(self.init_scheduler_durations, 0.50)
+
+    @property
+    def init_scheduler_p95(self) -> float | None:
+        return _percentile(self.init_scheduler_durations, 0.95)
+
+    @property
+    def search_scheduler_mean(self) -> float | None:
+        return self._mean(self.search_scheduler_durations)
+
+    @property
+    def search_scheduler_p50(self) -> float | None:
+        return _percentile(self.search_scheduler_durations, 0.50)
+
+    @property
+    def search_scheduler_p95(self) -> float | None:
+        return _percentile(self.search_scheduler_durations, 0.95)
 
     def record_reference(
         self,
@@ -112,14 +162,24 @@ class SearchStats:
         duration: float,
         *,
         initialization: bool,
+        reference_start: float | None = None,
+        reference_end: float | None = None,
     ) -> None:
-        self.scheduler_durations.append(duration)
+        if initialization:
+            self.init_scheduler_durations.append(duration)
+        else:
+            self.search_scheduler_durations.append(duration)
         self.reference_scheduler_time += duration
+        if reference_start is not None:
+            self.last_reference_start = reference_start
+        if reference_end is not None:
+            self.last_reference_end = reference_end
         if initialization:
             self.init_reference_calls += 1
             self.init_status_counts[status.value] += 1
             return
         self.nref += 1
+        self.reference_status_sequence.append(status.value)
         if status is ScheduleStatus.FEASIBLE:
             self.n_feasible += 1
         elif status is ScheduleStatus.DEADLOCK:
@@ -159,4 +219,3 @@ class SearchStats:
             raise AssertionError("per-iteration Kdp hard cap exceeded")
         if any(value > kref for value in self.per_iteration_nref):
             raise AssertionError("per-iteration Kref hard cap exceeded")
-

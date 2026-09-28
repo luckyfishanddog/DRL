@@ -249,7 +249,18 @@ def build_initial_solution(
                 ScheduleStatus.NUMERIC_FAILURE, diagnostics=(str(error),)
             )
         ref_duration = time.perf_counter() - ref_started
-        stats.record_reference(schedule.status, ref_duration, initialization=True)
+        ref_ended = time.perf_counter()
+        stats.record_reference(
+            schedule.status,
+            ref_duration,
+            initialization=True,
+            reference_start=(
+                None if stats.run_started is None else ref_started - stats.run_started
+            ),
+            reference_end=(
+                None if stats.run_started is None else ref_ended - stats.run_started
+            ),
+        )
         certification = None
         if schedule.status is ScheduleStatus.FEASIBLE:
             cert_started = time.perf_counter()
@@ -310,4 +321,3 @@ def build_initial_solution(
         None,
         tuple(attempts),
     )
-

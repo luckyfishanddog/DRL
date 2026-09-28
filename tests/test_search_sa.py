@@ -4,9 +4,9 @@ import random
 
 import pytest
 
-from mrta_exact import solve_exact_micro
-from mrta_reference.model import CandidateKey, CandidateMove, MoveType, ParentWeld, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind, SplitPattern
-from mrta_reference.scheduler import reference_schedule
+from mrta_exact import exact_schedule_from_templates, solve_exact_micro
+from mrta_reference.model import CandidateKey, CandidateMove, MoveType, OperationKind, ParentWeld, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind, SplitPattern
+from mrta_reference.scheduler import build_operation_templates, build_robot_routes, reference_schedule
 from mrta_reference.solution import canonicalize
 from mrta_search.direction import ConstrainedDirectionResult, DirectionStatus, optimize_directions_with_initial_feasibility
 from mrta_search.neighborhood import ScreenedCandidate
@@ -160,3 +160,116 @@ def test_deadlock_and_numeric_failure_are_never_sa_proposals() -> None:
         )
         assert iteration.proposal is None
 
+
+def _nontrivial_quality_cases():
+    return {
+        "Q1_assignment": (
+            (
+                ParentWeld("p0", (11.14, 10.0), (12.54, 10.0)),
+                ParentWeld("p1", (1.73, 10.0), (3.44, 10.0)),
+                ParentWeld("p2", (3.70, 10.0), (4.88, 10.0)),
+            ),
+            7,
+            1,
+            MoveType.INTER_RELOCATE,
+        ),
+        "Q2_route_order": (
+            (
+                ParentWeld("p0", (7.133, 8.048), (10.143, 11.5)),
+                ParentWeld("p1", (10.03, 8.264), (10.365, 8.484)),
+                ParentWeld("p2", (13.385, 9.169), (12.862, 9.463)),
+                ParentWeld("p3", (12.928, 8.209), (13.724, 8.133)),
+            ),
+            43,
+            8,
+            MoveType.TWO_OPT,
+        ),
+        "Q3_direction": (
+            (
+                ParentWeld("u", (1.26, 6.33), (5.33, 6.21)),
+                ParentWeld("l", (6.26, 5.68), (1.99, 5.79)),
+            ),
+            3,
+            20,
+            None,
+        ),
+        "Q4_optional_y": (
+            (ParentWeld("optional", (0.0, 6.0), (4.0, 6.0)),),
+            0,
+            10,
+            MoveType.SPLIT_ACTIVATE,
+        ),
+        "Q5_interference_wait": (
+            (
+                ParentWeld("u", (1.26, 6.33), (5.33, 6.21)),
+                ParentWeld("l", (6.26, 5.68), (1.99, 5.79)),
+                ParentWeld("d", (2.31, 10.0), (2.59, 10.0)),
+            ),
+            37,
+            12,
+            MoveType.INTER_RELOCATE,
+        ),
+    }
+
+
+def _fixed_coordination_cmax(solution, directions) -> float:
+    routes = build_robot_routes(
+        solution, FAST, {robot: directions[robot] for robot in range(4)}
+    )
+    exact = exact_schedule_from_templates(
+        {
+            route.robot_id: build_operation_templates(route, FAST)
+            for route in routes
+        },
+        FAST,
+        directions=directions,
+    )
+    assert exact.schedule is not None
+    assert exact.schedule.cmax is not None
+    return exact.schedule.cmax
+
+
+@pytest.mark.parametrize(
+    "case_name", tuple(_nontrivial_quality_cases())
+)
+def test_q1_q5_nontrivial_initial_gap_and_backbone_quality(case_name: str) -> None:
+    parents, seed, iterations, expected_move = _nontrivial_quality_cases()[case_name]
+    exact = solve_exact_micro(parents, FAST)
+    search = run_bounded_sa_oi(
+        parents,
+        FAST,
+        SearchConfig(m=64, kdp=8, kref=2, max_iterations=iterations),
+        seed=seed,
+    )
+    assert search.initialization.solution is not None
+    assert search.initialization.directions is not None
+    assert search.initialization.schedule is not None
+    assert search.initialization.schedule.cmax is not None
+    initial_coord = _fixed_coordination_cmax(
+        search.initialization.solution, search.initialization.directions
+    )
+    assert exact.best_cmax is not None
+    initial_gap = initial_coord - exact.best_cmax
+    assert initial_gap > 1.0e-6
+    final_gap = micro_gap_decomposition(search, exact, FAST)
+
+    if expected_move is None:
+        assert case_name == "Q3_direction"
+        assert final_gap.search_gap == pytest.approx(initial_gap)
+        assert exact.best_schedule is not None
+        assert exact.best_schedule.directions != search.best_directions
+    else:
+        assert final_gap.search_gap < initial_gap - 1.0e-6
+        assert search.stats.best_improvement_by_move[expected_move.value] >= 1
+
+    if case_name == "Q2_route_order":
+        assert [set(route.block_ids) for route in search.initialization.solution.routes] == [
+            set(route.block_ids) for route in search.best_solution.routes
+        ]
+    if case_name == "Q5_interference_wait":
+        assert any(
+            operation.kind is OperationKind.WAIT
+            for operation in search.initialization.schedule.operations
+        )
+    assert search.final_certification is not None
+    assert search.final_certification.certified

@@ -7,7 +7,7 @@ from mrta_reference.geometry import generate_y_split_patterns
 from mrta_reference.model import CandidateKey, CandidateMove, MoveType, ParentWeld, ScientificConfig, SplitKind, SplitPattern
 from mrta_reference.solution import canonicalize
 from mrta_search.direction import optimize_directions_with_initial_feasibility
-from mrta_search.neighborhood import RawAttempt, balanced_move_attempt_order, generate_raw_attempts, screen_raw_attempts
+from mrta_search.neighborhood import RawAttempt, applicable_move_mask, balanced_move_attempt_order, generate_raw_attempts, screen_raw_attempts
 from mrta_search.stats import ACTIVE_MOVE_TYPES, SearchStats
 
 
@@ -162,3 +162,47 @@ def test_balanced_quota_hard_m_duplicate_accounting_and_seeded_replay() -> None:
     assert stats.raw_candidate_reference_calls == 0
     assert stats.duplicates > 0
 
+
+def test_state_aware_applicable_mask_balances_only_possible_moves_and_keeps_hard_m() -> None:
+    solution = _base()
+    mask = applicable_move_mask(solution, FAST)
+    assert mask[MoveType.INTRA_RELOCATE]
+    assert mask[MoveType.INTER_RELOCATE]
+    assert mask[MoveType.SWAP]
+    assert mask[MoveType.TWO_OPT]
+    assert not mask[MoveType.SPLIT_ACTIVATE]
+    assert not mask[MoveType.SPLIT_DEACTIVATE]
+    assert not mask[MoveType.SPLIT_POINT_SWITCH]
+
+    stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 17)
+    attempts = generate_raw_attempts(solution, FAST, m=23, seed=17, stats=stats)
+    assert len(attempts) == 23
+    assert sum(stats.attempted_by_move.values()) == 23
+    active_counts = [
+        stats.attempted_by_move[move.value] for move, applies in mask.items() if applies
+    ]
+    assert max(active_counts) - min(active_counts) <= 1
+    for move, applies in mask.items():
+        assert stats.applicable_by_move[move.value] == int(applies)
+        if not applies:
+            assert stats.attempted_by_move[move.value] == 0
+
+    optional = ParentWeld("optional", (0.0, 5.9), (4.0, 7.0))
+    whole = canonicalize(
+        (optional,),
+        (SplitPattern("optional", SplitKind.WHOLE),),
+        {0: ("optional::whole",)},
+        FAST,
+    )
+    assert applicable_move_mask(whole, FAST)[MoveType.SPLIT_ACTIVATE]
+
+    patterns = generate_y_split_patterns(optional, FAST)
+    split = canonicalize(
+        (optional,),
+        (patterns[0],),
+        {0: ("optional::0",), 1: ("optional::1",)},
+        FAST,
+    )
+    split_mask = applicable_move_mask(split, FAST)
+    assert split_mask[MoveType.SPLIT_DEACTIVATE]
+    assert split_mask[MoveType.SPLIT_POINT_SWITCH]

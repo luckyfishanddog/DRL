@@ -20,6 +20,7 @@ from .initialization import (
 from .neighborhood import (
     RawAttempt,
     ScreenedCandidate,
+    applicable_move_mask,
     balanced_move_attempt_order,
     generate_raw_attempts,
     screen_raw_attempts,
@@ -50,6 +51,7 @@ __all__ = [
     "SearchResult",
     "SearchStatus",
     "SearchStats",
+    "applicable_move_mask",
     "balanced_move_attempt_order",
     "bounded_insertion_positions",
     "build_initial_solution",
