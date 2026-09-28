@@ -138,7 +138,7 @@ Q6 additional control：相同 seed 的 atomic-only、1 iteration 仍为 `19.357
 
 ## K. Initialization robustness matrix
 
-四类 × N=20/50/100 × 5 个固定 development seeds：60/60 SUCCESS。Initializer 本身 deterministic，因此 seed repetitions 是 replay/robustness diagnostic，不是统计推断。
+12 deterministic instance conditions（四类 × N=20/50/100）全部初始化成功；每个条件又以 5 个 seed 重放，总计 60/60 SUCCESS。这是 seed replay confirmation，不是 60 个独立 initialization robustness samples；只有 stochastic ALNS 搜索才使用真正的多 seed 统计。
 
 | family | N20 winner | N50 winner | N100 winner | success |
 |---|---|---|---|---:|

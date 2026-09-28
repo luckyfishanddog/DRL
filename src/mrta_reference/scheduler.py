@@ -22,6 +22,9 @@ from .model import (
     ScheduleResult,
     ScheduleStatus,
     ScientificConfig,
+    FormalScope,
+    FORMAL_SCOPE_V1,
+    SplitKind,
 )
 from .solution import block_map, canonicalize
 
@@ -1035,3 +1038,153 @@ def _operation_sort_key(operation: Operation):
         operation.kind.value,
         operation.operation_id,
     )
+
+
+def _bounded_dispatch_recovery(
+    templates_by_robot: Mapping[int, Sequence[Operation]],
+    config: ScientificConfig,
+    baseline: ScheduleResult,
+    *,
+    state_budget: int,
+    profile: SchedulerProfile | None = None,
+) -> ScheduleResult:
+    """DFS over finite ESS dispatch choices; one popped prefix is one state.
+
+    The baseline priority child is visited first. This is a bounded policy, not
+    an infeasibility proof or an exact optimization procedure. No incumbent from
+    an algorithm, time limit, RNG, or cross-call state participates.
+    """
+    if state_budget < 1:
+        raise ValueError("deadlock state budget must be positive")
+    if baseline.status is not ScheduleStatus.DEADLOCK:
+        return baseline
+    templates, invalid = _validated_reference_templates(templates_by_robot, config)
+    if invalid is not None:
+        return invalid
+    suffix = _remaining_processing_suffix(templates)
+    # next indices, completion, committed operations, per-robot WAIT counters.
+    stack = [((0, 0, 0, 0), (0.0, 0.0, 0.0, 0.0), (), (0, 0, 0, 0))]
+    expanded = 0
+    best = None
+    try:
+        while stack and expanded < state_budget:
+            indices, completion, fixed, waits = stack.pop()
+            expanded += 1
+            if all(indices[r] == len(templates[r]) for r in range(4)):
+                candidate = ScheduleResult(
+                    ScheduleStatus.FEASIBLE,
+                    tuple(sorted(fixed, key=_operation_sort_key)),
+                    max(completion), completion, directions=baseline.directions,
+                )
+                if best is None or (candidate.cmax, candidate.canonical_json()) < (
+                    best.cmax, best.canonical_json()
+                ):
+                    best = candidate
+                continue
+            choices = []
+            for robot in range(4):
+                if indices[robot] == len(templates[robot]):
+                    continue
+                template = templates[robot][indices[robot]]
+                relevant = relevant_fixed_operations(fixed, robot, completion[robot], config)
+                start, _, _ = earliest_safe_start_optimized(
+                    template, completion[robot], relevant, config, profile=profile
+                )
+                if math.isfinite(start):
+                    choices.append((start, -suffix[robot][indices[robot]],
+                                    -completion[robot], robot, template))
+            for start, _, _, robot, template in sorted(
+                choices, key=lambda choice: choice[:4], reverse=True
+            ):
+                new_indices, new_completion, new_waits = list(indices), list(completion), list(waits)
+                operations = fixed
+                if start > completion[robot]:
+                    point = (templates[robot][indices[robot] - 1].end
+                             if indices[robot] else template.start)
+                    operations += (Operation(
+                        f"R{robot}:WAIT:{waits[robot]}", robot, OperationKind.WAIT,
+                        completion[robot], start, point, point,
+                        template.sequence_index, template.block_id,
+                    ),)
+                    new_waits[robot] += 1
+                operation = _at_start(template, start)
+                operations += (operation,)
+                new_indices[robot] += 1
+                new_completion[robot] = operation.end_time
+                stack.append((tuple(new_indices), tuple(new_completion), operations, tuple(new_waits)))
+    except (ValueError, ArithmeticError, OverflowError) as error:
+        return replace(baseline, status=ScheduleStatus.NUMERIC_FAILURE,
+                       diagnostics=baseline.diagnostics + (f"bounded recovery numeric failure: {error}",),
+                       baseline_deadlock=True, expanded_states=expanded, state_budget=state_budget)
+    diagnostics = baseline.diagnostics + (
+        "baseline DEADLOCK", f"expanded_states={expanded}", f"budget={state_budget}",
+        f"recovery_exhausted={bool(stack)}", f"frontier_exhausted={not stack}",
+    )
+    return replace(
+        best if best is not None else baseline,
+        source="BOUNDED_DEADLOCK_RECOVERY" if best is not None else "BASELINE",
+        diagnostics=diagnostics, baseline_deadlock=True, expanded_states=expanded,
+        state_budget=state_budget, recovery_exhausted=bool(stack), frontier_exhausted=not stack,
+    )
+
+
+def reference_schedule_from_templates_formal(
+    templates_by_robot, config: ScientificConfig, *, scope: FormalScope = FORMAL_SCOPE_V1,
+    directions=((), (), (), ()), profile: SchedulerProfile | None = None,
+) -> ScheduleResult:
+    """Formal dispatch policy for operation fixtures; no parent-coverage claim."""
+    scope.validate_implemented()
+    baseline = reference_schedule_from_templates_optimized(
+        templates_by_robot, config, directions=directions, profile=profile
+    )
+    result = _bounded_dispatch_recovery(
+        templates_by_robot, config, baseline,
+        state_budget=scope.deadlock_state_budget, profile=profile,
+    ) if baseline.status is ScheduleStatus.DEADLOCK else baseline
+    return replace(result, reference_policy_id=scope.reference_scheduler_policy_id,
+                   scope_id=scope.scope_id, scope_hash=scope.scope_hash,
+                   state_budget=scope.deadlock_state_budget)
+
+
+def reference_schedule_formal(
+    solution: CanonicalSolution, config: ScientificConfig, *,
+    scope: FormalScope = FORMAL_SCOPE_V1,
+    orientations: Mapping[int, Sequence[int]] | None = None,
+    profile: SchedulerProfile | None = None,
+) -> ScheduleResult:
+    """The common formal evaluator. Development callbacks/X providers are absent."""
+    scope.validate_implemented()
+    if any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns):
+        result = _infeasible("FORMAL_SCOPE_V1: optional X_SPLIT is EXCLUDED")
+    else:
+        def dispatch(templates, cfg, *, directions, profile):
+            return reference_schedule_from_templates_formal(
+                templates, cfg, scope=scope, directions=directions, profile=profile
+            )
+        result = _reference_schedule_with(
+            solution, config, dispatch, orientations=orientations, profile=profile
+        )
+    return replace(result, reference_policy_id=scope.reference_scheduler_policy_id,
+                   scope_id=scope.scope_id, scope_hash=scope.scope_hash,
+                   state_budget=scope.deadlock_state_budget)
+
+
+@dataclass(frozen=True)
+class FormalReferenceEvaluator:
+    scope: FormalScope = FORMAL_SCOPE_V1
+
+    def __call__(self, solution, config, *, orientations=None):
+        return reference_schedule_formal(solution, config, scope=self.scope, orientations=orientations)
+
+
+def resolve_reference_evaluator(scope: FormalScope | None, evaluator=None):
+    if scope is None:
+        if isinstance(evaluator, FormalReferenceEvaluator) or evaluator is reference_schedule_formal:
+            raise ValueError("formal evaluator requires explicit scope")
+        return reference_schedule if evaluator is None else evaluator
+    scope.validate_implemented()
+    if evaluator is None or evaluator is reference_schedule_formal:
+        return FormalReferenceEvaluator(scope)
+    if isinstance(evaluator, FormalReferenceEvaluator) and evaluator.scope == scope:
+        return evaluator
+    raise ValueError("formal run requires the matching formal evaluator; development callbacks are unsupported")

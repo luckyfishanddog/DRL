@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import math
 import time
 
 from mrta_reference.certifier import CertificationReport, certify_schedule
+from mrta_reference.model import FormalScope
+from mrta_reference.scheduler import resolve_reference_evaluator
 from mrta_reference.geometry import (
     blocks_for_pattern,
     generate_y_split_patterns,
@@ -271,9 +273,13 @@ def build_initial_solution(
     construction_budget: int = 2,
     kinit_ref: int = 2,
     portfolio: bool = False,
-    reference_evaluator: ReferenceEvaluator = reference_schedule,
+    reference_evaluator: ReferenceEvaluator | None = None,
     certifier: Certifier = certify_schedule,
+    scope: FormalScope | None = None,
 ) -> InitializationResult:
+    reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
+    if scope is not None and certifier is not certify_schedule:
+        raise ValueError("formal initialization requires the common certifier")
     strategies = tuple(InitializationStrategy)[:construction_budget]
     if construction_budget < 1 or construction_budget > len(InitializationStrategy):
         raise ValueError("B_init_pool must be between 1 and 4")
@@ -392,10 +398,26 @@ def build_initial_solution(
             )
         ref_duration = time.perf_counter() - ref_started
         ref_ended = time.perf_counter()
+        certification = None
+        if schedule.status is ScheduleStatus.FEASIBLE:
+            cert_started = time.perf_counter()
+            certification = (certifier(solution, schedule, config, scope=scope)
+                             if scope is not None else certifier(solution, schedule, config))
+            stats.certifier_time += time.perf_counter() - cert_started
+            if not certification.certified:
+                schedule = replace(
+                    schedule, status=ScheduleStatus.NUMERIC_FAILURE, cmax=None,
+                    diagnostics=(
+                        "initial FEASIBLE schedule failed certification: "
+                        + "; ".join(certification.errors),
+                    ),
+                    directions=direction.directions,
+                )
         stats.record_reference(
             schedule.status,
             ref_duration,
             initialization=True,
+            schedule=schedule,
             reference_start=(
                 None if stats.run_started is None else ref_started - stats.run_started
             ),
@@ -403,22 +425,6 @@ def build_initial_solution(
                 None if stats.run_started is None else ref_ended - stats.run_started
             ),
         )
-        certification = None
-        if schedule.status is ScheduleStatus.FEASIBLE:
-            cert_started = time.perf_counter()
-            certification = certifier(solution, schedule, config)
-            stats.certifier_time += time.perf_counter() - cert_started
-            if not certification.certified:
-                schedule = ScheduleResult(
-                    ScheduleStatus.NUMERIC_FAILURE,
-                    diagnostics=(
-                        "initial FEASIBLE schedule failed certification: "
-                        + "; ".join(certification.errors),
-                    ),
-                    directions=direction.directions,
-                )
-                stats.init_status_counts[ScheduleStatus.FEASIBLE.value] -= 1
-                stats.init_status_counts[ScheduleStatus.NUMERIC_FAILURE.value] += 1
         old_attempt = attempts[attempt_index]
         attempt = InitializationAttempt(
             old_attempt.construction_index,

@@ -281,6 +281,49 @@ def test_hundreds_of_deterministic_random_solution_differentials() -> None:
             reference_schedule_slow(solution, FAST, orientations=directions),
             reference_schedule_optimized(solution, FAST, orientations=directions),
         )
+        baseline = reference_schedule_optimized(solution, FAST, orientations=directions)
+        formal = scheduler_module.reference_schedule_formal(solution, FAST, orientations=directions)
+        if baseline.feasible:
+            assert formal.canonical_json() == baseline.canonical_json()
+            assert formal.expanded_states == 0
+
+
+@pytest.mark.parametrize("index", range(4))
+def test_formal_e1_e4_policy_and_independent_template_certificate(index):
+    from mrta_reference.certifier import certify_template_schedule
+    templates = _oracle_cases()[index]
+    baseline = reference_schedule_from_templates_optimized(templates, FAST)
+    formal = scheduler_module.reference_schedule_from_templates_formal(templates, FAST)
+    if index < 2:
+        assert formal.canonical_json() == baseline.canonical_json()
+        assert formal.source == "BASELINE" and formal.expanded_states == 0
+    elif index == 2:
+        assert baseline.status is ScheduleStatus.DEADLOCK
+        assert formal.feasible and formal.source == "BOUNDED_DEADLOCK_RECOVERY"
+        assert formal.expanded_states == formal.state_budget == 16
+        assert formal.cmax == pytest.approx(15.5287634621)
+    else:
+        assert formal.status is ScheduleStatus.DEADLOCK
+        assert formal.cmax is None and formal.expanded_states == 7
+        assert formal.frontier_exhausted
+    if formal.feasible:
+        assert certify_template_schedule(templates, formal, FAST).certified
+        assert not certify_template_schedule(templates, replace(formal, cmax=formal.cmax + 1), FAST).certified
+        assert not certify_template_schedule(templates, replace(formal, operations=formal.operations[1:]), FAST).certified
+
+
+def test_bounded_exhaustion_stays_deadlock_and_numeric_failure_is_not_swallowed(monkeypatch):
+    templates = _oracle_cases()[2]
+    baseline = reference_schedule_from_templates_optimized(templates, FAST)
+    exhausted = scheduler_module._bounded_dispatch_recovery(templates, FAST, baseline, state_budget=1)
+    assert exhausted.status is ScheduleStatus.DEADLOCK
+    assert exhausted.recovery_exhausted and exhausted.expanded_states == 1
+    def explode(*args, **kwargs):
+        raise ArithmeticError("forced recovery failure")
+    monkeypatch.setattr(scheduler_module, "earliest_safe_start_optimized", explode)
+    numeric = scheduler_module._bounded_dispatch_recovery(templates, FAST, baseline, state_budget=16)
+    assert numeric.status is ScheduleStatus.NUMERIC_FAILURE
+    assert any("forced recovery failure" in d for d in numeric.diagnostics)
 
 
 def test_y_split_empty_route_wait_and_same_rail_boundary_differentials() -> None:
@@ -311,6 +354,10 @@ def test_y_split_empty_route_wait_and_same_rail_boundary_differentials() -> None
             reference_schedule_slow(solution, FAST, orientations=directions),
             reference_schedule_optimized(solution, FAST, orientations=directions),
         )
+        baseline = reference_schedule_optimized(solution, FAST, orientations=directions)
+        if baseline.feasible:
+            assert scheduler_module.reference_schedule_formal(
+                solution, FAST, orientations=directions).canonical_json() == baseline.canonical_json()
 
     touching = {
         0: _move_templates(0, ((0.0, 0.0), (1.0, 0.0), (2.0, 0.0))),
@@ -411,6 +458,10 @@ def test_phase2a_m1_m7_solution_differentials() -> None:
             reference_schedule_slow(solution, FAST, orientations=directions),
             reference_schedule_optimized(solution, FAST, orientations=directions),
         )
+        baseline = reference_schedule_optimized(solution, FAST, orientations=directions)
+        if baseline.feasible:
+            assert scheduler_module.reference_schedule_formal(
+                solution, FAST, orientations=directions).canonical_json() == baseline.canonical_json()
 
     _assert_schedule_equivalent(
         reference_schedule_from_templates_slow(_oracle_cases()[1], FAST),

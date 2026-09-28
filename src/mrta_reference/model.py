@@ -9,6 +9,11 @@ from typing import Mapping, Sequence
 
 Point = tuple[float, float]
 
+from .scope import (
+    FormalScope, FORMAL_SCOPE_V1, RunScientificIdentity,
+    DEVELOPMENT_NO_REPAIR_V1, FORMAL_BOUNDED_DISPATCH_POLICY_V1,
+)
+
 
 class Rail(str, Enum):
     UPPER = "UPPER"
@@ -261,6 +266,16 @@ class ScheduleResult:
         (),
         (),
     )
+    # Evaluator provenance is separate from the canonical scientific timeline.
+    source: str = "BASELINE"
+    reference_policy_id: str = "DEVELOPMENT_NO_REPAIR_V1"
+    scope_id: str | None = None
+    scope_hash: str | None = None
+    baseline_deadlock: bool = False
+    expanded_states: int = 0
+    state_budget: int = 0
+    recovery_exhausted: bool = False
+    frontier_exhausted: bool = False
 
     @property
     def feasible(self) -> bool:

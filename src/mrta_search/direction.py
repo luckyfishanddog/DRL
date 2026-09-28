@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import itertools
 import math
@@ -8,7 +8,8 @@ import time
 from collections.abc import Callable
 
 from mrta_reference.geometry import oriented_endpoints
-from mrta_reference.model import CanonicalSolution, ScheduleResult, ScheduleStatus, ScientificConfig
+from mrta_reference.model import CanonicalSolution, ScheduleResult, ScheduleStatus, ScientificConfig, FormalScope
+from mrta_reference.scheduler import resolve_reference_evaluator
 from mrta_reference.solution import block_map, official_metrics
 
 
@@ -39,6 +40,7 @@ class DirectionRefinementResult:
     calls: int
     improved: bool
     statuses: tuple[ScheduleStatus, ...]
+    diagnostics: tuple[tuple[str, ...], ...] = ()
 
 
 def _fixed_first_dp(blocks, first: int, config: ScientificConfig):
@@ -159,6 +161,7 @@ def refine_directions_bounded(
     max_calls: int,
     reference_evaluator: Callable[..., ScheduleResult],
     stats=None,
+    scope: FormalScope | None = None,
 ) -> DirectionRefinementResult:
     """Try a deterministic, budgeted set of single direction flips.
 
@@ -166,6 +169,8 @@ def refine_directions_bounded(
     reference call and only a certified official-metric improvement is retained.
     """
     from mrta_reference.certifier import certify_schedule
+
+    reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
 
     if max_calls <= 0 or base_schedule.status is not ScheduleStatus.FEASIBLE:
         return DirectionRefinementResult(
@@ -203,6 +208,7 @@ def refine_directions_bounded(
     best_schedule = base_schedule
     best_metrics = official_metrics(solution, base_schedule, config)
     statuses: list[ScheduleStatus] = []
+    diagnostics: list[tuple[str, ...]] = []
     calls = 0
     for _, robot, position in ordered[:max_calls]:
         vectors = [list(vector) for vector in base_directions]
@@ -226,7 +232,20 @@ def refine_directions_bounded(
         duration = time.perf_counter() - started
         ended = time.perf_counter()
         calls += 1
+        if schedule.status is ScheduleStatus.FEASIBLE:
+            cert_started = time.perf_counter()
+            certification = certify_schedule(solution, schedule, config, scope=scope)
+            if stats is not None:
+                stats.certifier_time += time.perf_counter() - cert_started
+            if not certification.certified:
+                schedule = replace(
+                    schedule, status=ScheduleStatus.NUMERIC_FAILURE, cmax=None,
+                    diagnostics=("direction refinement certification failed",)
+                    + certification.errors,
+                    directions=directions,
+                )
         statuses.append(schedule.status)
+        diagnostics.append(schedule.diagnostics)
         if stats is not None:
             stats.direction_refinement_calls += 1
             stats.c4_by_family["DIRECTION_REFINEMENT"] += 1
@@ -234,6 +253,7 @@ def refine_directions_bounded(
                 schedule.status,
                 duration,
                 initialization=False,
+                schedule=schedule,
                 reference_start=(
                     None if stats.run_started is None else started - stats.run_started
                 ),
@@ -242,12 +262,6 @@ def refine_directions_bounded(
                 ),
             )
         if schedule.status is not ScheduleStatus.FEASIBLE:
-            continue
-        cert_started = time.perf_counter()
-        certification = certify_schedule(solution, schedule, config)
-        if stats is not None:
-            stats.certifier_time += time.perf_counter() - cert_started
-        if not certification.certified:
             continue
         metrics = official_metrics(solution, schedule, config)
         if metrics.compare(best_metrics) < 0:
@@ -258,5 +272,5 @@ def refine_directions_bounded(
     if improved and stats is not None:
         stats.direction_improvements += 1
     return DirectionRefinementResult(
-        best_directions, best_schedule, calls, improved, tuple(statuses)
+        best_directions, best_schedule, calls, improved, tuple(statuses), tuple(diagnostics)
     )

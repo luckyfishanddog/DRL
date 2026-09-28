@@ -32,6 +32,11 @@ from .model import (
     SplitKind,
     SplitPattern,
     WeldingBlock,
+    FormalScope,
+    FORMAL_SCOPE_V1,
+    RunScientificIdentity,
+    DEVELOPMENT_NO_REPAIR_V1,
+    FORMAL_BOUNDED_DISPATCH_POLICY_V1,
 )
 from .oracle import (
     TinyOracleResult,
@@ -55,9 +60,16 @@ from .scheduler import (
     reference_schedule_from_templates_optimized,
     reference_schedule_from_templates_slow,
     wait_for_cycles,
+    reference_schedule_formal,
+    reference_schedule_from_templates_formal,
+    FormalReferenceEvaluator,
 )
 
 __all__ = [
+    "FormalScope", "FORMAL_SCOPE_V1", "RunScientificIdentity",
+    "DEVELOPMENT_NO_REPAIR_V1", "FORMAL_BOUNDED_DISPATCH_POLICY_V1",
+    "reference_schedule_formal", "reference_schedule_from_templates_formal",
+    "FormalReferenceEvaluator",
     "CertificationReport",
     "CandidateKey",
     "CandidateMove",

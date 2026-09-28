@@ -367,13 +367,8 @@ def _parent_alternatives(
                 for hint2 in (0, 1):
                     if evaluated >= remaining_budget:
                         break
-                    # Mandatory Y children may never collapse to an illegal WHOLE.
-                    if (
-                        pattern.mandatory
-                        and robot2 == robot
-                        and abs(position2 - position) <= 1
-                    ):
-                        continue
+                    # Insertion indices refer to different intermediate routes.
+                    # Only final canonicalization may decide split collapse.
                     evaluated += 1
                     routes2, hints2 = _insert_one(
                         routes1, hints1, second, robot2, position2, hint2

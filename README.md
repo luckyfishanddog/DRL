@@ -1,6 +1,6 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1` is not frozen. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1 = FROZEN`. This research is isolated from the repository's legacy V9/V10/PPO experiments.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
@@ -11,7 +11,7 @@ Implemented:
 - immutable scientific configuration and reproducibility hash;
 - parent weld, welding block, WHOLE/X_SPLIT/Y_SPLIT, route, operation, schedule, candidate, and metric models;
 - deterministic Y-handover candidates and frozen weighted-median `x_up`/`x_low`;
-- fail-closed formal validation for retained optional X splits;
+- historical fail-closed X validator support; formal scope explicitly excludes X_SPLIT;
 - canonicalization and deterministic solution identity;
 - open-route direction dynamic programming;
 - analytic continuous-time interference and same-rail non-passing checks;
@@ -32,7 +32,7 @@ Implemented:
 - split initialization/search scheduler timings, wall-clock overshoot records, anytime checkpoints, and micro gap decomposition;
 - adversarial and regression tests.
 
-Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR`, X_SPLIT search, and deadlock repair remain inactive. The implemented ALNS layer is the minimal development backbone, not a formal frozen algorithm or tuned benchmark.
+Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` and X_SPLIT search remain inactive. Formal evaluation enables bounded deterministic DEADLOCK recovery with 16 states. The implemented ALNS layer is the minimal development backbone, not a formal frozen algorithm or tuned benchmark.
 
 ## Development and formal scope
 
@@ -40,7 +40,13 @@ Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WA
 
 Development optimum notation is `Cmax_OPT_Y_CURRENT`, qualified by the current dispatch+ESS enumeration domain. It is not final full-problem `Cmax_OPT`. A limit-hit result is not optimal. Tests and certification of returned schedules do not establish general continuous-time optimality; the plan's `EXACT_SCHEDULER_VALIDITY_GATE` requires a dominance proof or explicitly limited independent validation before final exact claims.
 
-`FORMAL_SCOPE_V1` is **not frozen**. `FORMAL_SCOPE_GATE` must resolve the four questions below before adapted HGA/WAG common-model work, final ranker labels, and formal VALIDATION/ID_TEST/OOD. Formal exact must use the same final feasible set. Development results cannot be silently relabelled as formal results.
+`FORMAL_SCOPE_V1 = FROZEN`: F1 excludes optional X_SPLIT; F2/F3 use the explicit task-layer `TASK_HORIZON_RELEASE_V1` assumption (empty robots undeployed; active robots initially legal; occupancy ends after final POST); F4 uses `FORMAL_BOUNDED_DISPATCH_POLICY_V1`, baseline-first deterministic DFS with 16 popped-prefix states only after DEADLOCK. Bx is a spatial/load prior, not a split domain.
+
+See [scope contract](docs/FORMAL_SCOPE_V1.md) and [gate evidence](docs/FORMAL_SCOPE_GATE_V1_20260928.md). Scope hash: `8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9`.
+
+This is task-level weld allocation, sequencing, direction, and theoretical coordination. Deployment/retract/parking transitions require lower-level validation; no full physical parking or 3D collision-free execution claim is made. `mrta_exact` remains development-only. Formal results must be reevaluated and certified; development results are not relabelled.
+
+Next: Phase 3 — Adapted HGA / Adapted WAG common-model, beginning with paper-aligned sanity checks. Adapted HGA/WAG, LB_LP, MLP/GAT, ranker dataset, formal VALIDATION/ID_TEST/OOD, and final exact validation remain unfinished. Paper experiments are not complete.
 
 Reference statuses are `FEASIBLE`, `DEADLOCK`, `INFEASIBLE`, and `NUMERIC_FAILURE`. Only FEASIBLE has a reference Cmax; DEADLOCK is a failure of the deterministic scheduling policy, not mathematical infeasibility. Numeric failures are not normal negative training examples.
 
@@ -68,6 +74,7 @@ Run the repository and DRL suites together from the repository root:
 
 ## Module overview
 
+- `src/mrta_reference/scope.py`: unique immutable formal scope, canonical scope hash, and RunScientificIdentity.
 - `src/mrta_reference/model.py`: dataclasses, enums, scientific configuration, and config hash.
 - `src/mrta_reference/geometry.py`: eligibility, split geometry, frozen handover centers, direction DP, and analytic conflict geometry.
 - `src/mrta_reference/solution.py`: canonicalization and official metrics.
@@ -85,20 +92,33 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_search/pipeline.py`: unified atomic/LNS Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
 - `src/mrta_search/stats.py`: structured counters, timings, invariants, and anytime records.
 - `scripts/profile_phase2b1.py`: deterministic development-only N=20/50/100 smoke driver.
-- `scripts/profile_scheduler.py`: machine-readable slow/optimized profiling, N=100 5 s gate, Q1–Q6, initialization matrix, and development-family smoke driver.
+- `scripts/profile_scheduler.py`: formal gate calibration/Q1–Q6/family smoke plus historical slow/optimized profiling, N=100 5 s gate, Q1–Q6, initialization matrix, and development-family smoke driver.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
 - `docs/`: scientific plan and detailed AI handoff report.
 
-## Scientific ambiguities
+## Formal API
 
-The evaluator deliberately does not choose rules for the following unresolved scientific questions:
+```python
+from mrta_reference import FORMAL_SCOPE_V1, reference_schedule_formal, certify_schedule
+from mrta_search import run_bounded_sa_oi
 
-1. Optional X-split candidate enumeration. A retained X split requires an explicit `XSplitValidator`; there is no production default.
-2. Bounded deadlock repair trigger, priority alternatives, search order, tie breaking, budgets, and acceptance rule. The default scheduler performs no repair.
-3. Terminal occupancy after a robot's final POST. Currently the robot stops participating in interference after that explicit POST ends; no terminal WAIT is inserted.
-4. Parking/occupancy for an empty robot route. Currently it generates no operation, has completion `0.0`, and does not participate in interference.
+schedule = reference_schedule_formal(solution, config, orientations=directions)
+certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1)
+result = run_bounded_sa_oi(parents, config, scope=FORMAL_SCOPE_V1,
+                          source_commit=actual_git_head)
+```
 
-These current terminal/empty-route behaviors describe the implementation, including the absence of both TCP and rail-order occupancy after final POST and for empty routes. They are development scope boundaries, not final scientific conclusions. The plan assigns them to F1–F4 in FORMAL_SCOPE_GATE; Phase 2B may proceed without inventing rules for them.
+Explicit scope binds initialization, C4, direction refinement, and final certification to the same evaluator; a development callback is rejected in a formal run. Historical `reference_schedule`/slow/optimized retain `DEVELOPMENT_NO_REPAIR_V1`. `RunScientificIdentity` is available on `result.stats.scientific_identity`.
+
+Development gate commands (repository root; stdout JSON lines, no dataset):
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-gate calibration
+& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-gate quality
+& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-gate smoke
+```
+
+The fixed recovery budget does not guarantee recovery: more than 15 non-WAIT templates cannot reach a complete leaf in the 16-state DFS. DEADLOCK remains a policy outcome, not mathematical infeasibility. Tests, E1–E4, Q1–Q6 and the family smoke cover the published policy.
 
 ## Reproducibility identity
 
@@ -108,7 +128,7 @@ These current terminal/empty-route behaviors describe the implementation, includ
 791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e
 ```
 
-See the [Phase 1.1 handoff](docs/第一阶段公共科学模型与Reference_Evaluator_AI交接报告_20260914.md) and [Phase 2A handoff](docs/第二阶段Exact_Micro与LB0交接报告_20260927.md) for implementation evidence. The existing scientific config hash covers numeric parameters only; it does not mean FORMAL_SCOPE_V1 has been frozen.
+See the [Phase 1.1 handoff](docs/第一阶段公共科学模型与Reference_Evaluator_AI交接报告_20260914.md) and [Phase 2A handoff](docs/第二阶段Exact_Micro与LB0交接报告_20260927.md) for implementation evidence. The scientific config hash covers numeric parameters only. The independent scope hash and evaluator policy are defined in `src/mrta_reference/scope.py`; source commit is separate metadata.
 
 Phase 2B-1 evidence is recorded in [bounded SA-OI backbone handoff](docs/第三阶段Phase2B1_Bounded_SA_OI_Backbone交接报告_20260928.md). Development profiling can be reproduced with:
 

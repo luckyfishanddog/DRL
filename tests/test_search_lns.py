@@ -31,6 +31,45 @@ FAST = ScientificConfig(
 )
 
 
+def test_mandatory_pair_insertion_uses_final_route_not_old_index_difference(monkeypatch):
+    from mrta_reference.geometry import blocks_for_pattern, generate_y_split_patterns
+    from mrta_reference.model import SplitPattern
+    from mrta_search import lns
+
+    parent = ParentWeld("c", (2.0, 5.0), (2.0, 7.0))
+    pattern = generate_y_split_patterns(parent, FAST)[0]
+    blocks = {b.block_id: b for b in blocks_for_pattern(parent, pattern, FAST)}
+    for name, x in (("a", 1.0), ("b", 4.0)):
+        p = ParentWeld(name, (x, 6.0), (x + 0.5, 6.0))
+        blocks.update({b.block_id: b for b in blocks_for_pattern(
+            p, SplitPattern(name, SplitKind.WHOLE), FAST
+        )})
+    # Isolate structural insertion from rail eligibility: actual mandatory-Y
+    # geometry normally requires different rails. Final evaluation still checks it.
+    monkeypatch.setattr(lns, "robot_is_eligible", lambda *args: True)
+    alternatives, _ = lns._parent_alternatives(
+        "c", (("a::whole", "b::whole"), (), (), ()), ((0, 0), (), (), ()),
+        blocks, pattern, FAST, insertion_limit=8, remaining_budget=10000,
+    )
+    assert any(a.routes[0] == ("c::1", "a::whole", "c::0", "b::whole")
+               and a.trace[0][1:3] == (0, 1) and a.trace[1][1:3] == (0, 0)
+               for a in alternatives)
+
+
+def test_collapsed_mandatory_y_is_rejected_by_scientific_evaluator():
+    from mrta_reference.geometry import generate_y_split_patterns
+    from mrta_reference.model import CanonicalSolution, Route, ScheduleStatus
+    from mrta_reference.scheduler import reference_schedule
+    parent = ParentWeld("c", (2.0, 5.0), (2.0, 7.0))
+    pattern = generate_y_split_patterns(parent, FAST)[0]
+    raw = CanonicalSolution((parent,), (pattern,),
+                            tuple(Route(r, ("c::0", "c::1") if r == 0 else ())
+                                  for r in range(4)))
+    assert reference_schedule(raw, FAST).status is ScheduleStatus.INFEASIBLE
+    from mrta_reference.scheduler import reference_schedule_formal
+    assert reference_schedule_formal(raw, FAST).status is ScheduleStatus.INFEASIBLE
+
+
 def _parents() -> tuple[ParentWeld, ...]:
     return tuple(
         ParentWeld(name, start, end)

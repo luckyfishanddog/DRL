@@ -1,5 +1,31 @@
 from __future__ import annotations
 
+
+def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
+    from dataclasses import FrozenInstanceError, replace
+    import hashlib
+    import pytest
+    from mrta_reference.model import FORMAL_SCOPE_V1, FormalScope, ScientificConfig, RunScientificIdentity
+    scope = FORMAL_SCOPE_V1
+    assert scope.scope_hash == FormalScope().scope_hash
+    assert scope.scope_hash == hashlib.sha256(scope.canonical_json.encode()).hexdigest()
+    for change in (
+        {"optional_x_split_policy": "INCLUDED"}, {"pattern_domain": ("WHOLE",)},
+        {"terminal_policy": "OCCUPY_TO_CMAX"}, {"empty_route_policy": "PARK"},
+        {"initial_deployment_policy": "PAID"}, {"deadlock_policy_id": "OTHER"},
+        {"deadlock_state_budget": 32}, {"reference_scheduler_policy_id": "OTHER"},
+    ):
+        mutated = replace(scope, **change)
+        assert mutated.scope_hash != scope.scope_hash
+        with pytest.raises(ValueError, match="unsupported"):
+            mutated.validate_implemented()
+    with pytest.raises(FrozenInstanceError):
+        scope.deadlock_state_budget = 32
+    first = RunScientificIdentity.from_scope(scope, ScientificConfig(), "commit-a")
+    second = RunScientificIdentity.from_scope(scope, ScientificConfig(weld_speed=0.02), "commit-b")
+    assert first.scope_hash == second.scope_hash
+    assert first.scientific_config_hash != second.scientific_config_hash
+
 import itertools
 import math
 import random

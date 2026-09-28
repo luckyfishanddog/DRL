@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import math
 import random
@@ -20,6 +20,8 @@ from mrta_reference.model import (
     ScientificConfig,
 )
 from mrta_reference.scheduler import reference_schedule
+from mrta_reference.scheduler import resolve_reference_evaluator
+from mrta_reference.model import FormalScope, RunScientificIdentity, DEVELOPMENT_NO_REPAIR_V1
 from mrta_reference.scheduler import build_operation_templates, build_robot_routes
 from mrta_reference.solution import official_metrics
 
@@ -55,7 +57,7 @@ from .neighborhood import (
 from .stats import SearchStats
 
 
-REFERENCE_POLICY_ID = "REFERENCE_LIST_SCHEDULER_NO_REPAIR_V1"
+REFERENCE_POLICY_ID = DEVELOPMENT_NO_REPAIR_V1
 
 
 @dataclass(frozen=True)
@@ -290,10 +292,12 @@ def evaluate_iteration(
     stats: SearchStats,
     *,
     seed: int,
-    reference_evaluator: ReferenceEvaluator = reference_schedule,
+    reference_evaluator: ReferenceEvaluator | None = None,
     current_schedule: ScheduleResult | None = None,
     adaptive_state: AdaptiveOperatorState | None = None,
+    scope: FormalScope | None = None,
 ) -> IterationResult:
+    reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     attempts_before = stats.raw_attempts
     atomic_budget = (
         search_config.m
@@ -415,11 +419,11 @@ def evaluate_iteration(
         if move_name is not None:
             stats.c4_by_move[move_name] += 1
         cache_key = (
-            EXACT_Y_SCOPE_CURRENT_SEMANTICS,
+            EXACT_Y_SCOPE_CURRENT_SEMANTICS if scope is None else scope.scope_hash,
             config.scientific_hash,
             _solution_of(item.screened).canonical_hash,
             item.direction.directions,
-            REFERENCE_POLICY_ID,
+            REFERENCE_POLICY_ID if scope is None else scope.reference_scheduler_policy_id,
         )
         if cache_key in cache:
             cached = cache[cache_key]
@@ -455,14 +459,14 @@ def evaluate_iteration(
         effective_status = schedule.status
         if schedule.status is ScheduleStatus.FEASIBLE:
             cert_started = time.perf_counter()
-            certification = certify_schedule(_solution_of(item.screened), schedule, config)
+            certification = certify_schedule(_solution_of(item.screened), schedule, config, scope=scope)
             stats.certifier_time += time.perf_counter() - cert_started
             if certification.certified:
                 metrics = official_metrics(_solution_of(item.screened), schedule, config)
             else:
                 effective_status = ScheduleStatus.NUMERIC_FAILURE
-                schedule = ScheduleResult(
-                    ScheduleStatus.NUMERIC_FAILURE,
+                schedule = replace(
+                    schedule, status=ScheduleStatus.NUMERIC_FAILURE, cmax=None,
                     diagnostics=(
                         "candidate FEASIBLE schedule failed certification: "
                         + "; ".join(certification.errors),
@@ -473,6 +477,7 @@ def evaluate_iteration(
             effective_status,
             scheduler_duration,
             initialization=False,
+            schedule=schedule,
             reference_start=(
                 None if stats.run_started is None else started - stats.run_started
             ),
@@ -500,10 +505,15 @@ def run_bounded_sa_oi(
     search_config: SearchConfig = SearchConfig(),
     *,
     seed: int = 0,
-    reference_evaluator: ReferenceEvaluator = reference_schedule,
+    reference_evaluator: ReferenceEvaluator | None = None,
+    scope: FormalScope | None = None,
+    source_commit: str | None = None,
 ) -> SearchResult:
     started = time.perf_counter()
-    stats = SearchStats(EXACT_Y_SCOPE_CURRENT_SEMANTICS, seed)
+    reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
+    stats = SearchStats(EXACT_Y_SCOPE_CURRENT_SEMANTICS if scope is None else scope.scope_id, seed)
+    if scope is not None:
+        stats.scientific_identity = RunScientificIdentity.from_scope(scope, config, source_commit)
     stats.run_started = started
     stats.requested_budget = search_config.time_limit
     rng = random.Random(seed)
@@ -516,6 +526,7 @@ def run_bounded_sa_oi(
         kinit_ref=search_config.kinit_ref,
         portfolio=True,
         reference_evaluator=reference_evaluator,
+        scope=scope,
     )
     if initialization.status is not InitializationStatus.SUCCESS:
         runtime = time.perf_counter() - started
@@ -601,6 +612,7 @@ def run_bounded_sa_oi(
             reference_evaluator=reference_evaluator,
             current_schedule=current_schedule,
             adaptive_state=adaptive,
+            scope=scope,
         )
         stats.iterations += 1
         proposal = result.proposal
@@ -633,6 +645,7 @@ def run_bounded_sa_oi(
                 max_calls=remaining_refinement,
                 reference_evaluator=reference_evaluator,
                 stats=stats,
+                scope=scope,
             )
             if refined.improved:
                 proposal_refined = True
@@ -653,7 +666,7 @@ def run_bounded_sa_oi(
                     refined_direction,
                 )
                 certification = certify_schedule(
-                    _solution_of(base_candidate.screened), refined.schedule, config
+                    _solution_of(base_candidate.screened), refined.schedule, config, scope=scope
                 )
                 proposal = ReferenceEvaluatedCandidate(
                     refined_candidate,
@@ -725,7 +738,7 @@ def run_bounded_sa_oi(
         record_lns_observation(proposal, reward, global_best=global_best)
 
     cert_started = time.perf_counter()
-    final_certification = certify_schedule(best_solution, best_schedule, config)
+    final_certification = certify_schedule(best_solution, best_schedule, config, scope=scope)
     stats.certifier_time += time.perf_counter() - cert_started
     runtime = time.perf_counter() - started
     stats.actual_runtime = runtime
@@ -766,6 +779,8 @@ def micro_gap_decomposition(
     exact: ExactResult,
     config: ScientificConfig,
 ) -> MicroGapResult:
+    if search.stats.scope_id != EXACT_Y_SCOPE_CURRENT_SEMANTICS:
+        raise ValueError("development exact gaps cannot label a formal-scope run")
     if (
         search.status is not SearchStatus.COMPLETED
         or search.best_solution is None

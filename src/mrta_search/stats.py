@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import math
 from typing import Iterable
 
-from mrta_reference.model import MoveType, ScheduleStatus
+from mrta_reference.model import MoveType, ScheduleStatus, RunScientificIdentity, ScheduleResult
 
 
 ACTIVE_MOVE_TYPES = (
@@ -47,6 +47,8 @@ class SearchStats:
     scope_id: str
     seed: int
     iterations: int = 0
+    scientific_identity: RunScientificIdentity | None = None
+    reference_records: list[dict[str, object]] = field(default_factory=list)
 
     construction_attempts: int = 0
     init_reference_calls: int = 0
@@ -189,7 +191,17 @@ class SearchStats:
         initialization: bool,
         reference_start: float | None = None,
         reference_end: float | None = None,
+        schedule: ScheduleResult | None = None,
     ) -> None:
+        if schedule is not None:
+            self.reference_records.append({
+                "initialization": initialization, "status": status.value,
+                "source": schedule.source, "diagnostics": schedule.diagnostics,
+                "scope_id": schedule.scope_id, "scope_hash": schedule.scope_hash,
+                "reference_policy_id": schedule.reference_policy_id,
+                "expanded_states": schedule.expanded_states,
+                "baseline_deadlock": schedule.baseline_deadlock,
+            })
         if initialization:
             self.init_scheduler_durations.append(duration)
         else:

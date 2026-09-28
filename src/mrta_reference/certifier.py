@@ -17,6 +17,7 @@ from .model import (
     SplitPattern,
     ScientificAmbiguityError,
     robot_rail,
+    FormalScope,
 )
 
 XSplitValidator = Callable[[ParentWeld, SplitPattern, ScientificConfig], bool]
@@ -27,6 +28,71 @@ class CertificationReport:
     certified: bool
     errors: tuple[str, ...]
     recomputed_cmax: float | None
+
+
+def certify_template_schedule(templates_by_robot, schedule, config) -> CertificationReport:
+    """Independent trajectory certificate for development E1-E4 MOVE fixtures.
+
+    This validates the supplied templates, not parent weld coverage. Production
+    weld schedules must use certify_schedule as well.
+    """
+    if schedule.status is not ScheduleStatus.FEASIBLE or schedule.cmax is None:
+        return CertificationReport(False, ("schedule is not FEASIBLE",), None)
+    errors = []
+    completion = []
+    first = {}
+    for robot in range(4):
+        templates = tuple(templates_by_robot.get(robot, ()))
+        actual = sorted((op for op in schedule.operations if op.robot_id == robot),
+                        key=lambda op: (op.start_time, op.end_time, op.sequence_index,
+                                        0 if op.kind is OperationKind.WAIT else 1))
+        nonwait = tuple(op for op in actual if op.kind is not OperationKind.WAIT)
+        if len(nonwait) != len(templates):
+            errors.append(f"R{robot}: template coverage")
+        for expected, op in zip(templates, nonwait):
+            if (op.operation_id, op.kind, op.sequence_index, op.block_id) != (
+                expected.operation_id, expected.kind, expected.sequence_index, expected.block_id
+            ) or not _point_close(op.start, expected.start, config) or not _point_close(
+                op.end, expected.end, config
+            ) or not _close(op.duration, expected.duration, config):
+                errors.append(f"R{robot}: template mismatch")
+            if op.kind in (OperationKind.MOVE, OperationKind.WELD):
+                speed = config.empty_speed if op.kind is OperationKind.MOVE else config.weld_speed
+                if not _close(op.duration, math.dist(op.start, op.end) / speed, config):
+                    errors.append(f"R{robot}: incorrect motion duration")
+            elif (not _point_close(op.start, op.end, config)
+                  or not _close(op.duration, config.t_pre if op.kind is OperationKind.SETUP else config.t_post, config)):
+                errors.append(f"R{robot}: incorrect stationary operation")
+        ready = 0.0
+        point = templates[0].start if templates else None
+        if point is not None:
+            first[robot] = point
+        for op in actual:
+            if not _close(op.start_time, ready, config):
+                errors.append(f"R{robot}: overlap or uncovered idle")
+            if point is None or not _point_close(point, op.start, config):
+                errors.append(f"R{robot}: discontinuity")
+            if op.kind is OperationKind.WAIT and not _point_close(op.start, op.end, config):
+                errors.append(f"R{robot}: moving WAIT")
+            ready, point = op.end_time, op.end
+        if actual and actual[-1].kind is OperationKind.WAIT:
+            errors.append(f"R{robot}: terminal WAIT outside task horizon")
+        completion.append(ready)
+    for left, right in ((0, 1), (2, 3)):
+        if left in first and right in first and (
+            first[left][0] + config.interference_dx > first[right][0] + config.numeric_epsilon
+        ):
+            errors.append("illegal initial rail order")
+    for index, a in enumerate(schedule.operations):
+        for b in schedule.operations[index + 1:]:
+            if a.robot_id != b.robot_id and (_interferes(a, b, config) or _order_violation(a, b, config)):
+                errors.append(f"trajectory conflict: {a.operation_id}/{b.operation_id}")
+    cmax = max(completion)
+    if not _close(cmax, schedule.cmax, config) or any(
+        not _close(a, b, config) for a, b in zip(completion, schedule.robot_completion)
+    ):
+        errors.append("completion mismatch")
+    return CertificationReport(not errors, tuple(errors), cmax)
 
 
 def _close(left: float, right: float, config: ScientificConfig) -> bool:
@@ -97,9 +163,28 @@ def certify_schedule(
     config: ScientificConfig,
     *,
     x_split_validator: XSplitValidator | None = None,
+    scope: FormalScope | None = None,
 ) -> CertificationReport:
     """Independently reconstruct geometry and timing; scheduler helpers are not called."""
     errors: list[str] = []
+    if scope is not None:
+        scope.validate_implemented()
+        if (schedule.scope_id, schedule.scope_hash, schedule.reference_policy_id) != (
+            scope.scope_id, scope.scope_hash, scope.reference_scheduler_policy_id
+        ):
+            errors.append("formal evaluator identity mismatch")
+        if any(p.kind is SplitKind.X_SPLIT for p in solution.patterns):
+            return CertificationReport(False, ("FORMAL_SCOPE_V1: optional X_SPLIT is EXCLUDED",), None)
+        # TASK_HORIZON_RELEASE_V1 includes final POST (closed endpoint), then
+        # neither TCP nor rail occupancy. No invented parking/terminal WAIT.
+        for route in solution.routes:
+            rows = sorted((op for op in schedule.operations if op.robot_id == route.robot_id),
+                          key=lambda op: (op.start_time, op.end_time, op.sequence_index))
+            if not route.block_ids:
+                if rows or schedule.robot_completion[route.robot_id] != 0.0:
+                    errors.append("empty route must be undeployed with completion zero")
+            elif not rows or rows[-1].kind is not OperationKind.POST:
+                errors.append("formal task horizon must end at final POST")
     if schedule.status is not ScheduleStatus.FEASIBLE or schedule.cmax is None:
         return CertificationReport(False, ("schedule is not FEASIBLE",), None)
 

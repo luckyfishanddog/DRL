@@ -5,6 +5,10 @@ from collections import Counter
 import json
 import math
 import time
+from dataclasses import asdict
+from pathlib import Path
+import runpy
+import subprocess
 
 from mrta_exact import ExactSolveStatus, exact_schedule_from_templates, solve_exact_micro
 from mrta_reference.model import Operation, OperationKind, ParentWeld, ScientificConfig
@@ -22,6 +26,93 @@ from mrta_search.direction import optimize_directions_with_initial_feasibility
 from mrta_search.initialization import InitializationStrategy, _construct, _patterns
 
 from profile_phase2b1 import synthetic_parents
+
+
+def formal_scope_gate(stage: str, seeds: tuple[int, ...]) -> None:
+    """Development-only freeze evidence; JSON lines on stdout, no dataset files."""
+    from mrta_reference.scope import FORMAL_SCOPE_V1, RunScientificIdentity
+    from mrta_reference.scheduler import (
+        reference_schedule_from_templates_formal, _bounded_dispatch_recovery,
+    )
+    from mrta_reference.certifier import certify_template_schedule
+    scope = FORMAL_SCOPE_V1
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    def emit(row):
+        print(json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
+    emit({"stage": "identity", **asdict(RunScientificIdentity.from_scope(scope, ScientificConfig(), commit)),
+          "development_only": True, "source_worktree_dirty": bool(subprocess.check_output(
+              ["git", "status", "--porcelain"], text=True).strip())})
+    fast = ScientificConfig(weld_speed=1, empty_speed=1, t_pre=1, t_post=1)
+    if stage in ("all", "calibration"):
+        fixtures = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tests" / "test_exact.py"))
+        for budget in (16, 32, 64, 128):
+            for name, templates in fixtures["_manual_oracle_cases"]().items():
+                baseline = reference_schedule_from_templates_optimized(templates, fast)
+                started = time.perf_counter()
+                result = _bounded_dispatch_recovery(templates, fast, baseline, state_budget=budget)
+                elapsed = time.perf_counter() - started
+                certificate = certify_template_schedule(templates, result, fast) if result.feasible else None
+                if result.feasible and not certificate.certified:
+                    raise RuntimeError(certificate.errors)
+                emit({"stage": "calibration", "case": name, "budget": budget,
+                      "baseline": baseline.status.value, "status": result.status.value,
+                      "expanded_states": result.expanded_states, "Cmax": result.cmax,
+                      "certified": bool(certificate and certificate.certified), "runtime": elapsed,
+                      "frontier_exhausted": result.frontier_exhausted})
+        for name, templates in fixtures["_manual_oracle_cases"]().items():
+            start = time.perf_counter()
+            result = reference_schedule_from_templates_formal(templates, fast)
+            emit({"stage": "E1-E4", "case": name, "status": result.status.value,
+                  "Cmax": result.cmax, "source": result.source, "expanded_states": result.expanded_states,
+                  "budget": result.state_budget, "runtime": time.perf_counter() - start,
+                  "certified": certify_template_schedule(templates, result, fast).certified if result.feasible else None})
+    if stage in ("all", "quality"):
+        for name in ("Q1_assignment_trap", "Q2_route_order_trap", "Q3_direction_trap",
+                     "Q4_optional_y_split_trap", "Q5_interference_wait_trap", "Q6_lns_basin_trap"):
+            parents, seed, iterations = quality_fixture(name)
+            exact = solve_exact_micro(parents, fast)
+            result = run_bounded_sa_oi(parents, fast, SearchConfig(max_iterations=iterations),
+                                      seed=seed, scope=scope, source_commit=commit)
+            if not result.final_certification or not result.final_certification.certified:
+                raise RuntimeError(f"uncertified quality case {name}")
+            emit({"stage": "quality", "case": name, "seed": seed,
+                  "identity": asdict(result.stats.scientific_identity),
+                  "development_C_star": exact.best_cmax, "development_exact_status": exact.status.value,
+                  "formal_initial_Cref": result.initialization.schedule.cmax,
+                  "formal_Cref": result.best_schedule.cmax, "formal_exact_gap": None,
+                  "status": result.status.value, "certified": result.final_certification.certified,
+                  "runtime": result.runtime, "iterations": result.stats.iterations,
+                  "nref": result.stats.nref, "direction_calls": result.stats.direction_refinement_calls,
+                  "best_sources": result.stats.improvements_by_family,
+                  "recoveries": sum(r["source"] == "BOUNDED_DEADLOCK_RECOVERY" for r in result.stats.reference_records)})
+    if stage in ("all", "smoke"):
+        for family in ("load_skew", "spatial_cluster", "handover_heavy", "interference_stress"):
+            for size in (20, 50, 100):
+                initial_json = None
+                for seed in seeds:
+                    result = run_bounded_sa_oi(development_family(family, size), ScientificConfig(),
+                                              SearchConfig(max_iterations=2), seed=seed,
+                                              scope=scope, source_commit=commit)
+                    if not result.final_certification or not result.final_certification.certified:
+                        raise RuntimeError(f"uncertified family case {family}/{size}/{seed}")
+                    replay = result.initialization.schedule.canonical_json()
+                    if initial_json is not None and initial_json != replay:
+                        raise RuntimeError("deterministic initializer replay changed")
+                    initial_json = replay
+                    s = result.stats
+                    if s.n_numeric_failure:
+                        raise RuntimeError(f"numeric failure in {family}/{size}/{seed}")
+                    emit({"stage": "smoke", "family": family, "N": size, "seed": seed,
+                          "status": result.status.value, "certified": result.final_certification.certified,
+                          "initial": result.initialization.schedule.cmax, "best": result.best_schedule.cmax,
+                          "strategy": result.initialization.winning_strategy,
+                          "runtime": result.runtime, "iterations": s.iterations, "nref": s.nref,
+                          "direction_calls": s.direction_refinement_calls, "lns_attempts": s.attempted_by_family["LNS_REPAIRED"],
+                          "lns_c4": s.c4_by_family["LNS_REPAIRED"], "lns_accepted": s.accepted_by_family["LNS_REPAIRED"],
+                          "baseline_deadlocks": sum(r["baseline_deadlock"] for r in s.reference_records),
+                          "recoveries": sum(r["source"] == "BOUNDED_DEADLOCK_RECOVERY" for r in s.reference_records),
+                          "deadlock": s.n_deadlock, "repair_time": s.repair_time,
+                          "reference_time": s.reference_scheduler_time, "certifier_time": s.certifier_time})
 
 
 def _rail_x(local: int, total: int) -> float:
@@ -378,7 +469,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260928)
     parser.add_argument("--skip-families", action="store_true")
     parser.add_argument("--skip-quality", action="store_true")
+    parser.add_argument("--formal-scope-gate", choices=("all", "calibration", "quality", "smoke"))
+    parser.add_argument("--formal-seeds", nargs="+", type=int, default=(20260928, 20260929, 20260930))
     arguments = parser.parse_args()
+    if arguments.formal_scope_gate:
+        formal_scope_gate(arguments.formal_scope_gate, tuple(arguments.formal_seeds))
+        return
     config = ScientificConfig()
     scheduler_cases = [
         _profile_solution(synthetic_parents(size), config) for size in (20, 50, 100)
