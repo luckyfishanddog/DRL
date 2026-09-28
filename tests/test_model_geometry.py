@@ -6,6 +6,7 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
     import hashlib
     import pytest
     from mrta_reference.model import FORMAL_SCOPE_V1, FormalScope, ScientificConfig, RunScientificIdentity
+    from mrta_reference.provenance import SourceProvenance
     scope = FORMAL_SCOPE_V1
     assert scope.scope_hash == FormalScope().scope_hash
     assert scope.scope_hash == hashlib.sha256(scope.canonical_json.encode()).hexdigest()
@@ -21,10 +22,90 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
             mutated.validate_implemented()
     with pytest.raises(FrozenInstanceError):
         scope.deadlock_state_budget = 32
-    first = RunScientificIdentity.from_scope(scope, ScientificConfig(), "commit-a")
-    second = RunScientificIdentity.from_scope(scope, ScientificConfig(weld_speed=0.02), "commit-b")
+    first = RunScientificIdentity.from_scope(
+        scope, ScientificConfig(),
+        SourceProvenance("luckyfishanddog/DRL", "commit-a", "tree-a", False, True),
+    )
+    second = RunScientificIdentity.from_scope(
+        scope, ScientificConfig(weld_speed=0.02),
+        SourceProvenance("luckyfishanddog/DRL", "commit-b", "tree-b", True, False),
+    )
     assert first.scope_hash == second.scope_hash
     assert first.scientific_config_hash != second.scientific_config_hash
+    assert first.repository_id == "luckyfishanddog/DRL"
+    assert first.source_tree_hash == "tree-a" and first.commit_verified
+
+
+def _git(cwd, *args):
+    import subprocess
+    return subprocess.run(
+        ("git", *args), cwd=cwd, text=True, capture_output=True, check=True
+    ).stdout.strip()
+
+
+def _make_git_project(path, remote):
+    (path / "src").mkdir(parents=True)
+    (path / "src" / "model.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (path / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0'\n", encoding="utf-8")
+    _git(path, "init")
+    _git(path, "config", "user.email", "test@example.invalid")
+    _git(path, "config", "user.name", "Test")
+    _git(path, "add", ".")
+    _git(path, "commit", "-m", "fixture")
+    _git(path, "remote", "add", "origin", remote)
+    return _git(path, "rev-parse", "HEAD")
+
+
+def test_source_provenance_rejects_nested_outer_git_and_allows_explicit_development(tmp_path):
+    import pytest
+    from mrta_reference.provenance import SourceProvenanceError, resolve_source_provenance
+    outer = tmp_path / "outer"
+    project = outer / "DRL"
+    commit = _make_git_project(outer, "https://github.com/luckyfishanddog/DRL.git")
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "model.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (project / "pyproject.toml").write_text("[project]\nname='nested'\nversion='0'\n", encoding="utf-8")
+    with pytest.raises(SourceProvenanceError, match="git root"):
+        resolve_source_provenance(project)
+    unverified = resolve_source_provenance(
+        project, source_commit=commit, allow_unverified_source=True
+    )
+    assert not unverified.commit_verified
+    assert unverified.repository_id == "luckyfishanddog/DRL"
+    with pytest.raises(SourceProvenanceError, match="verified"):
+        unverified.require_formal_result()
+
+
+def test_source_provenance_auto_verifies_matching_root_and_rejects_wrong_remote(tmp_path):
+    import pytest
+    from mrta_reference.provenance import SourceProvenanceError, resolve_source_provenance
+    matching = tmp_path / "matching"
+    commit = _make_git_project(matching, "git@github.com:luckyfishanddog/DRL.git")
+    provenance = resolve_source_provenance(matching)
+    assert provenance.commit_verified and not provenance.worktree_dirty
+    assert provenance.source_commit == commit
+    provenance.require_formal_result()
+    wrong = tmp_path / "wrong"
+    _make_git_project(wrong, "https://github.com/luckyfishanddog/MRTA.git")
+    with pytest.raises(SourceProvenanceError, match="no remote"):
+        resolve_source_provenance(wrong)
+
+
+def test_source_tree_hash_is_stable_sensitive_and_ignores_cache(tmp_path):
+    from mrta_reference.provenance import compute_source_tree_hash
+    root = tmp_path / "tree"
+    (root / "src" / "pkg").mkdir(parents=True)
+    source = root / "src" / "pkg" / "module.py"
+    source.write_bytes(b"VALUE = 1\n")
+    (root / "pyproject.toml").write_bytes(b"[project]\nname='tree'\n")
+    first = compute_source_tree_hash(root)
+    assert first == compute_source_tree_hash(root)
+    cache = root / "src" / "pkg" / "__pycache__"
+    cache.mkdir()
+    (cache / "module.cpython-311.pyc").write_bytes(b"generated")
+    assert compute_source_tree_hash(root) == first
+    source.write_bytes(b"VALUE = 2\n")
+    assert compute_source_tree_hash(root) != first
 
 import itertools
 import math

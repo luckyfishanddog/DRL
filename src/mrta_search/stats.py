@@ -48,6 +48,7 @@ class SearchStats:
     seed: int
     iterations: int = 0
     scientific_identity: RunScientificIdentity | None = None
+    development_only: bool = True
     reference_records: list[dict[str, object]] = field(default_factory=list)
 
     construction_attempts: int = 0

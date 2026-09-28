@@ -6,6 +6,8 @@ import hashlib
 import json
 from typing import TYPE_CHECKING
 
+from .provenance import SourceProvenance
+
 if TYPE_CHECKING:
     from .model import ScientificConfig
 
@@ -56,13 +58,26 @@ class RunScientificIdentity:
     scope_hash: str
     scientific_config_hash: str
     reference_policy_id: str
+    repository_id: str
     source_commit: str
+    source_tree_hash: str
+    worktree_dirty: bool
+    commit_verified: bool
 
     @classmethod
-    def from_scope(cls, scope: FormalScope, config: ScientificConfig, source_commit: str):
+    def from_scope(
+        cls, scope: FormalScope, config: ScientificConfig, provenance: SourceProvenance
+    ):
         scope.validate_implemented()
-        if not source_commit:
-            raise ValueError("source_commit must be supplied by the run entry point")
-        return cls(scope.scope_id, scope.scope_hash, config.scientific_hash,
-                   scope.reference_scheduler_policy_id, source_commit)
+        return cls(
+            scope.scope_id,
+            scope.scope_hash,
+            config.scientific_hash,
+            scope.reference_scheduler_policy_id,
+            provenance.repository_id,
+            provenance.source_commit,
+            provenance.source_tree_hash,
+            provenance.worktree_dirty,
+            provenance.commit_verified,
+        )
 

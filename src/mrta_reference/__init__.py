@@ -43,6 +43,15 @@ from .oracle import (
     tiny_scheduler_oracle,
     tiny_scheduler_oracle_from_templates,
 )
+from .provenance import (
+    REPOSITORY_ID,
+    SOURCE_PROVENANCE_POLICY_V1,
+    SourceProvenance,
+    SourceProvenanceError,
+    canonicalize_repository_url,
+    compute_source_tree_hash,
+    resolve_source_provenance,
+)
 from .solution import canonicalize, official_metrics
 from .scheduler import (
     SchedulerProfile,
@@ -67,6 +76,9 @@ from .scheduler import (
 
 __all__ = [
     "FormalScope", "FORMAL_SCOPE_V1", "RunScientificIdentity",
+    "REPOSITORY_ID", "SOURCE_PROVENANCE_POLICY_V1", "SourceProvenance",
+    "SourceProvenanceError", "canonicalize_repository_url",
+    "compute_source_tree_hash", "resolve_source_provenance",
     "DEVELOPMENT_NO_REPAIR_V1", "FORMAL_BOUNDED_DISPATCH_POLICY_V1",
     "reference_schedule_formal", "reference_schedule_from_templates_formal",
     "FormalReferenceEvaluator",

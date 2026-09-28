@@ -326,6 +326,48 @@ def test_bounded_exhaustion_stays_deadlock_and_numeric_failure_is_not_swallowed(
     assert any("forced recovery failure" in d for d in numeric.diagnostics)
 
 
+def test_bounded_budget_recovery_is_monotonic_non_worsening_and_certified():
+    from mrta_reference.certifier import certify_template_schedule
+    templates = _oracle_cases()[2]
+    baseline = reference_schedule_from_templates_optimized(templates, FAST)
+    found = False
+    previous_cmax = None
+    for budget in (1, 2, 4, 8, 16, 32, 64, 128):
+        result = scheduler_module._bounded_dispatch_recovery(
+            templates, FAST, baseline, state_budget=budget
+        )
+        if found:
+            assert result.status is ScheduleStatus.FEASIBLE
+        if result.feasible:
+            found = True
+            assert certify_template_schedule(templates, result, FAST).certified
+            if previous_cmax is not None:
+                assert result.cmax <= previous_cmax + FAST.numeric_epsilon
+            previous_cmax = result.cmax
+        else:
+            assert result.status is ScheduleStatus.DEADLOCK
+    assert found
+
+
+def test_plateau_detector_uses_per_candidate_status_cmax_and_certification(monkeypatch):
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
+    from profile_scheduler import detect_local_plateaus
+    budgets = (16, 32, 64, 128, 256)
+    entry = {"replays": {
+        str(budget): {
+            "status": "FEASIBLE", "Cmax": 10.0, "certified": True
+        }
+        for budget in budgets
+    }}
+    assert detect_local_plateaus([entry], budgets) == [16, 32, 64]
+    entry["replays"]["64"]["Cmax"] = 9.0
+    assert 16 not in detect_local_plateaus([entry], budgets)
+    entry["replays"]["64"]["Cmax"] = 10.0
+    entry["replays"]["128"]["certified"] = False
+    assert 32 not in detect_local_plateaus([entry], budgets)
+
+
 def test_y_split_empty_route_wait_and_same_rail_boundary_differentials() -> None:
     cases = []
     mandatory = ParentWeld("mandatory", (2.0, 5.0), (2.0, 7.0))

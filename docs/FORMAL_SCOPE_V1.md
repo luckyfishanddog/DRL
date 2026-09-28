@@ -51,14 +51,17 @@ Scope hash：
 8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9
 ```
 
-`ScientificConfig.scientific_hash` 单独覆盖数值参数；改变 vw 等数值不会改变 scope hash。Timestamp、machine、Git SHA、测试计数均不进入 scope hash。每个正式运行承载 `RunScientificIdentity(scope_id, scope_hash, scientific_config_hash, reference_policy_id, source_commit)`；dirty worktree 另行记录，source_commit 不被描述为包含未提交代码的完整版本。
+`ScientificConfig.scientific_hash` 单独覆盖数值参数；改变 vw 等数值不会改变 scope hash。Timestamp、machine、Git SHA、测试计数均不进入 scope hash。每个运行承载 `RunScientificIdentity(scope_id, scope_hash, scientific_config_hash, reference_policy_id, repository_id, source_commit, source_tree_hash, worktree_dirty, commit_verified)`；实现 provenance 与 scientific scope identity 分离，不进入 scope hash。
+
+`SOURCE_PROVENANCE_POLICY_V1` 只有在实际 Git root 等于 DRL root 且 canonical remote 匹配 `github.com/luckyfishanddog/DRL` 时才自动接受 HEAD；publishable formal result 还要求 clean worktree，并在运行入口重新解析和比对 provenance。嵌套在其他仓库中的 development smoke 必须显式 `allow_unverified_source=True`，输出 `UNVERIFIED_SOURCE_PROVENANCE` 与 `development_only=true`，不得冒充正式结果。
 
 ```python
 from mrta_reference import FORMAL_SCOPE_V1, reference_schedule_formal, certify_schedule
 schedule = reference_schedule_formal(solution, config, scope=FORMAL_SCOPE_V1,
                                      orientations=directions)
 certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1)
-# run_bounded_sa_oi(..., scope=FORMAL_SCOPE_V1, source_commit=actual_git_head)
+# standalone clean luckyfishanddog/DRL checkout only:
+# run_bounded_sa_oi(..., scope=FORMAL_SCOPE_V1, formal_result=True)
 ```
 
 正式 ALNS 的 initial portfolio、candidate C4、direction refinement、final certification 共享一个 scope；显式 scope 下拒绝 development callback。开发历史 API `reference_schedule`/slow/optimized 仍是 `DEVELOPMENT_NO_REPAIR_V1`，`EXACT_Y_SCOPE_CURRENT_SEMANTICS` 保留。未来 HGA/WAG/ranker labels 必须显式使用 formal API 与同一 certifier。
@@ -68,6 +71,8 @@ certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1
 目标仍为 task-level weld allocation、sequencing、direction、theoretical coordination；保持 Cmax-first 与既有辅助指标词典序。不是 full robot motion planning、full physical parking 或 3D collision-free execution。
 
 有限恢复既非完整可行性判定也非 exact scheduler。16 个 popped prefixes 至多访问深度 15 的 complete schedule；超过 15 个非 WAIT templates 的 baseline DEADLOCK 不可能在此 V1 recovery 内到达 complete leaf。此限制明确接受，不能以后随算法增大预算。大型 handover smoke 的死锁没有被隐瞒，后续科学 policy 变更需要新 scope version。
+
+2026-09-29 large-state development stress 没有触发 scope 版本升级：31 个 unique baseline-DEADLOCK states 在 16/32/64 的 status/Cmax 完全一致，满足冻结的 local plateau 判据；16–1024 无恢复，2048 仅恢复一个 certified handover-heavy/N100 state。该结果验证单调实现，也量化了大型恢复限制；它不把 DEADLOCK 改写为 INFEASIBLE。完整证据见 [Pre-Phase3 release audit](PRE_PHASE3_RELEASE_AUDIT_20260929.md)。
 
 Development results 不能直接更名为 formal results：F4 policy/identity 改变，必须重新 evaluation/certification，Q4 已实际出现恢复调用。即便数值偶然相同，也分别携带 identity；本轮报告 development C* 与 formal Cref，不伪造正式 exact gap。
 

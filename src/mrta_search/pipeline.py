@@ -6,6 +6,7 @@ from enum import Enum
 import math
 import random
 import time
+from pathlib import Path
 
 from mrta_exact import EXACT_Y_SCOPE_CURRENT_SEMANTICS
 from mrta_exact import ExactResult, ExactSolveStatus, exact_schedule_from_templates
@@ -22,6 +23,11 @@ from mrta_reference.model import (
 from mrta_reference.scheduler import reference_schedule
 from mrta_reference.scheduler import resolve_reference_evaluator
 from mrta_reference.model import FormalScope, RunScientificIdentity, DEVELOPMENT_NO_REPAIR_V1
+from mrta_reference.provenance import (
+    SourceProvenance,
+    SourceProvenanceError,
+    resolve_source_provenance,
+)
 from mrta_reference.scheduler import build_operation_templates, build_robot_routes
 from mrta_reference.solution import official_metrics
 
@@ -507,13 +513,35 @@ def run_bounded_sa_oi(
     seed: int = 0,
     reference_evaluator: ReferenceEvaluator | None = None,
     scope: FormalScope | None = None,
+    source_provenance: SourceProvenance | None = None,
     source_commit: str | None = None,
+    allow_unverified_source: bool = False,
+    formal_result: bool = False,
 ) -> SearchResult:
     started = time.perf_counter()
     reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     stats = SearchStats(EXACT_Y_SCOPE_CURRENT_SEMANTICS if scope is None else scope.scope_id, seed)
     if scope is not None:
-        stats.scientific_identity = RunScientificIdentity.from_scope(scope, config, source_commit)
+        root = Path(__file__).resolve().parents[2]
+        if source_provenance is not None and source_commit is not None:
+            raise ValueError("provide source_provenance or source_commit, not both")
+        if source_provenance is None:
+            source_provenance = resolve_source_provenance(
+                root,
+                source_commit=source_commit,
+                allow_unverified_source=allow_unverified_source,
+            )
+        if formal_result:
+            verified = resolve_source_provenance(root)
+            if source_provenance != verified:
+                raise SourceProvenanceError(
+                    "formal result provenance does not match the executing DRL tree"
+                )
+            source_provenance.require_formal_result()
+        stats.scientific_identity = RunScientificIdentity.from_scope(
+            scope, config, source_provenance
+        )
+        stats.development_only = not formal_result
     stats.run_started = started
     stats.requested_budget = search_config.time_limit
     rng = random.Random(seed)
