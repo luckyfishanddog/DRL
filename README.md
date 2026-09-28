@@ -1,6 +1,6 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator and Phase 2A exact micro validation backbone for multi-robot weld allocation and sequencing. Phase 2B0 closes the scientific plan; minimal deterministic SA-OI-ALNS is next. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, and Phase 2B-1 bounded SA-OI neighborhood-search backbone for multi-robot weld allocation and sequencing. Phase 2B-1 is not a complete SA-OI-ALNS: destroy/repair and adaptive destroy/repair operator selection are intentionally deferred to Phase 2B-2. This research is isolated from the repository's legacy V9/V10/PPO experiments.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
@@ -21,9 +21,14 @@ Implemented:
 - `mrta_exact`: Y-only pattern/assignment/route/full-direction micro enumeration, with exhaustive and branch-and-bound modes;
 - independent coordination scheduler using dispatch interleaving enumeration and earliest-safe-start placement;
 - analytical LB0, exact/reference comparison, and explicit enumeration limits;
+- initial-orientation-constrained exact empty-travel direction DP;
+- deterministic bounded initial construction with one fallback;
+- balanced hard-budget generation for seven atomic neighborhood moves;
+- makespan-first C0-C4 screening, Kdp direction rerank, Kref reference evaluation, and seeded SA acceptance;
+- structured search instrumentation, anytime checkpoints, and micro gap decomposition;
 - adversarial and regression tests.
 
-Not implemented in this research: formal full-scope exact, LB_LP, initial-solution heuristics, the initial-orientation-constrained DP wrapper, bounded candidate pools, SA-OI-ALNS, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. Existing generic CandidateMove types do not imply an active search backbone.
+Not implemented in this research: formal full-scope exact, LB_LP, complete SA-OI-ALNS destroy/repair, adaptive operator selection, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR`, X_SPLIT search, direction refinement, and deadlock repair remain inactive.
 
 ## Development and formal scope
 
@@ -69,6 +74,12 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_exact/lower_bounds.py`: analytical LB0.
 - `src/mrta_exact/scheduler.py`: independent dispatch+ESS coordination enumeration.
 - `src/mrta_exact/solver.py`: Y-only exact micro backbone, full directions, limits, and comparison metrics.
+- `src/mrta_search/direction.py`: initial-feasibility-constrained direction DP.
+- `src/mrta_search/initialization.py`: deterministic initial construction and bounded fallback.
+- `src/mrta_search/neighborhood.py`: balanced seven-move raw proposal and cheap screening.
+- `src/mrta_search/pipeline.py`: Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
+- `src/mrta_search/stats.py`: structured counters, timings, invariants, and anytime records.
+- `scripts/profile_phase2b1.py`: deterministic development-only N=20/50/100 smoke driver.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
 - `docs/`: scientific plan and detailed AI handoff report.
 
@@ -92,3 +103,9 @@ These current terminal/empty-route behaviors describe the implementation, includ
 ```
 
 See the [Phase 1.1 handoff](docs/第一阶段公共科学模型与Reference_Evaluator_AI交接报告_20260914.md) and [Phase 2A handoff](docs/第二阶段Exact_Micro与LB0交接报告_20260927.md) for implementation evidence. The existing scientific config hash covers numeric parameters only; it does not mean FORMAL_SCOPE_V1 has been frozen.
+
+Phase 2B-1 evidence is recorded in [bounded SA-OI backbone handoff](docs/第三阶段Phase2B1_Bounded_SA_OI_Backbone交接报告_20260928.md). Development profiling can be reproduced with:
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' scripts\profile_phase2b1.py --sizes 20 50 100 --budgets 0.2 1 5 --seed 20260928
+```
