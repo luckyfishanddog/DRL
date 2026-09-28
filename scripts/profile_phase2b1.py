@@ -51,6 +51,17 @@ def profile(count: int, seconds: float, seed: int) -> dict[str, object]:
     attempted = sum(stats.attempted_by_move.values())
     valid = sum(stats.valid_by_move.values())
     accepted = sum(stats.accepted_by_move.values())
+    family_attempts = sum(stats.attempted_by_family.values())
+    component_total = sum(
+        (
+            stats.candidate_generation_time,
+            stats.repair_time,
+            stats.cheap_screen_time,
+            stats.direction_dp_time,
+            stats.reference_scheduler_time,
+            stats.certifier_time,
+        )
+    )
     return {
         "N": count,
         "budget_seconds": seconds,
@@ -60,12 +71,49 @@ def profile(count: int, seconds: float, seed: int) -> dict[str, object]:
         "initial_cmax": initial,
         "best_cmax": best,
         "improvement": None if initial is None or best is None else initial - best,
+        "relative_improvement": (
+            None
+            if initial is None or best is None or initial == 0.0
+            else (initial - best) / initial
+        ),
         "iterations": stats.iterations,
-        "candidate_per_second": stats.raw_attempts / result.runtime if result.runtime else None,
+        "candidate_per_second": family_attempts / result.runtime if result.runtime else None,
+        "atomic_candidates": stats.attempted_by_family["ATOMIC"],
+        "lns_candidates": stats.attempted_by_family["LNS_REPAIRED"],
         "Nref": stats.nref,
         "Nref_per_second": stats.nref / result.runtime if result.runtime else None,
         "scheduler_mean": stats.scheduler_mean,
         "scheduler_p95": stats.scheduler_p95,
+        "init_scheduler_p50": stats.init_scheduler_p50,
+        "init_scheduler_p95": stats.init_scheduler_p95,
+        "search_scheduler_p50": stats.search_scheduler_p50,
+        "search_scheduler_p95": stats.search_scheduler_p95,
+        "direction_refinement_calls": stats.direction_refinement_calls,
+        "direction_improvements": stats.direction_improvements,
+        "accepted_by_family": stats.accepted_by_family,
+        "improvements_by_family": stats.improvements_by_family,
+        "operator_pair_uses": dict(stats.operator_pair_uses),
+        "operator_pair_rewards": dict(stats.operator_pair_rewards),
+        "operator_pair_global_bests": dict(stats.operator_pair_global_bests),
+        "operator_weights": stats.final_operator_weights,
+        "repair_insertion_evaluations": stats.repair_insertion_evaluations,
+        "timing_seconds": {
+            "candidate_generation": stats.candidate_generation_time,
+            "repair": stats.repair_time,
+            "cheap_screening": stats.cheap_screen_time,
+            "direction_dp": stats.direction_dp_time,
+            "reference_scheduler": stats.reference_scheduler_time,
+            "certifier": stats.certifier_time,
+            "other_nonexclusive": max(0.0, result.runtime - component_total),
+        },
+        "scheduler_runtime_share": (
+            stats.reference_scheduler_time / result.runtime if result.runtime else None
+        ),
+        "requested_budget": stats.requested_budget,
+        "actual_runtime": stats.actual_runtime,
+        "overshoot": stats.overshoot,
+        "last_reference_start": stats.last_reference_start,
+        "last_reference_end": stats.last_reference_end,
         "deadlock_rate": stats.n_deadlock / stats.nref if stats.nref else None,
         "initialization_failed": result.status.value == "INITIALIZATION_FAILED",
         "move_valid_rate": valid / attempted if attempted else None,
@@ -76,10 +124,10 @@ def profile(count: int, seconds: float, seed: int) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 2B-1 development profiling (not a formal benchmark)"
+        description="Phase 2B-2 development profiling (not a formal benchmark)"
     )
     parser.add_argument("--sizes", nargs="+", type=int, default=(20, 50, 100))
-    parser.add_argument("--budgets", nargs="+", type=float, default=(0.2, 1.0, 5.0))
+    parser.add_argument("--budgets", nargs="+", type=float, default=(1.0, 5.0, 30.0))
     parser.add_argument("--seed", type=int, default=20260928)
     arguments = parser.parse_args()
     rows = [

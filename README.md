@@ -1,6 +1,6 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood-search backbone, and Phase 2B-1.5 reference-scheduler performance closure for multi-robot weld allocation and sequencing. This is not a complete SA-OI-ALNS: destroy/repair and adaptive destroy/repair operator selection are intentionally deferred to Phase 2B-2. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1` is not frozen. This research is isolated from the repository's legacy V9/V10/PPO experiments.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
@@ -23,13 +23,16 @@ Implemented:
 - independent coordination scheduler using dispatch interleaving enumeration and earliest-safe-start placement;
 - analytical LB0, exact/reference comparison, and explicit enumeration limits;
 - initial-orientation-constrained exact empty-travel direction DP;
-- deterministic bounded initial construction with one fallback;
+- bounded four-strategy deterministic initial portfolio with capped reference evaluation;
 - state-aware balanced hard-budget generation for seven atomic neighborhood moves;
+- parent-level random/critical-load destroy, greedy/regret-2 repair, and reproducible adaptive operator-pair weights;
+- one unified complete-candidate pipeline for atomic and repaired LNS solutions;
+- bounded certified schedule-aware single-flip direction refinement inside the total reference budget;
 - makespan-first C0-C4 screening, Kdp direction rerank, Kref reference evaluation, and seeded SA acceptance;
 - split initialization/search scheduler timings, wall-clock overshoot records, anytime checkpoints, and micro gap decomposition;
 - adversarial and regression tests.
 
-Not implemented in this research: formal full-scope exact, LB_LP, complete SA-OI-ALNS destroy/repair, adaptive operator selection, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR`, X_SPLIT search, direction refinement, and deadlock repair remain inactive.
+Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR`, X_SPLIT search, and deadlock repair remain inactive. The implemented ALNS layer is the minimal development backbone, not a formal frozen algorithm or tuned benchmark.
 
 ## Development and formal scope
 
@@ -51,7 +54,7 @@ From `D:\pybullet_test\MRTA_GA\DRL`:
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -m pip install --no-build-isolation --no-deps -e .
 ```
 
-Run the complete DRL suite (Phase 1.1 + Phase 2A + Phase 2B-1/1.5):
+Run the complete DRL suite (Phase 1.1 + Phase 2A + Phase 2B):
 
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -m pytest -q -p no:cacheprovider
@@ -75,13 +78,14 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_exact/lower_bounds.py`: analytical LB0.
 - `src/mrta_exact/scheduler.py`: independent dispatch+ESS coordination enumeration.
 - `src/mrta_exact/solver.py`: Y-only exact micro backbone, full directions, limits, and comparison metrics.
-- `src/mrta_search/direction.py`: initial-feasibility-constrained direction DP.
-- `src/mrta_search/initialization.py`: deterministic initial construction and bounded fallback.
+- `src/mrta_search/direction.py`: initial-feasibility-constrained direction DP and bounded schedule-aware refinement.
+- `src/mrta_search/initialization.py`: deterministic bounded initial portfolio.
 - `src/mrta_search/neighborhood.py`: balanced seven-move raw proposal and cheap screening.
-- `src/mrta_search/pipeline.py`: Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
+- `src/mrta_search/lns.py`: complete-candidate identity, parent destroy, bounded repair, and adaptive operator state.
+- `src/mrta_search/pipeline.py`: unified atomic/LNS Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
 - `src/mrta_search/stats.py`: structured counters, timings, invariants, and anytime records.
 - `scripts/profile_phase2b1.py`: deterministic development-only N=20/50/100 smoke driver.
-- `scripts/profile_scheduler.py`: machine-readable slow/optimized profiling, N=100 5 s gate, Q1–Q5, and development-family smoke driver.
+- `scripts/profile_scheduler.py`: machine-readable slow/optimized profiling, N=100 5 s gate, Q1–Q6, initialization matrix, and development-family smoke driver.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
 - `docs/`: scientific plan and detailed AI handoff report.
 
@@ -116,4 +120,10 @@ Phase 2B-1.5 evidence is recorded in [reference scheduler performance closure ha
 
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' scripts\profile_scheduler.py --seed 20260928
+```
+
+Phase 2B-2 evidence is recorded in [minimal real ALNS closure handoff](docs/Phase2B2_Minimal_Real_ALNS_Closure_20260928.md). The 1/5/30 s development-only run is reproduced with:
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' scripts\profile_phase2b1.py --sizes 20 50 100 --budgets 1 5 30 --seed 20260928
 ```

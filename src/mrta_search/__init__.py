@@ -1,21 +1,32 @@
-"""Phase 2B-1 bounded SA-OI neighborhood-search backbone.
-
-This package is intentionally not a complete ALNS layer: it has no destroy/repair
-operators and no adaptive operator selection.
-"""
+"""Deterministic minimal SA-OI-ALNS search backbone."""
 
 from .direction import (
     ConstrainedDirectionResult,
     DirectionStatus,
     DirectionVectors,
+    DirectionRefinementResult,
     optimize_directions_with_initial_feasibility,
+    refine_directions_bounded,
 )
 from .stats import ACTIVE_MOVE_TYPES, SearchStats
 from .initialization import (
     InitializationResult,
     InitializationStatus,
+    InitializationStrategy,
     bounded_insertion_positions,
     build_initial_solution,
+)
+from .lns import (
+    AdaptiveOperatorState,
+    CandidateSourceKind,
+    CompleteCandidateIdentity,
+    CompleteSearchCandidate,
+    DestroyOperator,
+    PartialSearchState,
+    RepairOperator,
+    destroy_parents,
+    destroy_size,
+    repair_partial_state,
 )
 from .neighborhood import (
     RawAttempt,
@@ -42,8 +53,17 @@ __all__ = [
     "ConstrainedDirectionResult",
     "DirectionStatus",
     "DirectionVectors",
+    "DirectionRefinementResult",
+    "AdaptiveOperatorState",
+    "CandidateSourceKind",
+    "CompleteCandidateIdentity",
+    "CompleteSearchCandidate",
+    "DestroyOperator",
+    "PartialSearchState",
+    "RepairOperator",
     "InitializationResult",
     "InitializationStatus",
+    "InitializationStrategy",
     "MicroGapResult",
     "RawAttempt",
     "ScreenedCandidate",
@@ -58,6 +78,10 @@ __all__ = [
     "evaluate_iteration",
     "generate_raw_attempts",
     "optimize_directions_with_initial_feasibility",
+    "refine_directions_bounded",
+    "destroy_parents",
+    "destroy_size",
+    "repair_partial_state",
     "micro_gap_decomposition",
     "rerank_c3",
     "run_bounded_sa_oi",

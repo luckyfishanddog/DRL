@@ -23,6 +23,10 @@ def _move_counter() -> dict[str, int]:
     return {move.value: 0 for move in ACTIVE_MOVE_TYPES}
 
 
+def _family_counter() -> dict[str, int]:
+    return {"ATOMIC": 0, "LNS_REPAIRED": 0, "DIRECTION_REFINEMENT": 0}
+
+
 def _percentile(values: Iterable[float], fraction: float) -> float | None:
     ordered = sorted(values)
     if not ordered:
@@ -48,6 +52,8 @@ class SearchStats:
     init_reference_calls: int = 0
     init_status_counts: Counter[str] = field(default_factory=Counter)
     init_time: float = 0.0
+    init_direction_failures: int = 0
+    initial_strategy_wins: Counter[str] = field(default_factory=Counter)
 
     raw_attempts: int = 0
     constructed: int = 0
@@ -66,6 +72,24 @@ class SearchStats:
     direction_dp_time: float = 0.0
     reference_scheduler_time: float = 0.0
     certifier_time: float = 0.0
+    repair_time: float = 0.0
+    repair_insertion_evaluations: int = 0
+    repair_reference_calls: int = 0
+    repair_full_direction_dp_calls: int = 0
+
+    attempted_by_family: dict[str, int] = field(default_factory=_family_counter)
+    constructed_by_family: dict[str, int] = field(default_factory=_family_counter)
+    valid_by_family: dict[str, int] = field(default_factory=_family_counter)
+    c4_by_family: dict[str, int] = field(default_factory=_family_counter)
+    accepted_by_family: dict[str, int] = field(default_factory=_family_counter)
+    improvements_by_family: dict[str, int] = field(default_factory=_family_counter)
+    direction_refinement_calls: int = 0
+    direction_improvements: int = 0
+    operator_pair_uses: Counter[str] = field(default_factory=Counter)
+    operator_pair_rewards: Counter[str] = field(default_factory=Counter)
+    operator_pair_global_bests: Counter[str] = field(default_factory=Counter)
+    final_operator_weights: dict[str, float] = field(default_factory=dict)
+    operator_sequence: list[tuple[str, str]] = field(default_factory=list)
 
     attempted_by_move: dict[str, int] = field(default_factory=_move_counter)
     applicable_by_move: dict[str, int] = field(default_factory=_move_counter)
@@ -82,6 +106,7 @@ class SearchStats:
     raw_candidate_reference_calls: int = 0
     per_iteration_kdp: list[int] = field(default_factory=list)
     per_iteration_nref: list[int] = field(default_factory=list)
+    per_iteration_attempts: list[int] = field(default_factory=list)
     init_scheduler_durations: list[float] = field(default_factory=list)
     search_scheduler_durations: list[float] = field(default_factory=list)
     best_events: list[tuple[float, float]] = field(default_factory=list)
@@ -203,7 +228,7 @@ class SearchStats:
             )
         return result
 
-    def assert_invariants(self, *, kdp: int, kref: int) -> None:
+    def assert_invariants(self, *, kdp: int, kref: int, m: int | None = None) -> None:
         if self.nref != (
             self.n_feasible
             + self.n_deadlock
@@ -215,7 +240,13 @@ class SearchStats:
             raise AssertionError("raw candidates invoked full direction DP")
         if self.raw_candidate_reference_calls != 0:
             raise AssertionError("raw candidates invoked reference scheduler")
+        if self.repair_reference_calls != 0:
+            raise AssertionError("repair invoked reference scheduler")
+        if self.repair_full_direction_dp_calls != 0:
+            raise AssertionError("repair invoked full direction DP")
         if any(value > kdp for value in self.per_iteration_kdp):
             raise AssertionError("per-iteration Kdp hard cap exceeded")
         if any(value > kref for value in self.per_iteration_nref):
             raise AssertionError("per-iteration Kref hard cap exceeded")
+        if m is not None and any(value > m for value in self.per_iteration_attempts):
+            raise AssertionError("per-iteration total candidate attempt cap exceeded")

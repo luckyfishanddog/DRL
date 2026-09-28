@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import time
@@ -18,7 +19,7 @@ from mrta_reference.scheduler import (
 )
 from mrta_search import SearchConfig, micro_gap_decomposition, run_bounded_sa_oi
 from mrta_search.direction import optimize_directions_with_initial_feasibility
-from mrta_search.initialization import _construct, _patterns
+from mrta_search.initialization import InitializationStrategy, _construct, _patterns
 
 from profile_phase2b1 import synthetic_parents
 
@@ -86,7 +87,7 @@ def _profile_solution(parents, config: ScientificConfig) -> dict[str, object]:
         _patterns(parents, config),
         config,
         insertion_limit=8,
-        fallback_order=False,
+        strategy=InitializationStrategy.LOAD_FIRST,
     )
     directions = optimize_directions_with_initial_feasibility(solution, config)
     orientation_map = {robot: directions.directions[robot] for robot in range(4)}
@@ -240,6 +241,16 @@ def quality_fixture(name: str) -> tuple[tuple[ParentWeld, ...], int, int]:
             37,
             12,
         ),
+        "Q6_lns_basin_trap": (
+            (
+                ParentWeld("p0", (1.6988031761970745, 8.06251909281191), (2.507267666737879, 8.024513064718768)),
+                ParentWeld("p1", (10.876415580121574, 3.0587891677034196), (11.955019966147066, 3.7709109070254483)),
+                ParentWeld("p2", (16.84513432535822, 8.602342619881437), (15.951444969122434, 9.165047149162183)),
+                ParentWeld("p3", (6.854207738122211, 1.5241986081119485), (5.40597202291001, 2.096412420693884)),
+            ),
+            1,
+            4,
+        ),
     }
     return cases[name]
 
@@ -314,6 +325,51 @@ def _quality_summary(name: str, config: ScientificConfig) -> dict[str, object]:
             for move, count in search.stats.best_improvement_by_move.items()
             if count
         },
+        "best_improvement_by_family": {
+            family: count
+            for family, count in search.stats.improvements_by_family.items()
+            if count
+        },
+    }
+
+
+def _initialization_matrix_row(
+    family: str,
+    size: int,
+    config: ScientificConfig,
+    seeds: tuple[int, ...],
+) -> dict[str, object]:
+    successes = 0
+    reference_calls = 0
+    winners: Counter[str] = Counter()
+    status_counts: Counter[str] = Counter()
+    for seed in seeds:
+        result = run_bounded_sa_oi(
+            development_family(family, size),
+            config,
+            SearchConfig(max_iterations=0),
+            seed=seed,
+            reference_evaluator=reference_schedule_optimized,
+        )
+        reference_calls += result.stats.init_reference_calls
+        if result.status.value == "COMPLETED":
+            successes += 1
+        if result.initialization.winning_strategy:
+            winners[result.initialization.winning_strategy] += 1
+        for attempt in result.initialization.attempts:
+            if attempt.directions is not None and attempt.directions.status.value != "FEASIBLE":
+                status_counts[attempt.directions.status.value] += 1
+            if attempt.schedule is not None:
+                status_counts[attempt.schedule.status.value] += 1
+    return {
+        "family": family,
+        "N": size,
+        "seeds": seeds,
+        "successes": successes,
+        "success_rate": successes / len(seeds),
+        "initial_reference_calls": reference_calls,
+        "winning_strategies": dict(winners),
+        "status_counts": dict(status_counts),
     }
 
 
@@ -335,6 +391,7 @@ def main() -> None:
         arguments.seed,
     )
     families = []
+    initialization_matrix = []
     if not arguments.skip_families:
         for family in (
             "load_skew",
@@ -351,6 +408,14 @@ def main() -> None:
                 )
                 summary["family"] = family
                 families.append(summary)
+                initialization_matrix.append(
+                    _initialization_matrix_row(
+                        family,
+                        size,
+                        config,
+                        tuple(arguments.seed + offset for offset in range(5)),
+                    )
+                )
     quality = []
     if not arguments.skip_quality:
         quality = [
@@ -361,6 +426,7 @@ def main() -> None:
                 "Q3_direction_trap",
                 "Q4_optional_y_split_trap",
                 "Q5_interference_wait_trap",
+                "Q6_lns_basin_trap",
             )
         ]
     print(
@@ -371,6 +437,7 @@ def main() -> None:
                 "scheduler_cases": scheduler_cases,
                 "N100_5s_search": search_5s,
                 "development_families": families,
+                "initialization_matrix": initialization_matrix,
                 "search_quality": quality,
             },
             ensure_ascii=False,

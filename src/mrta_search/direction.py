@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from enum import Enum
 import itertools
 import math
+import time
+from collections.abc import Callable
 
 from mrta_reference.geometry import oriented_endpoints
-from mrta_reference.model import CanonicalSolution, ScientificConfig
-from mrta_reference.solution import block_map
+from mrta_reference.model import CanonicalSolution, ScheduleResult, ScheduleStatus, ScientificConfig
+from mrta_reference.solution import block_map, official_metrics
 
 
 DirectionVectors = tuple[
@@ -28,6 +30,15 @@ class ConstrainedDirectionResult:
     diagnostics: tuple[str, ...] = ()
     legal_first_combinations: int = 0
     route_dp_calls: int = 0
+
+
+@dataclass(frozen=True)
+class DirectionRefinementResult:
+    directions: DirectionVectors
+    schedule: ScheduleResult
+    calls: int
+    improved: bool
+    statuses: tuple[ScheduleStatus, ...]
 
 
 def _fixed_first_dp(blocks, first: int, config: ScientificConfig):
@@ -138,3 +149,114 @@ def optimize_directions_with_initial_feasibility(
         calls,
     )
 
+
+def refine_directions_bounded(
+    solution: CanonicalSolution,
+    base_directions: DirectionVectors,
+    base_schedule: ScheduleResult,
+    config: ScientificConfig,
+    *,
+    max_calls: int,
+    reference_evaluator: Callable[..., ScheduleResult],
+    stats=None,
+) -> DirectionRefinementResult:
+    """Try a deterministic, budgeted set of single direction flips.
+
+    The assignment, pattern, and route remain fixed. Every attempted flip is a real
+    reference call and only a certified official-metric improvement is retained.
+    """
+    from mrta_reference.certifier import certify_schedule
+
+    if max_calls <= 0 or base_schedule.status is not ScheduleStatus.FEASIBLE:
+        return DirectionRefinementResult(
+            base_directions, base_schedule, 0, False, ()
+        )
+    completion = base_schedule.robot_completion
+    active = [robot for robot, route in enumerate(solution.routes) if route.block_ids]
+    critical = sorted(active, key=lambda robot: (-completion[robot], robot))
+    wait_blocks = {
+        operation.block_id
+        for operation in base_schedule.operations
+        if operation.kind.value == "WAIT" and operation.block_id is not None
+    }
+    ranked: list[tuple[tuple[object, ...], int, int]] = []
+    for robot in critical:
+        route = solution.routes[robot].block_ids
+        for position, block_id in enumerate(route):
+            ranked.append(
+                (
+                    (
+                        0 if robot == critical[0] else 1,
+                        0 if block_id in wait_blocks else 1,
+                        0 if position == 0 else 1,
+                        0 if position == len(route) - 1 else 1,
+                        position,
+                        robot,
+                        block_id,
+                    ),
+                    robot,
+                    position,
+                )
+            )
+    ordered = sorted(ranked)
+    best_directions = base_directions
+    best_schedule = base_schedule
+    best_metrics = official_metrics(solution, base_schedule, config)
+    statuses: list[ScheduleStatus] = []
+    calls = 0
+    for _, robot, position in ordered[:max_calls]:
+        vectors = [list(vector) for vector in base_directions]
+        vectors[robot][position] = 1 - vectors[robot][position]
+        directions: DirectionVectors = tuple(
+            tuple(vector) for vector in vectors
+        )  # type: ignore[assignment]
+        started = time.perf_counter()
+        try:
+            schedule = reference_evaluator(
+                solution,
+                config,
+                orientations={index: directions[index] for index in range(4)},
+            )
+        except (ArithmeticError, OverflowError, ValueError) as error:
+            schedule = ScheduleResult(
+                ScheduleStatus.NUMERIC_FAILURE,
+                diagnostics=(str(error),),
+                directions=directions,
+            )
+        duration = time.perf_counter() - started
+        ended = time.perf_counter()
+        calls += 1
+        statuses.append(schedule.status)
+        if stats is not None:
+            stats.direction_refinement_calls += 1
+            stats.c4_by_family["DIRECTION_REFINEMENT"] += 1
+            stats.record_reference(
+                schedule.status,
+                duration,
+                initialization=False,
+                reference_start=(
+                    None if stats.run_started is None else started - stats.run_started
+                ),
+                reference_end=(
+                    None if stats.run_started is None else ended - stats.run_started
+                ),
+            )
+        if schedule.status is not ScheduleStatus.FEASIBLE:
+            continue
+        cert_started = time.perf_counter()
+        certification = certify_schedule(solution, schedule, config)
+        if stats is not None:
+            stats.certifier_time += time.perf_counter() - cert_started
+        if not certification.certified:
+            continue
+        metrics = official_metrics(solution, schedule, config)
+        if metrics.compare(best_metrics) < 0:
+            best_directions = directions
+            best_schedule = schedule
+            best_metrics = metrics
+    improved = best_schedule is not base_schedule
+    if improved and stats is not None:
+        stats.direction_improvements += 1
+    return DirectionRefinementResult(
+        best_directions, best_schedule, calls, improved, tuple(statuses)
+    )

@@ -255,9 +255,9 @@ def test_q1_q5_nontrivial_initial_gap_and_backbone_quality(case_name: str) -> No
 
     if expected_move is None:
         assert case_name == "Q3_direction"
-        assert final_gap.search_gap == pytest.approx(initial_gap)
-        assert exact.best_schedule is not None
-        assert exact.best_schedule.directions != search.best_directions
+        assert final_gap.search_gap < initial_gap - 1.0e-6
+        assert search.stats.direction_improvements >= 1
+        assert search.stats.improvements_by_family["DIRECTION_REFINEMENT"] >= 1
     else:
         assert final_gap.search_gap < initial_gap - 1.0e-6
         assert search.stats.best_improvement_by_move[expected_move.value] >= 1

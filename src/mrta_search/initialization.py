@@ -27,6 +27,7 @@ from mrta_reference.model import (
 )
 from mrta_reference.scheduler import reference_schedule
 from mrta_reference.solution import canonicalize
+from mrta_reference.solution import block_map, official_metrics
 
 from .direction import (
     ConstrainedDirectionResult,
@@ -43,6 +44,13 @@ class InitializationStatus(str, Enum):
     NUMERIC_FAILURE = "NUMERIC_FAILURE"
 
 
+class InitializationStrategy(str, Enum):
+    LOAD_FIRST = "LOAD_FIRST"
+    RAIL_BALANCED = "RAIL_BALANCED"
+    X_ORDER_AWARE = "X_ORDER_AWARE"
+    SPATIAL_SPREAD = "SPATIAL_SPREAD"
+
+
 @dataclass(frozen=True)
 class InitializationAttempt:
     construction_index: int
@@ -52,6 +60,7 @@ class InitializationAttempt:
     certification: CertificationReport | None
     diagnostics: tuple[str, ...] = ()
     duplicate: bool = False
+    strategy: str = InitializationStrategy.LOAD_FIRST.value
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,7 @@ class InitializationResult:
     schedule: ScheduleResult | None
     certification: CertificationReport | None
     attempts: tuple[InitializationAttempt, ...]
+    winning_strategy: str | None = None
 
 
 ReferenceEvaluator = Callable[..., ScheduleResult]
@@ -123,7 +133,8 @@ def _construct(
     config: ScientificConfig,
     *,
     insertion_limit: int,
-    fallback_order: bool,
+    strategy: InitializationStrategy,
+    legacy_robot_tie_first: bool = False,
 ) -> CanonicalSolution:
     parent_by_id = {parent.parent_id: parent for parent in parents}
     all_blocks = {
@@ -153,10 +164,88 @@ def _construct(
                         loads[index] + (duration if index == robot else 0.0)
                         for index in range(4)
                     )
-                    if fallback_order:
-                        score = (projected, robot, delta, position, hint)
-                    else:
+                    projected_loads = tuple(
+                        loads[index] + (duration if index == robot else 0.0)
+                        for index in range(4)
+                    )
+                    if strategy is InitializationStrategy.LOAD_FIRST:
                         score = (projected, delta, robot, position, hint)
+                    elif legacy_robot_tie_first:
+                        score = (projected, robot, delta, position, hint)
+                    elif strategy is InitializationStrategy.RAIL_BALANCED:
+                        pair_spread = max(
+                            abs(projected_loads[0] - projected_loads[1]),
+                            abs(projected_loads[2] - projected_loads[3]),
+                        )
+                        rail_spread = abs(
+                            projected_loads[0]
+                            + projected_loads[1]
+                            - projected_loads[2]
+                            - projected_loads[3]
+                        )
+                        score = (
+                            pair_spread,
+                            rail_spread,
+                            projected,
+                            delta,
+                            robot,
+                            position,
+                            hint,
+                        )
+                    elif strategy is InitializationStrategy.X_ORDER_AWARE:
+                        provisional_routes = [list(route) for route in routes]
+                        provisional_hints = [list(vector) for vector in hints]
+                        provisional_routes[robot].insert(position, block.block_id)
+                        provisional_hints[robot].insert(position, hint)
+                        first_points = {}
+                        for active_robot in range(4):
+                            if provisional_routes[active_robot]:
+                                first_block = all_blocks[provisional_routes[active_robot][0]]
+                                first_points[active_robot] = oriented_endpoints(
+                                    first_block, provisional_hints[active_robot][0]
+                                )[0]
+                        violations = 0
+                        crossing = 0.0
+                        for left, right in ((0, 1), (2, 3)):
+                            if left in first_points and right in first_points:
+                                excess = (
+                                    first_points[left][0]
+                                    + config.interference_dx
+                                    - first_points[right][0]
+                                )
+                                if excess > config.numeric_epsilon:
+                                    violations += 1
+                                    crossing += excess
+                        score = (
+                            violations,
+                            crossing,
+                            projected,
+                            robot,
+                            delta,
+                            position,
+                            hint,
+                        )
+                    else:
+                        other_points = []
+                        start, _ = oriented_endpoints(block, hint)
+                        for other_robot in range(4):
+                            if routes[other_robot]:
+                                first_block = all_blocks[routes[other_robot][0]]
+                                other_points.append(
+                                    oriented_endpoints(first_block, hints[other_robot][0])[0]
+                                )
+                        nearest = min(
+                            (math.dist(start, point) for point in other_points),
+                            default=math.inf,
+                        )
+                        score = (
+                            projected,
+                            -nearest,
+                            delta,
+                            robot,
+                            position,
+                            hint,
+                        )
                     candidates.append((score, robot, position, hint))
         if not candidates:
             raise ValueError(f"{block.block_id}: no eligible insertion")
@@ -180,11 +269,16 @@ def build_initial_solution(
     *,
     insertion_limit: int = 8,
     construction_budget: int = 2,
+    kinit_ref: int = 2,
+    portfolio: bool = False,
     reference_evaluator: ReferenceEvaluator = reference_schedule,
     certifier: Certifier = certify_schedule,
 ) -> InitializationResult:
-    if construction_budget < 1 or construction_budget > 2:
-        raise ValueError("Phase 2B-1 B_init must be 1 or 2")
+    strategies = tuple(InitializationStrategy)[:construction_budget]
+    if construction_budget < 1 or construction_budget > len(InitializationStrategy):
+        raise ValueError("B_init_pool must be between 1 and 4")
+    if not (1 <= kinit_ref <= construction_budget):
+        raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
     started = time.perf_counter()
     attempts: list[InitializationAttempt] = []
     seen: set[str] = set()
@@ -201,7 +295,8 @@ def build_initial_solution(
             (InitializationAttempt(0, None, None, None, None, (str(error),)),),
         )
 
-    for construction_index in range(construction_budget):
+    constructed: list[tuple[int, CanonicalSolution, ConstrainedDirectionResult, tuple[object, ...]]] = []
+    for construction_index, strategy in enumerate(strategies):
         stats.construction_attempts += 1
         try:
             solution = _construct(
@@ -209,12 +304,20 @@ def build_initial_solution(
                 selected_patterns,
                 config,
                 insertion_limit=insertion_limit,
-                fallback_order=construction_index == 1,
+                strategy=strategy,
+                legacy_robot_tie_first=(not portfolio and construction_index == 1),
             )
         except (ValueError, ArithmeticError, OverflowError) as error:
             attempts.append(
                 InitializationAttempt(
-                    construction_index, None, None, None, None, (str(error),)
+                    construction_index,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (str(error),),
+                    False,
+                    strategy.value,
                 )
             )
             continue
@@ -228,6 +331,7 @@ def build_initial_solution(
                     None,
                     ("duplicate construction; reference evaluation skipped",),
                     True,
+                    strategy.value,
                 )
             )
             continue
@@ -236,6 +340,44 @@ def build_initial_solution(
         dp_started = time.perf_counter()
         direction = optimize_directions_with_initial_feasibility(solution, config)
         stats.direction_dp_time += time.perf_counter() - dp_started
+        attempts.append(
+            InitializationAttempt(
+                construction_index,
+                solution,
+                direction,
+                None,
+                None,
+                direction.diagnostics,
+                False,
+                strategy.value,
+            )
+        )
+        if direction.status is not DirectionStatus.FEASIBLE:
+            stats.init_direction_failures += 1
+            continue
+        blocks = block_map(solution, config)
+        loads = tuple(
+            sum(config.process_time(blocks[item].length) for item in route.block_ids)
+            for route in solution.routes
+        )
+        constructed.append(
+            (
+                len(attempts) - 1,
+                solution,
+                direction,
+                (
+                    max(loads, default=0.0),
+                    direction.total_empty_travel,
+                    construction_index,
+                    solution.canonical_hash,
+                ),
+            )
+        )
+
+    feasible = []
+    for attempt_index, solution, direction, _ in sorted(
+        constructed, key=(lambda item: item[3]) if portfolio else (lambda item: item[0])
+    )[:kinit_ref]:
         orientation_map = {robot: direction.directions[robot] for robot in range(4)}
         ref_started = time.perf_counter()
         try:
@@ -277,24 +419,27 @@ def build_initial_solution(
                 )
                 stats.init_status_counts[ScheduleStatus.FEASIBLE.value] -= 1
                 stats.init_status_counts[ScheduleStatus.NUMERIC_FAILURE.value] += 1
+        old_attempt = attempts[attempt_index]
         attempt = InitializationAttempt(
-            construction_index,
+            old_attempt.construction_index,
             solution,
             direction,
             schedule,
             certification,
             direction.diagnostics + schedule.diagnostics,
+            False,
+            old_attempt.strategy,
         )
-        attempts.append(attempt)
+        attempts[attempt_index] = attempt
         if schedule.status is ScheduleStatus.NUMERIC_FAILURE:
             stats.init_time += time.perf_counter() - started
             return InitializationResult(
                 InitializationStatus.NUMERIC_FAILURE,
                 None,
                 None,
-                schedule,
-                certification,
-                tuple(attempts),
+                attempt.schedule,
+                attempt.certification,
+                tuple(item for item in attempts if item.schedule is not None),
             )
         if (
             direction.status is DirectionStatus.FEASIBLE
@@ -302,15 +447,24 @@ def build_initial_solution(
             and certification is not None
             and certification.certified
         ):
-            stats.init_time += time.perf_counter() - started
-            return InitializationResult(
-                InitializationStatus.SUCCESS,
-                solution,
-                direction.directions,
-                schedule,
-                certification,
-                tuple(attempts),
-            )
+            feasible.append((official_metrics(solution, schedule, config), attempt))
+
+    if feasible:
+        best_metrics, best_attempt = feasible[0]
+        for metrics, attempt in feasible[1:]:
+            if metrics.compare(best_metrics) < 0:
+                best_metrics, best_attempt = metrics, attempt
+        stats.init_time += time.perf_counter() - started
+        stats.initial_strategy_wins[best_attempt.strategy] += 1
+        return InitializationResult(
+            InitializationStatus.SUCCESS,
+            best_attempt.solution,
+            best_attempt.directions.directions if best_attempt.directions else None,
+            best_attempt.schedule,
+            best_attempt.certification,
+            tuple(attempts),
+            best_attempt.strategy,
+        )
 
     stats.init_time += time.perf_counter() - started
     return InitializationResult(

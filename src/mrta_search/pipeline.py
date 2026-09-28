@@ -27,11 +27,24 @@ from .direction import (
     ConstrainedDirectionResult,
     DirectionVectors,
     optimize_directions_with_initial_feasibility,
+    refine_directions_bounded,
 )
 from .initialization import (
     InitializationResult,
     InitializationStatus,
     build_initial_solution,
+)
+from .lns import (
+    AdaptiveOperatorState,
+    CandidateSourceKind,
+    CompleteSearchCandidate,
+    DestroyOperator,
+    RepairOperator,
+    atomic_complete_candidate,
+    destroy_parents,
+    destroy_size,
+    lns_pair,
+    repair_partial_state,
 )
 from .neighborhood import (
     ScreenedCandidate,
@@ -51,7 +64,24 @@ class SearchConfig:
     kdp: int = 8
     kref: int = 2
     insertion_limit: int = 8
-    construction_budget: int = 2
+    construction_budget: int = 4
+    kinit_ref: int = 2
+    m_atomic: int | None = None
+    m_lns: int = 16
+    kref_total: int = 4
+    destroy_rho: float = 0.15
+    destroy_q_min: int = 2
+    destroy_q_max: int = 8
+    repair_insertion_limit: int = 8
+    repair_evaluation_cap: int = 4096
+    adaptive_reaction: float = 0.2
+    adaptive_segment_length: int = 20
+    reward_global_best: float = 8.0
+    reward_accepted_improvement: float = 4.0
+    reward_accepted_non_improvement: float = 1.0
+    reward_rejected: float = 0.0
+    reward_evaluation_failed: float = 0.0
+    direction_refinement_budget: int = 4
     t0: float = 0.05
     cooling_rate: float = 0.995
     tmin: float = 1.0e-6
@@ -64,8 +94,23 @@ class SearchConfig:
             raise ValueError("require 1 <= Kref <= Kdp <= M")
         if self.insertion_limit < 2:
             raise ValueError("I_init must be at least 2")
-        if self.construction_budget not in (1, 2):
-            raise ValueError("B_init must be 1 or 2")
+        if not (1 <= self.construction_budget <= 4):
+            raise ValueError("B_init_pool must be between 1 and 4")
+        if not (1 <= self.kinit_ref <= self.construction_budget):
+            raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
+        atomic = self.m - self.m_lns if self.m_atomic is None else self.m_atomic
+        if min(atomic, self.m_lns) < 0 or atomic + self.m_lns > self.m:
+            raise ValueError("atomic + LNS attempts must not exceed M")
+        if self.kref_total < self.kref:
+            raise ValueError("Kref_total must be at least Kref")
+        if self.destroy_q_min < 1 or self.destroy_q_max < self.destroy_q_min:
+            raise ValueError("invalid destroy q bounds")
+        if self.repair_insertion_limit < 2 or self.repair_evaluation_cap < 1:
+            raise ValueError("invalid repair bounds")
+        if self.adaptive_segment_length < 1 or not (0.0 < self.adaptive_reaction <= 1.0):
+            raise ValueError("invalid adaptive configuration")
+        if self.direction_refinement_budget < 0:
+            raise ValueError("Bdir must be non-negative")
         if self.t0 < 0.0 or self.tmin < 0.0:
             raise ValueError("temperatures must be non-negative")
         if not (0.0 < self.cooling_rate <= 1.0):
@@ -78,12 +123,17 @@ class SearchConfig:
 
 @dataclass(frozen=True)
 class DirectionEvaluatedCandidate:
-    screened: ScreenedCandidate
+    screened: CompleteSearchCandidate | ScreenedCandidate
     cheap_rank: int
     direction: ConstrainedDirectionResult
 
     @property
     def rerank_key(self) -> tuple[object, ...]:
+        identity = (
+            self.screened.candidate_identity
+            if isinstance(self.screened, CompleteSearchCandidate)
+            else candidate_key_order(self.screened.candidate.key)
+        )
         return (
             self.screened.projected_process_makespan,
             math.inf
@@ -91,7 +141,7 @@ class DirectionEvaluatedCandidate:
             else self.direction.total_empty_travel,
             self.screened.split_count_delta,
             self.cheap_rank,
-            candidate_key_order(self.screened.candidate.key),
+            identity,
         )
 
 
@@ -107,6 +157,7 @@ class ReferenceEvaluatedCandidate:
 @dataclass(frozen=True)
 class IterationResult:
     c1_candidates: tuple[ScreenedCandidate, ...]
+    complete_candidates: tuple[CompleteSearchCandidate, ...]
     c3_candidates: tuple[DirectionEvaluatedCandidate, ...]
     c4_candidates: tuple[ReferenceEvaluatedCandidate, ...]
     proposal: ReferenceEvaluatedCandidate | None
@@ -191,11 +242,41 @@ def _proposal(
         comparison = item.metrics.compare(best.metrics)
         if comparison < 0 or (
             comparison == 0
-            and candidate_key_order(item.direction_candidate.screened.candidate.key)
-            < candidate_key_order(best.direction_candidate.screened.candidate.key)
+            and _complete_identity(item.direction_candidate.screened)
+            < _complete_identity(best.direction_candidate.screened)
         ):
             best = item
     return best
+
+
+def _complete_identity(
+    candidate: CompleteSearchCandidate | ScreenedCandidate,
+) -> tuple[object, ...] | object:
+    if isinstance(candidate, CompleteSearchCandidate):
+        return candidate.candidate_identity
+    return candidate_key_order(candidate.candidate.key)
+
+
+def _solution_of(
+    candidate: CompleteSearchCandidate | ScreenedCandidate,
+) -> CanonicalSolution:
+    return candidate.solution
+
+
+def _family_of(candidate: CompleteSearchCandidate | ScreenedCandidate) -> str:
+    if isinstance(candidate, CompleteSearchCandidate):
+        return candidate.source_kind.value
+    return CandidateSourceKind.ATOMIC.value
+
+
+def _move_name(candidate: CompleteSearchCandidate | ScreenedCandidate) -> str | None:
+    if isinstance(candidate, CompleteSearchCandidate):
+        return (
+            None
+            if candidate.atomic_move is None
+            else candidate.atomic_move.key.move_type.value
+        )
+    return candidate.candidate.key.move_type.value
 
 
 ReferenceEvaluator = Callable[..., ScheduleResult]
@@ -210,16 +291,100 @@ def evaluate_iteration(
     *,
     seed: int,
     reference_evaluator: ReferenceEvaluator = reference_schedule,
+    current_schedule: ScheduleResult | None = None,
+    adaptive_state: AdaptiveOperatorState | None = None,
 ) -> IterationResult:
+    attempts_before = stats.raw_attempts
+    atomic_budget = (
+        search_config.m
+        if current_schedule is None
+        else (
+            search_config.m - search_config.m_lns
+            if search_config.m_atomic is None
+            else search_config.m_atomic
+        )
+    )
     raw = generate_raw_attempts(
         current,
         config,
-        m=search_config.m,
+        m=atomic_budget,
         seed=seed,
         stats=stats,
     )
+    stats.attempted_by_family[CandidateSourceKind.ATOMIC.value] += len(raw)
+    stats.constructed_by_family[CandidateSourceKind.ATOMIC.value] += sum(
+        attempt.candidate is not None for attempt in raw
+    )
     screened = screen_raw_attempts(current, current_directions, raw, config, stats)
-    cheap_ranked = tuple(sorted(screened, key=lambda item: item.cheap_score))
+    complete: list[CompleteSearchCandidate] = []
+    seen_solutions: set[str] = {current.canonical_hash}
+    for item in screened:
+        candidate = atomic_complete_candidate(current, current_directions, item, config)
+        if candidate.solution.canonical_hash in seen_solutions:
+            stats.duplicates += 1
+            continue
+        seen_solutions.add(candidate.solution.canonical_hash)
+        complete.append(candidate)
+        stats.valid_by_family[CandidateSourceKind.ATOMIC.value] += 1
+
+    if current_schedule is not None and search_config.m_lns:
+        if adaptive_state is None:
+            adaptive_state = AdaptiveOperatorState(
+                search_config.adaptive_reaction,
+                search_config.adaptive_segment_length,
+            )
+        lns_rng = random.Random(seed + 7_919_119 * (current.revision + 1))
+        q = destroy_size(
+            len(current.parents),
+            rho=search_config.destroy_rho,
+            q_min=search_config.destroy_q_min,
+            q_max=search_config.destroy_q_max,
+        )
+        for ordinal in range(search_config.m_lns):
+            stats.raw_attempts += 1
+            stats.attempted_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            pair = adaptive_state.select(lns_rng)
+            generation_started = time.perf_counter()
+            partial = destroy_parents(
+                current,
+                current_schedule,
+                pair[0],
+                q=q,
+                seed=seed + 104_729 * ordinal,
+                config=config,
+            )
+            repair_started = time.perf_counter()
+            repaired = repair_partial_state(
+                current,
+                current_directions,
+                partial,
+                pair[0],
+                pair[1],
+                config,
+                insertion_limit=search_config.repair_insertion_limit,
+                max_insertion_evaluations=search_config.repair_evaluation_cap,
+            )
+            stats.repair_time += time.perf_counter() - repair_started
+            stats.candidate_generation_time += repair_started - generation_started
+            stats.repair_insertion_evaluations += repaired.insertion_evaluations
+            if repaired.candidate is None:
+                stats.rejection_reasons[
+                    f"LNS:{repaired.rejection_reason or 'REPAIR_FAILED'}"
+                ] += 1
+                continue
+            stats.constructed += 1
+            stats.constructed_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            candidate = repaired.candidate
+            if candidate.solution.canonical_hash in seen_solutions:
+                stats.duplicates += 1
+                stats.rejection_reasons["DUPLICATE_CANONICAL_SOLUTION"] += 1
+                continue
+            seen_solutions.add(candidate.solution.canonical_hash)
+            complete.append(candidate)
+            stats.cheap_feasible += 1
+            stats.valid_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+
+    cheap_ranked = tuple(sorted(complete, key=lambda item: item.cheap_score))
     c2 = cheap_ranked[: search_config.kdp]
     stats.kdp_count += len(c2)
     stats.per_iteration_kdp.append(len(c2))
@@ -231,20 +396,28 @@ def evaluate_iteration(
             candidate.solution, config
         )
         stats.direction_dp_time += time.perf_counter() - started
-        stats.c3_by_move[candidate.candidate.key.move_type.value] += 1
+        move_name = _move_name(candidate)
+        if move_name is not None:
+            stats.c3_by_move[move_name] += 1
         c3.append(DirectionEvaluatedCandidate(candidate, cheap_rank, direction))
-    shortlist = rerank_c3(c3, search_config.kref)
+    shortlist = rerank_c3(
+        [item for item in c3 if item.direction.total_empty_travel is not None],
+        search_config.kref,
+    )
 
     cache: dict[tuple[object, ...], ReferenceEvaluatedCandidate] = {}
     c4 = []
     calls_before = stats.nref
     for item in shortlist:
-        move_name = item.screened.candidate.key.move_type.value
-        stats.c4_by_move[move_name] += 1
+        move_name = _move_name(item.screened)
+        family = _family_of(item.screened)
+        stats.c4_by_family[family] += 1
+        if move_name is not None:
+            stats.c4_by_move[move_name] += 1
         cache_key = (
             EXACT_Y_SCOPE_CURRENT_SEMANTICS,
             config.scientific_hash,
-            item.screened.solution.canonical_hash,
+            _solution_of(item.screened).canonical_hash,
             item.direction.directions,
             REFERENCE_POLICY_ID,
         )
@@ -282,10 +455,10 @@ def evaluate_iteration(
         effective_status = schedule.status
         if schedule.status is ScheduleStatus.FEASIBLE:
             cert_started = time.perf_counter()
-            certification = certify_schedule(item.screened.solution, schedule, config)
+            certification = certify_schedule(_solution_of(item.screened), schedule, config)
             stats.certifier_time += time.perf_counter() - cert_started
             if certification.certified:
-                metrics = official_metrics(item.screened.solution, schedule, config)
+                metrics = official_metrics(_solution_of(item.screened), schedule, config)
             else:
                 effective_status = ScheduleStatus.NUMERIC_FAILURE
                 schedule = ScheduleResult(
@@ -315,7 +488,10 @@ def evaluate_iteration(
         cache[cache_key] = evaluated
         c4.append(evaluated)
     stats.per_iteration_nref.append(stats.nref - calls_before)
-    return IterationResult(tuple(screened), tuple(c3), tuple(c4), _proposal(c4))
+    stats.per_iteration_attempts.append(stats.raw_attempts - attempts_before)
+    return IterationResult(
+        tuple(screened), tuple(complete), tuple(c3), tuple(c4), _proposal(c4)
+    )
 
 
 def run_bounded_sa_oi(
@@ -337,6 +513,8 @@ def run_bounded_sa_oi(
         stats,
         insertion_limit=search_config.insertion_limit,
         construction_budget=search_config.construction_budget,
+        kinit_ref=search_config.kinit_ref,
+        portfolio=True,
         reference_evaluator=reference_evaluator,
     )
     if initialization.status is not InitializationStatus.SUCCESS:
@@ -352,7 +530,9 @@ def run_bounded_sa_oi(
             if initialization.status is InitializationStatus.NUMERIC_FAILURE
             else SearchStatus.INITIALIZATION_FAILED
         )
-        stats.assert_invariants(kdp=search_config.kdp, kref=search_config.kref)
+        stats.assert_invariants(
+            kdp=search_config.kdp, kref=search_config.kref_total, m=search_config.m
+        )
         return SearchResult(
             status,
             None,
@@ -379,6 +559,30 @@ def run_bounded_sa_oi(
     best_metrics = current_metrics
     stats.record_best(time.perf_counter() - started, best_metrics.cmax)
     scale = cscale_for(parents, config)
+    adaptive = AdaptiveOperatorState(
+        search_config.adaptive_reaction,
+        search_config.adaptive_segment_length,
+    )
+
+    def record_lns_observation(
+        evaluated: ReferenceEvaluatedCandidate,
+        reward: float | None,
+        *,
+        global_best: bool = False,
+    ) -> None:
+        candidate = evaluated.direction_candidate.screened
+        if not isinstance(candidate, CompleteSearchCandidate):
+            return
+        pair = lns_pair(candidate)
+        if pair is None:
+            return
+        label = f"{pair[0].value}+{pair[1].value}"
+        stats.operator_pair_uses[label] += 1
+        if reward is not None:
+            stats.operator_pair_rewards[label] += reward
+        if global_best:
+            stats.operator_pair_global_bests[label] += 1
+        adaptive.record(pair, reward)
 
     for iteration in range(search_config.max_iterations):
         if (
@@ -386,6 +590,7 @@ def run_bounded_sa_oi(
             and time.perf_counter() - started >= search_config.time_limit
         ):
             break
+        iteration_calls_before = stats.nref
         result = evaluate_iteration(
             current_solution,
             current_directions,
@@ -394,12 +599,71 @@ def run_bounded_sa_oi(
             stats,
             seed=seed + iteration * 65_537,
             reference_evaluator=reference_evaluator,
+            current_schedule=current_schedule,
+            adaptive_state=adaptive,
         )
         stats.iterations += 1
         proposal = result.proposal
+        for evaluated in result.c4_candidates:
+            if evaluated is proposal:
+                continue
+            if evaluated.schedule.status is ScheduleStatus.NUMERIC_FAILURE:
+                reward = None
+            elif evaluated.metrics is None:
+                reward = search_config.reward_evaluation_failed
+            else:
+                reward = search_config.reward_rejected
+            record_lns_observation(evaluated, reward)
         if proposal is None or proposal.metrics is None:
             stats.proposal_trajectory.append((iteration, None, False, None))
+            stats.per_iteration_nref[-1] = stats.nref - iteration_calls_before
             continue
+        remaining_refinement = min(
+            search_config.direction_refinement_budget,
+            max(0, search_config.kref_total - (stats.nref - iteration_calls_before)),
+        )
+        proposal_refined = False
+        if remaining_refinement:
+            base_candidate = proposal.direction_candidate
+            refined = refine_directions_bounded(
+                _solution_of(base_candidate.screened),
+                base_candidate.direction.directions,
+                proposal.schedule,
+                config,
+                max_calls=remaining_refinement,
+                reference_evaluator=reference_evaluator,
+                stats=stats,
+            )
+            if refined.improved:
+                proposal_refined = True
+                refined_metrics = official_metrics(
+                    _solution_of(base_candidate.screened), refined.schedule, config
+                )
+                refined_direction = ConstrainedDirectionResult(
+                    base_candidate.direction.status,
+                    refined.directions,
+                    refined_metrics.total_empty_travel,
+                    base_candidate.direction.diagnostics,
+                    base_candidate.direction.legal_first_combinations,
+                    base_candidate.direction.route_dp_calls,
+                )
+                refined_candidate = DirectionEvaluatedCandidate(
+                    base_candidate.screened,
+                    base_candidate.cheap_rank,
+                    refined_direction,
+                )
+                certification = certify_schedule(
+                    _solution_of(base_candidate.screened), refined.schedule, config
+                )
+                proposal = ReferenceEvaluatedCandidate(
+                    refined_candidate,
+                    refined.schedule,
+                    certification,
+                    refined_metrics,
+                    False,
+                )
+        stats.per_iteration_nref[-1] = stats.nref - iteration_calls_before
+        current_before = current_metrics
         accepted, _, _ = sa_accept(
             current_metrics.cmax,
             proposal.metrics.cmax,
@@ -416,6 +680,7 @@ def run_bounded_sa_oi(
                     proposal.metrics.cmax,
                 )
             )
+            record_lns_observation(proposal, search_config.reward_rejected)
             continue
         stats.proposal_trajectory.append(
             (
@@ -425,20 +690,39 @@ def run_bounded_sa_oi(
                 proposal.metrics.cmax,
             )
         )
-        move_name = proposal.direction_candidate.screened.candidate.key.move_type.value
-        stats.accepted_by_move[move_name] += 1
-        current_solution = proposal.direction_candidate.screened.solution
+        candidate = proposal.direction_candidate.screened
+        family = _family_of(candidate)
+        move_name = _move_name(candidate)
+        stats.accepted_by_family[family] += 1
+        if move_name is not None:
+            stats.accepted_by_move[move_name] += 1
+        current_solution = _solution_of(candidate)
         current_directions = proposal.direction_candidate.direction.directions
         current_schedule = proposal.schedule
         current_metrics = proposal.metrics
-        if current_metrics.compare(best_metrics) < 0:
+        global_best = current_metrics.compare(best_metrics) < 0
+        if global_best:
             best_solution = current_solution
             best_directions = current_directions
             best_schedule = current_schedule
             best_metrics = current_metrics
-            stats.best_improvement_by_move[move_name] += 1
+            best_family = (
+                "DIRECTION_REFINEMENT" if proposal_refined else family
+            )
+            stats.improvements_by_family[best_family] += 1
+            if move_name is not None:
+                stats.best_improvement_by_move[move_name] += 1
             stats.best_improvement_cmax.append(best_metrics.cmax)
             stats.record_best(time.perf_counter() - started, best_metrics.cmax)
+        if global_best:
+            reward = search_config.reward_global_best
+        elif current_metrics.cmax < current_before.cmax - 1.0e-9 * max(
+            1.0, abs(current_before.cmax), abs(current_metrics.cmax)
+        ):
+            reward = search_config.reward_accepted_improvement
+        else:
+            reward = search_config.reward_accepted_non_improvement
+        record_lns_observation(proposal, reward, global_best=global_best)
 
     cert_started = time.perf_counter()
     final_certification = certify_schedule(best_solution, best_schedule, config)
@@ -455,7 +739,14 @@ def run_bounded_sa_oi(
         if final_certification.certified
         else SearchStatus.NUMERIC_FAILURE
     )
-    stats.assert_invariants(kdp=search_config.kdp, kref=search_config.kref)
+    stats.operator_sequence = list(adaptive.selection_history)
+    stats.final_operator_weights = {
+        f"{pair[0].value}+{pair[1].value}": weight
+        for pair, weight in adaptive.weights.items()
+    }
+    stats.assert_invariants(
+        kdp=search_config.kdp, kref=search_config.kref_total, m=search_config.m
+    )
     return SearchResult(
         status,
         best_solution,
