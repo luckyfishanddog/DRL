@@ -1,6 +1,6 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1_1 = FINAL ACTIVE SCOPE FOR PHASE 3`; V1 remains a reproducible historical scope superseded before formal experiments. The final method-independent F4 calibration retained B32, so Phase 3 is authorized. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1_1 = FINAL ACTIVE SCOPE FOR PHASE 3`; V1 remains a reproducible historical scope superseded before formal experiments. The final method-independent F4 calibration retained B32, so scientific Phase 3 scope is authorized. The scientific core remains isolated from legacy PPO solver code; Phase 3 data intake now reads only the already-frozen platform Excel outputs through an optional adapter.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
@@ -30,6 +30,7 @@ Implemented:
 - bounded certified schedule-aware single-flip direction refinement inside the total reference budget;
 - makespan-first C0-C4 screening, Kdp direction rerank, Kref reference evaluation, and seeded SA acceptance;
 - split initialization/search scheduler timings, wall-clock overshoot records, deadline-safe anytime checkpoints, and micro gap decomposition;
+- fail-closed, lazy-Excel intake for the two observed frozen PPO family schemas, with per-instance geometry/formal validation, hashes, duplicate analysis, and deterministic smoke selection;
 - adversarial and regression tests.
 
 Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` and X_SPLIT search remain inactive. Formal evaluation enables deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS layer is the minimal development backbone, not a formal frozen algorithm or tuned benchmark.
@@ -52,13 +53,13 @@ F4 is final for Phase 3 and later common-model comparisons. HGA/WAG/ALNS behavio
 
 This is task-level weld allocation, sequencing, direction, and theoretical coordination. Deployment/retract/parking transitions require lower-level validation; no full physical parking or 3D collision-free execution claim is made. `mrta_exact` remains development-only. Formal results must be reevaluated and certified; development results are not relabelled.
 
-`FINAL_F4_RELEASE_STATUS = PASS` and `PHASE3_AUTHORIZED = YES`. Next: Phase 3 — Adapted HGA / Adapted WAG common-model, beginning with paper-aligned sanity checks. Adapted HGA/WAG, LB_LP, MLP/GAT, ranker dataset, formal VALIDATION/ID_TEST/OOD, and final exact validation remain unfinished. Paper experiments are not complete.
+`FINAL_F4_RELEASE_STATUS = PASS` and `PHASE3_AUTHORIZED = YES` remain unchanged. Phase 3-0 found 96 frozen PPO workbooks containing 2942 valid unique platform instances and froze `PPO_DATASET_MANIFEST_V1`, but the deterministic N=55 and N=102 smoke instances failed initialization under the unchanged B32 evaluator. Therefore `PPO_DATA_INTAKE_STATUS = FAIL` and Phase 3-1 Adapted HGA/WAG is not yet authorized. No solver result was used to change the manifest, smoke selection, formal scope, or B32.
 
 Reference statuses are `FEASIBLE`, `DEADLOCK`, `INFEASIBLE`, and `NUMERIC_FAILURE`. Only FEASIBLE has a reference Cmax; DEADLOCK is a failure of the deterministic scheduling policy, not mathematical infeasibility. Numeric failures are not normal negative training examples.
 
 ## Environment and installation
 
-The verified environment is Python 3.11. The project has no third-party runtime dependency.
+The verified environment is Python 3.11. The scientific core has no third-party runtime dependency. PPO Excel intake is optional and lazy-loads `openpyxl` only when workbook functions are called.
 
 From `D:\pybullet_test\MRTA_GA\DRL`:
 
@@ -99,10 +100,30 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_search/lns.py`: complete-candidate identity, parent destroy, bounded repair, and adaptive operator state.
 - `src/mrta_search/pipeline.py`: unified atomic/LNS Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
 - `src/mrta_search/stats.py`: structured counters, timings, invariants, and anytime records.
+- `src/mrta_data/ppo_instances.py`: optional frozen PPO workbook discovery, schema inspection, loading, validation, metrics, manifests, and smoke-set selection; it never generates, filters, clips, or moves welds.
+- `scripts/audit_ppo_instances.py`: local read-only PPO inventory and manifest CLI.
+- `scripts/run_ppo_smoke.py`: manifest-driven SA-OI-ALNS compatibility smoke CLI.
 - `scripts/profile_phase2b1.py`: deterministic development-only N=20/50/100 smoke driver.
 - `scripts/profile_scheduler.py`: formal gate regression, method-independent direct sampling, final B32/B64/B128 calibration, historical replay, evaluator profiling, N=100 usability gates, Q1–Q6, and development-family smoke driver.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
 - `docs/`: scientific plan and detailed AI handoff report.
+
+## Phase 3 frozen PPO data
+
+Paper-comparison geometry for SA-OI-ALNS, Adapted HGA, Adapted WAG, MLP, and GAT must come from the same `PPO_DATASET_MANIFEST_V1`-derived frozen Excel instances. Runtime generation through `layout_packing`, `generate_weld_instance_from_source`, `get_welds`, `get_welds_from_excel`, or the candidate-generation main flow is forbidden for the paper benchmark. Existing synthetic families, E1-E4, Q1-Q6, tiny exact fixtures, and F4 corpora remain regression, mechanism, stress, exact-micro, and historical evaluator evidence only.
+
+Raw PPO Excel files are local and are not tracked or versioned with this project. Provide their root with `--ppo-root` or `MRTA_PPO_ROOT`; manifests contain only PPO-relative paths and hashes. The observed V9 family sheets store frozen coordinates in metres (`x1..z2`, `length_m`); their `META.input_units=mm` records the pre-packing source workbook units, not the frozen sheet units.
+
+For local smoke replay, exact byte copies of only the three deterministic smoke workbooks may be kept under the ignored directory `data/local/ppo_smokeset/`. This local cache preserves the original PPO-relative `data/...` paths and raw SHA-256 values, so the existing manifest and smoke set can be used with `--ppo-root data/local/ppo_smokeset`. The directory is excluded by `.gitignore` and must not be uploaded.
+
+```powershell
+$env:PYTHONPATH='src'
+& '<PYTHON>' scripts\audit_ppo_instances.py --ppo-root '<PATH_TO_PPO>'
+& '<PYTHON>' scripts\run_ppo_smoke.py --ppo-root '<PATH_TO_PPO>' --include-30
+& '<PYTHON>' scripts\run_ppo_smoke.py --ppo-root 'data/local/ppo_smokeset'
+```
+
+The frozen manifests are [PPO_DATASET_MANIFEST_V1](data/manifests/PPO_DATASET_MANIFEST_V1.json) and [PPO_PHASE3_SMOKESET_V1](data/manifests/PPO_PHASE3_SMOKESET_V1.json). Dataset identity is separate from `FORMAL_SCOPE_V1_1.scope_hash`.
 
 ## Formal API
 

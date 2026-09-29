@@ -1,0 +1,33 @@
+{
+  "dataset_manifest_hash": "3a12fc59708fcd6adc20bb19ba44ba8ece585f8e0a81a93304694960f18f2a31",
+  "dataset_manifest_id": "PPO_DATASET_MANIFEST_V1",
+  "instances": [
+    {
+      "actual_weld_count": 10,
+      "instance_geometry_hash": "412c2a5a8a23df1fd6e8ea72417c49d589333185c792b9a675f89437a51f15be",
+      "instance_id": "data/DEV_ONLY/seed_000202::g06_w010",
+      "relative_path": "data/DEV_ONLY/seed_000202.xlsx",
+      "sheet_name": "g06_w010",
+      "tier": "small"
+    },
+    {
+      "actual_weld_count": 55,
+      "instance_geometry_hash": "00ec9cb45f83d42e3c60a600fd01837d1197f463c59eac08acd365a00dcab9a6",
+      "instance_id": "data/VALIDATION/seed_0967455456::g27_w055",
+      "relative_path": "data/VALIDATION/seed_0967455456.xlsx",
+      "sheet_name": "g27_w055",
+      "tier": "medium"
+    },
+    {
+      "actual_weld_count": 102,
+      "instance_geometry_hash": "7295d29ee4cfc7963c0bf402dd447ac7fe93b1a7176f9651ba7fcc2ef5c24dad",
+      "instance_id": "data/ID_TEST/seed_1411387107::g45_w102",
+      "relative_path": "data/ID_TEST/seed_1411387107.xlsx",
+      "sheet_name": "g45_w102",
+      "tier": "large"
+    }
+  ],
+  "median_weld_count": 55.0,
+  "selection_policy": "small=min N; medium=closest to median N; large=max N; ties by instance_geometry_hash; selections distinct",
+  "smokeset_id": "PPO_PHASE3_SMOKESET_V1"
+}
