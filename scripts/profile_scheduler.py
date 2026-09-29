@@ -27,9 +27,13 @@ from mrta_reference.scheduler import (
     SchedulerProfile,
     _bounded_dispatch_recovery,
     _limited_discrepancy_dispatch_recovery,
+    _limited_discrepancy_dispatch_recovery_slow,
+    _limited_discrepancy_dispatch_recovery_optimized,
     _optimized_dispatch_outcome,
+    _prepared_dispatch_outcome,
     build_operation_templates,
     build_robot_routes,
+    prepare_dispatch_problem,
     reference_schedule_from_templates_optimized,
     reference_schedule_from_templates_slow,
     reference_schedule_optimized,
@@ -364,6 +368,235 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
+def _entry_dispatch_problem(entry):
+    solution = _solution_from_payload(entry["canonical_solution"])
+    config = _config_from_mapping(entry["scientific_config"])
+    directions = tuple(tuple(row) for row in entry["directions"])
+    routes = build_robot_routes(
+        solution, config, {robot: directions[robot] for robot in range(4)}
+    )
+    templates = {
+        route.robot_id: build_operation_templates(route, config) for route in routes
+    }
+    return solution, config, directions, templates
+
+
+def performance_closure_profile(corpus_path: Path) -> dict[str, object]:
+    """Profile the frozen known recovery and three deterministic N100 cases."""
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    known = "328926b7612633797dbe0ae62b62964bbf0a6765b1ef0d6147305b07a0ec6511"
+    known_entry = next(row for row in corpus["entries"] if row["identity"] == known)
+    n100 = [
+        row
+        for row in corpus["entries"]
+        if row["identity"] != known
+        and any(origin["N"] == 100 for origin in row["origins"])
+    ][:3]
+    rows = []
+    for entry in (known_entry, *n100):
+        _, config, directions, templates = _entry_dispatch_problem(entry)
+        profile = SchedulerProfile()
+        started = time.perf_counter()
+        prepared = prepare_dispatch_problem(
+            templates, config, directions=directions, profile=profile
+        )
+        baseline = _prepared_dispatch_outcome(
+            prepared, profile=profile, collect_trace=True
+        )
+        result = _limited_discrepancy_dispatch_recovery_optimized(
+            prepared,
+            baseline,
+            rollout_budget=FORMAL_SCOPE_V1_1.deadlock_rollout_budget,
+            profile=profile,
+        )
+        elapsed = time.perf_counter() - started
+        metrics = profile.as_dict()
+        timed = {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, float) and value > 0.0
+        }
+        rows.append({
+            "identity": entry["identity"],
+            "status": result.status.value,
+            "runtime": elapsed,
+            "recovery_rollouts": result.recovery_rollouts,
+            "profile": metrics,
+            "time_percent": {
+                key: 100.0 * value / elapsed for key, value in timed.items()
+            },
+            "cache_entries": {
+                "forbidden_intervals": len(prepared.forbidden_interval_cache),
+                "conflicts": len(prepared.conflict_cache),
+                "ESS": len(prepared.ess_cache),
+                "fixed_index_snapshots": len(prepared.fixed_index_snapshots),
+            },
+        })
+    return {"stage": "v1_1_performance_profile", "cases": rows}
+
+
+def performance_closure_differential(
+    corpus_path: Path, *, rollout_budget: int = 32
+) -> dict[str, object]:
+    """Run the 31-state slow/fast oracle differential without mutating corpus."""
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    rows = []
+    for entry in corpus["entries"]:
+        solution, config, directions, templates = _entry_dispatch_problem(entry)
+        started = time.perf_counter()
+        slow_baseline = _optimized_dispatch_outcome(
+            templates, config, directions=directions, collect_trace=True
+        )
+        slow = _limited_discrepancy_dispatch_recovery_slow(
+            templates,
+            config,
+            slow_baseline,
+            rollout_budget=rollout_budget,
+        )
+        slow_runtime = time.perf_counter() - started
+
+        profile = SchedulerProfile()
+        started = time.perf_counter()
+        prepared = prepare_dispatch_problem(
+            templates, config, directions=directions, profile=profile
+        )
+        fast_baseline = _prepared_dispatch_outcome(
+            prepared, profile=profile, collect_trace=True
+        )
+        fast = _limited_discrepancy_dispatch_recovery_optimized(
+            prepared,
+            fast_baseline,
+            rollout_budget=rollout_budget,
+            profile=profile,
+        )
+        fast_runtime = time.perf_counter() - started
+        if slow_baseline.result != fast_baseline.result or slow_baseline.trace != fast_baseline.trace:
+            raise RuntimeError(f"baseline/trace differential: {entry['identity']}")
+        if slow != fast:
+            raise RuntimeError(f"recovery scientific differential: {entry['identity']}")
+        formal = replace(
+            fast,
+            reference_policy_id=FORMAL_SCOPE_V1_1.reference_scheduler_policy_id,
+            scope_id=FORMAL_SCOPE_V1_1.scope_id,
+            scope_hash=FORMAL_SCOPE_V1_1.scope_hash,
+        )
+        certificate = (
+            certify_schedule(solution, formal, config, scope=FORMAL_SCOPE_V1_1)
+            if formal.feasible
+            else None
+        )
+        if certificate is not None and not certificate.certified:
+            raise RuntimeError(
+                f"uncertified optimized result {entry['identity']}: {certificate.errors}"
+            )
+        rows.append({
+            "identity": entry["identity"],
+            "status": fast.status.value,
+            "Cmax": fast.cmax,
+            "recovery_rollouts": fast.recovery_rollouts,
+            "slow_runtime": slow_runtime,
+            "optimized_runtime": fast_runtime,
+            "speedup": slow_runtime / fast_runtime,
+            "certified": certificate.certified if certificate else None,
+            "profile": profile.as_dict(),
+            "cache_entries": {
+                "forbidden_intervals": len(prepared.forbidden_interval_cache),
+                "conflicts": len(prepared.conflict_cache),
+                "ESS": len(prepared.ess_cache),
+                "fixed_index_snapshots": len(prepared.fixed_index_snapshots),
+            },
+        })
+        print(json.dumps({"stage": "v1_1_differential_case", **rows[-1]}, sort_keys=True), flush=True)
+    slow_times = [row["slow_runtime"] for row in rows]
+    fast_times = [row["optimized_runtime"] for row in rows]
+    speedups = [row["speedup"] for row in rows]
+    slow_p50, slow_p95 = _percentile(slow_times, 0.5), _percentile(slow_times, 0.95)
+    fast_p50, fast_p95 = _percentile(fast_times, 0.5), _percentile(fast_times, 0.95)
+    return {
+        "stage": "v1_1_performance_differential",
+        "entries": len(rows),
+        "status_counts": dict(Counter(row["status"] for row in rows)),
+        "slow_p50": slow_p50,
+        "slow_p95": slow_p95,
+        "optimized_p50": fast_p50,
+        "optimized_p95": fast_p95,
+        "median_case_speedup": _percentile(speedups, 0.5),
+        "p95_case_speedup": _percentile(speedups, 0.95),
+        "p50_distribution_speedup": slow_p50 / fast_p50,
+        "p95_distribution_speedup": slow_p95 / fast_p95,
+        "scientific_differentials": 0,
+        "certified_feasible": sum(row["certified"] is True for row in rows),
+    }
+
+
+def performance_closure_marginal(corpus_path: Path) -> dict[str, object]:
+    """Final B32/B64 diagnostic; invoke only after optimized B32 is frozen."""
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    rows = []
+    for entry in corpus["entries"]:
+        solution, config, directions, templates = _entry_dispatch_problem(entry)
+        by_budget = {}
+        for budget in (32, 64):
+            started = time.perf_counter()
+            prepared = prepare_dispatch_problem(templates, config, directions=directions)
+            baseline = _prepared_dispatch_outcome(prepared, collect_trace=True)
+            result = _limited_discrepancy_dispatch_recovery_optimized(
+                prepared, baseline, rollout_budget=budget
+            )
+            runtime = time.perf_counter() - started
+            formal = replace(
+                result,
+                reference_policy_id=FORMAL_SCOPE_V1_1.reference_scheduler_policy_id,
+                scope_id=FORMAL_SCOPE_V1_1.scope_id,
+                scope_hash=FORMAL_SCOPE_V1_1.scope_hash,
+            )
+            certificate = (
+                certify_schedule(solution, formal, config, scope=FORMAL_SCOPE_V1_1)
+                if formal.feasible
+                else None
+            )
+            if certificate is not None and not certificate.certified:
+                raise RuntimeError(f"uncertified B{budget}: {entry['identity']}")
+            by_budget[budget] = {
+                "status": result.status.value,
+                "Cmax": result.cmax,
+                "runtime": runtime,
+                "rollouts": result.recovery_rollouts,
+                "certified": certificate.certified if certificate else None,
+            }
+        if by_budget[32]["status"] == ScheduleStatus.FEASIBLE.value:
+            if by_budget[64]["status"] != ScheduleStatus.FEASIBLE.value:
+                raise RuntimeError(f"B64 regressed status: {entry['identity']}")
+            if by_budget[64]["Cmax"] > by_budget[32]["Cmax"] + config.numeric_epsilon:
+                raise RuntimeError(f"B64 worsened Cmax: {entry['identity']}")
+        rows.append({"identity": entry["identity"], "budgets": by_budget})
+        print(json.dumps({"stage": "v1_1_marginal_case", **rows[-1]}, sort_keys=True), flush=True)
+    summaries = {}
+    for budget in (32, 64):
+        runtimes = [row["budgets"][budget]["runtime"] for row in rows]
+        summaries[str(budget)] = {
+            "FEASIBLE": sum(
+                row["budgets"][budget]["status"] == ScheduleStatus.FEASIBLE.value
+                for row in rows
+            ),
+            "DEADLOCK": sum(
+                row["budgets"][budget]["status"] == ScheduleStatus.DEADLOCK.value
+                for row in rows
+            ),
+            "runtime_p50": _percentile(runtimes, 0.5),
+            "runtime_p95": _percentile(runtimes, 0.95),
+            "rollouts": sum(row["budgets"][budget]["rollouts"] for row in rows),
+        }
+    added = summaries["64"]["FEASIBLE"] - summaries["32"]["FEASIBLE"]
+    return {
+        "stage": "v1_1_b32_b64_marginal",
+        "entries": len(rows),
+        "budgets": summaries,
+        "added_certified_recoveries": added,
+        "release_rule": "A" if added <= 1 else "B",
+    }
+
+
 def detect_local_plateaus(
     entries: list[dict[str, object]],
     budgets: tuple[int, ...],
@@ -661,23 +894,26 @@ def replay_v1_1_deadlock_stress_corpus(
     return analysis
 
 
-def formal_n100_performance(seed: int, *, scope=FORMAL_SCOPE_V1) -> dict[str, object]:
+def formal_n100_performance(
+    seed: int, *, scope=FORMAL_SCOPE_V1, time_limit: float = 5.0
+) -> dict[str, object]:
     provenance = _development_provenance()
     result = run_bounded_sa_oi(
         development_family("handover_heavy", 100),
         ScientificConfig(),
-        SearchConfig(max_iterations=100_000, time_limit=5.0),
+        SearchConfig(max_iterations=100_000, time_limit=time_limit),
         seed=seed,
         scope=scope,
         source_provenance=provenance,
     )
     if not result.final_certification or not result.final_certification.certified:
-        raise RuntimeError("N100/5s formal performance result is not certified")
+        raise RuntimeError("N100 formal performance result is not certified")
     if result.stats.iterations < 1:
-        raise RuntimeError("N100/5s formal performance run did not enter search")
+        raise RuntimeError("N100 formal performance run did not enter search")
     stats = result.stats
+    checkpoints = stats.anytime((1.0, 5.0, 30.0))
     return {
-        "stage": "N100_5s_performance",
+        "stage": "N100_performance",
         "family": "handover_heavy",
         "N": 100,
         "seed": seed,
@@ -686,6 +922,9 @@ def formal_n100_performance(seed: int, *, scope=FORMAL_SCOPE_V1) -> dict[str, ob
         "initial_success": result.initialization.status.value == "SUCCESS",
         "initial_Cmax": result.initialization.schedule.cmax,
         "best_Cmax": result.best_schedule.cmax,
+        "Cmax_at_1": checkpoints[1.0]["cmax"],
+        "Cmax_at_5": checkpoints[5.0]["cmax"],
+        "Cmax_at_30": checkpoints[30.0]["cmax"],
         "iterations": stats.iterations,
         "Nref": stats.nref,
         "C4_feasible_rate": stats.n_feasible / stats.nref if stats.nref else None,
@@ -699,7 +938,9 @@ def formal_n100_performance(seed: int, *, scope=FORMAL_SCOPE_V1) -> dict[str, ob
         "overall_scheduler_p50": stats.scheduler_p50,
         "overall_scheduler_p95": stats.scheduler_p95,
         "repair_time": stats.repair_time,
+        "scheduler_time": stats.reference_scheduler_time,
         "certifier_time": stats.certifier_time,
+        "candidate_generation_time": stats.candidate_generation_time,
         "baseline_deadlocks": sum(row["baseline_deadlock"] for row in stats.reference_records),
         "recovered_deadlocks": sum(
             row["source"] in {
@@ -1075,9 +1316,37 @@ def main() -> None:
     )
     parser.add_argument("--formal-seeds", nargs="+", type=int, default=(20260928, 20260929, 20260930))
     parser.add_argument("--pre-phase3-release", choices=("collect", "replay", "performance"))
+    parser.add_argument(
+        "--performance-closure",
+        choices=("profile", "differential", "marginal", "n100"),
+    )
+    parser.add_argument("--time-limit", type=float, default=5.0)
     parser.add_argument("--corpus-path", type=Path, default=DEFAULT_CORPUS_PATH)
     parser.add_argument("--stress-target", type=int, default=30)
     arguments = parser.parse_args()
+    if arguments.performance_closure == "profile":
+        print(json.dumps(performance_closure_profile(arguments.corpus_path), sort_keys=True))
+        return
+    if arguments.performance_closure == "differential":
+        print(json.dumps(
+            performance_closure_differential(arguments.corpus_path), sort_keys=True
+        ))
+        return
+    if arguments.performance_closure == "marginal":
+        print(json.dumps(
+            performance_closure_marginal(arguments.corpus_path), sort_keys=True
+        ))
+        return
+    if arguments.performance_closure == "n100":
+        print(json.dumps(
+            formal_n100_performance(
+                arguments.seed,
+                scope=FORMAL_SCOPE_V1_1,
+                time_limit=arguments.time_limit,
+            ),
+            sort_keys=True,
+        ))
+        return
     if arguments.formal_scope_v1_1 == "replay":
         analysis = replay_v1_1_deadlock_stress_corpus(arguments.corpus_path)
         print(json.dumps({"stage": "v1_1_stress_replay", **analysis}, sort_keys=True))

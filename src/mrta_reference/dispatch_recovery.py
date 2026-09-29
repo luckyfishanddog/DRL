@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import hashlib
 import heapq
 import json
+import time
 from collections.abc import Callable
 from typing import Protocol
 
@@ -171,6 +172,7 @@ def run_dispatch_rollout(
     choice_selector: Callable[
         [DispatchState, tuple[DispatchChoice, ...]], int
     ] | None = None,
+    profile=None,
 ) -> RolloutOutcome:
     """Run a complete deterministic continuation to FEASIBLE or DEADLOCK."""
     state = DispatchState() if initial_state is None else initial_state
@@ -219,12 +221,19 @@ def run_dispatch_rollout(
         chosen_rank = 0
         if forced_index < len(forced_decisions):
             forced = forced_decisions[forced_index]
-            if forced.state_identity == state.identity:
+            identity_started = time.perf_counter()
+            state_identity = state.identity
+            if profile is not None:
+                profile.state_identity_time += time.perf_counter() - identity_started
+            if forced.state_identity == state_identity:
+                identity_started = time.perf_counter()
                 matches = [
                     index
                     for index, choice in enumerate(choices)
                     if choice.identity == forced.choice_identity
                 ]
+                if profile is not None:
+                    profile.state_identity_time += time.perf_counter() - identity_started
                 if len(matches) != 1:
                     raise ValueError("forced dispatch choice is unavailable or ambiguous")
                 chosen_rank = matches[0]
@@ -235,6 +244,7 @@ def run_dispatch_rollout(
                 raise ValueError("dispatch choice selector returned an invalid rank")
 
         if collect_trace and len(choices) >= 2:
+            trace_started = time.perf_counter()
             trace.append(
                 BranchPoint(
                     state.depth,
@@ -244,6 +254,10 @@ def run_dispatch_rollout(
                     chosen_rank,
                 )
             )
+            if profile is not None:
+                elapsed = time.perf_counter() - trace_started
+                profile.branch_trace_time += elapsed
+                profile.branch_snapshot_preparation_time += elapsed
         state = kernel.commit(state, choices[chosen_rank], runtime)
 
 
@@ -275,6 +289,7 @@ def limited_discrepancy_recovery(
     *,
     rollout_budget: int,
     rollout_from_snapshot,
+    profile=None,
 ) -> RecoverySummary:
     """Search deterministic complete continuations with a rollout-count budget."""
     if rollout_budget < 1:
@@ -293,6 +308,7 @@ def limited_discrepancy_recovery(
         *,
         after_depth: int,
     ) -> None:
+        enqueue_started = time.perf_counter()
         eligible = tuple(
             point for point in trace.branch_points if point.depth > after_depth
         )
@@ -333,6 +349,16 @@ def limited_discrepancy_recovery(
                         plan,
                     ),
                 )
+        if profile is not None:
+            elapsed = time.perf_counter() - enqueue_started
+            profile.frontier_time += elapsed
+            profile.dedup_time += elapsed
+            profile.peak_branch_states = max(
+                profile.peak_branch_states, len(frontier)
+            )
+            profile.peak_dedup_entries = max(
+                profile.peak_dedup_entries, len(enqueued)
+            )
 
     # The baseline root has depth -1 for filtering so every branch is eligible.
     enqueue_trace(baseline.trace, 1, (), after_depth=-1)
@@ -342,7 +368,10 @@ def limited_discrepancy_recovery(
     best_plan: tuple[ForcedDispatchDecision, ...] = ()
 
     while frontier and rollouts < rollout_budget:
+        frontier_started = time.perf_counter()
         item = heapq.heappop(frontier)
+        if profile is not None:
+            profile.frontier_time += time.perf_counter() - frontier_started
         point = item.branch_point
         choice = point.ordered_choices[item.alternative_rank]
         decision = ForcedDispatchDecision(point.state.identity, choice.identity)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 import time
 
@@ -83,6 +83,28 @@ class SchedulerProfile:
     conflict_validation_time: float = 0.0
     wait_conflict_validation_time: float = 0.0
     remaining_processing_time: float = 0.0
+    template_validation_time: float = 0.0
+    dispatch_state_construction_time: float = 0.0
+    fixed_index_rebuild_time: float = 0.0
+    fixed_index_cache_hits: int = 0
+    fixed_index_cache_misses: int = 0
+    forbidden_interval_cache_hits: int = 0
+    forbidden_interval_cache_misses: int = 0
+    conflict_cache_hits: int = 0
+    conflict_cache_misses: int = 0
+    ess_cache_hits: int = 0
+    ess_cache_misses: int = 0
+    recovery_rollout_time: float = 0.0
+    recovery_rollout_count: int = 0
+    branch_trace_time: float = 0.0
+    branch_snapshot_preparation_time: float = 0.0
+    state_identity_time: float = 0.0
+    frontier_time: float = 0.0
+    dedup_time: float = 0.0
+    peak_branch_states: int = 0
+    peak_index_snapshots: int = 0
+    peak_operation_nodes: int = 0
+    peak_dedup_entries: int = 0
 
     @property
     def conflict_time(self) -> float:
@@ -123,6 +145,28 @@ class SchedulerProfile:
             "interval_sort_sweep": self.interval_sort_sweep_time,
             "conflict": self.conflict_time,
             "remaining_processing": self.remaining_processing_time,
+            "template_validation": self.template_validation_time,
+            "dispatch_state_construction": self.dispatch_state_construction_time,
+            "fixed_index_rebuild": self.fixed_index_rebuild_time,
+            "fixed_index_cache_hits": self.fixed_index_cache_hits,
+            "fixed_index_cache_misses": self.fixed_index_cache_misses,
+            "forbidden_interval_cache_hits": self.forbidden_interval_cache_hits,
+            "forbidden_interval_cache_misses": self.forbidden_interval_cache_misses,
+            "conflict_cache_hits": self.conflict_cache_hits,
+            "conflict_cache_misses": self.conflict_cache_misses,
+            "ESS_cache_hits": self.ess_cache_hits,
+            "ESS_cache_misses": self.ess_cache_misses,
+            "recovery_rollout_time": self.recovery_rollout_time,
+            "recovery_rollout_count": self.recovery_rollout_count,
+            "branch_trace": self.branch_trace_time,
+            "branch_snapshot_preparation": self.branch_snapshot_preparation_time,
+            "state_identity": self.state_identity_time,
+            "frontier": self.frontier_time,
+            "dedup": self.dedup_time,
+            "peak_branch_states": self.peak_branch_states,
+            "peak_index_snapshots": self.peak_index_snapshots,
+            "peak_operation_nodes": self.peak_operation_nodes,
+            "peak_dedup_entries": self.peak_dedup_entries,
             "other": self.other_time,
         }
 
@@ -160,6 +204,12 @@ class _RelevantFixedIndex:
             raise ValueError("per-robot fixed operation end times must be monotone")
         self.operations[robot].append(operation)
         self.end_times[robot].append(operation.end_time)
+
+    def clone(self) -> "_RelevantFixedIndex":
+        clone = _RelevantFixedIndex()
+        clone.operations = [items.copy() for items in self.operations]
+        clone.end_times = [items.copy() for items in self.end_times]
+        return clone
 
     def relevant(
         self, robot_id: int, ready: float, config: ScientificConfig
@@ -398,28 +448,65 @@ def earliest_safe_start_optimized(
     config: ScientificConfig,
     *,
     profile: SchedulerProfile | None = None,
+    forbidden_interval_cache: dict[
+        tuple[Operation, Operation, float], tuple[tuple[float, float], ...]
+    ] | None = None,
+    conflict_cache: dict[tuple[Operation, Operation], bool] | None = None,
+    ess_cache: dict[
+        tuple[Operation, float, tuple[Operation, ...]],
+        tuple[float, tuple[int, ...], tuple[str, ...]],
+    ] | None = None,
 ) -> tuple[float, tuple[int, ...], tuple[str, ...]]:
     """Equivalent ESS using expired filtering and one deterministic interval sweep."""
     ess_started = time.perf_counter()
+    relevant_tuple = tuple(relevant_fixed)
+    ess_key = (template, ready, relevant_tuple)
+    cached_ess = ess_cache.get(ess_key) if ess_cache is not None else None
+    if cached_ess is not None:
+        if profile is not None:
+            profile.ess_calls += 1
+            profile.ess_cache_hits += 1
+            profile.ess_time += time.perf_counter() - ess_started
+        return cached_ess
     if profile is not None:
         profile.ess_calls += 1
+        profile.ess_cache_misses += 1
         profile.relevant_fixed_operations_scanned += len(relevant_fixed)
+
+    def finish(result):
+        if ess_cache is not None:
+            ess_cache[ess_key] = result
+        return result
     intervals: list[tuple[float, float, int, str]] = []
     for fixed in relevant_fixed:
         interval_started = time.perf_counter()
-        generated = forbidden_start_intervals(
-            template.robot_id,
-            template.duration,
-            template.start,
-            template.end,
-            fixed,
-            ready,
-            config,
+        cache_key = (template, fixed, ready)
+        generated = (
+            forbidden_interval_cache.get(cache_key)
+            if forbidden_interval_cache is not None
+            else None
         )
+        cache_hit = generated is not None
+        if not cache_hit:
+            generated = forbidden_start_intervals(
+                template.robot_id,
+                template.duration,
+                template.start,
+                template.end,
+                fixed,
+                ready,
+                config,
+            )
+            if forbidden_interval_cache is not None:
+                forbidden_interval_cache[cache_key] = generated
         if profile is not None:
             profile.forbidden_interval_calls += 1
             profile.forbidden_intervals_generated += len(generated)
             profile.forbidden_interval_time += time.perf_counter() - interval_started
+            if cache_hit:
+                profile.forbidden_interval_cache_hits += 1
+            else:
+                profile.forbidden_interval_cache_misses += 1
         intervals.extend(
             (lo, hi, fixed.robot_id, fixed.operation_id) for lo, hi in generated
         )
@@ -455,7 +542,7 @@ def earliest_safe_start_optimized(
             if profile is not None:
                 profile.interval_sort_sweep_time += time.perf_counter() - sweep_started
                 profile.ess_time += time.perf_counter() - ess_started
-            return math.inf, tuple(sorted(blockers)), tuple(sorted(blocker_ids))
+            return finish((math.inf, tuple(sorted(blockers)), tuple(sorted(blocker_ids))))
         start = next_start
     if profile is not None:
         profile.interval_sort_sweep_time += time.perf_counter() - sweep_started
@@ -465,11 +552,27 @@ def earliest_safe_start_optimized(
     for fixed in relevant_fixed:
         if profile is not None:
             profile.operations_conflict_calls += 1
-        if operations_conflict(candidate, fixed, config):
+        conflict_key = (candidate, fixed)
+        conflict = (
+            conflict_cache.get(conflict_key)
+            if conflict_cache is not None
+            else None
+        )
+        conflict_hit = conflict is not None
+        if not conflict_hit:
+            conflict = operations_conflict(candidate, fixed, config)
+            if conflict_cache is not None:
+                conflict_cache[conflict_key] = conflict
+        if profile is not None:
+            if conflict_hit:
+                profile.conflict_cache_hits += 1
+            else:
+                profile.conflict_cache_misses += 1
+        if conflict:
             if profile is not None:
                 profile.conflict_validation_time += time.perf_counter() - validation_started
                 profile.ess_time += time.perf_counter() - ess_started
-            return math.inf, tuple(sorted(blockers)), tuple(sorted(blocker_ids))
+            return finish((math.inf, tuple(sorted(blockers)), tuple(sorted(blocker_ids))))
     if profile is not None:
         profile.conflict_validation_time += time.perf_counter() - validation_started
 
@@ -489,18 +592,34 @@ def earliest_safe_start_optimized(
         for fixed in relevant_fixed:
             if profile is not None:
                 profile.wait_conflict_calls += 1
-            if operations_conflict(waiting, fixed, config):
+            conflict_key = (waiting, fixed)
+            conflict = (
+                conflict_cache.get(conflict_key)
+                if conflict_cache is not None
+                else None
+            )
+            conflict_hit = conflict is not None
+            if not conflict_hit:
+                conflict = operations_conflict(waiting, fixed, config)
+                if conflict_cache is not None:
+                    conflict_cache[conflict_key] = conflict
+            if profile is not None:
+                if conflict_hit:
+                    profile.conflict_cache_hits += 1
+                else:
+                    profile.conflict_cache_misses += 1
+            if conflict:
                 blockers.add(fixed.robot_id)
                 blocker_ids.add(fixed.operation_id)
                 if profile is not None:
                     profile.wait_conflict_validation_time += time.perf_counter() - wait_started
                     profile.ess_time += time.perf_counter() - ess_started
-                return math.inf, tuple(sorted(blockers)), tuple(sorted(blocker_ids))
+                return finish((math.inf, tuple(sorted(blockers)), tuple(sorted(blocker_ids))))
         if profile is not None:
             profile.wait_conflict_validation_time += time.perf_counter() - wait_started
     if profile is not None:
         profile.ess_time += time.perf_counter() - ess_started
-    return start, tuple(sorted(blockers)), tuple(sorted(blocker_ids))
+    return finish((start, tuple(sorted(blockers)), tuple(sorted(blocker_ids))))
 
 
 def earliest_safe_start(
@@ -759,6 +878,64 @@ def _remaining_processing_suffix(
     return tuple(suffixes)  # type: ignore[return-value]
 
 
+@dataclass
+class PreparedDispatchProblem:
+    """Validated immutable dispatch inputs plus call-local exact caches.
+
+    One instance is shared by the baseline and every V1.1 continuation. Cache
+    keys contain the complete immutable scientific inputs; dictionary equality
+    resolves hash collisions before a cached value is reused.
+    """
+
+    templates: dict[int, tuple[Operation, ...]]
+    remaining_suffix: tuple[
+        tuple[float, ...], tuple[float, ...], tuple[float, ...], tuple[float, ...]
+    ]
+    config: ScientificConfig
+    directions: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+    invalid: ScheduleResult | None = None
+    forbidden_interval_cache: dict[
+        tuple[Operation, Operation, float], tuple[tuple[float, float], ...]
+    ] = field(default_factory=dict)
+    conflict_cache: dict[tuple[Operation, Operation], bool] = field(default_factory=dict)
+    ess_cache: dict[
+        tuple[Operation, float, tuple[Operation, ...]],
+        tuple[float, tuple[int, ...], tuple[str, ...]],
+    ] = field(default_factory=dict)
+    fixed_index_snapshots: dict[tuple[Operation, ...], _RelevantFixedIndex] = field(
+        default_factory=dict
+    )
+
+
+def prepare_dispatch_problem(
+    templates_by_robot: Mapping[int, Sequence[Operation]],
+    config: ScientificConfig,
+    *,
+    directions=((), (), (), ()),
+    profile: SchedulerProfile | None = None,
+) -> PreparedDispatchProblem:
+    started = time.perf_counter()
+    templates, invalid = _validated_reference_templates(templates_by_robot, config)
+    if profile is not None:
+        profile.template_validation_time += time.perf_counter() - started
+        profile.number_of_operations = sum(len(items) for items in templates.values())
+    suffix_started = time.perf_counter()
+    suffix = (
+        _remaining_processing_suffix(templates)
+        if invalid is None
+        else ((), (), (), ())
+    )
+    if profile is not None:
+        profile.remaining_processing_time += time.perf_counter() - suffix_started
+    return PreparedDispatchProblem(
+        templates,
+        suffix,
+        config,
+        directions,
+        invalid,
+    )
+
+
 class _OptimizedDispatchKernel:
     """Scientific dispatch kernel shared by baseline and recovery rollouts."""
 
@@ -769,17 +946,37 @@ class _OptimizedDispatchKernel:
         config: ScientificConfig,
         directions,
         profile: SchedulerProfile | None,
+        prepared: PreparedDispatchProblem | None = None,
     ) -> None:
         self.templates = templates
         self.remaining_suffix = remaining_suffix
         self.config = config
         self.directions = directions
         self.profile = profile
+        self.prepared = prepared
 
     def start_runtime(self, state: DispatchState) -> _RelevantFixedIndex:
+        started = time.perf_counter()
+        if self.prepared is not None:
+            cached = self.prepared.fixed_index_snapshots.get(state.fixed_operations)
+            if cached is not None:
+                if self.profile is not None:
+                    self.profile.fixed_index_cache_hits += 1
+                    self.profile.fixed_index_rebuild_time += time.perf_counter() - started
+                return cached.clone()
         index = _RelevantFixedIndex()
         for operation in state.fixed_operations:
             index.add(operation)
+        if self.prepared is not None:
+            self.prepared.fixed_index_snapshots[state.fixed_operations] = index.clone()
+            if self.profile is not None:
+                self.profile.fixed_index_cache_misses += 1
+                self.profile.peak_index_snapshots = max(
+                    self.profile.peak_index_snapshots,
+                    len(self.prepared.fixed_index_snapshots),
+                )
+        if self.profile is not None:
+            self.profile.fixed_index_rebuild_time += time.perf_counter() - started
         return index
 
     def is_complete(self, state: DispatchState) -> bool:
@@ -808,6 +1005,21 @@ class _OptimizedDispatchKernel:
                 relevant,
                 self.config,
                 profile=self.profile,
+                forbidden_interval_cache=(
+                    self.prepared.forbidden_interval_cache
+                    if self.prepared is not None
+                    else None
+                ),
+                conflict_cache=(
+                    self.prepared.conflict_cache
+                    if self.prepared is not None
+                    else None
+                ),
+                ess_cache=(
+                    self.prepared.ess_cache
+                    if self.prepared is not None
+                    else None
+                ),
             )
             blockers_by_robot[robot] = blockers
             blocker_ids_by_robot[robot] = blocker_ids
@@ -845,6 +1057,7 @@ class _OptimizedDispatchKernel:
         choice: DispatchChoice,
         fixed_index: _RelevantFixedIndex,
     ) -> DispatchState:
+        state_started = time.perf_counter()
         robot = choice.robot_id
         if state.next_index[robot] != choice.template_index:
             raise ValueError("dispatch choice template index does not match state")
@@ -879,13 +1092,21 @@ class _OptimizedDispatchKernel:
         completion[robot] = operation.end_time
         current_point[robot] = operation.end
         next_index[robot] += 1
-        return DispatchState(
+        result = DispatchState(
             tuple(next_index),
             tuple(completion),
             tuple(current_point),
             fixed,
             tuple(wait_count),
         )
+        if self.profile is not None:
+            self.profile.dispatch_state_construction_time += (
+                time.perf_counter() - state_started
+            )
+            self.profile.peak_operation_nodes = max(
+                self.profile.peak_operation_nodes, len(result.fixed_operations)
+            )
+        return result
 
     def feasible_result(self, state: DispatchState) -> ScheduleResult:
         return ScheduleResult(
@@ -956,6 +1177,59 @@ def _optimized_dispatch_outcome(
             forced_decisions=forced_decisions,
             collect_trace=collect_trace,
             choice_selector=choice_selector,
+            profile=profile,
+        )
+    except ValueError as error:
+        outcome = RolloutOutcome(
+            _infeasible(str(error)),
+            RolloutTrace((), start_state.depth, start_state.depth, forced_decisions),
+            start_state,
+        )
+    except (OverflowError, ArithmeticError) as error:
+        outcome = RolloutOutcome(
+            ScheduleResult(ScheduleStatus.NUMERIC_FAILURE, diagnostics=(str(error),)),
+            RolloutTrace((), start_state.depth, start_state.depth, forced_decisions),
+            start_state,
+        )
+    if profile is not None:
+        profile.scheduler_main_loop_time += time.perf_counter() - main_started
+    return outcome
+
+
+def _prepared_dispatch_outcome(
+    prepared: PreparedDispatchProblem,
+    *,
+    profile: SchedulerProfile | None = None,
+    initial_state: DispatchState | None = None,
+    forced_decisions: tuple[ForcedDispatchDecision, ...] = (),
+    collect_trace: bool = True,
+    choice_selector=None,
+) -> RolloutOutcome:
+    """Run one exact rollout while reusing a call-local prepared problem."""
+    main_started = time.perf_counter()
+    start_state = DispatchState() if initial_state is None else initial_state
+    if prepared.invalid is not None:
+        return RolloutOutcome(
+            prepared.invalid,
+            RolloutTrace((), start_state.depth, start_state.depth, forced_decisions),
+            start_state,
+        )
+    kernel = _OptimizedDispatchKernel(
+        prepared.templates,
+        prepared.remaining_suffix,
+        prepared.config,
+        prepared.directions,
+        profile,
+        prepared,
+    )
+    try:
+        outcome = run_dispatch_rollout(
+            kernel,
+            initial_state=start_state,
+            forced_decisions=forced_decisions,
+            collect_trace=collect_trace,
+            choice_selector=choice_selector,
+            profile=profile,
         )
     except ValueError as error:
         outcome = RolloutOutcome(
@@ -1258,7 +1532,7 @@ def _bounded_dispatch_recovery(
     )
 
 
-def _limited_discrepancy_dispatch_recovery(
+def _limited_discrepancy_dispatch_recovery_slow(
     templates_by_robot: Mapping[int, Sequence[Operation]],
     config: ScientificConfig,
     baseline: RolloutOutcome,
@@ -1297,6 +1571,7 @@ def _limited_discrepancy_dispatch_recovery(
         baseline,
         rollout_budget=rollout_budget,
         rollout_from_snapshot=rollout_from_snapshot,
+        profile=profile,
     )
     numeric = summary.result.status is ScheduleStatus.NUMERIC_FAILURE
     recovered = summary.result.status is ScheduleStatus.FEASIBLE
@@ -1329,6 +1604,91 @@ def _limited_discrepancy_dispatch_recovery(
     )
 
 
+def _limited_discrepancy_dispatch_recovery_optimized(
+    prepared: PreparedDispatchProblem,
+    baseline: RolloutOutcome,
+    *,
+    rollout_budget: int,
+    profile: SchedulerProfile | None = None,
+) -> ScheduleResult:
+    """Semantics-identical V1.1 recovery using shared exact call-local caches."""
+    if baseline.result.status is not ScheduleStatus.DEADLOCK:
+        return baseline.result
+
+    def rollout_from_snapshot(
+        state: DispatchState,
+        decision: ForcedDispatchDecision,
+        causal_blocker_operation_ids: tuple[str, ...],
+    ) -> RolloutOutcome:
+        blockers = frozenset(causal_blocker_operation_ids)
+
+        def causal_selector(_state, choices):
+            if blockers and choices[0].operation_id in blockers and len(choices) >= 2:
+                return 1
+            return 0
+
+        started = time.perf_counter()
+        outcome = _prepared_dispatch_outcome(
+            prepared,
+            profile=profile,
+            initial_state=state,
+            forced_decisions=(decision,),
+            collect_trace=True,
+            choice_selector=causal_selector if blockers else None,
+        )
+        if profile is not None:
+            profile.recovery_rollout_count += 1
+            profile.recovery_rollout_time += time.perf_counter() - started
+        return outcome
+
+    summary = limited_discrepancy_recovery(
+        baseline,
+        rollout_budget=rollout_budget,
+        rollout_from_snapshot=rollout_from_snapshot,
+        profile=profile,
+    )
+    if profile is not None:
+        profile.peak_branch_states = max(
+            profile.peak_branch_states, summary.branch_points_considered
+        )
+        profile.peak_dedup_entries = max(
+            profile.peak_dedup_entries, summary.branch_points_considered
+        )
+    numeric = summary.result.status is ScheduleStatus.NUMERIC_FAILURE
+    recovered = summary.result.status is ScheduleStatus.FEASIBLE
+    diagnostics = baseline.result.diagnostics + (
+        "baseline DEADLOCK",
+        f"recovery_rollouts={summary.recovery_rollouts}",
+        f"rollout_budget={summary.rollout_budget}",
+        f"max_discrepancies_used={summary.max_discrepancies_used}",
+        f"branch_points_considered={summary.branch_points_considered}",
+        f"recovery_exhausted={not summary.frontier_exhausted}",
+        f"frontier_exhausted={summary.frontier_exhausted}",
+    )
+    if numeric:
+        diagnostics += tuple(
+            item for item in summary.result.diagnostics if item not in diagnostics
+        )
+    return replace(
+        summary.result,
+        source="LIMITED_DISCREPANCY_RECOVERY" if recovered else "BASELINE",
+        diagnostics=diagnostics,
+        baseline_deadlock=True,
+        recovery_exhausted=not summary.frontier_exhausted,
+        frontier_exhausted=summary.frontier_exhausted,
+        recovery_rollouts=summary.recovery_rollouts,
+        rollout_budget=summary.rollout_budget,
+        max_discrepancies_used=summary.max_discrepancies_used,
+        branch_points_considered=summary.branch_points_considered,
+    )
+
+
+# Compatibility name now denotes the production optimized implementation only
+# when supplied a prepared problem through the formal path. Direct historical
+# callers keep using the explicit slow oracle signature below.
+_limited_discrepancy_dispatch_recovery = _limited_discrepancy_dispatch_recovery_slow
+
+
 def reference_schedule_from_templates_formal(
     templates_by_robot, config: ScientificConfig, *, scope: FormalScope = ACTIVE_FORMAL_SCOPE,
     directions=((), (), (), ()), profile: SchedulerProfile | None = None,
@@ -1355,17 +1715,18 @@ def reference_schedule_from_templates_formal(
     if scope.deadlock_policy_id == FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1:
         if scope.deadlock_rollout_budget is None:
             raise ValueError("V1.1 limited-discrepancy policy requires a rollout budget")
-        baseline_outcome = _optimized_dispatch_outcome(
+        prepared = prepare_dispatch_problem(
             templates_by_robot,
             config,
             directions=directions,
             profile=profile,
-            collect_trace=True,
+        )
+        baseline_outcome = _prepared_dispatch_outcome(
+            prepared, profile=profile, collect_trace=True
         )
         result = (
-            _limited_discrepancy_dispatch_recovery(
-                templates_by_robot,
-                config,
+            _limited_discrepancy_dispatch_recovery_optimized(
+                prepared,
                 baseline_outcome,
                 rollout_budget=scope.deadlock_rollout_budget,
                 profile=profile,

@@ -561,6 +561,95 @@ def test_known_old_2048_case_recovers_with_16_complete_rollouts_monotonically():
     ).certified
 
 
+def test_prepared_v1_1_recovery_is_exactly_equal_to_slow_oracle():
+    solution, config, directions, templates, slow_baseline = _known_recoverable_large_case()
+    slow = scheduler_module._limited_discrepancy_dispatch_recovery_slow(
+        templates, config, slow_baseline, rollout_budget=32
+    )
+    prepared = scheduler_module.prepare_dispatch_problem(
+        templates, config, directions=directions
+    )
+    fast_baseline = scheduler_module._prepared_dispatch_outcome(
+        prepared, collect_trace=True
+    )
+    fast = scheduler_module._limited_discrepancy_dispatch_recovery_optimized(
+        prepared, fast_baseline, rollout_budget=32
+    )
+    assert fast_baseline.result == slow_baseline.result
+    assert fast_baseline.trace == slow_baseline.trace
+    assert fast == slow
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1
+    formal_fast = replace(
+        fast,
+        reference_policy_id=FORMAL_SCOPE_V1_1.reference_scheduler_policy_id,
+        scope_id=FORMAL_SCOPE_V1_1.scope_id,
+        scope_hash=FORMAL_SCOPE_V1_1.scope_hash,
+    )
+    assert certify_schedule(
+        solution, formal_fast, config, scope=FORMAL_SCOPE_V1_1
+    ).certified
+
+
+def test_prepared_branch_index_snapshots_are_isolated_and_replay_identically():
+    from mrta_reference.dispatch_recovery import ForcedDispatchDecision
+
+    _, config, directions, templates, _ = _known_recoverable_large_case()
+    prepared = scheduler_module.prepare_dispatch_problem(
+        templates, config, directions=directions
+    )
+    baseline = scheduler_module._prepared_dispatch_outcome(prepared, collect_trace=True)
+    point = baseline.trace.branch_points[-1]
+    decision = ForcedDispatchDecision(
+        point.state.identity, point.ordered_choices[1].identity
+    )
+    first = scheduler_module._prepared_dispatch_outcome(
+        prepared,
+        initial_state=point.state,
+        forced_decisions=(decision,),
+        collect_trace=True,
+    )
+    cache_snapshot = {
+        key: tuple(tuple(items) for items in value.operations)
+        for key, value in prepared.fixed_index_snapshots.items()
+    }
+    second = scheduler_module._prepared_dispatch_outcome(
+        prepared,
+        initial_state=point.state,
+        forced_decisions=(decision,),
+        collect_trace=True,
+    )
+    assert first == second
+    assert cache_snapshot == {
+        key: tuple(tuple(items) for items in value.operations)
+        for key, value in prepared.fixed_index_snapshots.items()
+    }
+
+
+def test_v1_1_profile_on_off_has_identical_scientific_result():
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1
+
+    solution, config, directions, _, _ = _known_recoverable_large_case()
+    without_profile = scheduler_module.reference_schedule_formal(
+        solution,
+        config,
+        scope=FORMAL_SCOPE_V1_1,
+        orientations={robot: directions[robot] for robot in range(4)},
+    )
+    profile = scheduler_module.SchedulerProfile()
+    with_profile = scheduler_module.reference_schedule_formal(
+        solution,
+        config,
+        scope=FORMAL_SCOPE_V1_1,
+        orientations={robot: directions[robot] for robot in range(4)},
+        profile=profile,
+    )
+    assert with_profile == without_profile
+    assert profile.recovery_rollout_count == with_profile.recovery_rollouts
+    assert profile.forbidden_interval_cache_hits > 0
+    assert profile.peak_index_snapshots > 0
+
+
 def test_plateau_detector_uses_per_candidate_status_cmax_and_certification(monkeypatch):
     from pathlib import Path
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
