@@ -530,10 +530,13 @@ def test_known_old_2048_case_recovers_with_16_complete_rollouts_monotonically():
 
     solution, config, directions, templates, baseline = _known_recoverable_large_case()
     rows = []
-    for budget in (1, 2, 4, 8, 16, 32):
+    budgets = (1, 2, 4, 8, 16, 32, 64, 128)
+    for budget in budgets:
         result = scheduler_module._limited_discrepancy_dispatch_recovery(
             templates, config, baseline, rollout_budget=budget
         )
+        assert result.rollout_budget == budget
+        assert result.recovery_rollouts <= budget
         rows.append(result)
     found = False
     previous = None
@@ -828,3 +831,135 @@ def test_fixed_budget_search_trajectory_is_identical() -> None:
     assert slow.stats.reference_status_sequence == optimized.stats.reference_status_sequence
     assert slow.stats.proposal_trajectory == optimized.stats.proposal_trajectory
     assert slow.stats.best_improvement_cmax == optimized.stats.best_improvement_cmax
+
+
+def test_method_independent_sampler_is_deterministic_canonical_and_search_free(
+    monkeypatch,
+) -> None:
+    import profile_scheduler as profiler
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a search heuristic was called by the direct sampler")
+
+    monkeypatch.setattr(profiler, "run_bounded_sa_oi", forbidden)
+    monkeypatch.setattr(profiler, "optimize_directions_with_initial_feasibility", forbidden)
+    monkeypatch.setattr(profiler, "_construct", forbidden)
+    monkeypatch.setattr(profiler, "_patterns", forbidden)
+    parents = profiler.development_family("handover_heavy", 20)
+    sequences = []
+    for _ in range(2):
+        sequence = []
+        for ordinal in range(8):
+            sampled = profiler.sample_method_independent_solution(
+                parents,
+                FAST,
+                master_seed=20260929,
+                family="handover_heavy",
+                size=20,
+                sample_ordinal=ordinal,
+            )
+            solution, directions, metadata = sampled
+            assert canonicalize(
+                solution.parents, solution.patterns, solution.routes, FAST
+            ).canonical_json == solution.canonical_json
+            assert tuple(len(row) for row in directions) == tuple(
+                len(route.block_ids) for route in solution.routes
+            )
+            assert metadata["sampler_policy_id"] == "METHOD_INDEPENDENT_DIRECT_SAMPLER_V1"
+            sequence.append((solution.canonical_json, directions, metadata))
+        sequences.append(sequence)
+    assert sequences[0] == sequences[1]
+
+
+def test_method_independent_pattern_sampling_selects_kind_before_y_candidate() -> None:
+    import profile_scheduler as profiler
+
+    parent = ParentWeld("optional-many-y", (1.0, 5.8), (9.0, 10.0))
+
+    class RecordingRng:
+        def __init__(self):
+            self.calls = []
+
+        def randrange(self, stop):
+            self.calls.append(("kind", stop))
+            return 1
+
+        def choice(self, values):
+            self.calls.append(("candidate", len(values)))
+            return values[-1]
+
+    rng = RecordingRng()
+    pattern = profiler._sample_formal_pattern(parent, FAST, rng)
+    assert pattern.kind is SplitKind.Y_SPLIT
+    assert rng.calls[0] == ("kind", 2)
+    assert rng.calls[1][0] == "candidate"
+    assert rng.calls[1][1] >= 2
+
+
+def test_method_independent_identity_dedup_and_json_round_trip_are_stable() -> None:
+    import profile_scheduler as profiler
+
+    parents = profiler.development_family("load_skew", 20)
+    solution, directions, metadata = profiler.sample_method_independent_solution(
+        parents,
+        FAST,
+        master_seed=20260929,
+        family="load_skew",
+        size=20,
+        sample_ordinal=3,
+    )
+    first = profiler._direct_state_exact_key(solution, directions, FAST)
+    second = profiler._direct_state_exact_key(solution, directions, FAST)
+    assert first == second
+    baseline = reference_schedule_optimized(
+        solution, FAST, orientations={robot: directions[robot] for robot in range(4)}
+    )
+    entry = profiler._direct_corpus_entry(
+        solution, directions, FAST, metadata, baseline
+    )
+    import json
+
+    restored = json.loads(json.dumps(entry, sort_keys=True, allow_nan=False))
+    assert restored == entry
+    assert profiler._solution_from_payload(restored["canonical_solution"]).canonical_json == solution.canonical_json
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        (ScheduleStatus.DEADLOCK, True),
+        (ScheduleStatus.FEASIBLE, False),
+        (ScheduleStatus.INFEASIBLE, False),
+        (ScheduleStatus.NUMERIC_FAILURE, False),
+    ),
+)
+def test_method_independent_corpus_accepts_only_baseline_deadlock(status, expected) -> None:
+    import profile_scheduler as profiler
+
+    assert profiler._baseline_status_is_collectible(status) is expected
+
+
+def test_final_budget_selector_uses_smallest_90_percent_budget_and_runtime_gate() -> None:
+    import profile_scheduler as profiler
+
+    selection = profiler.select_final_deadlock_budget(
+        {32: 89, 64: 90, 128: 100},
+        {32: 1.0, 64: 7.9, 128: 7.0},
+    )
+    assert selection == 64
+    assert selection == profiler.select_final_deadlock_budget(
+        {32: 89, 64: 90, 128: 100},
+        {32: 1.0, 64: 7.9, 128: 7.0},
+    )
+    assert profiler.select_final_deadlock_budget(
+        {32: 90, 64: 95, 128: 100},
+        {32: 8.1, 64: 8.0, 128: 7.0},
+    ) == 64
+    assert profiler.select_final_deadlock_budget(
+        {32: 0, 64: 0, 128: 0},
+        {32: 2.0, 64: 3.0, 128: 4.0},
+    ) == 32
+    assert profiler.select_final_deadlock_budget(
+        {32: 89, 64: 90, 128: 100},
+        {32: 8.1, 64: 8.1, 128: 8.1},
+    ) is None

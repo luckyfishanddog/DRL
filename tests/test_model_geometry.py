@@ -16,6 +16,7 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
     from mrta_reference.provenance import SourceProvenance
     scope = FORMAL_SCOPE_V1
     assert scope.scope_hash == "8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9"
+    assert FORMAL_SCOPE_V1_1.scope_hash == "5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc"
     assert scope.scope_hash == FormalScope().scope_hash
     assert scope.scope_hash == hashlib.sha256(scope.canonical_json.encode()).hexdigest()
     for change in (

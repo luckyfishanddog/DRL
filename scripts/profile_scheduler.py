@@ -5,6 +5,7 @@ from collections import Counter
 import hashlib
 import json
 import math
+import random
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -40,8 +41,15 @@ from mrta_reference.scheduler import (
     reference_schedule_slow,
 )
 from mrta_reference.certifier import certify_schedule
+from mrta_reference.geometry import (
+    blocks_for_pattern,
+    generate_y_split_patterns,
+    robot_is_eligible,
+    whole_eligible_rails,
+)
 from mrta_reference.provenance import resolve_source_provenance
 from mrta_reference.scope import FORMAL_SCOPE_V1, FORMAL_SCOPE_V1_1
+from mrta_reference.solution import canonicalize
 from mrta_search import SearchConfig, micro_gap_decomposition, run_bounded_sa_oi
 from mrta_search.direction import optimize_directions_with_initial_feasibility
 from mrta_search.initialization import InitializationStrategy, _construct, _patterns
@@ -54,6 +62,26 @@ DEFAULT_CORPUS_PATH = (
     / "data"
     / "development"
     / "f4_deadlock_stress_corpus.json"
+)
+
+METHOD_INDEPENDENT_SAMPLER_POLICY_ID = "METHOD_INDEPENDENT_DIRECT_SAMPLER_V1"
+METHOD_INDEPENDENT_CORPUS_SCHEMA_ID = "F4_METHOD_INDEPENDENT_CALIBRATION_CORPUS_V1"
+METHOD_INDEPENDENT_MASTER_SEED = 20260929
+METHOD_INDEPENDENT_STRATA = tuple(
+    (family, size)
+    for family in (
+        "load_skew",
+        "spatial_cluster",
+        "handover_heavy",
+        "interference_stress",
+    )
+    for size in (20, 50, 100)
+)
+METHOD_INDEPENDENT_CORPUS_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "development"
+    / "f4_method_independent_calibration_v1.json"
 )
 
 
@@ -597,6 +625,56 @@ def performance_closure_marginal(corpus_path: Path) -> dict[str, object]:
     }
 
 
+def replay_historical_corpus_final(
+    corpus_path: Path = DEFAULT_CORPUS_PATH,
+) -> dict[str, object]:
+    """Cross-distribution B32/B64/B128 diagnostic after budget selection."""
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    summaries = {
+        budget: {"FEASIBLE": 0, "DEADLOCK": 0, "certified": 0, "runtimes": []}
+        for budget in (32, 64, 128)
+    }
+    for entry in corpus["entries"]:
+        solution, config, directions, templates = _entry_dispatch_problem(entry)
+        previous = None
+        for budget in (32, 64, 128):
+            started = time.perf_counter()
+            prepared = prepare_dispatch_problem(templates, config, directions=directions)
+            baseline = _prepared_dispatch_outcome(prepared, collect_trace=True)
+            result = _limited_discrepancy_dispatch_recovery_optimized(
+                prepared, baseline, rollout_budget=budget
+            )
+            elapsed = time.perf_counter() - started
+            certificate = certify_schedule(solution, result, config) if result.feasible else None
+            if certificate is not None and not certificate.certified:
+                raise RuntimeError(f"uncertified historical B{budget}: {entry['identity']}")
+            summaries[budget][result.status.value] += 1
+            summaries[budget]["certified"] += int(bool(certificate and certificate.certified))
+            summaries[budget]["runtimes"].append(elapsed)
+            if previous is not None and previous.feasible:
+                if not result.feasible:
+                    raise RuntimeError(f"historical B{budget} status regression")
+                if result.cmax > previous.cmax + config.numeric_epsilon:
+                    raise RuntimeError(f"historical B{budget} Cmax regression")
+            previous = result
+    return {
+        "entries": len(corpus["entries"]),
+        "selected_budget": 32,
+        "budgets": {
+            str(budget): {
+                "FEASIBLE": row["FEASIBLE"],
+                "DEADLOCK": row["DEADLOCK"],
+                "certified": row["certified"],
+                "runtime_p50": _percentile(row["runtimes"], 0.50),
+                "runtime_p95": _percentile(row["runtimes"], 0.95),
+            }
+            for budget, row in summaries.items()
+        },
+        "monotonicity_violations": 0,
+        "certification_failures": 0,
+    }
+
+
 def detect_local_plateaus(
     entries: list[dict[str, object]],
     budgets: tuple[int, ...],
@@ -1012,6 +1090,436 @@ def development_family(name: str, count: int) -> tuple[ParentWeld, ...]:
     return tuple(parents)
 
 
+def _direct_sampling_seed(
+    master_seed: int, family: str, size: int, sample_ordinal: int
+) -> int:
+    payload = json.dumps(
+        {
+            "family": family,
+            "master_seed": master_seed,
+            "policy": METHOD_INDEPENDENT_SAMPLER_POLICY_ID,
+            "sample_ordinal": sample_ordinal,
+            "size": size,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:8], "big")
+
+
+def _sample_formal_pattern(
+    parent: ParentWeld, config: ScientificConfig, rng: random.Random
+) -> SplitPattern:
+    """Sample pattern kind first so Y candidate multiplicity cannot bias the kind."""
+    y_patterns = tuple(
+        pattern
+        for pattern in generate_y_split_patterns(parent, config)
+        if all(
+            any(robot_is_eligible(block, robot, config) for robot in range(4))
+            for block in blocks_for_pattern(parent, pattern, config)
+        )
+    )
+    whole_eligible = bool(whole_eligible_rails(parent.start, parent.end, config))
+    if not whole_eligible:
+        if not y_patterns:
+            raise ValueError(f"{parent.parent_id}: mandatory Y has no legal candidate")
+        return rng.choice(y_patterns)
+    if not y_patterns or rng.randrange(2) == 0:
+        return SplitPattern(parent.parent_id, SplitKind.WHOLE)
+    return rng.choice(y_patterns)
+
+
+def sample_method_independent_solution(
+    parents: tuple[ParentWeld, ...],
+    config: ScientificConfig,
+    *,
+    master_seed: int,
+    family: str,
+    size: int,
+    sample_ordinal: int,
+) -> tuple[CanonicalSolution, tuple[tuple[int, ...], ...], dict[str, object]]:
+    """Directly sample the formal structural domain without a search heuristic."""
+    sampling_seed = _direct_sampling_seed(master_seed, family, size, sample_ordinal)
+    rng = random.Random(sampling_seed)
+    ordered_parents = tuple(sorted(parents, key=lambda parent: parent.parent_id))
+    for structural_draw in range(1, 4097):
+        patterns = tuple(
+            _sample_formal_pattern(parent, config, rng) for parent in ordered_parents
+        )
+        blocks = sorted(
+            (
+                block
+                for parent, pattern in zip(ordered_parents, patterns)
+                for block in blocks_for_pattern(parent, pattern, config)
+            ),
+            key=lambda block: block.block_id,
+        )
+        assigned = [[] for _ in range(4)]
+        for block in blocks:
+            eligible = tuple(
+                robot for robot in range(4) if robot_is_eligible(block, robot, config)
+            )
+            if not eligible:
+                raise ValueError(f"{block.block_id}: no formally eligible robot")
+            assigned[rng.choice(eligible)].append(block.block_id)
+        for block_ids in assigned:
+            block_ids.sort()
+            rng.shuffle(block_ids)
+        routes = tuple(Route(robot, tuple(assigned[robot])) for robot in range(4))
+        try:
+            solution = canonicalize(ordered_parents, patterns, routes, config)
+        except ValueError:
+            # Mandatory-Y children that become adjacent on one robot are not a
+            # canonical formal solution. Rejection sampling preserves the
+            # direct uniform draws while returning only structural-domain rows.
+            continue
+        directions = tuple(
+            tuple(rng.randrange(2) for _ in route.block_ids)
+            for route in solution.routes
+        )
+        metadata = {
+            "sampler_policy_id": METHOD_INDEPENDENT_SAMPLER_POLICY_ID,
+            "master_seed": master_seed,
+            "stratum": {"family": family, "N": size},
+            "sample_ordinal": sample_ordinal,
+            "sampling_seed": sampling_seed,
+            "structural_draws": structural_draw,
+        }
+        return solution, directions, metadata
+    raise RuntimeError("direct sampler exceeded 4096 deterministic structural draws")
+
+
+def _direct_state_exact_key(
+    solution: CanonicalSolution,
+    directions: tuple[tuple[int, ...], ...],
+    config: ScientificConfig,
+) -> str:
+    return json.dumps(
+        {
+            "canonical_solution_hash": solution.canonical_hash,
+            "directions": directions,
+            "scientific_config_hash": config.scientific_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _direct_corpus_entry(
+    solution: CanonicalSolution,
+    directions: tuple[tuple[int, ...], ...],
+    config: ScientificConfig,
+    metadata: dict[str, object],
+    baseline,
+) -> dict[str, object]:
+    exact_key = _direct_state_exact_key(solution, directions, config)
+    return {
+        "identity": hashlib.sha256(exact_key.encode("utf-8")).hexdigest(),
+        "canonical_solution_hash": solution.canonical_hash,
+        "canonical_solution": solution.canonical_payload(),
+        "directions": [list(row) for row in directions],
+        "scientific_config_hash": config.scientific_hash,
+        "scientific_config": json.loads(json.dumps(asdict(config), allow_nan=False)),
+        **metadata,
+        "baseline": {
+            "status": baseline.status.value,
+            "source": baseline.source,
+            "diagnostics": list(baseline.diagnostics),
+            "wait_for_graph": [
+                [robot, list(blockers)] for robot, blockers in baseline.wait_for_graph
+            ],
+            "canonical_schedule_hash": hashlib.sha256(
+                baseline.canonical_json().encode("utf-8")
+            ).hexdigest(),
+        },
+    }
+
+
+def _baseline_status_is_collectible(status: ScheduleStatus) -> bool:
+    return status is ScheduleStatus.DEADLOCK
+
+
+def build_method_independent_corpus(
+    *, master_seed: int = METHOD_INDEPENDENT_MASTER_SEED
+) -> dict[str, object]:
+    """Execute the predeclared two-stage collection policy entirely in memory."""
+    config = ScientificConfig()
+    accepted: list[dict[str, object]] = []
+    exact_seen: set[str] = set()
+    stats = {
+        f"{family}/N{size}": {
+            "family": family,
+            "N": size,
+            "attempts": 0,
+            "accepted_unique_deadlocks": 0,
+            "duplicate_deadlocks": 0,
+            "status_counts": {},
+        }
+        for family, size in METHOD_INDEPENDENT_STRATA
+    }
+
+    def execute_stage(start: int, stop: int, cap: int) -> None:
+        for family, size in METHOD_INDEPENDENT_STRATA:
+            parents = development_family(family, size)
+            row = stats[f"{family}/N{size}"]
+            counts = Counter(row["status_counts"])
+            for ordinal in range(start, stop):
+                solution, directions, metadata = sample_method_independent_solution(
+                    parents,
+                    config,
+                    master_seed=master_seed,
+                    family=family,
+                    size=size,
+                    sample_ordinal=ordinal,
+                )
+                orientation_map = {
+                    robot: directions[robot] for robot in range(4)
+                }
+                baseline = reference_schedule_optimized(
+                    solution, config, orientations=orientation_map
+                )
+                row["attempts"] += 1
+                counts[baseline.status.value] += 1
+                if not _baseline_status_is_collectible(baseline.status):
+                    continue
+                exact_key = _direct_state_exact_key(solution, directions, config)
+                if exact_key in exact_seen:
+                    row["duplicate_deadlocks"] += 1
+                    continue
+                exact_seen.add(exact_key)
+                if row["accepted_unique_deadlocks"] >= cap:
+                    continue
+                entry = _direct_corpus_entry(
+                    solution, directions, config, metadata, baseline
+                )
+                # Digest is an external label only; exact-key membership above
+                # prevents a theoretical SHA collision from merging states.
+                entry["collection_index"] = len(accepted)
+                accepted.append(entry)
+                row["accepted_unique_deadlocks"] += 1
+            row["status_counts"] = dict(sorted(counts.items()))
+
+    execute_stage(0, 256, 8)
+    stage = "A"
+    if len(accepted) < 48:
+        execute_stage(256, 1024, 12)
+        stage = "B"
+    corpus = {
+        "schema_id": METHOD_INDEPENDENT_CORPUS_SCHEMA_ID,
+        "development_only": True,
+        "future_validation_test_ood_used": False,
+        "method_source": "DIRECT_FORMAL_DOMAIN_SAMPLING",
+        "sampler_policy_id": METHOD_INDEPENDENT_SAMPLER_POLICY_ID,
+        "master_seed": master_seed,
+        "scope_id_at_collection": FORMAL_SCOPE_V1_1.scope_id,
+        "scope_hash_at_collection": FORMAL_SCOPE_V1_1.scope_hash,
+        "scientific_config_hash": config.scientific_hash,
+        "collection_policy": {
+            "strata": [
+                {"family": family, "N": size}
+                for family, size in METHOD_INDEPENDENT_STRATA
+            ],
+            "stage_a_attempts_per_stratum": 256,
+            "stage_a_max_unique_deadlocks_per_stratum": 8,
+            "stage_a_stop_total": 48,
+            "stage_b_total_attempts_per_stratum": 1024,
+            "stage_b_max_unique_deadlocks_per_stratum": 12,
+            "completed_stage": stage,
+        },
+        "strata": [stats[f"{family}/N{size}"] for family, size in METHOD_INDEPENDENT_STRATA],
+        "unique_baseline_deadlocks": len(accepted),
+        "entries": accepted,
+    }
+    # Prove that the in-memory payload is JSON round-trip exact before a caller
+    # is allowed to freeze it on disk.
+    encoded = json.dumps(corpus, sort_keys=True, allow_nan=False)
+    if json.loads(encoded) != corpus:
+        raise RuntimeError("method-independent corpus JSON round-trip failed")
+    return corpus
+
+
+def write_method_independent_corpus(
+    output_path: Path = METHOD_INDEPENDENT_CORPUS_PATH,
+    *,
+    master_seed: int = METHOD_INDEPENDENT_MASTER_SEED,
+) -> dict[str, object]:
+    corpus = build_method_independent_corpus(master_seed=master_seed)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(corpus, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    if json.loads(output_path.read_text(encoding="utf-8")) != corpus:
+        raise RuntimeError("frozen method-independent corpus did not round-trip")
+    return corpus
+
+
+def select_final_deadlock_budget(
+    recovery_counts: dict[int, int], n100_p95: dict[int, float | None]
+) -> int | None:
+    """Apply the predeclared 90%-of-B128 coverage and eight-second gate."""
+    r128 = recovery_counts[128]
+    for budget in (32, 64, 128):
+        coverage = 1.0 if r128 == 0 else recovery_counts[budget] / r128
+        p95 = n100_p95.get(budget)
+        if coverage >= 0.90 and p95 is not None and p95 <= 8.0:
+            return budget
+    return None
+
+
+def calibrate_method_independent_corpus(
+    corpus_path: Path = METHOD_INDEPENDENT_CORPUS_PATH,
+    *,
+    emit_cases: bool = False,
+) -> dict[str, object]:
+    """Replay the already-frozen corpus at exactly B32/B64/B128."""
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    if corpus.get("schema_id") != METHOD_INDEPENDENT_CORPUS_SCHEMA_ID:
+        raise ValueError("unexpected method-independent corpus schema")
+    if corpus.get("unique_baseline_deadlocks", 0) < 31:
+        raise RuntimeError("INSUFFICIENT_METHOD_INDEPENDENT_DEADLOCK_EVIDENCE")
+    rows = [
+        {
+            "identity": entry["identity"],
+            "family": entry["stratum"]["family"],
+            "N": entry["stratum"]["N"],
+            "sample_ordinal": entry["sample_ordinal"],
+            "budgets": {},
+        }
+        for entry in corpus["entries"]
+    ]
+    for budget in (32, 64, 128):
+        for entry, row in zip(corpus["entries"], rows):
+            solution, config, directions, templates = _entry_dispatch_problem(entry)
+            profile = SchedulerProfile()
+            started = time.perf_counter()
+            prepared = prepare_dispatch_problem(
+                templates, config, directions=directions, profile=profile
+            )
+            baseline = _prepared_dispatch_outcome(
+                prepared, profile=profile, collect_trace=True
+            )
+            if baseline.result.status is not ScheduleStatus.DEADLOCK:
+                raise RuntimeError(
+                    f"frozen baseline no longer DEADLOCK: {entry['identity']}"
+                )
+            baseline_hash = hashlib.sha256(
+                baseline.result.canonical_json().encode("utf-8")
+            ).hexdigest()
+            if baseline_hash != entry["baseline"]["canonical_schedule_hash"]:
+                raise RuntimeError(
+                    f"frozen baseline schedule changed: {entry['identity']}"
+                )
+            result = _limited_discrepancy_dispatch_recovery_optimized(
+                prepared, baseline, rollout_budget=budget, profile=profile
+            )
+            runtime = time.perf_counter() - started
+            if result.rollout_budget != budget or result.recovery_rollouts > budget:
+                raise RuntimeError(
+                    f"B{budget} rollout cap violated: {entry['identity']}"
+                )
+            certificate = (
+                certify_schedule(solution, result, config) if result.feasible else None
+            )
+            if certificate is not None and not certificate.certified:
+                raise RuntimeError(
+                    f"uncertified B{budget}: {entry['identity']}: {certificate.errors}"
+                )
+            row["budgets"][str(budget)] = {
+                "status": result.status.value,
+                "Cmax": result.cmax,
+                "runtime": runtime,
+                "recovery_rollouts": result.recovery_rollouts,
+                "max_discrepancies_used": result.max_discrepancies_used,
+                "branch_points_considered": result.branch_points_considered,
+                "frontier_exhausted": result.frontier_exhausted,
+                "certified": certificate.certified if certificate else None,
+                "canonical_schedule_hash": hashlib.sha256(
+                    result.canonical_json().encode("utf-8")
+                ).hexdigest(),
+            }
+            if emit_cases:
+                print(
+                    json.dumps(
+                        {
+                            "stage": "final_f4_calibration_case",
+                            "identity": row["identity"],
+                            "family": row["family"],
+                            "N": row["N"],
+                            "budget": budget,
+                            **row["budgets"][str(budget)],
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+    for entry, row in zip(corpus["entries"], rows):
+        config = _config_from_mapping(entry["scientific_config"])
+        for smaller, larger in ((32, 64), (64, 128)):
+            left, right = row["budgets"][str(smaller)], row["budgets"][str(larger)]
+            if left["status"] == ScheduleStatus.FEASIBLE.value:
+                if right["status"] != ScheduleStatus.FEASIBLE.value:
+                    raise RuntimeError(
+                        f"B{larger} status regression: {entry['identity']}"
+                    )
+                if right["Cmax"] > left["Cmax"] + config.numeric_epsilon:
+                    raise RuntimeError(
+                        f"B{larger} Cmax regression: {entry['identity']}"
+                    )
+    counts = {
+        budget: sum(
+            row["budgets"][str(budget)]["status"] == ScheduleStatus.FEASIBLE.value
+            for row in rows
+        )
+        for budget in (32, 64, 128)
+    }
+    runtime = {}
+    n100_p95 = {}
+    for budget in (32, 64, 128):
+        all_times = [row["budgets"][str(budget)]["runtime"] for row in rows]
+        n100_times = [
+            row["budgets"][str(budget)]["runtime"]
+            for row in rows
+            if row["N"] == 100
+        ]
+        rollouts = [
+            row["budgets"][str(budget)]["recovery_rollouts"] for row in rows
+        ]
+        n100_p95[budget] = _percentile(n100_times, 0.95)
+        runtime[str(budget)] = {
+            "all_p50": _percentile(all_times, 0.50),
+            "all_p95": _percentile(all_times, 0.95),
+            "N100_count": len(n100_times),
+            "N100_p50": _percentile(n100_times, 0.50),
+            "N100_p95": n100_p95[budget],
+            "N100_mean": sum(n100_times) / len(n100_times) if n100_times else None,
+            "N100_max": max(n100_times) if n100_times else None,
+            "rollout_mean": sum(rollouts) / len(rollouts),
+            "rollout_median": _percentile(rollouts, 0.50),
+        }
+    selected = select_final_deadlock_budget(counts, n100_p95)
+    return {
+        "schema_id": "FINAL_F4_DEVELOPMENT_CALIBRATION_RESULT_V1",
+        "development_only": True,
+        "corpus_path": str(corpus_path),
+        "corpus_entries": len(rows),
+        "recovery_counts": {str(key): value for key, value in counts.items()},
+        "coverage_of_B128": {
+            str(budget): (1.0 if counts[128] == 0 else counts[budget] / counts[128])
+            for budget in (32, 64, 128)
+        },
+        "runtime": runtime,
+        "monotonicity_violations": 0,
+        "certification_failures": 0,
+        "selected_budget": selected,
+        "selection_rule": "SMALLEST_B_WITH_RECOVERY_AT_LEAST_90_PERCENT_OF_B128_AND_N100_P95_LE_8S",
+        "rows": rows,
+    }
+
+
 def _profile_solution(parents, config: ScientificConfig) -> dict[str, object]:
     solution = _construct(
         parents,
@@ -1320,10 +1828,35 @@ def main() -> None:
         "--performance-closure",
         choices=("profile", "differential", "marginal", "n100"),
     )
+    parser.add_argument(
+        "--final-f4-release",
+        choices=("collect", "calibrate"),
+    )
     parser.add_argument("--time-limit", type=float, default=5.0)
     parser.add_argument("--corpus-path", type=Path, default=DEFAULT_CORPUS_PATH)
+    parser.add_argument(
+        "--method-corpus-path", type=Path, default=METHOD_INDEPENDENT_CORPUS_PATH
+    )
     parser.add_argument("--stress-target", type=int, default=30)
     arguments = parser.parse_args()
+    if arguments.final_f4_release == "collect":
+        corpus = write_method_independent_corpus(
+            arguments.method_corpus_path, master_seed=METHOD_INDEPENDENT_MASTER_SEED
+        )
+        print(json.dumps({
+            "stage": "method_independent_collection",
+            "path": str(arguments.method_corpus_path),
+            "completed_stage": corpus["collection_policy"]["completed_stage"],
+            "unique_baseline_deadlocks": corpus["unique_baseline_deadlocks"],
+            "strata": corpus["strata"],
+        }, sort_keys=True))
+        return
+    if arguments.final_f4_release == "calibrate":
+        print(json.dumps(
+            calibrate_method_independent_corpus(arguments.method_corpus_path),
+            sort_keys=True,
+        ))
+        return
     if arguments.performance_closure == "profile":
         print(json.dumps(performance_closure_profile(arguments.corpus_path), sort_keys=True))
         return

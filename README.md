@@ -1,6 +1,6 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1_1 = ACTIVE`; V1 remains a reproducible historical scope superseded before formal experiments. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1_1 = FINAL ACTIVE SCOPE FOR PHASE 3`; V1 remains a reproducible historical scope superseded before formal experiments. The final method-independent F4 calibration retained B32, so Phase 3 is authorized. This research is isolated from the repository's legacy V9/V10/PPO experiments.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
@@ -46,11 +46,13 @@ Development optimum notation is `Cmax_OPT_Y_CURRENT`, qualified by the current d
 
 V1 hash: `8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9`. Active V1.1 hash: `5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc`. See the [historical scope contract](docs/FORMAL_SCOPE_V1.md), [V1 gate evidence](docs/FORMAL_SCOPE_GATE_V1_20260928.md), and [V1.1 F4 closure](docs/FORMAL_SCOPE_V1_1_F4_CLOSURE_20260929.md).
 
-The existing 31-state development corpus was replayed at B=1/2/4/8/16/32 complete rollouts. Certified recoveries were 0/0/0/0/1/9. The known N=100 case that first required 2048 prefix states under V1 recovered in 14 complete rollouts. Budget 32 was selected because the 16→32 curve still changed materially; remaining failures stay DEADLOCK. The measured recovery p50/p95 at B=32 was 13.581/37.369 s, so the evaluator cost is an explicit limitation rather than a hidden search advantage. See the replayable [development corpus](data/development/f4_deadlock_stress_corpus.json).
+The final release budget was selected only from the method-independent direct-sampling corpus: 12 development strata, 256 attempts per stratum, and the first eight unique baseline-DEADLOCK states per stratum produced 96 frozen states. B32/B64/B128 each recovered 6/96 certified schedules; B32 therefore provides 100% of B128 coverage and its N100 end-to-end p95 was 5.147 s, satisfying the predeclared 8 s gate. The selected budget remains 32 and no V1.2 is created. The older 31-state ALNS-derived corpus remains an external regression only: B32/B64/B128 recovered 9/15/15 certified schedules. See the [method-independent corpus](data/development/f4_method_independent_calibration_v1.json), [historical stress corpus](data/development/f4_deadlock_stress_corpus.json), and [final release handoff](docs/FINAL_F4_RELEASE_CALIBRATION_20260929.md).
+
+F4 is final for Phase 3 and later common-model comparisons. HGA/WAG/ALNS behavior and future TEST results must not be used to retune the evaluator budget. Evaluator performance optimization and F4 calibration are closed.
 
 This is task-level weld allocation, sequencing, direction, and theoretical coordination. Deployment/retract/parking transitions require lower-level validation; no full physical parking or 3D collision-free execution claim is made. `mrta_exact` remains development-only. Formal results must be reevaluated and certified; development results are not relabelled.
 
-Next: Phase 3 — Adapted HGA / Adapted WAG common-model, beginning with paper-aligned sanity checks. Adapted HGA/WAG, LB_LP, MLP/GAT, ranker dataset, formal VALIDATION/ID_TEST/OOD, and final exact validation remain unfinished. Paper experiments are not complete.
+`FINAL_F4_RELEASE_STATUS = PASS` and `PHASE3_AUTHORIZED = YES`. Next: Phase 3 — Adapted HGA / Adapted WAG common-model, beginning with paper-aligned sanity checks. Adapted HGA/WAG, LB_LP, MLP/GAT, ranker dataset, formal VALIDATION/ID_TEST/OOD, and final exact validation remain unfinished. Paper experiments are not complete.
 
 Reference statuses are `FEASIBLE`, `DEADLOCK`, `INFEASIBLE`, and `NUMERIC_FAILURE`. Only FEASIBLE has a reference Cmax; DEADLOCK is a failure of the deterministic scheduling policy, not mathematical infeasibility. Numeric failures are not normal negative training examples.
 
@@ -98,7 +100,7 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_search/pipeline.py`: unified atomic/LNS Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
 - `src/mrta_search/stats.py`: structured counters, timings, invariants, and anytime records.
 - `scripts/profile_phase2b1.py`: deterministic development-only N=20/50/100 smoke driver.
-- `scripts/profile_scheduler.py`: formal gate calibration/Q1–Q6/family smoke plus historical slow/optimized profiling, N=100 5 s gate, Q1–Q6, initialization matrix, and development-family smoke driver.
+- `scripts/profile_scheduler.py`: formal gate regression, method-independent direct sampling, final B32/B64/B128 calibration, historical replay, evaluator profiling, N=100 usability gates, Q1–Q6, and development-family smoke driver.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
 - `docs/`: scientific plan and detailed AI handoff report.
 
