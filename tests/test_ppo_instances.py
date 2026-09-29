@@ -15,7 +15,10 @@ from mrta_data.ppo_instances import (
     build_dataset_manifest,
     instance_geometry_hash,
     load_ppo_platform_instance,
+    main_experimental_range_summary,
+    select_init_bootstrap_devset,
     select_phase3_smokeset,
+    select_phase3_smokeset_v2,
     validate_ppo_platform_instance,
 )
 
@@ -161,3 +164,77 @@ def test_manifest_order_hash_stability_and_duplicate_geometry(tmp_path):
     smokeset = select_phase3_smokeset(first)
     assert len({entry["instance_id"] for entry in smokeset["instances"]}) == 3
     json.dumps(first, allow_nan=False)
+
+
+def _selection_manifest() -> dict[str, object]:
+    entries = []
+    counts = (10, 20, 25, 28, 30, 31, 40, 45, 48, 50, 51, 55, 60, 65, 70,
+              71, 75, 80, 85, 90, 91)
+    for index, count in enumerate(counts):
+        entries.append(
+            {
+                "instance_id": f"data/F/seed_{index:03d}::g{index:02d}_w{count:03d}",
+                "relative_path": f"data/F/seed_{index:03d}.xlsx",
+                "sheet_name": f"g{index:02d}_w{count:03d}",
+                "actual_weld_count": count,
+                "instance_geometry_hash": f"{index:064x}",
+                "validation_status": "VALID",
+                "duplicate_of": None,
+            }
+        )
+    return {
+        "dataset_manifest_id": "PPO_DATASET_MANIFEST_V1",
+        "dataset_manifest_hash": "dataset-hash",
+        "instances": entries,
+    }
+
+
+def test_v2_main_range_selection_retains_but_excludes_n_above_90() -> None:
+    manifest = _selection_manifest()
+    summary = main_experimental_range_summary(manifest)
+    assert summary["valid_unique_total"] == 21
+    assert summary["valid_unique_in_main_range"] == 20
+    assert summary["valid_unique_out_of_main_range"] == 1
+    assert summary["weld_count_distribution"]["90"] == 1
+    first = select_phase3_smokeset_v2(manifest)
+    second = select_phase3_smokeset_v2(manifest)
+    assert first == second
+    assert [entry["actual_weld_count"] for entry in first["instances"]] == [10, 50, 90]
+    assert all(entry["actual_weld_count"] <= 90 for entry in first["instances"])
+
+
+def test_bootstrap_devset_strata_workbooks_and_consumed_tracking_are_stable() -> None:
+    manifest = _selection_manifest()
+    historical = {
+        "instances": [
+            {"relative_path": "history/small.xlsx"},
+            {"relative_path": "history/medium.xlsx"},
+            {"relative_path": "history/large.xlsx"},
+        ]
+    }
+    current = {
+        "instances": [{"relative_path": "current/large_n090.xlsx"}]
+    }
+    first = select_init_bootstrap_devset(
+        manifest, historical, additional_consumed_smokesets=(current,)
+    )
+    second = select_init_bootstrap_devset(
+        manifest, historical, additional_consumed_smokesets=(current,)
+    )
+    assert first == second
+    assert len(first["instances"]) == 20
+    assert len({entry["relative_path"] for entry in first["instances"]}) == 20
+    assert [len(group["instances"]) for group in first["strata"]] == [5, 5, 5, 5]
+    assert set(first["historical_smoke_workbooks"]) <= set(
+        first["development_consumed_workbooks"]
+    )
+    assert "current/large_n090.xlsx" in first["development_consumed_workbooks"]
+
+
+def test_smoke_runner_requires_explicit_source_label_without_stale_commit() -> None:
+    source = (Path(__file__).parents[1] / "scripts" / "run_ppo_smoke.py").read_text(
+        encoding="utf-8"
+    )
+    assert "e4de209d872d46687af4974d030b32904192b906" not in source
+    assert '"--source-commit-label"' in source
+    assert "required=True" in source

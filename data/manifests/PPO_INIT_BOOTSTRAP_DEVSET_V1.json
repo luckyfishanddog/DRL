@@ -1,0 +1,396 @@
+{
+  "all_consumed_smoke_workbooks": [
+    "data/DEV_ONLY/seed_000202.xlsx",
+    "data/ID_TEST/seed_1411387107.xlsx",
+    "data/PPO_TRAIN/seed_1118337379.xlsx",
+    "data/VALIDATION/seed_0967455456.xlsx"
+  ],
+  "dataset_manifest_hash": "3a12fc59708fcd6adc20bb19ba44ba8ece585f8e0a81a93304694960f18f2a31",
+  "dataset_manifest_id": "PPO_DATASET_MANIFEST_V1",
+  "development_consumed_workbooks": [
+    "data/DEV_ONLY/seed_000202.xlsx",
+    "data/DEV_ONLY/seed_000505.xlsx",
+    "data/ID_TEST/seed_0401115467.xlsx",
+    "data/ID_TEST/seed_0469626998.xlsx",
+    "data/ID_TEST/seed_1411387107.xlsx",
+    "data/PPO_TRAIN/seed_0194123089.xlsx",
+    "data/PPO_TRAIN/seed_0211781140.xlsx",
+    "data/PPO_TRAIN/seed_0442383381.xlsx",
+    "data/PPO_TRAIN/seed_0457685429.xlsx",
+    "data/PPO_TRAIN/seed_0566744530.xlsx",
+    "data/PPO_TRAIN/seed_0676566458.xlsx",
+    "data/PPO_TRAIN/seed_0760656368.xlsx",
+    "data/PPO_TRAIN/seed_0767803876.xlsx",
+    "data/PPO_TRAIN/seed_0900775608.xlsx",
+    "data/PPO_TRAIN/seed_1054426823.xlsx",
+    "data/PPO_TRAIN/seed_1064648049.xlsx",
+    "data/PPO_TRAIN/seed_1118337379.xlsx",
+    "data/PPO_TRAIN/seed_1137713392.xlsx",
+    "data/PPO_TRAIN/seed_1419626827.xlsx",
+    "data/PPO_TRAIN/seed_1727996722.xlsx",
+    "data/VALIDATION/seed_0471570702.xlsx",
+    "data/VALIDATION/seed_0967455456.xlsx",
+    "data/VALIDATION/seed_1964628001.xlsx"
+  ],
+  "devset_id": "PPO_INIT_BOOTSTRAP_DEVSET_V1",
+  "future_split_isolation_policy": "all instances from a development-consumed workbook/generation-seed family are excluded from untouched TEST",
+  "historical_smoke_workbooks": [
+    "data/DEV_ONLY/seed_000202.xlsx",
+    "data/ID_TEST/seed_1411387107.xlsx",
+    "data/VALIDATION/seed_0967455456.xlsx"
+  ],
+  "instances": [
+    {
+      "actual_weld_count": 24,
+      "instance_geometry_hash": "005ba798836e5b1234424e4f762abb54842b101bda71e1cce5a86a617f59a51c",
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g18_w024",
+      "relative_path": "data/PPO_TRAIN/seed_1064648049.xlsx",
+      "sheet_name": "g18_w024",
+      "stratum": "N10_30"
+    },
+    {
+      "actual_weld_count": 30,
+      "instance_geometry_hash": "02e6d7e1500545b6425a79d6ed17a5d1644393e8474a6e36c4d6b63dec3d6e8a",
+      "instance_id": "data/ID_TEST/seed_0469626998::g15_w030",
+      "relative_path": "data/ID_TEST/seed_0469626998.xlsx",
+      "sheet_name": "g15_w030",
+      "stratum": "N10_30"
+    },
+    {
+      "actual_weld_count": 30,
+      "instance_geometry_hash": "02fc0e95b08cb4877eb826cfc8143430f6029565f2e92cd69e11d66f967d4a96",
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g16_w030",
+      "relative_path": "data/PPO_TRAIN/seed_0900775608.xlsx",
+      "sheet_name": "g16_w030",
+      "stratum": "N10_30"
+    },
+    {
+      "actual_weld_count": 30,
+      "instance_geometry_hash": "0396e61e1b2c90b97b760c071b4817db88b399fb9f0d4669568757d25e279fc5",
+      "instance_id": "data/VALIDATION/seed_1964628001::g15_w030",
+      "relative_path": "data/VALIDATION/seed_1964628001.xlsx",
+      "sheet_name": "g15_w030",
+      "stratum": "N10_30"
+    },
+    {
+      "actual_weld_count": 29,
+      "instance_geometry_hash": "06ab3e21d4d76c7c01e724110274c7d54d6426d2631a18be3aa1b6ec2810bd95",
+      "instance_id": "data/DEV_ONLY/seed_000505::g18_w029",
+      "relative_path": "data/DEV_ONLY/seed_000505.xlsx",
+      "sheet_name": "g18_w029",
+      "stratum": "N10_30"
+    },
+    {
+      "actual_weld_count": 49,
+      "instance_geometry_hash": "00278581d7daf08504cbd99d83cbc01e25ff46ad3d39a6096021d6e361741fca",
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g21_w049",
+      "relative_path": "data/PPO_TRAIN/seed_0194123089.xlsx",
+      "sheet_name": "g21_w049",
+      "stratum": "N31_50"
+    },
+    {
+      "actual_weld_count": 47,
+      "instance_geometry_hash": "016be2940ccfa3c5ec8a8c7c56feb9ac06335b55c18f3d2052f78132ed6e06d3",
+      "instance_id": "data/VALIDATION/seed_0967455456::g19_w047",
+      "relative_path": "data/VALIDATION/seed_0967455456.xlsx",
+      "sheet_name": "g19_w047",
+      "stratum": "N31_50"
+    },
+    {
+      "actual_weld_count": 48,
+      "instance_geometry_hash": "021ee664fd110648532dccfd560e272733d89d5b9ce34ef9a8afec1c73526ce7",
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g24_w048",
+      "relative_path": "data/PPO_TRAIN/seed_1419626827.xlsx",
+      "sheet_name": "g24_w048",
+      "stratum": "N31_50"
+    },
+    {
+      "actual_weld_count": 38,
+      "instance_geometry_hash": "038f5f6a57f1a1c2c9670adba06314e38335ed24942647e9e49bb99d901f3f91",
+      "instance_id": "data/PPO_TRAIN/seed_0760656368::g25_w038",
+      "relative_path": "data/PPO_TRAIN/seed_0760656368.xlsx",
+      "sheet_name": "g25_w038",
+      "stratum": "N31_50"
+    },
+    {
+      "actual_weld_count": 48,
+      "instance_geometry_hash": "03967d11dd621bdab65f831077e65d100c0521da47e8630f1d2fecd8b25b8c4c",
+      "instance_id": "data/PPO_TRAIN/seed_1727996722::g20_w048",
+      "relative_path": "data/PPO_TRAIN/seed_1727996722.xlsx",
+      "sheet_name": "g20_w048",
+      "stratum": "N31_50"
+    },
+    {
+      "actual_weld_count": 59,
+      "instance_geometry_hash": "001f164503a5650f4a23700dbd4315b3efa5bf3e60e540b53f1c098f286ff889",
+      "instance_id": "data/PPO_TRAIN/seed_0767803876::g33_w059",
+      "relative_path": "data/PPO_TRAIN/seed_0767803876.xlsx",
+      "sheet_name": "g33_w059",
+      "stratum": "N51_70"
+    },
+    {
+      "actual_weld_count": 62,
+      "instance_geometry_hash": "00d81044c57e67715fa101e875dce3ca9d87ab1995c492582f09cf37302fd249",
+      "instance_id": "data/PPO_TRAIN/seed_0442383381::g41_w062",
+      "relative_path": "data/PPO_TRAIN/seed_0442383381.xlsx",
+      "sheet_name": "g41_w062",
+      "stratum": "N51_70"
+    },
+    {
+      "actual_weld_count": 68,
+      "instance_geometry_hash": "013cdebba3892631ccf1f21a473d9eadc1a7808463c9741b923f4ad71762e28e",
+      "instance_id": "data/PPO_TRAIN/seed_1137713392::g34_w068",
+      "relative_path": "data/PPO_TRAIN/seed_1137713392.xlsx",
+      "sheet_name": "g34_w068",
+      "stratum": "N51_70"
+    },
+    {
+      "actual_weld_count": 58,
+      "instance_geometry_hash": "0166213bba9015432b20daa26dd7c5db5226102355b14614b3aec45b65f17602",
+      "instance_id": "data/VALIDATION/seed_0471570702::g38_w058",
+      "relative_path": "data/VALIDATION/seed_0471570702.xlsx",
+      "sheet_name": "g38_w058",
+      "stratum": "N51_70"
+    },
+    {
+      "actual_weld_count": 70,
+      "instance_geometry_hash": "016badac36557f08c81a6ef3dd4c35788da2746d6a3d7a6c2d1196a78c476dae",
+      "instance_id": "data/PPO_TRAIN/seed_0457685429::g42_w070",
+      "relative_path": "data/PPO_TRAIN/seed_0457685429.xlsx",
+      "sheet_name": "g42_w070",
+      "stratum": "N51_70"
+    },
+    {
+      "actual_weld_count": 78,
+      "instance_geometry_hash": "00acabaf2df8706dba41b040f9cbb77d04808f6cd28bb9f15d12106f280e3e39",
+      "instance_id": "data/PPO_TRAIN/seed_1054426823::g37_w078",
+      "relative_path": "data/PPO_TRAIN/seed_1054426823.xlsx",
+      "sheet_name": "g37_w078",
+      "stratum": "N71_90"
+    },
+    {
+      "actual_weld_count": 73,
+      "instance_geometry_hash": "024a74bc054e0971ae6768084aa4905b87b23f0b7027358d195dbb9566911fea",
+      "instance_id": "data/PPO_TRAIN/seed_0566744530::g42_w073",
+      "relative_path": "data/PPO_TRAIN/seed_0566744530.xlsx",
+      "sheet_name": "g42_w073",
+      "stratum": "N71_90"
+    },
+    {
+      "actual_weld_count": 71,
+      "instance_geometry_hash": "037be75b6699f1368a0f78b59079f56546c3edc247fed75fff76d6ca66283c80",
+      "instance_id": "data/PPO_TRAIN/seed_0676566458::g39_w071",
+      "relative_path": "data/PPO_TRAIN/seed_0676566458.xlsx",
+      "sheet_name": "g39_w071",
+      "stratum": "N71_90"
+    },
+    {
+      "actual_weld_count": 85,
+      "instance_geometry_hash": "0395e11300f687af90bdaced161afe6cd6adb5a21d41a1368a2fbcb8851bbb79",
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "relative_path": "data/PPO_TRAIN/seed_0211781140.xlsx",
+      "sheet_name": "g32_w085",
+      "stratum": "N71_90"
+    },
+    {
+      "actual_weld_count": 73,
+      "instance_geometry_hash": "03e8d6cbe9d8b9be9e9f030874229a92c087d733fe9288800eb22c930c3505e0",
+      "instance_id": "data/ID_TEST/seed_0401115467::g37_w073",
+      "relative_path": "data/ID_TEST/seed_0401115467.xlsx",
+      "sheet_name": "g37_w073",
+      "stratum": "N71_90"
+    }
+  ],
+  "per_stratum": 5,
+  "selection_policy": "solver-independent four strata N=10..30,31..50,51..70,71..90; five per stratum; stable instance_geometry_hash order; prefer distinct workbooks and use at most one per workbook when possible",
+  "strata": [
+    {
+      "instances": [
+        {
+          "actual_weld_count": 24,
+          "instance_geometry_hash": "005ba798836e5b1234424e4f762abb54842b101bda71e1cce5a86a617f59a51c",
+          "instance_id": "data/PPO_TRAIN/seed_1064648049::g18_w024",
+          "relative_path": "data/PPO_TRAIN/seed_1064648049.xlsx",
+          "sheet_name": "g18_w024",
+          "stratum": "N10_30"
+        },
+        {
+          "actual_weld_count": 30,
+          "instance_geometry_hash": "02e6d7e1500545b6425a79d6ed17a5d1644393e8474a6e36c4d6b63dec3d6e8a",
+          "instance_id": "data/ID_TEST/seed_0469626998::g15_w030",
+          "relative_path": "data/ID_TEST/seed_0469626998.xlsx",
+          "sheet_name": "g15_w030",
+          "stratum": "N10_30"
+        },
+        {
+          "actual_weld_count": 30,
+          "instance_geometry_hash": "02fc0e95b08cb4877eb826cfc8143430f6029565f2e92cd69e11d66f967d4a96",
+          "instance_id": "data/PPO_TRAIN/seed_0900775608::g16_w030",
+          "relative_path": "data/PPO_TRAIN/seed_0900775608.xlsx",
+          "sheet_name": "g16_w030",
+          "stratum": "N10_30"
+        },
+        {
+          "actual_weld_count": 30,
+          "instance_geometry_hash": "0396e61e1b2c90b97b760c071b4817db88b399fb9f0d4669568757d25e279fc5",
+          "instance_id": "data/VALIDATION/seed_1964628001::g15_w030",
+          "relative_path": "data/VALIDATION/seed_1964628001.xlsx",
+          "sheet_name": "g15_w030",
+          "stratum": "N10_30"
+        },
+        {
+          "actual_weld_count": 29,
+          "instance_geometry_hash": "06ab3e21d4d76c7c01e724110274c7d54d6426d2631a18be3aa1b6ec2810bd95",
+          "instance_id": "data/DEV_ONLY/seed_000505::g18_w029",
+          "relative_path": "data/DEV_ONLY/seed_000505.xlsx",
+          "sheet_name": "g18_w029",
+          "stratum": "N10_30"
+        }
+      ],
+      "maximum_weld_count": 30,
+      "minimum_weld_count": 10,
+      "stratum": "N10_30"
+    },
+    {
+      "instances": [
+        {
+          "actual_weld_count": 49,
+          "instance_geometry_hash": "00278581d7daf08504cbd99d83cbc01e25ff46ad3d39a6096021d6e361741fca",
+          "instance_id": "data/PPO_TRAIN/seed_0194123089::g21_w049",
+          "relative_path": "data/PPO_TRAIN/seed_0194123089.xlsx",
+          "sheet_name": "g21_w049",
+          "stratum": "N31_50"
+        },
+        {
+          "actual_weld_count": 47,
+          "instance_geometry_hash": "016be2940ccfa3c5ec8a8c7c56feb9ac06335b55c18f3d2052f78132ed6e06d3",
+          "instance_id": "data/VALIDATION/seed_0967455456::g19_w047",
+          "relative_path": "data/VALIDATION/seed_0967455456.xlsx",
+          "sheet_name": "g19_w047",
+          "stratum": "N31_50"
+        },
+        {
+          "actual_weld_count": 48,
+          "instance_geometry_hash": "021ee664fd110648532dccfd560e272733d89d5b9ce34ef9a8afec1c73526ce7",
+          "instance_id": "data/PPO_TRAIN/seed_1419626827::g24_w048",
+          "relative_path": "data/PPO_TRAIN/seed_1419626827.xlsx",
+          "sheet_name": "g24_w048",
+          "stratum": "N31_50"
+        },
+        {
+          "actual_weld_count": 38,
+          "instance_geometry_hash": "038f5f6a57f1a1c2c9670adba06314e38335ed24942647e9e49bb99d901f3f91",
+          "instance_id": "data/PPO_TRAIN/seed_0760656368::g25_w038",
+          "relative_path": "data/PPO_TRAIN/seed_0760656368.xlsx",
+          "sheet_name": "g25_w038",
+          "stratum": "N31_50"
+        },
+        {
+          "actual_weld_count": 48,
+          "instance_geometry_hash": "03967d11dd621bdab65f831077e65d100c0521da47e8630f1d2fecd8b25b8c4c",
+          "instance_id": "data/PPO_TRAIN/seed_1727996722::g20_w048",
+          "relative_path": "data/PPO_TRAIN/seed_1727996722.xlsx",
+          "sheet_name": "g20_w048",
+          "stratum": "N31_50"
+        }
+      ],
+      "maximum_weld_count": 50,
+      "minimum_weld_count": 31,
+      "stratum": "N31_50"
+    },
+    {
+      "instances": [
+        {
+          "actual_weld_count": 59,
+          "instance_geometry_hash": "001f164503a5650f4a23700dbd4315b3efa5bf3e60e540b53f1c098f286ff889",
+          "instance_id": "data/PPO_TRAIN/seed_0767803876::g33_w059",
+          "relative_path": "data/PPO_TRAIN/seed_0767803876.xlsx",
+          "sheet_name": "g33_w059",
+          "stratum": "N51_70"
+        },
+        {
+          "actual_weld_count": 62,
+          "instance_geometry_hash": "00d81044c57e67715fa101e875dce3ca9d87ab1995c492582f09cf37302fd249",
+          "instance_id": "data/PPO_TRAIN/seed_0442383381::g41_w062",
+          "relative_path": "data/PPO_TRAIN/seed_0442383381.xlsx",
+          "sheet_name": "g41_w062",
+          "stratum": "N51_70"
+        },
+        {
+          "actual_weld_count": 68,
+          "instance_geometry_hash": "013cdebba3892631ccf1f21a473d9eadc1a7808463c9741b923f4ad71762e28e",
+          "instance_id": "data/PPO_TRAIN/seed_1137713392::g34_w068",
+          "relative_path": "data/PPO_TRAIN/seed_1137713392.xlsx",
+          "sheet_name": "g34_w068",
+          "stratum": "N51_70"
+        },
+        {
+          "actual_weld_count": 58,
+          "instance_geometry_hash": "0166213bba9015432b20daa26dd7c5db5226102355b14614b3aec45b65f17602",
+          "instance_id": "data/VALIDATION/seed_0471570702::g38_w058",
+          "relative_path": "data/VALIDATION/seed_0471570702.xlsx",
+          "sheet_name": "g38_w058",
+          "stratum": "N51_70"
+        },
+        {
+          "actual_weld_count": 70,
+          "instance_geometry_hash": "016badac36557f08c81a6ef3dd4c35788da2746d6a3d7a6c2d1196a78c476dae",
+          "instance_id": "data/PPO_TRAIN/seed_0457685429::g42_w070",
+          "relative_path": "data/PPO_TRAIN/seed_0457685429.xlsx",
+          "sheet_name": "g42_w070",
+          "stratum": "N51_70"
+        }
+      ],
+      "maximum_weld_count": 70,
+      "minimum_weld_count": 51,
+      "stratum": "N51_70"
+    },
+    {
+      "instances": [
+        {
+          "actual_weld_count": 78,
+          "instance_geometry_hash": "00acabaf2df8706dba41b040f9cbb77d04808f6cd28bb9f15d12106f280e3e39",
+          "instance_id": "data/PPO_TRAIN/seed_1054426823::g37_w078",
+          "relative_path": "data/PPO_TRAIN/seed_1054426823.xlsx",
+          "sheet_name": "g37_w078",
+          "stratum": "N71_90"
+        },
+        {
+          "actual_weld_count": 73,
+          "instance_geometry_hash": "024a74bc054e0971ae6768084aa4905b87b23f0b7027358d195dbb9566911fea",
+          "instance_id": "data/PPO_TRAIN/seed_0566744530::g42_w073",
+          "relative_path": "data/PPO_TRAIN/seed_0566744530.xlsx",
+          "sheet_name": "g42_w073",
+          "stratum": "N71_90"
+        },
+        {
+          "actual_weld_count": 71,
+          "instance_geometry_hash": "037be75b6699f1368a0f78b59079f56546c3edc247fed75fff76d6ca66283c80",
+          "instance_id": "data/PPO_TRAIN/seed_0676566458::g39_w071",
+          "relative_path": "data/PPO_TRAIN/seed_0676566458.xlsx",
+          "sheet_name": "g39_w071",
+          "stratum": "N71_90"
+        },
+        {
+          "actual_weld_count": 85,
+          "instance_geometry_hash": "0395e11300f687af90bdaced161afe6cd6adb5a21d41a1368a2fbcb8851bbb79",
+          "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+          "relative_path": "data/PPO_TRAIN/seed_0211781140.xlsx",
+          "sheet_name": "g32_w085",
+          "stratum": "N71_90"
+        },
+        {
+          "actual_weld_count": 73,
+          "instance_geometry_hash": "03e8d6cbe9d8b9be9e9f030874229a92c087d733fe9288800eb22c930c3505e0",
+          "instance_id": "data/ID_TEST/seed_0401115467::g37_w073",
+          "relative_path": "data/ID_TEST/seed_0401115467.xlsx",
+          "sheet_name": "g37_w073",
+          "stratum": "N71_90"
+        }
+      ],
+      "maximum_weld_count": 90,
+      "minimum_weld_count": 71,
+      "stratum": "N71_90"
+    }
+  ]
+}

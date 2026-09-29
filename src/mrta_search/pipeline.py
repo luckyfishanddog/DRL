@@ -74,6 +74,7 @@ class SearchConfig:
     insertion_limit: int = 8
     construction_budget: int = 4
     kinit_ref: int = 2
+    feasibility_bootstrap_budget: int = 1
     m_atomic: int | None = None
     m_lns: int = 16
     kref_total: int = 4
@@ -106,6 +107,8 @@ class SearchConfig:
             raise ValueError("B_init_pool must be between 1 and 4")
         if not (1 <= self.kinit_ref <= self.construction_budget):
             raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
+        if self.feasibility_bootstrap_budget not in (0, 1):
+            raise ValueError("B_init_bootstrap must be 0 or 1")
         atomic = self.m - self.m_lns if self.m_atomic is None else self.m_atomic
         if min(atomic, self.m_lns) < 0 or atomic + self.m_lns > self.m:
             raise ValueError("atomic + LNS attempts must not exceed M")
@@ -552,6 +555,7 @@ def run_bounded_sa_oi(
         insertion_limit=search_config.insertion_limit,
         construction_budget=search_config.construction_budget,
         kinit_ref=search_config.kinit_ref,
+        feasibility_bootstrap_budget=search_config.feasibility_bootstrap_budget,
         portfolio=True,
         reference_evaluator=reference_evaluator,
         scope=scope,

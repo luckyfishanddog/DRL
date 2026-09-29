@@ -18,7 +18,9 @@ def _checkpoint(result, deadline: float, budget: float) -> dict[str, object]:
     return result.anytime[deadline]
 
 
-def _run(entry: dict[str, Any], root: Path, budget: float, source_commit: str) -> dict[str, Any]:
+def _run(
+    entry: dict[str, Any], root: Path, budget: float, source_commit_label: str
+) -> dict[str, Any]:
     instance = load_ppo_platform_instance(
         root / entry["relative_path"],
         entry["sheet_name"],
@@ -32,7 +34,7 @@ def _run(entry: dict[str, Any], root: Path, budget: float, source_commit: str) -
         SearchConfig(time_limit=budget),
         seed=20260929,
         scope=FORMAL_SCOPE_V1_1,
-        source_commit=source_commit,
+        source_commit=source_commit_label,
         allow_unverified_source=True,
         formal_result=False,
     )
@@ -51,6 +53,9 @@ def _run(entry: dict[str, Any], root: Path, budget: float, source_commit: str) -
         "solver_seed": 20260929,
         "requested_time_limit_s": budget,
         "initialization_status": result.initialization.status.value,
+        "initialization_strategy": result.initialization.winning_strategy,
+        "initialization_time_s": result.stats.init_time,
+        "construction_attempts": result.stats.construction_attempts,
         "initial_cmax": None if initial_schedule is None else initial_schedule.cmax,
         "best_cmax": None if result.best_metrics is None else result.best_metrics.cmax,
         "cmax_at_1": _checkpoint(result, 1.0, budget),
@@ -91,11 +96,13 @@ def main() -> int:
         "--manifest", default="data/manifests/PPO_DATASET_MANIFEST_V1.json"
     )
     parser.add_argument(
-        "--smokeset", default="data/manifests/PPO_PHASE3_SMOKESET_V1.json"
+        "--smokeset", default="data/manifests/PPO_PHASE3_SMOKESET_V2.json"
     )
     parser.add_argument("--include-30", action="store_true")
     parser.add_argument(
-        "--source-commit", default="e4de209d872d46687af4974d030b32904192b906"
+        "--source-commit-label",
+        required=True,
+        help="Explicit source revision/tree label for this local result",
     )
     args = parser.parse_args()
     if not args.ppo_root:
@@ -110,10 +117,10 @@ def main() -> int:
         entry["tier"] = selected_entry["tier"]
         entry["dataset_manifest_hash"] = manifest["dataset_manifest_hash"]
         selected.append(entry)
-    results = [_run(entry, root, 5.0, args.source_commit) for entry in selected]
+    results = [_run(entry, root, 5.0, args.source_commit_label) for entry in selected]
     if args.include_30:
         results.extend(
-            _run(entry, root, 30.0, args.source_commit)
+            _run(entry, root, 30.0, args.source_commit_label)
             for entry in selected
             if entry["tier"] in {"medium", "large"}
         )

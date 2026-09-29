@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from mrta_reference.model import ParentWeld, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind
 from mrta_reference.scheduler import reference_schedule
-from mrta_search.initialization import InitializationStatus, bounded_insertion_positions, build_initial_solution
+import pytest
+
+from mrta_search.initialization import (
+    RAIL_SERIAL_BOOTSTRAP,
+    InitializationStatus,
+    bounded_insertion_positions,
+    build_initial_solution,
+)
 from mrta_search.stats import SearchStats
 
 
@@ -80,5 +87,92 @@ def test_initialization_failed_is_run_outcome_and_duplicate_fallback_is_not_reev
     result = build_initial_solution(parents, FAST, _stats(), reference_evaluator=deadlock)
     assert result.status is InitializationStatus.INITIALIZATION_FAILED
     assert calls == 1
-    assert len(result.attempts) == 2
+    assert len(result.attempts) == 3
     assert result.attempts[1].duplicate
+    assert result.attempts[2].duplicate
+    assert result.attempts[2].strategy == RAIL_SERIAL_BOOTSTRAP
+
+
+def test_all_four_diagnostics_kinit_filter_and_bounded_bootstrap_are_reproducible() -> None:
+    parents = tuple(
+        ParentWeld(str(index), (x, 2.0), (x + 0.5, 2.0))
+        for index, x in enumerate(
+            (2.55, 16.10, 14.51, 4.85, 9.41, 8.54, 12.38, 6.25)
+        )
+    )
+    config = ScientificConfig(
+        weld_speed=1.0,
+        empty_speed=1.0,
+        t_pre=1.0,
+        t_post=1.0,
+        interference_dx=0.01,
+        interference_dy=0.01,
+    )
+
+    def run_once():
+        calls = []
+
+        def evaluator(solution, scientific_config, *, orientations):
+            calls.append(solution.canonical_hash)
+            if not solution.routes[1].block_ids and not solution.routes[3].block_ids:
+                return reference_schedule(
+                    solution, scientific_config, orientations=orientations
+                )
+            return ScheduleResult(ScheduleStatus.DEADLOCK)
+
+        result = build_initial_solution(
+            parents,
+            config,
+            _stats(),
+            construction_budget=4,
+            kinit_ref=2,
+            feasibility_bootstrap_budget=1,
+            portfolio=True,
+            reference_evaluator=evaluator,
+        )
+        return result, calls
+
+    first, first_calls = run_once()
+    second, second_calls = run_once()
+    assert first.status is InitializationStatus.SUCCESS
+    assert first.winning_strategy == RAIL_SERIAL_BOOTSTRAP
+    assert first.solution == second.solution
+    assert first.directions == second.directions
+    assert first_calls == second_calls
+    assert len(first_calls) == 3  # Kinit_ref=2 plus one bounded bootstrap call.
+    assert [attempt.strategy for attempt in first.attempts[:4]] == [
+        "LOAD_FIRST",
+        "RAIL_BALANCED",
+        "X_ORDER_AWARE",
+        "SPATIAL_SPREAD",
+    ]
+    assert sum(attempt.schedule is not None for attempt in first.attempts[:4]) == 2
+    assert first.attempts[-1].strategy == RAIL_SERIAL_BOOTSTRAP
+    assert not first.solution.routes[1].block_ids
+    assert not first.solution.routes[3].block_ids
+
+
+def test_feasibility_bootstrap_budget_can_be_disabled_and_is_validated() -> None:
+    parents = (
+        ParentWeld("a", (1.0, 2.0), (2.0, 2.0)),
+        ParentWeld("b", (10.0, 2.0), (11.0, 2.0)),
+    )
+
+    def deadlock(*args, **kwargs):
+        return ScheduleResult(ScheduleStatus.DEADLOCK)
+
+    result = build_initial_solution(
+        parents,
+        FAST,
+        _stats(),
+        feasibility_bootstrap_budget=0,
+        reference_evaluator=deadlock,
+    )
+    assert all(attempt.strategy != RAIL_SERIAL_BOOTSTRAP for attempt in result.attempts)
+    with pytest.raises(ValueError, match="B_init_bootstrap"):
+        build_initial_solution(
+            parents,
+            FAST,
+            _stats(),
+            feasibility_bootstrap_budget=2,
+        )

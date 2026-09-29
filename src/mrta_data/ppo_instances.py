@@ -18,6 +18,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 DATASET_MANIFEST_ID = "PPO_DATASET_MANIFEST_V1"
 PHASE3_SMOKESET_ID = "PPO_PHASE3_SMOKESET_V1"
+PHASE3_SMOKESET_V2_ID = "PPO_PHASE3_SMOKESET_V2"
+INIT_BOOTSTRAP_DEVSET_ID = "PPO_INIT_BOOTSTRAP_DEVSET_V1"
 CURRENT_SCHEMA_ID = "PPO_FROZEN_FAMILY_SCHEMA_V1"
 LEGACY_SCHEMA_ID = "PPO_LEGACY_FROZEN_FAMILY_SCHEMA_V1"
 UNRECOGNIZED_SCHEMA_ID = "UNRECOGNIZED"
@@ -914,6 +916,205 @@ def select_phase3_smokeset(manifest: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "median_weld_count": median_n,
         "instances": [record("small", small), record("medium", medium), record("large", large)],
+    }
+
+
+def _valid_unique_entries(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        dict(entry)
+        for entry in manifest["instances"]
+        if entry["validation_status"] == "VALID" and entry.get("duplicate_of") is None
+    ]
+
+
+def main_experimental_range_summary(
+    manifest: Mapping[str, Any], *, maximum_weld_count: int = 90
+) -> dict[str, Any]:
+    valid = _valid_unique_entries(manifest)
+    in_range = [entry for entry in valid if entry["actual_weld_count"] <= maximum_weld_count]
+    out_of_range = [entry for entry in valid if entry["actual_weld_count"] > maximum_weld_count]
+    counts = Counter(int(entry["actual_weld_count"]) for entry in in_range)
+    return {
+        "maximum_weld_count": maximum_weld_count,
+        "valid_unique_total": len(valid),
+        "valid_unique_in_main_range": len(in_range),
+        "valid_unique_out_of_main_range": len(out_of_range),
+        "out_of_main_range_percentage": (
+            100.0 * len(out_of_range) / len(valid) if valid else 0.0
+        ),
+        "weld_count_distribution": {
+            str(count): counts.get(count, 0)
+            for count in range(10, maximum_weld_count + 1)
+        },
+        "out_of_range_policy": (
+            "retained as VALID manifest entries and stress instances; excluded from "
+            "the Phase 3 main-range gate"
+        ),
+    }
+
+
+def select_phase3_smokeset_v2(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    valid = [
+        entry
+        for entry in _valid_unique_entries(manifest)
+        if entry["actual_weld_count"] <= 90
+    ]
+    if len(valid) < 3:
+        raise PPOInstanceError(
+            "INSUFFICIENT_MAIN_RANGE_INSTANCES", f"found {len(valid)}, require at least 3"
+        )
+    ordered = sorted(
+        valid,
+        key=lambda entry: (entry["actual_weld_count"], entry["instance_geometry_hash"]),
+    )
+    small = ordered[0]
+    remaining = [entry for entry in valid if entry["instance_id"] != small["instance_id"]]
+    large = min(
+        remaining,
+        key=lambda entry: (-entry["actual_weld_count"], entry["instance_geometry_hash"]),
+    )
+    remaining = [entry for entry in remaining if entry["instance_id"] != large["instance_id"]]
+    median_n = statistics.median(entry["actual_weld_count"] for entry in valid)
+    medium = min(
+        remaining,
+        key=lambda entry: (
+            abs(entry["actual_weld_count"] - median_n),
+            entry["instance_geometry_hash"],
+        ),
+    )
+
+    def record(tier: str, entry: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "tier": tier,
+            "instance_id": entry["instance_id"],
+            "relative_path": entry["relative_path"],
+            "sheet_name": entry["sheet_name"],
+            "actual_weld_count": entry["actual_weld_count"],
+            "instance_geometry_hash": entry["instance_geometry_hash"],
+        }
+
+    return {
+        "smokeset_id": PHASE3_SMOKESET_V2_ID,
+        "dataset_manifest_id": manifest["dataset_manifest_id"],
+        "dataset_manifest_hash": manifest["dataset_manifest_hash"],
+        "main_range_maximum_weld_count": 90,
+        "selection_policy": (
+            "among VALID unique N<=90: small=min N; medium=closest to median N; "
+            "large=max N; ties by instance_geometry_hash; selections distinct"
+        ),
+        "median_weld_count": median_n,
+        "instances": [
+            record("small", small),
+            record("medium", medium),
+            record("large", large),
+        ],
+    }
+
+
+def select_init_bootstrap_devset(
+    manifest: Mapping[str, Any],
+    historical_smokeset: Mapping[str, Any],
+    *,
+    additional_consumed_smokesets: Sequence[Mapping[str, Any]] = (),
+    per_stratum: int = 5,
+) -> dict[str, Any]:
+    if per_stratum < 1:
+        raise ValueError("per_stratum must be positive")
+    strata = (
+        ("N10_30", 10, 30),
+        ("N31_50", 31, 50),
+        ("N51_70", 51, 70),
+        ("N71_90", 71, 90),
+    )
+    valid = _valid_unique_entries(manifest)
+    selected: list[dict[str, Any]] = []
+    stratum_records: list[dict[str, Any]] = []
+    globally_used_workbooks: set[str] = set()
+    for stratum_id, lower, upper in strata:
+        candidates = sorted(
+            (
+                entry
+                for entry in valid
+                if lower <= entry["actual_weld_count"] <= upper
+            ),
+            key=lambda entry: (entry["instance_geometry_hash"], entry["instance_id"]),
+        )
+        chosen: list[dict[str, Any]] = []
+        for entry in candidates:
+            if entry["relative_path"] in globally_used_workbooks:
+                continue
+            chosen.append(entry)
+            globally_used_workbooks.add(entry["relative_path"])
+            if len(chosen) == per_stratum:
+                break
+        if len(chosen) < per_stratum:
+            chosen_ids = {entry["instance_id"] for entry in chosen}
+            for entry in candidates:
+                if entry["instance_id"] in chosen_ids:
+                    continue
+                chosen.append(entry)
+                if len(chosen) == per_stratum:
+                    break
+        if len(chosen) < per_stratum:
+            raise PPOInstanceError(
+                "INSUFFICIENT_BOOTSTRAP_STRATUM",
+                f"{stratum_id}: found {len(chosen)}, require {per_stratum}",
+            )
+        records = [
+            {
+                "stratum": stratum_id,
+                "instance_id": entry["instance_id"],
+                "relative_path": entry["relative_path"],
+                "sheet_name": entry["sheet_name"],
+                "actual_weld_count": entry["actual_weld_count"],
+                "instance_geometry_hash": entry["instance_geometry_hash"],
+            }
+            for entry in chosen
+        ]
+        selected.extend(records)
+        stratum_records.append(
+            {
+                "stratum": stratum_id,
+                "minimum_weld_count": lower,
+                "maximum_weld_count": upper,
+                "instances": records,
+            }
+        )
+    smoke_workbooks = {
+        str(entry["relative_path"])
+        for entry in historical_smokeset["instances"]
+    }
+    for smokeset in additional_consumed_smokesets:
+        smoke_workbooks.update(
+            str(entry["relative_path"]) for entry in smokeset["instances"]
+        )
+    consumed = sorted(
+        {
+            entry["relative_path"] for entry in selected
+        }
+        | smoke_workbooks
+    )
+    return {
+        "devset_id": INIT_BOOTSTRAP_DEVSET_ID,
+        "dataset_manifest_id": manifest["dataset_manifest_id"],
+        "dataset_manifest_hash": manifest["dataset_manifest_hash"],
+        "selection_policy": (
+            "solver-independent four strata N=10..30,31..50,51..70,71..90; "
+            "five per stratum; stable instance_geometry_hash order; prefer distinct "
+            "workbooks and use at most one per workbook when possible"
+        ),
+        "future_split_isolation_policy": (
+            "all instances from a development-consumed workbook/generation-seed family "
+            "are excluded from untouched TEST"
+        ),
+        "per_stratum": per_stratum,
+        "instances": selected,
+        "strata": stratum_records,
+        "development_consumed_workbooks": consumed,
+        "historical_smoke_workbooks": sorted(
+            {str(entry["relative_path"]) for entry in historical_smokeset["instances"]}
+        ),
+        "all_consumed_smoke_workbooks": sorted(smoke_workbooks),
     }
 
 

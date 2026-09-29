@@ -53,6 +53,9 @@ class InitializationStrategy(str, Enum):
     SPATIAL_SPREAD = "SPATIAL_SPREAD"
 
 
+RAIL_SERIAL_BOOTSTRAP = "RAIL_SERIAL_BOOTSTRAP"
+
+
 @dataclass(frozen=True)
 class InitializationAttempt:
     construction_index: int
@@ -264,6 +267,68 @@ def _construct(
     )
 
 
+def _construct_rail_serial_bootstrap(
+    parents: Sequence[ParentWeld],
+    patterns: tuple[SplitPattern, ...],
+    config: ScientificConfig,
+) -> CanonicalSolution:
+    """Build one deterministic, interference-safe feasibility fallback.
+
+    The normal portfolio uses both robots on each rail.  If every selected
+    construction deadlocks, this bounded fallback activates only the left
+    robot on each rail and orders its blocks monotonically by X.  Flexible
+    blocks are assigned to the less-loaded rail.  Geometry and split patterns
+    are unchanged.
+    """
+
+    parent_by_id = {parent.parent_id: parent for parent in parents}
+    blocks = tuple(
+        block
+        for pattern in patterns
+        for block in blocks_for_pattern(parent_by_id[pattern.parent_id], pattern, config)
+    )
+    assigned: dict[int, list[WeldingBlock]] = {0: [], 2: []}
+    loads = {0: 0.0, 2: 0.0}
+    for block in sorted(
+        blocks,
+        key=lambda item: (
+            -config.process_time(item.length),
+            item.parent_id,
+            item.block_id,
+        ),
+    ):
+        eligible = tuple(
+            robot for robot in (0, 2) if robot_is_eligible(block, robot, config)
+        )
+        if not eligible:
+            raise ValueError(f"{block.block_id}: no eligible rail for bootstrap")
+        robot = min(eligible, key=lambda item: (loads[item], item))
+        assigned[robot].append(block)
+        loads[robot] += config.process_time(block.length)
+
+    for robot in (0, 2):
+        assigned[robot].sort(
+            key=lambda item: (
+                (item.start[0] + item.end[0]) / 2.0,
+                min(item.start[0], item.end[0]),
+                max(item.start[0], item.end[0]),
+                item.block_id,
+            )
+        )
+    return canonicalize(
+        parents,
+        patterns,
+        (
+            Route(0, tuple(block.block_id for block in assigned[0])),
+            Route(1, ()),
+            Route(2, tuple(block.block_id for block in assigned[2])),
+            Route(3, ()),
+        ),
+        config,
+        revision=0,
+    )
+
+
 def build_initial_solution(
     parents: Sequence[ParentWeld],
     config: ScientificConfig,
@@ -272,6 +337,7 @@ def build_initial_solution(
     insertion_limit: int = 8,
     construction_budget: int = 2,
     kinit_ref: int = 2,
+    feasibility_bootstrap_budget: int = 1,
     portfolio: bool = False,
     reference_evaluator: ReferenceEvaluator | None = None,
     certifier: Certifier = certify_schedule,
@@ -285,6 +351,8 @@ def build_initial_solution(
         raise ValueError("B_init_pool must be between 1 and 4")
     if not (1 <= kinit_ref <= construction_budget):
         raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
+    if feasibility_bootstrap_budget not in (0, 1):
+        raise ValueError("B_init_bootstrap must be 0 or 1")
     started = time.perf_counter()
     attempts: list[InitializationAttempt] = []
     seen: set[str] = set()
@@ -471,6 +539,152 @@ def build_initial_solution(
             tuple(attempts),
             best_attempt.strategy,
         )
+
+    if feasibility_bootstrap_budget:
+        construction_index = len(strategies)
+        stats.construction_attempts += 1
+        try:
+            solution = _construct_rail_serial_bootstrap(
+                parents,
+                selected_patterns,
+                config,
+            )
+        except (ValueError, ArithmeticError, OverflowError) as error:
+            attempts.append(
+                InitializationAttempt(
+                    construction_index,
+                    None,
+                    None,
+                    None,
+                    None,
+                    (str(error),),
+                    False,
+                    RAIL_SERIAL_BOOTSTRAP,
+                )
+            )
+        else:
+            if solution.canonical_hash in seen:
+                attempts.append(
+                    InitializationAttempt(
+                        construction_index,
+                        solution,
+                        None,
+                        None,
+                        None,
+                        ("duplicate bootstrap; reference evaluation skipped",),
+                        True,
+                        RAIL_SERIAL_BOOTSTRAP,
+                    )
+                )
+            else:
+                dp_started = time.perf_counter()
+                direction = optimize_directions_with_initial_feasibility(solution, config)
+                stats.direction_dp_time += time.perf_counter() - dp_started
+                if direction.status is not DirectionStatus.FEASIBLE:
+                    stats.init_direction_failures += 1
+                    attempts.append(
+                        InitializationAttempt(
+                            construction_index,
+                            solution,
+                            direction,
+                            None,
+                            None,
+                            direction.diagnostics,
+                            False,
+                            RAIL_SERIAL_BOOTSTRAP,
+                        )
+                    )
+                else:
+                    orientation_map = {
+                        robot: direction.directions[robot] for robot in range(4)
+                    }
+                    ref_started = time.perf_counter()
+                    try:
+                        schedule = reference_evaluator(
+                            solution,
+                            config,
+                            orientations=orientation_map,
+                        )
+                    except (ArithmeticError, OverflowError, ValueError) as error:
+                        schedule = ScheduleResult(
+                            ScheduleStatus.NUMERIC_FAILURE,
+                            diagnostics=(str(error),),
+                        )
+                    ref_duration = time.perf_counter() - ref_started
+                    ref_ended = time.perf_counter()
+                    certification = None
+                    if schedule.status is ScheduleStatus.FEASIBLE:
+                        cert_started = time.perf_counter()
+                        certification = (
+                            certifier(solution, schedule, config, scope=scope)
+                            if scope is not None
+                            else certifier(solution, schedule, config)
+                        )
+                        stats.certifier_time += time.perf_counter() - cert_started
+                        if not certification.certified:
+                            schedule = replace(
+                                schedule,
+                                status=ScheduleStatus.NUMERIC_FAILURE,
+                                cmax=None,
+                                diagnostics=(
+                                    "bootstrap FEASIBLE schedule failed certification: "
+                                    + "; ".join(certification.errors),
+                                ),
+                                directions=direction.directions,
+                            )
+                    stats.record_reference(
+                        schedule.status,
+                        ref_duration,
+                        initialization=True,
+                        schedule=schedule,
+                        reference_start=(
+                            None
+                            if stats.run_started is None
+                            else ref_started - stats.run_started
+                        ),
+                        reference_end=(
+                            None
+                            if stats.run_started is None
+                            else ref_ended - stats.run_started
+                        ),
+                    )
+                    attempt = InitializationAttempt(
+                        construction_index,
+                        solution,
+                        direction,
+                        schedule,
+                        certification,
+                        direction.diagnostics + schedule.diagnostics,
+                        False,
+                        RAIL_SERIAL_BOOTSTRAP,
+                    )
+                    attempts.append(attempt)
+                    if schedule.status is ScheduleStatus.NUMERIC_FAILURE:
+                        stats.init_time += time.perf_counter() - started
+                        return InitializationResult(
+                            InitializationStatus.NUMERIC_FAILURE,
+                            None,
+                            None,
+                            schedule,
+                            certification,
+                            tuple(attempts),
+                        )
+                    if (
+                        schedule.status is ScheduleStatus.FEASIBLE
+                        and certification is not None
+                        and certification.certified
+                    ):
+                        stats.init_time += time.perf_counter() - started
+                        stats.initial_strategy_wins[RAIL_SERIAL_BOOTSTRAP] += 1
+                        return InitializationResult(
+                            InitializationStatus.SUCCESS,
+                            solution,
+                            direction.directions,
+                            schedule,
+                            certification,
+                            tuple(attempts),
+                            RAIL_SERIAL_BOOTSTRAP,
+                        )
 
     stats.init_time += time.perf_counter() - started
     return InitializationResult(

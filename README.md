@@ -53,7 +53,7 @@ F4 is final for Phase 3 and later common-model comparisons. HGA/WAG/ALNS behavio
 
 This is task-level weld allocation, sequencing, direction, and theoretical coordination. Deployment/retract/parking transitions require lower-level validation; no full physical parking or 3D collision-free execution claim is made. `mrta_exact` remains development-only. Formal results must be reevaluated and certified; development results are not relabelled.
 
-`FINAL_F4_RELEASE_STATUS = PASS` and `PHASE3_AUTHORIZED = YES` remain unchanged. Phase 3-0 found 96 frozen PPO workbooks containing 2942 valid unique platform instances and froze `PPO_DATASET_MANIFEST_V1`, but the deterministic N=55 and N=102 smoke instances failed initialization under the unchanged B32 evaluator. Therefore `PPO_DATA_INTAKE_STATUS = FAIL` and Phase 3-1 Adapted HGA/WAG is not yet authorized. No solver result was used to change the manifest, smoke selection, formal scope, or B32.
+`FINAL_F4_RELEASE_STATUS = PASS` and `PHASE3_AUTHORIZED = YES` remain unchanged. Phase 3-0 found 96 frozen PPO workbooks containing 2942 valid unique platform instances and froze `PPO_DATASET_MANIFEST_V1`. Phase 3-0.5 closed the N=55 initialization failure with one deterministic rail-serial feasibility bootstrap that is called only after the normal portfolio fails. The solver-independent 20-instance development set achieved 20/20 certified initializations, and the N=10/55/90 V2 smoke achieved 3/3 certified initializations and search entry. Therefore `PPO_DATA_INTAKE_STATUS = PASS`, `PPO_ALNS_INITIALIZATION_STATUS = PASS`, and Phase 3-1 Adapted HGA/WAG is authorized. `FORMAL_SCOPE_V1_1` and B32 were not changed.
 
 Reference statuses are `FEASIBLE`, `DEADLOCK`, `INFEASIBLE`, and `NUMERIC_FAILURE`. Only FEASIBLE has a reference Cmax; DEADLOCK is a failure of the deterministic scheduling policy, not mathematical infeasibility. Numeric failures are not normal negative training examples.
 
@@ -95,7 +95,7 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_exact/scheduler.py`: independent dispatch+ESS coordination enumeration.
 - `src/mrta_exact/solver.py`: Y-only exact micro backbone, full directions, limits, and comparison metrics.
 - `src/mrta_search/direction.py`: initial-feasibility-constrained direction DP and bounded schedule-aware refinement.
-- `src/mrta_search/initialization.py`: deterministic bounded initial portfolio.
+- `src/mrta_search/initialization.py`: deterministic bounded initial portfolio plus one-call rail-serial feasibility bootstrap.
 - `src/mrta_search/neighborhood.py`: balanced seven-move raw proposal and cheap screening.
 - `src/mrta_search/lns.py`: complete-candidate identity, parent destroy, bounded repair, and adaptive operator state.
 - `src/mrta_search/pipeline.py`: unified atomic/LNS Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
@@ -119,11 +119,13 @@ For local smoke replay, exact byte copies of only the three deterministic smoke 
 ```powershell
 $env:PYTHONPATH='src'
 & '<PYTHON>' scripts\audit_ppo_instances.py --ppo-root '<PATH_TO_PPO>'
-& '<PYTHON>' scripts\run_ppo_smoke.py --ppo-root '<PATH_TO_PPO>' --include-30
-& '<PYTHON>' scripts\run_ppo_smoke.py --ppo-root 'data/local/ppo_smokeset'
+& '<PYTHON>' scripts\run_ppo_smoke.py --ppo-root '<PATH_TO_PPO>' --include-30 --source-commit-label '<LOCAL_REVISION_LABEL>'
+& '<PYTHON>' scripts\run_ppo_smoke.py --ppo-root 'data/local/ppo_smokeset' --smokeset data/manifests/PPO_PHASE3_SMOKESET_V1.json --source-commit-label '<LOCAL_REVISION_LABEL>'
 ```
 
-The frozen manifests are [PPO_DATASET_MANIFEST_V1](data/manifests/PPO_DATASET_MANIFEST_V1.json) and [PPO_PHASE3_SMOKESET_V1](data/manifests/PPO_PHASE3_SMOKESET_V1.json). Dataset identity is separate from `FORMAL_SCOPE_V1_1.scope_hash`.
+The frozen intake manifest is [PPO_DATASET_MANIFEST_V1](data/manifests/PPO_DATASET_MANIFEST_V1.json). [PPO_PHASE3_SMOKESET_V1](data/manifests/PPO_PHASE3_SMOKESET_V1.json) remains historical. The current initialization-development and compatibility selections are [PPO_INIT_BOOTSTRAP_DEVSET_V1](data/manifests/PPO_INIT_BOOTSTRAP_DEVSET_V1.json) and [PPO_PHASE3_SMOKESET_V2](data/manifests/PPO_PHASE3_SMOKESET_V2.json). Dataset identity is separate from `FORMAL_SCOPE_V1_1.scope_hash`.
+
+The Phase 3 main operating range is `10 <= N <= 90`: 2893 of 2942 valid unique instances are in range. The remaining 49 (1.6655%) stay valid in the manifest as large-scale stress/out-of-main-range data and do not block Phase 3. Future TRAIN/VALIDATION/TEST assignment must isolate complete workbooks/generation-seed families; every workbook listed as development-consumed in `PPO_INIT_BOOTSTRAP_DEVSET_V1` is excluded from untouched TEST.
 
 ## Formal API
 
