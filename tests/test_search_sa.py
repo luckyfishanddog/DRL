@@ -117,6 +117,21 @@ def test_optional_y_activation_enters_search_and_improves_whole_only() -> None:
     assert result.final_certification.certified
 
 
+def test_time_limited_run_completes_one_real_iteration_after_initialization() -> None:
+    parents = (ParentWeld("one", (1.0, 2.0), (2.0, 2.0)),)
+    result = run_bounded_sa_oi(
+        parents,
+        FAST,
+        SearchConfig(max_iterations=100, time_limit=0.0),
+        seed=9,
+    )
+    assert result.status is SearchStatus.COMPLETED
+    assert result.stats.iterations == 1
+    assert result.stats.actual_runtime is not None
+    assert result.stats.overshoot == pytest.approx(result.stats.actual_runtime)
+    assert result.final_certification.certified
+
+
 @pytest.mark.parametrize("count", (1, 2, 3, 4))
 def test_micro_exact_reference_gap_decomposition_and_certified_best(count: int) -> None:
     specs = (

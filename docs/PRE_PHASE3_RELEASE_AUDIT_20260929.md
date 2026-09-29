@@ -1,5 +1,7 @@
 # Pre-Phase3 Release Audit — 2026-09-29
 
+> **Superseding correction（2026-09-29）**：本文的 V1/16 结论按当时冻结的 local-plateau rule 得出，结果数据仍有效，但“16/32/64 相同可支持最终 F4”这一解释已被 [FORMAL_SCOPE_V1_1 F4 closure](FORMAL_SCOPE_V1_1_F4_CLOSURE_20260929.md) 取代。每个 prefix expansion 最多推进一个 template，K-template complete leaf 至少需要 K+1 states；因此旧 plateau 是 depth-censored evidence。`FORMAL_SCOPE_V1` 作为历史 replay identity 保留，active scope 已是 `FORMAL_SCOPE_V1_1`。
+
 `PRE_PHASE3_RELEASE_STATUS = PASS`
 `ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V1`
 `NEXT_PHASE = Phase 3 — Adapted HGA / Adapted WAG common-model`

@@ -3021,7 +3021,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "7e50051141da48fe50d0a981e016be102eedee224d7f9dc124b827d835eff758"
+      "solution_canonical_hash": "7e50051141da48fe50d0a981e016be102eedee224d7f9dc124b827d835eff758",
+      "v1_1_baseline_runtime": 0.23034189967438579,
+      "v1_1_branch_points": 376,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.34722959995269775,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.11688770027831197,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 34,
+          "overall_runtime": 1.5622501000761986,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 1.3319082004018128,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.39946489967405796,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.16912299999967217,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 36,
+          "overall_runtime": 2.1462110998108983,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 1.9158692001365125,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.5477660996839404,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.3174242000095546,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.8502148995175958,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.61987299984321,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -6023,7 +6111,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "a9a6517ee638da0faab83a6d14280401812d8c5c759d6be8afcdac06ece1640b"
+      "solution_canonical_hash": "a9a6517ee638da0faab83a6d14280401812d8c5c759d6be8afcdac06ece1640b",
+      "v1_1_baseline_runtime": 1.348523000255227,
+      "v1_1_branch_points": 305,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.665667099878192,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 1.3171440996229649,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 178,
+          "overall_runtime": 27.47674180008471,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 26.128218799829483,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.9948024000041187,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 2.6462793997488916,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 178,
+          "overall_runtime": 38.361281600315124,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 37.0127586000599,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 6.606027199886739,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 5.257504199631512,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 11.90870110038668,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 10.560178100131452,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -9025,7 +9201,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "7e7b64777acfd9c008d22ebd0678c8d8e5c78356222fca5b57095e4b752c1326"
+      "solution_canonical_hash": "7e7b64777acfd9c008d22ebd0678c8d8e5c78356222fca5b57095e4b752c1326",
+      "v1_1_baseline_runtime": 0.7420716001652181,
+      "v1_1_branch_points": 328,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.4401867999695241,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.698115199804306,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 130,
+          "overall_runtime": 14.002147700171918,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 13.2600761000067,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.1259277001954615,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 1.3838561000302434,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 132,
+          "overall_runtime": 20.221287400461733,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 19.479215800296515,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.4923982000909746,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 2.7503265999257565,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 6.262554700020701,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 5.520483099855483,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -12037,7 +12301,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "61c3578e35a84b4d01ac6b95002d400726a0540169ab77213a2bd4e3d790204d"
+      "solution_canonical_hash": "61c3578e35a84b4d01ac6b95002d400726a0540169ab77213a2bd4e3d790204d",
+      "v1_1_baseline_runtime": 1.2864549001678824,
+      "v1_1_branch_points": 300,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.5764243002049625,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 1.28996940003708,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 186,
+          "overall_runtime": 26.828830699902028,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 25.542375799734145,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.8501547002233565,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 2.563699800055474,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 188,
+          "overall_runtime": 39.01139180036262,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 37.724936900194734,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 6.407090799883008,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 5.120635899715126,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 11.524219100363553,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 10.23776420019567,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -15039,7 +15391,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "17bcba1b641598d5524d31c9e4d00f12d3a887ecdf56dd35cba47bf1e9d8d18a"
+      "solution_canonical_hash": "17bcba1b641598d5524d31c9e4d00f12d3a887ecdf56dd35cba47bf1e9d8d18a",
+      "v1_1_baseline_runtime": 0.9031521999277174,
+      "v1_1_branch_points": 324,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.6645943997427821,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.7614421998150647,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 13.422253199853003,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 12.519100999925286,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.4516499997116625,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 1.548497799783945,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 138,
+          "overall_runtime": 31.710186200216413,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 30.807034000288695,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.932070099748671,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 3.0289178998209536,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 6.966050199698657,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 6.062897999770939,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -18041,7 +18481,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "acf3061f2c7196face2c097f63ec8d60e4458b85a3a5a88c717f0a6d8bab81d6"
+      "solution_canonical_hash": "acf3061f2c7196face2c097f63ec8d60e4458b85a3a5a88c717f0a6d8bab81d6",
+      "v1_1_baseline_runtime": 0.6410304000601172,
+      "v1_1_branch_points": 339,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.225298899691552,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.5842684996314347,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 9.502891900017858,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 8.86186149995774,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.773405599873513,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 1.1323751998133957,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 92,
+          "overall_runtime": 19.517570400144905,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 18.876540000084788,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.858223299961537,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 2.21719289990142,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 5.022511100396514,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 4.381480700336397,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -21043,7 +21571,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "be664fb24ec4b3441e2b628ffc2e66858889871b5a9ee3112c967d3fac31990a"
+      "solution_canonical_hash": "be664fb24ec4b3441e2b628ffc2e66858889871b5a9ee3112c967d3fac31990a",
+      "v1_1_baseline_runtime": 1.3501680996268988,
+      "v1_1_branch_points": 300,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.675179799553007,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 1.3250116999261081,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 22.320489399600774,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 20.970321299973875,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.9788631997071207,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 2.628695100080222,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 170,
+          "overall_runtime": 47.67449009977281,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 46.32432200014591,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 6.609950099606067,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 5.259781999979168,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 11.998053499497473,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 10.647885399870574,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -24045,7 +24661,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "2b5be3f3da3cccdda52d05b4b7240803de1ea30c915c64a3b9213c177f4c1320"
+      "solution_canonical_hash": "2b5be3f3da3cccdda52d05b4b7240803de1ea30c915c64a3b9213c177f4c1320",
+      "v1_1_baseline_runtime": 0.29518349980935454,
+      "v1_1_branch_points": 365,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.49053919967263937,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.19535569986328483,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 58,
+          "overall_runtime": 3.5136411995626986,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 3.218457699753344,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.6637935000471771,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.36861000023782253,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 58,
+          "overall_runtime": 4.951057499740273,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 4.655873999930918,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.0272464994341135,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.732062999624759,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.7197476997971535,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 1.424564199987799,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -27047,7 +27751,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "3a5c430bf2e04c163172394debccb4655afe7d59717c69197c49514d30ea953c"
+      "solution_canonical_hash": "3a5c430bf2e04c163172394debccb4655afe7d59717c69197c49514d30ea953c",
+      "v1_1_baseline_runtime": 0.18083100020885468,
+      "v1_1_branch_points": 393,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 3,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.20991750014945865,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.02908649994060397,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": 2298.92129651784,
+          "branch_points_considered": 3,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 5,
+          "overall_runtime": 0.3195692002773285,
+          "recovery_rollouts": 14,
+          "rollout_budget": 16,
+          "runtime": 0.13873820006847382,
+          "schedule_canonical_hash": "46d19d663853738574b18e663a8fd68d73d303768594cc2ee893773fb4b78b3e",
+          "status": "FEASIBLE"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 3,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.21993430005386472,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.03910329984501004,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2298.92129651784,
+          "branch_points_considered": 3,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 5,
+          "overall_runtime": 0.3148691998794675,
+          "recovery_rollouts": 14,
+          "rollout_budget": 32,
+          "runtime": 0.1340381996706128,
+          "schedule_canonical_hash": "822a9674ed375d72ee045d2dc75025de1d020fe67643b87f88cd94f8836e4bf9",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 3,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.2297361004166305,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.04890510020777583,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 3,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 2,
+          "overall_runtime": 0.2619259003549814,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.08109490014612675,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -30049,7 +30841,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "7896c79923968af3c33c88404eadafaa25d4c851c9026dbbac8c6739c16942db"
+      "solution_canonical_hash": "7896c79923968af3c33c88404eadafaa25d4c851c9026dbbac8c6739c16942db",
+      "v1_1_baseline_runtime": 0.6158603001385927,
+      "v1_1_branch_points": 336,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.1718453001230955,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.5559849999845028,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 114,
+          "overall_runtime": 11.14134019985795,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 10.525479899719357,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.7385675003752112,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 1.1227072002366185,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 116,
+          "overall_runtime": 15.8039668998681,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 15.188106599729508,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.831752000376582,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 2.2158917002379894,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 5.020761700347066,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 4.404901400208473,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -33051,7 +33931,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "d97bad181aa362fe685c30a5614482746346ecbb96833a147da4243d2d1ca843"
+      "solution_canonical_hash": "d97bad181aa362fe685c30a5614482746346ecbb96833a147da4243d2d1ca843",
+      "v1_1_baseline_runtime": 0.44858730025589466,
+      "v1_1_branch_points": 348,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.8169015999883413,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.36831429973244667,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 90,
+          "overall_runtime": 7.237777200061828,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 6.789189899805933,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.1791059002280235,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.7305185999721289,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2300.3796297536824,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 139,
+          "overall_runtime": 10.75019699987024,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 10.301609699614346,
+          "schedule_canonical_hash": "6969e56fab8840624a3ff0254ceaf4d17c11e0f053c802fb84de6a0b64daa0e4",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.8816325003281236,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 1.433045200072229,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.325156600214541,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 2.8765692999586463,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -36053,7 +37021,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "ce2b3f3e6c4f2efc89b5bff479054b068404a9cfd81ca53d263a5603603acb0f"
+      "solution_canonical_hash": "ce2b3f3e6c4f2efc89b5bff479054b068404a9cfd81ca53d263a5603603acb0f",
+      "v1_1_baseline_runtime": 0.28935009986162186,
+      "v1_1_branch_points": 364,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.4777461998164654,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.18839609995484352,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 58,
+          "overall_runtime": 3.3977540996856987,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 3.108403999824077,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.6499950997531414,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.36064499989151955,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2390.333333501488,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 90,
+          "overall_runtime": 4.910355599597096,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 4.621005499735475,
+          "schedule_canonical_hash": "2ae3afe5186a08b9976764dd240a35ddeaad1fea863e1a0c083c37d9591ad35f",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.9786574998870492,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.6893074000254273,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.6339779999107122,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 1.3446279000490904,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -39055,7 +40111,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "7e94ba64631850ee98034a4bf05fdf23d11c762d98770579b2a470bfc4c78166"
+      "solution_canonical_hash": "7e94ba64631850ee98034a4bf05fdf23d11c762d98770579b2a470bfc4c78166",
+      "v1_1_baseline_runtime": 0.20455479994416237,
+      "v1_1_branch_points": 372,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.3423756998963654,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.13782089995220304,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.1083798999898136,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 1.9038251000456512,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.4307432002387941,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.22618840029463172,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 43,
+          "overall_runtime": 3.9464711998589337,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 3.7419163999147713,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.6122456998564303,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.4076908999122679,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.9951468999497592,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.7905921000055969,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -42057,7 +43201,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "04486ac68d8251564ecea560527934f396bf2dbef2d6c0d96ac90674e98e9484"
+      "solution_canonical_hash": "04486ac68d8251564ecea560527934f396bf2dbef2d6c0d96ac90674e98e9484",
+      "v1_1_baseline_runtime": 0.1857801997102797,
+      "v1_1_branch_points": 388,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.23338630003854632,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.04760610032826662,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 10,
+          "overall_runtime": 0.4911789996549487,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 0.305398799944669,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.24622719967737794,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.060446999967098236,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2298.921296508844,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 21,
+          "overall_runtime": 0.6361762997694314,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 0.45039610005915165,
+          "schedule_canonical_hash": "a46d6a02aeba3cad93feb0e14fa5634456073be48c63831fc72b343b8d2cede7",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.27446919959038496,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.08868899988010526,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.3477641995996237,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.16198399988934398,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -45059,7 +46291,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "9e4e178551884d161a77c440f19e7a0ec298e3ca245325066194a25b23cb79ae"
+      "solution_canonical_hash": "9e4e178551884d161a77c440f19e7a0ec298e3ca245325066194a25b23cb79ae",
+      "v1_1_baseline_runtime": 0.6877120002172887,
+      "v1_1_branch_points": 332,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.3234665002673864,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.6357545000500977,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 122,
+          "overall_runtime": 12.499617700465024,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 11.811905700247735,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.9321083002723753,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 1.2443963000550866,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 124,
+          "overall_runtime": 17.910783900413662,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 17.223071900196373,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.1889471001923084,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 2.5012350999750197,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 5.639477199874818,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 4.95176519965753,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -48061,7 +49381,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "6d32767bab52f6727dad0e365bc53209cb5ee299d8fbfebd0df9656b0bc66fd1"
+      "solution_canonical_hash": "6d32767bab52f6727dad0e365bc53209cb5ee299d8fbfebd0df9656b0bc66fd1",
+      "v1_1_baseline_runtime": 0.2059173001907766,
+      "v1_1_branch_points": 384,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.28135270019993186,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.07543540000915527,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.6995089002884924,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 0.49359160009771585,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.2980882003903389,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.09217090019956231,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 18,
+          "overall_runtime": 1.1788266003131866,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 0.9729093001224101,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.3545933999121189,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.14867609972134233,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.4478489002212882,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.24193160003051162,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -51070,7 +52478,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "1600ff6f543082d2b6c110b525bcf8e17f9ccc265f4eb4b1bcba08c022f2585d"
+      "solution_canonical_hash": "1600ff6f543082d2b6c110b525bcf8e17f9ccc265f4eb4b1bcba08c022f2585d",
+      "v1_1_baseline_runtime": 1.0528630996122956,
+      "v1_1_branch_points": 289,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.3320037997327745,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.27914070012047887,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 12.958937699906528,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 11.906074600294232,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.5975730996578932,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.5447100000455976,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 137,
+          "overall_runtime": 26.003391999285668,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 24.950528899673373,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.1751204999163747,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 1.122257400304079,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 4.805173699744046,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 3.75231060013175,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -54072,7 +55568,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "a1af6d6fc80df6fe3780bab6ff1525883bb4e912c2abe1f772eaf3d38403d673"
+      "solution_canonical_hash": "a1af6d6fc80df6fe3780bab6ff1525883bb4e912c2abe1f772eaf3d38403d673",
+      "v1_1_baseline_runtime": 0.3664820999838412,
+      "v1_1_branch_points": 356,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.6370071996934712,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.27052509970963,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 74,
+          "overall_runtime": 5.259916299954057,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 4.893434199970216,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.8857292998582125,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.5192471998743713,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2300.379629771381,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 115,
+          "overall_runtime": 7.45685760024935,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 7.090375500265509,
+          "schedule_canonical_hash": "70200c0b21ff46663a2dd9575e660ab614c8a156b237035586d18d2753baa700",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.386432200204581,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 1.0199501002207398,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.4232713002711535,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 2.0567892002873123,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -57081,7 +58665,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "8ff0e00aba363abe71ba79a40765adb7d03e7cb3c0b8efd9cbe36da67db99edb"
+      "solution_canonical_hash": "8ff0e00aba363abe71ba79a40765adb7d03e7cb3c0b8efd9cbe36da67db99edb",
+      "v1_1_baseline_runtime": 1.3193741999566555,
+      "v1_1_branch_points": 293,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.4350149999372661,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.11564079998061061,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 14.960764300078154,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 13.641390100121498,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.5389906000345945,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.21961640007793903,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 165,
+          "overall_runtime": 29.293124800082296,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 27.97375060012564,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.813136599957943,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.49376240000128746,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 14,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 4.937210300005972,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 3.617836100049317,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -60088,7 +61760,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "8c3ad8b6670dcad8ffb5c4fec0c2e17687265553bbb907334a51704e18853b03"
+      "solution_canonical_hash": "8c3ad8b6670dcad8ffb5c4fec0c2e17687265553bbb907334a51704e18853b03",
+      "v1_1_baseline_runtime": 0.9012434999458492,
+      "v1_1_branch_points": 320,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.7521450002677739,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.8509015003219247,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 14.522979999892414,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 13.621736499946564,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.5956650003790855,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 1.6944215004332364,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 146,
+          "overall_runtime": 34.767901400104165,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 33.866657900158316,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 4.276512200012803,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 3.375268700066954,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 7.64846479985863,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 6.7472212999127805,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -61707,7 +63467,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "10276573e078615695bd60250fd7dda00131d643f167b093ffaead004ab8356f"
+      "solution_canonical_hash": "10276573e078615695bd60250fd7dda00131d643f167b093ffaead004ab8356f",
+      "v1_1_baseline_runtime": 0.13438939955085516,
+      "v1_1_branch_points": 149,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 2,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.23578439932316542,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.10139499977231026,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 2,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 10,
+          "overall_runtime": 1.2153348997235298,
+          "recovery_rollouts": 10,
+          "rollout_budget": 16,
+          "runtime": 1.0809455001726747,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 2,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.3293354995548725,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.19494610000401735,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 2,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 10,
+          "overall_runtime": 1.2161863995715976,
+          "recovery_rollouts": 10,
+          "rollout_budget": 32,
+          "runtime": 1.0817970000207424,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 2,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.534649399574846,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.40026000002399087,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 2,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 9,
+          "overall_runtime": 0.9698022995144129,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.8354128999635577,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -64709,7 +66557,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "680106bdd29d3eb9b08ddd4622c450328cd896bb3755fc42985f48953ee0d41b"
+      "solution_canonical_hash": "680106bdd29d3eb9b08ddd4622c450328cd896bb3755fc42985f48953ee0d41b",
+      "v1_1_baseline_runtime": 0.21817649994045496,
+      "v1_1_branch_points": 376,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.3175128996372223,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.09933639969676733,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 34,
+          "overall_runtime": 1.5353717999532819,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 1.317195300012827,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.385988499969244,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.16781200002878904,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 36,
+          "overall_runtime": 2.160700799897313,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 1.9425242999568582,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.5278582996688783,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.30968179972842336,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.8202656996436417,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.6020891997031868,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -67711,7 +69647,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "f58c7411d2f58b1628d7c81fecf4171f169482b8e41cec6b855c3c96b122ad56"
+      "solution_canonical_hash": "f58c7411d2f58b1628d7c81fecf4171f169482b8e41cec6b855c3c96b122ad56",
+      "v1_1_baseline_runtime": 0.5174471996724606,
+      "v1_1_branch_points": 347,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.9548433995805681,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.4373961999081075,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 7.002092099748552,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 6.484644900076091,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.345354599878192,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.8279074002057314,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 76,
+          "overall_runtime": 14.457894499413669,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 13.940447299741209,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.1445499998517334,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 1.627102800179273,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 13,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.7416167994961143,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 3.2241695998236537,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -70713,7 +72737,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "c1dea20e1d4aaef3822375db103e27a8294d2868e0e0415e2d3fe1e4bae01310"
+      "solution_canonical_hash": "c1dea20e1d4aaef3822375db103e27a8294d2868e0e0415e2d3fe1e4bae01310",
+      "v1_1_baseline_runtime": 0.1908772001042962,
+      "v1_1_branch_points": 384,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.25153869995847344,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.06066149985417724,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 18,
+          "overall_runtime": 0.744291499722749,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 0.5534142996184528,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.27843340020626783,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.08755620010197163,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2300.3796298333277,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 28,
+          "overall_runtime": 1.0165641997009516,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 0.8256869995966554,
+          "schedule_canonical_hash": "3628d9bcdb61f896d910c6421ec7dbf3813b9e22f94c6f6a2e0000f6d04764e9",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.3406948000192642,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.149817599914968,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.46613630047068,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.2752591003663838,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -73715,7 +75827,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "6a7de0fa20064156d288b7054e9558598759506e37957f559787b1334a2e2e73"
+      "solution_canonical_hash": "6a7de0fa20064156d288b7054e9558598759506e37957f559787b1334a2e2e73",
+      "v1_1_baseline_runtime": 1.2400588998571038,
+      "v1_1_branch_points": 304,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.4561383998952806,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 1.2160795000381768,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 178,
+          "overall_runtime": 25.817265499848872,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 24.57720659999177,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.671816799789667,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 2.4317578999325633,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2300.3796296563373,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 271,
+          "overall_runtime": 37.35982839995995,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 36.11976950010285,
+          "schedule_canonical_hash": "84c0b5fd4891e5417ca536fb11a025a8c20814a45abb74cc56fc90b8862c92b7",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 6.116500599775463,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 4.8764416999183595,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 10.99571010004729,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 9.755651200190187,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -76759,7 +78959,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "23426da6f663c9294380c0711e38b344cac9a4fcfeb6b26751af34d4454f8449"
+      "solution_canonical_hash": "23426da6f663c9294380c0711e38b344cac9a4fcfeb6b26751af34d4454f8449",
+      "v1_1_baseline_runtime": 0.45316149992868304,
+      "v1_1_branch_points": 295,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 10,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.8382085999473929,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.3850471000187099,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 10,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 48,
+          "overall_runtime": 6.434744900092483,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 5.9815834001637995,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 10,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.2059444999322295,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.7527830000035465,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 10,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 60,
+          "overall_runtime": 10.883687200024724,
+          "recovery_rollouts": 26,
+          "rollout_budget": 32,
+          "runtime": 10.430525700096041,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 10,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.9034020998515189,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 1.4502405999228358,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 10,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.343821700196713,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 2.89066020026803,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -79761,7 +82049,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "c9e14d03fccb95e7d7200ef1c4771693b364368971ad38fe1ac72bc13a6e63fd"
+      "solution_canonical_hash": "c9e14d03fccb95e7d7200ef1c4771693b364368971ad38fe1ac72bc13a6e63fd",
+      "v1_1_baseline_runtime": 1.095064400229603,
+      "v1_1_branch_points": 317,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.1516028000041842,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 1.0565383997745812,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 154,
+          "overall_runtime": 22.55075480043888,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 21.455690400209278,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.2201382000930607,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 2.1250737998634577,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 154,
+          "overall_runtime": 36.04411330027506,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 34.949048900045455,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 5.374360300600529,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 4.279295900370926,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 9.60762850008905,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 8.512564099859446,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -82763,7 +85139,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "8a8edbc740e2cddbe27cdae20755e00c442da30e1b4dd1f4dad1e072ea09633f"
+      "solution_canonical_hash": "8a8edbc740e2cddbe27cdae20755e00c442da30e1b4dd1f4dad1e072ea09633f",
+      "v1_1_baseline_runtime": 0.49518470000475645,
+      "v1_1_branch_points": 344,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.9122105999849737,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.4170258999802172,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 98,
+          "overall_runtime": 12.862367100082338,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 12.367182400077581,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 1.3249940001405776,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.8298093001358211,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2300.379629744833,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 148,
+          "overall_runtime": 14.076062500011176,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 13.58087780000642,
+          "schedule_canonical_hash": "de5f071d9910ad1e227962307d041d0c6077cdbe2465c67d368433b532fe1d96",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.1257855002768338,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 1.6306008002720773,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 3.7532246001064777,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 3.2580399001017213,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -85765,7 +88229,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "b069d0fc8c3e6ec2142045dfca2896b1d9a17c00b0015854b1a208e2e8582d89"
+      "solution_canonical_hash": "b069d0fc8c3e6ec2142045dfca2896b1d9a17c00b0015854b1a208e2e8582d89",
+      "v1_1_baseline_runtime": 1.2567217000760138,
+      "v1_1_branch_points": 308,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 2.4537263000383973,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 1.1970045999623835,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 170,
+          "overall_runtime": 24.440784299746156,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 23.184062599670142,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 4.15583570022136,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 2.899114000145346,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": 2300.3796296651867,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": true,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 259,
+          "overall_runtime": 38.10726619977504,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 36.850544499699026,
+          "schedule_canonical_hash": "d183b4d7f82ea9fe4485f458eefb3c8e4025a539e14dfc2098bfbb4fc07171d4",
+          "status": "FEASIBLE"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 9.696189700160176,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 8.439468000084162,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 12.692899500019848,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 11.436177799943835,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -88767,7 +91319,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "ea51d8d3ce5999f87f6e16cb82014eb122391f0be9b04998c8ab1280aeab78fc"
+      "solution_canonical_hash": "ea51d8d3ce5999f87f6e16cb82014eb122391f0be9b04998c8ab1280aeab78fc",
+      "v1_1_baseline_runtime": 0.21054780017584562,
+      "v1_1_branch_points": 384,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.28380340011790395,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.07325559994205832,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.7494573001749814,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 0.5389094999991357,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.30147960036993027,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.09093180019408464,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 18,
+          "overall_runtime": 1.2549743000417948,
+          "recovery_rollouts": 32,
+          "rollout_budget": 32,
+          "runtime": 1.0444264998659492,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.34147230023518205,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.13092450005933642,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 9,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.4372871997766197,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.22673939960077405,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     },
     {
       "baseline": {
@@ -91769,7 +94409,95 @@
         ]
       },
       "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
-      "solution_canonical_hash": "ef9f12e2dc71f1206a9f2549fdbc946ef1b95bb347a9f7bea4eaa894d2c0d5ff"
+      "solution_canonical_hash": "ef9f12e2dc71f1206a9f2549fdbc946ef1b95bb347a9f7bea4eaa894d2c0d5ff",
+      "v1_1_baseline_runtime": 0.22594689996913075,
+      "v1_1_branch_points": 381,
+      "v1_1_replays": {
+        "1": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.31401089997962117,
+          "recovery_rollouts": 1,
+          "rollout_budget": 1,
+          "runtime": 0.08806400001049042,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "16": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 26,
+          "overall_runtime": 1.3686253000050783,
+          "recovery_rollouts": 16,
+          "rollout_budget": 16,
+          "runtime": 1.1426784000359476,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "2": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.35827159974724054,
+          "recovery_rollouts": 2,
+          "rollout_budget": 2,
+          "runtime": 0.1323246997781098,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "32": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": false,
+          "certified": null,
+          "frontier_exhausted": true,
+          "max_discrepancies_used": 26,
+          "overall_runtime": 1.5763643002137542,
+          "recovery_rollouts": 22,
+          "rollout_budget": 32,
+          "runtime": 1.3504174002446234,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "4": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.4613056001253426,
+          "recovery_rollouts": 4,
+          "rollout_budget": 4,
+          "runtime": 0.23535870015621185,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        },
+        "8": {
+          "Cmax": null,
+          "branch_points_considered": 5,
+          "budget_exhausted": true,
+          "certified": null,
+          "frontier_exhausted": false,
+          "max_discrepancies_used": 1,
+          "overall_runtime": 0.6825894000940025,
+          "recovery_rollouts": 8,
+          "rollout_budget": 8,
+          "runtime": 0.45664250012487173,
+          "schedule_canonical_hash": null,
+          "status": "DEADLOCK"
+        }
+      }
     }
   ],
   "provenance_status": "UNVERIFIED_SOURCE_PROVENANCE",
@@ -92210,5 +94938,97 @@
     "source_tree_hash": "cee32a0f7da5c1c3465f5d56251341d1330d8b8486d55a900db2c47388f8a261",
     "worktree_dirty": true
   },
-  "unique_entries": 31
+  "unique_entries": 31,
+  "v1_1_replay_analysis": {
+    "baseline_p50": 0.49518470000475645,
+    "baseline_p95": 1.3339486001059413,
+    "budget_summary": {
+      "1": {
+        "DEADLOCK": 31,
+        "FEASIBLE": 0,
+        "certified_feasible": 0,
+        "max_discrepancies": 1,
+        "overall_p50": 0.9122105999849737,
+        "overall_p95": 2.621045700041577,
+        "recovery_p50": 0.36831429973244667,
+        "recovery_p95": 1.3035567498300225,
+        "rollouts_mean": 1.0,
+        "rollouts_median": 1
+      },
+      "16": {
+        "DEADLOCK": 30,
+        "FEASIBLE": 1,
+        "certified_feasible": 1,
+        "max_discrepancies": 186,
+        "overall_p50": 7.237777200061828,
+        "overall_p95": 26.32304809987545,
+        "recovery_p50": 6.789189899805933,
+        "recovery_p95": 25.059791199862957,
+        "rollouts_mean": 15.741935483870968,
+        "rollouts_median": 16
+      },
+      "2": {
+        "DEADLOCK": 31,
+        "FEASIBLE": 0,
+        "certified_feasible": 0,
+        "max_discrepancies": 1,
+        "overall_p50": 1.3249940001405776,
+        "overall_p95": 3.9868327998556197,
+        "recovery_p50": 0.7305185999721289,
+        "recovery_p95": 2.6374872499145567,
+        "rollouts_mean": 2.0,
+        "rollouts_median": 2
+      },
+      "32": {
+        "DEADLOCK": 22,
+        "FEASIBLE": 9,
+        "certified_feasible": 9,
+        "max_discrepancies": 271,
+        "overall_p50": 14.076062500011176,
+        "overall_p95": 38.68633670033887,
+        "recovery_p50": 13.58087780000642,
+        "recovery_p95": 37.368847750127316,
+        "rollouts_mean": 24.70967741935484,
+        "rollouts_median": 22
+      },
+      "4": {
+        "DEADLOCK": 31,
+        "FEASIBLE": 0,
+        "certified_feasible": 0,
+        "max_discrepancies": 1,
+        "overall_p50": 1.9034020998515189,
+        "overall_p95": 6.607988649746403,
+        "recovery_p50": 1.433045200072229,
+        "recovery_p95": 5.25864309980534,
+        "rollouts_mean": 4.0,
+        "rollouts_median": 4
+      },
+      "8": {
+        "DEADLOCK": 31,
+        "FEASIBLE": 0,
+        "certified_feasible": 0,
+        "max_discrepancies": 9,
+        "overall_p50": 3.7416167994961143,
+        "overall_p95": 11.953377299942076,
+        "recovery_p50": 3.2241695998236537,
+        "recovery_p95": 10.604031750001013,
+        "rollouts_mean": 8.0,
+        "rollouts_median": 8
+      }
+    },
+    "budgets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "entries": 31,
+    "known_2048_prefix_case_recovered_within_16": true,
+    "scope_hash": "5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc",
+    "scope_id": "FORMAL_SCOPE_V1_1",
+    "selected_rollout_budget": 32,
+    "selection_reason": "B16 recovered the known case, but B32 added eight certified corpus recoveries; freeze the largest calibrated complete-rollout budget"
+  }
 }

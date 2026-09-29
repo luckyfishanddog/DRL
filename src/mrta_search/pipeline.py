@@ -625,6 +625,8 @@ def run_bounded_sa_oi(
 
     for iteration in range(search_config.max_iterations):
         if (
+            iteration > 0
+            and
             search_config.time_limit is not None
             and time.perf_counter() - started >= search_config.time_limit
         ):

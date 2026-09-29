@@ -291,25 +291,41 @@ def test_hundreds_of_deterministic_random_solution_differentials() -> None:
 @pytest.mark.parametrize("index", range(4))
 def test_formal_e1_e4_policy_and_independent_template_certificate(index):
     from mrta_reference.certifier import certify_template_schedule
+    from mrta_reference.scope import FORMAL_SCOPE_V1, FORMAL_SCOPE_V1_1
     templates = _oracle_cases()[index]
     baseline = reference_schedule_from_templates_optimized(templates, FAST)
-    formal = scheduler_module.reference_schedule_from_templates_formal(templates, FAST)
+    historical = scheduler_module.reference_schedule_from_templates_formal(
+        templates, FAST, scope=FORMAL_SCOPE_V1
+    )
+    formal = scheduler_module.reference_schedule_from_templates_formal(
+        templates, FAST, scope=FORMAL_SCOPE_V1_1
+    )
     if index < 2:
         assert formal.canonical_json() == baseline.canonical_json()
-        assert formal.source == "BASELINE" and formal.expanded_states == 0
+        assert historical.canonical_json() == baseline.canonical_json()
+        assert formal.source == "BASELINE" and formal.recovery_rollouts == 0
     elif index == 2:
         assert baseline.status is ScheduleStatus.DEADLOCK
-        assert formal.feasible and formal.source == "BOUNDED_DEADLOCK_RECOVERY"
-        assert formal.expanded_states == formal.state_budget == 16
-        assert formal.cmax == pytest.approx(15.5287634621)
+        assert historical.feasible and historical.source == "BOUNDED_DEADLOCK_RECOVERY"
+        assert historical.expanded_states == historical.state_budget == 16
+        assert historical.cmax == pytest.approx(15.5287634621)
+        assert formal.feasible and formal.source == "LIMITED_DISCREPANCY_RECOVERY"
+        assert 1 <= formal.recovery_rollouts <= formal.rollout_budget == 32
     else:
+        assert historical.status is ScheduleStatus.DEADLOCK
+        assert historical.expanded_states == 7 and historical.frontier_exhausted
         assert formal.status is ScheduleStatus.DEADLOCK
-        assert formal.cmax is None and formal.expanded_states == 7
+        assert formal.cmax is None and formal.recovery_rollouts > 0
         assert formal.frontier_exhausted
-    if formal.feasible:
-        assert certify_template_schedule(templates, formal, FAST).certified
-        assert not certify_template_schedule(templates, replace(formal, cmax=formal.cmax + 1), FAST).certified
-        assert not certify_template_schedule(templates, replace(formal, operations=formal.operations[1:]), FAST).certified
+    for result in (historical, formal):
+        if result.feasible:
+            assert certify_template_schedule(templates, result, FAST).certified
+            assert not certify_template_schedule(
+                templates, replace(result, cmax=result.cmax + 1), FAST
+            ).certified
+            assert not certify_template_schedule(
+                templates, replace(result, operations=result.operations[1:]), FAST
+            ).certified
 
 
 def test_bounded_exhaustion_stays_deadlock_and_numeric_failure_is_not_swallowed(monkeypatch):
@@ -347,6 +363,202 @@ def test_bounded_budget_recovery_is_monotonic_non_worsening_and_certified():
         else:
             assert result.status is ScheduleStatus.DEADLOCK
     assert found
+
+
+def _known_recoverable_large_case():
+    import json
+    from pathlib import Path
+    from mrta_reference.model import CanonicalSolution
+
+    corpus = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "data"
+            / "development"
+            / "f4_deadlock_stress_corpus.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        row
+        for row in corpus["entries"]
+        if row["identity"]
+        == "328926b7612633797dbe0ae62b62964bbf0a6765b1ef0d6147305b07a0ec6511"
+    )
+    payload = entry["canonical_solution"]
+    solution = CanonicalSolution(
+        tuple(ParentWeld(row[0], tuple(row[1]), tuple(row[2])) for row in payload["parents"]),
+        tuple(
+            SplitPattern(row[0], SplitKind(row[1]), row[2], row[3], row[4])
+            for row in payload["patterns"]
+        ),
+        tuple(Route(row[0], tuple(row[1])) for row in payload["routes"]),
+    )
+    values = dict(entry["scientific_config"])
+    values["workspace_x"] = tuple(values["workspace_x"])
+    values["workspace_y"] = tuple(values["workspace_y"])
+    config = ScientificConfig(**values)
+    directions = tuple(tuple(row) for row in entry["directions"])
+    routes = scheduler_module.build_robot_routes(
+        solution, config, {robot: directions[robot] for robot in range(4)}
+    )
+    templates = {
+        route.robot_id: scheduler_module.build_operation_templates(route, config)
+        for route in routes
+    }
+    baseline = scheduler_module._optimized_dispatch_outcome(
+        templates, config, directions=directions, collect_trace=True
+    )
+    return solution, config, directions, templates, baseline
+
+
+def test_dispatch_rollout_trace_is_deterministic_and_snapshot_matches_root_replay():
+    from mrta_reference.dispatch_recovery import ForcedDispatchDecision
+
+    templates = _oracle_cases()[2]
+    first = scheduler_module._optimized_dispatch_outcome(
+        templates, FAST, collect_trace=True
+    )
+    second = scheduler_module._optimized_dispatch_outcome(
+        templates, FAST, collect_trace=True
+    )
+    assert first.trace == second.trace
+    point = first.trace.branch_points[-1]
+    decision = ForcedDispatchDecision(
+        point.state.identity, point.ordered_choices[1].identity
+    )
+    snapshot = scheduler_module._optimized_dispatch_outcome(
+        templates,
+        FAST,
+        initial_state=point.state,
+        forced_decisions=(decision,),
+        collect_trace=True,
+    )
+    root = scheduler_module._optimized_dispatch_outcome(
+        templates, FAST, forced_decisions=(decision,), collect_trace=True
+    )
+    assert snapshot.result.canonical_json() == root.result.canonical_json()
+    assert snapshot.trace.terminal_depth == root.trace.terminal_depth
+
+
+def test_complete_rollout_engine_reaches_a_404_template_terminal_state():
+    points = ((0.0, 10.0), (10.0, 10.0), (0.0, 2.0), (10.0, 2.0))
+    templates = {
+        robot: tuple(
+            Operation(
+                f"R{robot}:{index}",
+                robot,
+                OperationKind.SETUP,
+                float(index),
+                float(index + 1),
+                points[robot],
+                points[robot],
+                index,
+            )
+            for index in range(101)
+        )
+        for robot in range(4)
+    }
+    outcome = scheduler_module._optimized_dispatch_outcome(
+        templates, FAST, collect_trace=True
+    )
+    assert sum(len(rows) for rows in templates.values()) == 404
+    assert outcome.result.status is ScheduleStatus.FEASIBLE
+    assert outcome.trace.terminal_depth == 404
+
+
+def test_limited_discrepancy_recent_branch_rank_order_dedup_and_exact_budget():
+    from mrta_reference.dispatch_recovery import (
+        ForcedDispatchDecision,
+        limited_discrepancy_recovery,
+    )
+
+    _, config, directions, templates, baseline = _known_recoverable_large_case()
+    observed = []
+
+    def replay(state, decision, causal_blockers):
+        point = next(
+            branch
+            for branch in baseline.trace.branch_points
+            if branch.state.identity == state.identity
+        )
+        rank = next(
+            index
+            for index, choice in enumerate(point.ordered_choices)
+            if choice.identity == decision.choice_identity
+        )
+        observed.append((point.depth, rank, decision.key, causal_blockers))
+        blockers = frozenset(causal_blockers)
+
+        def selector(_state, choices):
+            return 1 if blockers and choices[0].operation_id in blockers and len(choices) > 1 else 0
+
+        return scheduler_module._optimized_dispatch_outcome(
+            templates,
+            config,
+            directions=directions,
+            initial_state=state,
+            forced_decisions=(decision,),
+            collect_trace=True,
+            choice_selector=selector if blockers else None,
+        )
+
+    result = limited_discrepancy_recovery(
+        baseline, rollout_budget=4, rollout_from_snapshot=replay
+    )
+    causal_ids = set(baseline.trace.terminal_blocker_operation_ids)
+    causal_points = sorted(
+        (
+            point
+            for point in baseline.trace.branch_points
+            if point.ordered_choices[0].operation_id in causal_ids
+        ),
+        key=lambda point: (-point.depth, point.ordinal, point.identity),
+    )
+    expected = [
+        (point.depth, rank)
+        for point in causal_points
+        for rank in range(1, len(point.ordered_choices))
+    ][:4]
+    assert [(depth, rank) for depth, rank, _, _ in observed] == expected
+    assert len({decision for _, _, decision, _ in observed}) == len(observed)
+    assert result.recovery_rollouts == result.rollout_budget == 4
+
+
+def test_known_old_2048_case_recovers_with_16_complete_rollouts_monotonically():
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1
+
+    solution, config, directions, templates, baseline = _known_recoverable_large_case()
+    rows = []
+    for budget in (1, 2, 4, 8, 16, 32):
+        result = scheduler_module._limited_discrepancy_dispatch_recovery(
+            templates, config, baseline, rollout_budget=budget
+        )
+        rows.append(result)
+    found = False
+    previous = None
+    for result in rows:
+        if found:
+            assert result.status is ScheduleStatus.FEASIBLE
+        if result.feasible:
+            found = True
+            if previous is not None:
+                assert result.cmax <= previous + config.numeric_epsilon
+            previous = result.cmax
+        else:
+            assert result.status is ScheduleStatus.DEADLOCK
+    assert rows[4].feasible and rows[4].recovery_rollouts <= 16
+    formal = scheduler_module.reference_schedule_formal(
+        solution,
+        config,
+        scope=FORMAL_SCOPE_V1_1,
+        orientations={robot: directions[robot] for robot in range(4)},
+    )
+    assert formal.feasible and formal.source == "LIMITED_DISCREPANCY_RECOVERY"
+    assert formal.cmax == pytest.approx(rows[4].cmax)
+    assert certify_schedule(
+        solution, formal, config, scope=FORMAL_SCOPE_V1_1
+    ).certified
 
 
 def test_plateau_detector_uses_per_candidate_status_cmax_and_certification(monkeypatch):

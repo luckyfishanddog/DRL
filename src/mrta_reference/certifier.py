@@ -174,7 +174,11 @@ def certify_schedule(
         ):
             errors.append("formal evaluator identity mismatch")
         if any(p.kind is SplitKind.X_SPLIT for p in solution.patterns):
-            return CertificationReport(False, ("FORMAL_SCOPE_V1: optional X_SPLIT is EXCLUDED",), None)
+            return CertificationReport(
+                False,
+                (f"{scope.scope_id}: optional X_SPLIT is EXCLUDED",),
+                None,
+            )
         # TASK_HORIZON_RELEASE_V1 includes final POST (closed endpoint), then
         # neither TCP nor rail occupancy. No invented parking/terminal WAIT.
         for route in solution.routes:

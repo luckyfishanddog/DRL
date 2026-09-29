@@ -1,6 +1,6 @@
 # FORMAL_SCOPE_V1
 
-`FORMAL_SCOPE_V1 = FROZEN`。任务层 scientific scope contract；主实验方案仍为 [多机器人焊缝分配与排序实验方案](多机器人焊缝分配与排序实验方案.md)。本文件解释唯一机器定义 `src/mrta_reference/scope.py`，不另行定义实验流程。完整回归证据见 [Gate 交接报告](FORMAL_SCOPE_GATE_V1_20260928.md)。
+`FORMAL_SCOPE_V1 = FROZEN_HISTORICAL`。任务层 scientific scope contract；主实验方案仍为 [多机器人焊缝分配与排序实验方案](多机器人焊缝分配与排序实验方案.md)。本文件解释 V1 的机器定义与历史结果，完整回归证据见 [Gate 交接报告](FORMAL_SCOPE_GATE_V1_20260928.md)。2026-09-29 的 large-state stress 证明 16-prefix F4 与 template depth 结构性耦合；V1 随后由只改变 F4 的 `FORMAL_SCOPE_V1_1` 取代。V1 的定义、hash 与 replay API 保留且不静默变义；active contract 与修正证据见 [V1.1 F4 closure](FORMAL_SCOPE_V1_1_F4_CLOSURE_20260929.md)。
 
 ## F1：optional X_SPLIT = EXCLUDED
 
@@ -72,7 +72,7 @@ certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1
 
 有限恢复既非完整可行性判定也非 exact scheduler。16 个 popped prefixes 至多访问深度 15 的 complete schedule；超过 15 个非 WAIT templates 的 baseline DEADLOCK 不可能在此 V1 recovery 内到达 complete leaf。此限制明确接受，不能以后随算法增大预算。大型 handover smoke 的死锁没有被隐瞒，后续科学 policy 变更需要新 scope version。
 
-2026-09-29 large-state development stress 没有触发 scope 版本升级：31 个 unique baseline-DEADLOCK states 在 16/32/64 的 status/Cmax 完全一致，满足冻结的 local plateau 判据；16–1024 无恢复，2048 仅恢复一个 certified handover-heavy/N100 state。该结果验证单调实现，也量化了大型恢复限制；它不把 DEADLOCK 改写为 INFEASIBLE。完整证据见 [Pre-Phase3 release audit](PRE_PHASE3_RELEASE_AUDIT_20260929.md)。
+2026-09-29 large-state development stress 的原始审计曾按 local-plateau 规则保留 V1：31 个 unique baseline-DEADLOCK states 在 16/32/64 的 status/Cmax 相同，16–1024 无恢复，2048 恢复一个 certified handover-heavy/N100 state。后续 closure 明确纠正了科学解释：该 plateau 是 prefix depth censoring，因为 K-template complete leaf 至少需要 K+1 prefix states；它不能证明 16 已稳定。该事实触发 V1.1，而没有改写此处的历史 V1 identity。完整原始证据见 [Pre-Phase3 release audit](PRE_PHASE3_RELEASE_AUDIT_20260929.md)。
 
 Development results 不能直接更名为 formal results：F4 policy/identity 改变，必须重新 evaluation/certification，Q4 已实际出现恢复调用。即便数值偶然相同，也分别携带 identity；本轮报告 development C* 与 formal Cref，不伪造正式 exact gap。
 

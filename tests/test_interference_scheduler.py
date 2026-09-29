@@ -31,7 +31,7 @@ CONFIG = ScientificConfig()
 
 
 def test_formal_task_horizon_empty_initial_post_and_same_rail_release():
-    from mrta_reference.model import FORMAL_SCOPE_V1
+    from mrta_reference.model import FORMAL_SCOPE_V1_1
     from mrta_reference.scheduler import reference_schedule_formal, reference_schedule_slow
     cfg = ScientificConfig(weld_speed=1, empty_speed=1, t_pre=1, t_post=1)
     parents = (ParentWeld("left", (2, 10), (3, 10)),
@@ -44,7 +44,7 @@ def test_formal_task_horizon_empty_initial_post_and_same_rail_release():
         solution, cfg, orientations={0: (0,), 1: (0,)}).canonical_json()
     assert schedule.robot_completion == (3, 11, 0, 0)
     assert not any(op.robot_id >= 2 for op in schedule.operations)
-    assert certify_schedule(solution, schedule, cfg, scope=FORMAL_SCOPE_V1).certified
+    assert certify_schedule(solution, schedule, cfg, scope=FORMAL_SCOPE_V1_1).certified
     assert all(min(op.start_time for op in schedule.operations if op.robot_id == r) == 0 for r in (0, 1))
     assert all(max((op for op in schedule.operations if op.robot_id == r),
                    key=lambda op: op.end_time).kind is OperationKind.POST for r in (0, 1))
@@ -53,25 +53,25 @@ def test_formal_task_horizon_empty_initial_post_and_same_rail_release():
     parked = Operation("fake-park", 0, OperationKind.WAIT, 3, 11, (3, 10), (3, 10), 3)
     assert any(operations_conflict(parked, op, cfg) for op in schedule.operations if op.robot_id == 1)
     bad = replace(schedule, operations=schedule.operations + (parked,), robot_completion=(11, 11, 0, 0))
-    assert not certify_schedule(solution, bad, cfg, scope=FORMAL_SCOPE_V1).certified
+    assert not certify_schedule(solution, bad, cfg, scope=FORMAL_SCOPE_V1_1).certified
     post = next(op for op in schedule.operations if op.robot_id == 0 and op.kind is OperationKind.POST)
     touching = Operation("touch", 1, OperationKind.WAIT, 3, 3, (3, 10), (3, 10), 0)
     assert operations_conflict(post, touching, cfg)  # closed final POST endpoint
     empty = canonicalize((), (), {}, cfg)
     result = reference_schedule_formal(empty, cfg)
     assert result.operations == () and result.cmax == 0
-    assert certify_schedule(empty, result, cfg, scope=FORMAL_SCOPE_V1).certified
+    assert certify_schedule(empty, result, cfg, scope=FORMAL_SCOPE_V1_1).certified
     wrong_order = canonicalize(parents, solution.patterns,
                               {1: ("left::whole",), 0: ("right::whole",)}, cfg)
     assert reference_schedule_formal(wrong_order, cfg, orientations={0: (0,), 1: (0,)}).status is ScheduleStatus.INFEASIBLE
     single = canonicalize(parents[:1], solution.patterns[:1], {1: ("left::whole",)}, cfg)
     result = reference_schedule_formal(single, cfg)
     assert result.feasible and result.robot_completion[0] == 0
-    assert certify_schedule(single, result, cfg, scope=FORMAL_SCOPE_V1).certified
+    assert certify_schedule(single, result, cfg, scope=FORMAL_SCOPE_V1_1).certified
 
 
 def test_formal_x_excluded_even_with_valid_legacy_validator():
-    from mrta_reference.model import CanonicalSolution, Route, FORMAL_SCOPE_V1
+    from mrta_reference.model import CanonicalSolution, Route, FORMAL_SCOPE_V1_1
     from mrta_reference.scheduler import reference_schedule_formal
     parent = ParentWeld("x", (1, 8), (5, 8))
     pattern = SplitPattern("x", SplitKind.X_SPLIT, 0.5, "explicit-x")
@@ -80,7 +80,7 @@ def test_formal_x_excluded_even_with_valid_legacy_validator():
     assert formal.status is ScheduleStatus.INFEASIBLE
     assert "EXCLUDED" in formal.diagnostics[0]
     fake = replace(formal, status=ScheduleStatus.FEASIBLE, cmax=0)
-    assert not certify_schedule(solution, fake, CONFIG, scope=FORMAL_SCOPE_V1,
+    assert not certify_schedule(solution, fake, CONFIG, scope=FORMAL_SCOPE_V1_1,
                                 x_split_validator=lambda *args: True).certified
 
 

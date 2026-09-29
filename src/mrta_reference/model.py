@@ -10,8 +10,10 @@ from typing import Mapping, Sequence
 Point = tuple[float, float]
 
 from .scope import (
-    FormalScope, FORMAL_SCOPE_V1, RunScientificIdentity,
-    DEVELOPMENT_NO_REPAIR_V1, FORMAL_BOUNDED_DISPATCH_POLICY_V1,
+    FormalScope, FORMAL_SCOPE_V1, FORMAL_SCOPE_V1_1, ACTIVE_FORMAL_SCOPE,
+    RunScientificIdentity, DEVELOPMENT_NO_REPAIR_V1,
+    FORMAL_BOUNDED_DISPATCH_POLICY_V1,
+    FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
 )
 from .provenance import SourceProvenance
 
@@ -277,6 +279,10 @@ class ScheduleResult:
     state_budget: int = 0
     recovery_exhausted: bool = False
     frontier_exhausted: bool = False
+    recovery_rollouts: int = 0
+    rollout_budget: int = 0
+    max_discrepancies_used: int = 0
+    branch_points_considered: int = 0
 
     @property
     def feasible(self) -> bool:

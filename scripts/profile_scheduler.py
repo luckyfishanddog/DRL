@@ -26,6 +26,8 @@ from mrta_reference.scheduler import (
     FormalReferenceEvaluator,
     SchedulerProfile,
     _bounded_dispatch_recovery,
+    _limited_discrepancy_dispatch_recovery,
+    _optimized_dispatch_outcome,
     build_operation_templates,
     build_robot_routes,
     reference_schedule_from_templates_optimized,
@@ -35,7 +37,7 @@ from mrta_reference.scheduler import (
 )
 from mrta_reference.certifier import certify_schedule
 from mrta_reference.provenance import resolve_source_provenance
-from mrta_reference.scope import FORMAL_SCOPE_V1
+from mrta_reference.scope import FORMAL_SCOPE_V1, FORMAL_SCOPE_V1_1
 from mrta_search import SearchConfig, micro_gap_decomposition, run_bounded_sa_oi
 from mrta_search.direction import optimize_directions_with_initial_feasibility
 from mrta_search.initialization import InitializationStrategy, _construct, _patterns
@@ -59,14 +61,15 @@ def _development_provenance():
     )
 
 
-def formal_scope_gate(stage: str, seeds: tuple[int, ...]) -> None:
+def formal_scope_gate(
+    stage: str, seeds: tuple[int, ...], *, scope=FORMAL_SCOPE_V1
+) -> None:
     """Development-only freeze evidence; JSON lines on stdout, no dataset files."""
     from mrta_reference.scope import RunScientificIdentity
     from mrta_reference.scheduler import (
         reference_schedule_from_templates_formal, _bounded_dispatch_recovery,
     )
     from mrta_reference.certifier import certify_template_schedule
-    scope = FORMAL_SCOPE_V1
     provenance = _development_provenance()
     def emit(row):
         print(json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
@@ -79,26 +82,53 @@ def formal_scope_gate(stage: str, seeds: tuple[int, ...]) -> None:
     fast = ScientificConfig(weld_speed=1, empty_speed=1, t_pre=1, t_post=1)
     if stage in ("all", "calibration"):
         fixtures = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tests" / "test_exact.py"))
-        for budget in (16, 32, 64, 128):
+        calibration_budgets = (
+            (1, 2, 4, 8, 16, 32)
+            if scope is FORMAL_SCOPE_V1_1
+            else (16, 32, 64, 128)
+        )
+        for budget in calibration_budgets:
             for name, templates in fixtures["_manual_oracle_cases"]().items():
-                baseline = reference_schedule_from_templates_optimized(templates, fast)
+                baseline_outcome = _optimized_dispatch_outcome(
+                    templates, fast, collect_trace=True
+                )
+                baseline = baseline_outcome.result
                 started = time.perf_counter()
-                result = _bounded_dispatch_recovery(templates, fast, baseline, state_budget=budget)
+                result = (
+                    _limited_discrepancy_dispatch_recovery(
+                        templates,
+                        fast,
+                        baseline_outcome,
+                        rollout_budget=budget,
+                    )
+                    if scope is FORMAL_SCOPE_V1_1
+                    else _bounded_dispatch_recovery(
+                        templates, fast, baseline, state_budget=budget
+                    )
+                )
                 elapsed = time.perf_counter() - started
                 certificate = certify_template_schedule(templates, result, fast) if result.feasible else None
                 if result.feasible and not certificate.certified:
                     raise RuntimeError(certificate.errors)
                 emit({"stage": "calibration", "case": name, "budget": budget,
                       "baseline": baseline.status.value, "status": result.status.value,
-                      "expanded_states": result.expanded_states, "Cmax": result.cmax,
+                      "expanded_states": result.expanded_states,
+                      "recovery_rollouts": result.recovery_rollouts,
+                      "max_discrepancies_used": result.max_discrepancies_used,
+                      "Cmax": result.cmax,
                       "certified": bool(certificate and certificate.certified), "runtime": elapsed,
                       "frontier_exhausted": result.frontier_exhausted})
         for name, templates in fixtures["_manual_oracle_cases"]().items():
             start = time.perf_counter()
-            result = reference_schedule_from_templates_formal(templates, fast)
+            result = reference_schedule_from_templates_formal(
+                templates, fast, scope=scope
+            )
             emit({"stage": "E1-E4", "case": name, "status": result.status.value,
                   "Cmax": result.cmax, "source": result.source, "expanded_states": result.expanded_states,
-                  "budget": result.state_budget, "runtime": time.perf_counter() - start,
+                  "budget": result.state_budget or result.rollout_budget,
+                  "recovery_rollouts": result.recovery_rollouts,
+                  "max_discrepancies_used": result.max_discrepancies_used,
+                  "runtime": time.perf_counter() - start,
                   "certified": certify_template_schedule(templates, result, fast).certified if result.feasible else None})
     if stage in ("all", "quality"):
         for name in ("Q1_assignment_trap", "Q2_route_order_trap", "Q3_direction_trap",
@@ -136,7 +166,9 @@ def formal_scope_gate(stage: str, seeds: tuple[int, ...]) -> None:
                   "runtime": result.runtime, "iterations": result.stats.iterations,
                   "nref": result.stats.nref, "direction_calls": result.stats.direction_refinement_calls,
                   "best_sources": result.stats.improvements_by_family,
-                  "recoveries": sum(r["source"] == "BOUNDED_DEADLOCK_RECOVERY" for r in result.stats.reference_records)})
+                  "recoveries": sum(r["source"] in {
+                      "BOUNDED_DEADLOCK_RECOVERY", "LIMITED_DISCREPANCY_RECOVERY"
+                  } for r in result.stats.reference_records)})
     if stage in ("all", "smoke"):
         for family in ("load_skew", "spatial_cluster", "handover_heavy", "interference_stress"):
             for size in (20, 50, 100):
@@ -162,7 +194,9 @@ def formal_scope_gate(stage: str, seeds: tuple[int, ...]) -> None:
                           "direction_calls": s.direction_refinement_calls, "lns_attempts": s.attempted_by_family["LNS_REPAIRED"],
                           "lns_c4": s.c4_by_family["LNS_REPAIRED"], "lns_accepted": s.accepted_by_family["LNS_REPAIRED"],
                           "baseline_deadlocks": sum(r["baseline_deadlock"] for r in s.reference_records),
-                          "recoveries": sum(r["source"] == "BOUNDED_DEADLOCK_RECOVERY" for r in s.reference_records),
+                          "recoveries": sum(r["source"] in {
+                              "BOUNDED_DEADLOCK_RECOVERY", "LIMITED_DISCREPANCY_RECOVERY"
+                          } for r in s.reference_records),
                           "remaining_deadlocks": sum(
                               r["baseline_deadlock"] and r["status"] == "DEADLOCK"
                               for r in s.reference_records
@@ -484,14 +518,157 @@ def replay_deadlock_stress_corpus(
     return corpus["replay_analysis"]
 
 
-def formal_n100_performance(seed: int) -> dict[str, object]:
+def replay_v1_1_deadlock_stress_corpus(
+    corpus_path: Path,
+    *,
+    budgets: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+) -> dict[str, object]:
+    """Replay the frozen V1 corpus with the V1.1 complete-rollout policy."""
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    if corpus["schema_id"] != "F4_DEADLOCK_STRESS_CORPUS_V1":
+        raise RuntimeError("unsupported stress corpus schema")
+    baseline_runtimes: list[float] = []
+    known_identity = "328926b7612633797dbe0ae62b62964bbf0a6765b1ef0d6147305b07a0ec6511"
+    known_recovered_within_16 = False
+    for entry in corpus["entries"]:
+        solution = _solution_from_payload(entry["canonical_solution"])
+        directions = tuple(tuple(row) for row in entry["directions"])
+        config = _config_from_mapping(entry["scientific_config"])
+        routes = build_robot_routes(
+            solution, config, {robot: directions[robot] for robot in range(4)}
+        )
+        templates = {
+            route.robot_id: build_operation_templates(route, config) for route in routes
+        }
+        started = time.perf_counter()
+        baseline_outcome = _optimized_dispatch_outcome(
+            templates, config, directions=directions, collect_trace=True
+        )
+        baseline_runtime = time.perf_counter() - started
+        baseline = baseline_outcome.result
+        baseline_runtimes.append(baseline_runtime)
+        if baseline.status is not ScheduleStatus.DEADLOCK:
+            raise RuntimeError("corpus candidate no longer reproduces baseline DEADLOCK")
+        baseline_hash = hashlib.sha256(
+            baseline.canonical_json().encode("utf-8")
+        ).hexdigest()
+        if baseline_hash != entry["baseline"]["canonical_hash"]:
+            raise RuntimeError("V1.1 replay changed the baseline scheduler output")
+        entry["v1_1_baseline_runtime"] = baseline_runtime
+        entry["v1_1_branch_points"] = len(baseline_outcome.trace.branch_points)
+        entry["v1_1_replays"] = {}
+        found_feasible = False
+        previous_cmax = None
+        for budget in budgets:
+            started = time.perf_counter()
+            result = _limited_discrepancy_dispatch_recovery(
+                templates,
+                config,
+                baseline_outcome,
+                rollout_budget=budget,
+            )
+            recovery_runtime = time.perf_counter() - started
+            result = replace(
+                result,
+                reference_policy_id=FORMAL_SCOPE_V1_1.reference_scheduler_policy_id,
+                scope_id=FORMAL_SCOPE_V1_1.scope_id,
+                scope_hash=FORMAL_SCOPE_V1_1.scope_hash,
+                rollout_budget=budget,
+            )
+            if result.status not in (ScheduleStatus.FEASIBLE, ScheduleStatus.DEADLOCK):
+                raise RuntimeError(f"unexpected V1.1 stress status: {result.status.value}")
+            certificate = (
+                certify_schedule(solution, result, config, scope=FORMAL_SCOPE_V1_1)
+                if result.feasible
+                else None
+            )
+            if certificate is not None and not certificate.certified:
+                raise RuntimeError(
+                    f"uncertified V1.1 recovery {entry['identity']}/{budget}: "
+                    f"{certificate.errors}"
+                )
+            if found_feasible and not result.feasible:
+                raise RuntimeError("V1.1 recovery status is not monotonic in budget")
+            if result.feasible:
+                found_feasible = True
+                if (
+                    previous_cmax is not None
+                    and result.cmax > previous_cmax + config.numeric_epsilon
+                ):
+                    raise RuntimeError("V1.1 recovered Cmax worsened at a larger budget")
+                previous_cmax = result.cmax
+            if entry["identity"] == known_identity and budget <= 16 and result.feasible:
+                known_recovered_within_16 = True
+            entry["v1_1_replays"][str(budget)] = {
+                "status": result.status.value,
+                "Cmax": result.cmax,
+                "recovery_rollouts": result.recovery_rollouts,
+                "rollout_budget": budget,
+                "max_discrepancies_used": result.max_discrepancies_used,
+                "branch_points_considered": result.branch_points_considered,
+                "frontier_exhausted": result.frontier_exhausted,
+                "budget_exhausted": result.recovery_exhausted,
+                "runtime": recovery_runtime,
+                "overall_runtime": baseline_runtime + recovery_runtime,
+                "certified": certificate.certified if certificate else None,
+                "schedule_canonical_hash": (
+                    hashlib.sha256(result.canonical_json().encode("utf-8")).hexdigest()
+                    if result.feasible
+                    else None
+                ),
+            }
+    if not known_recovered_within_16:
+        raise RuntimeError("known 2048-prefix N100 case did not recover within 16 rollouts")
+
+    summaries = {}
+    for budget in budgets:
+        rows = [entry["v1_1_replays"][str(budget)] for entry in corpus["entries"]]
+        recovery_times = [row["runtime"] for row in rows]
+        overall_times = [row["overall_runtime"] for row in rows]
+        rollout_counts = [row["recovery_rollouts"] for row in rows]
+        summaries[str(budget)] = {
+            "FEASIBLE": sum(row["status"] == ScheduleStatus.FEASIBLE.value for row in rows),
+            "DEADLOCK": sum(row["status"] == ScheduleStatus.DEADLOCK.value for row in rows),
+            "certified_feasible": sum(row["certified"] is True for row in rows),
+            "recovery_p50": _percentile(recovery_times, 0.50),
+            "recovery_p95": _percentile(recovery_times, 0.95),
+            "overall_p50": _percentile(overall_times, 0.50),
+            "overall_p95": _percentile(overall_times, 0.95),
+            "rollouts_mean": sum(rollout_counts) / len(rollout_counts),
+            "rollouts_median": _percentile(rollout_counts, 0.50),
+            "max_discrepancies": max(row["max_discrepancies_used"] for row in rows),
+        }
+    analysis = {
+        "scope_id": FORMAL_SCOPE_V1_1.scope_id,
+        "scope_hash": FORMAL_SCOPE_V1_1.scope_hash,
+        "selected_rollout_budget": FORMAL_SCOPE_V1_1.deadlock_rollout_budget,
+        "selection_reason": (
+            "B16 recovered the known case, but B32 added eight certified corpus "
+            "recoveries; freeze the largest calibrated complete-rollout budget"
+        ),
+        "budgets": list(budgets),
+        "entries": len(corpus["entries"]),
+        "baseline_p50": _percentile(baseline_runtimes, 0.50),
+        "baseline_p95": _percentile(baseline_runtimes, 0.95),
+        "budget_summary": summaries,
+        "known_2048_prefix_case_recovered_within_16": known_recovered_within_16,
+    }
+    corpus["v1_1_replay_analysis"] = analysis
+    corpus_path.write_text(
+        json.dumps(corpus, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return analysis
+
+
+def formal_n100_performance(seed: int, *, scope=FORMAL_SCOPE_V1) -> dict[str, object]:
     provenance = _development_provenance()
     result = run_bounded_sa_oi(
         development_family("handover_heavy", 100),
         ScientificConfig(),
         SearchConfig(max_iterations=100_000, time_limit=5.0),
         seed=seed,
-        scope=FORMAL_SCOPE_V1,
+        scope=scope,
         source_provenance=provenance,
     )
     if not result.final_certification or not result.final_certification.certified:
@@ -507,8 +684,11 @@ def formal_n100_performance(seed: int) -> dict[str, object]:
         "status": result.status.value,
         "certified": result.final_certification.certified,
         "initial_success": result.initialization.status.value == "SUCCESS",
+        "initial_Cmax": result.initialization.schedule.cmax,
+        "best_Cmax": result.best_schedule.cmax,
         "iterations": stats.iterations,
         "Nref": stats.nref,
+        "C4_feasible_rate": stats.n_feasible / stats.nref if stats.nref else None,
         "requested_budget": stats.requested_budget,
         "actual_runtime": stats.actual_runtime,
         "overshoot": stats.overshoot,
@@ -518,9 +698,13 @@ def formal_n100_performance(seed: int) -> dict[str, object]:
         "search_scheduler_p95": stats.search_scheduler_p95,
         "overall_scheduler_p50": stats.scheduler_p50,
         "overall_scheduler_p95": stats.scheduler_p95,
+        "repair_time": stats.repair_time,
+        "certifier_time": stats.certifier_time,
         "baseline_deadlocks": sum(row["baseline_deadlock"] for row in stats.reference_records),
         "recovered_deadlocks": sum(
-            row["source"] == "BOUNDED_DEADLOCK_RECOVERY"
+            row["source"] in {
+                "BOUNDED_DEADLOCK_RECOVERY", "LIMITED_DISCREPANCY_RECOVERY"
+            }
             for row in stats.reference_records
         ),
         "remaining_deadlocks": sum(
@@ -885,11 +1069,32 @@ def main() -> None:
     parser.add_argument("--skip-families", action="store_true")
     parser.add_argument("--skip-quality", action="store_true")
     parser.add_argument("--formal-scope-gate", choices=("all", "calibration", "quality", "smoke"))
+    parser.add_argument(
+        "--formal-scope-v1-1",
+        choices=("all", "calibration", "quality", "smoke", "replay", "performance"),
+    )
     parser.add_argument("--formal-seeds", nargs="+", type=int, default=(20260928, 20260929, 20260930))
     parser.add_argument("--pre-phase3-release", choices=("collect", "replay", "performance"))
     parser.add_argument("--corpus-path", type=Path, default=DEFAULT_CORPUS_PATH)
     parser.add_argument("--stress-target", type=int, default=30)
     arguments = parser.parse_args()
+    if arguments.formal_scope_v1_1 == "replay":
+        analysis = replay_v1_1_deadlock_stress_corpus(arguments.corpus_path)
+        print(json.dumps({"stage": "v1_1_stress_replay", **analysis}, sort_keys=True))
+        return
+    if arguments.formal_scope_v1_1 == "performance":
+        print(json.dumps(
+            formal_n100_performance(arguments.seed, scope=FORMAL_SCOPE_V1_1),
+            sort_keys=True,
+        ))
+        return
+    if arguments.formal_scope_v1_1:
+        formal_scope_gate(
+            arguments.formal_scope_v1_1,
+            tuple(arguments.formal_seeds),
+            scope=FORMAL_SCOPE_V1_1,
+        )
+        return
     if arguments.pre_phase3_release == "collect":
         corpus = collect_deadlock_stress_corpus(
             arguments.corpus_path,

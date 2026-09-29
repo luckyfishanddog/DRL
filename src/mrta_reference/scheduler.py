@@ -24,7 +24,23 @@ from .model import (
     ScientificConfig,
     FormalScope,
     FORMAL_SCOPE_V1,
+    FORMAL_SCOPE_V1_1,
+    ACTIVE_FORMAL_SCOPE,
     SplitKind,
+)
+from .scope import (
+    FORMAL_BOUNDED_DISPATCH_POLICY_V1,
+    FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
+)
+from .dispatch_recovery import (
+    DispatchChoice,
+    DispatchChoiceSet,
+    DispatchState,
+    ForcedDispatchDecision,
+    RolloutOutcome,
+    RolloutTrace,
+    limited_discrepancy_recovery,
+    run_dispatch_rollout,
 )
 from .solution import block_map, canonicalize
 
@@ -743,6 +759,221 @@ def _remaining_processing_suffix(
     return tuple(suffixes)  # type: ignore[return-value]
 
 
+class _OptimizedDispatchKernel:
+    """Scientific dispatch kernel shared by baseline and recovery rollouts."""
+
+    def __init__(
+        self,
+        templates: Mapping[int, Sequence[Operation]],
+        remaining_suffix,
+        config: ScientificConfig,
+        directions,
+        profile: SchedulerProfile | None,
+    ) -> None:
+        self.templates = templates
+        self.remaining_suffix = remaining_suffix
+        self.config = config
+        self.directions = directions
+        self.profile = profile
+
+    def start_runtime(self, state: DispatchState) -> _RelevantFixedIndex:
+        index = _RelevantFixedIndex()
+        for operation in state.fixed_operations:
+            index.add(operation)
+        return index
+
+    def is_complete(self, state: DispatchState) -> bool:
+        return all(
+            state.next_index[robot] == len(self.templates[robot])
+            for robot in range(4)
+        )
+
+    def choices(
+        self, state: DispatchState, fixed_index: _RelevantFixedIndex
+    ) -> DispatchChoiceSet:
+        choices: list[DispatchChoice] = []
+        blockers_by_robot: dict[int, tuple[int, ...]] = {}
+        blocker_ids_by_robot: dict[int, tuple[str, ...]] = {}
+        for robot in range(4):
+            template_index = state.next_index[robot]
+            if template_index >= len(self.templates[robot]):
+                continue
+            template = self.templates[robot][template_index]
+            relevant = fixed_index.relevant(
+                robot, state.completion[robot], self.config
+            )
+            start, blockers, blocker_ids = earliest_safe_start_optimized(
+                template,
+                state.completion[robot],
+                relevant,
+                self.config,
+                profile=self.profile,
+            )
+            blockers_by_robot[robot] = blockers
+            blocker_ids_by_robot[robot] = blocker_ids
+            remaining_started = time.perf_counter()
+            remaining_processing = self.remaining_suffix[robot][template_index]
+            if self.profile is not None:
+                self.profile.remaining_processing_time += (
+                    time.perf_counter() - remaining_started
+                )
+            if math.isfinite(start):
+                priority = (
+                    start,
+                    -remaining_processing,
+                    -state.completion[robot],
+                    robot,
+                )
+                choices.append(
+                    DispatchChoice(
+                        priority,
+                        robot,
+                        template_index,
+                        template.operation_id,
+                        start,
+                    )
+                )
+        return DispatchChoiceSet(
+            tuple(sorted(choices, key=lambda choice: choice.priority)),
+            tuple(sorted(blockers_by_robot.items())),
+            tuple(sorted(blocker_ids_by_robot.items())),
+        )
+
+    def commit(
+        self,
+        state: DispatchState,
+        choice: DispatchChoice,
+        fixed_index: _RelevantFixedIndex,
+    ) -> DispatchState:
+        robot = choice.robot_id
+        if state.next_index[robot] != choice.template_index:
+            raise ValueError("dispatch choice template index does not match state")
+        template = self.templates[robot][choice.template_index]
+        if template.operation_id != choice.operation_id:
+            raise ValueError("dispatch choice operation identity does not match template")
+        fixed = state.fixed_operations
+        completion = list(state.completion)
+        current_point = list(state.current_point)
+        next_index = list(state.next_index)
+        wait_count = list(state.wait_count)
+        ready = completion[robot]
+        if choice.start_time > ready:
+            point = current_point[robot] if current_point[robot] is not None else template.start
+            waiting = Operation(
+                f"R{robot}:WAIT:{wait_count[robot]}",
+                robot,
+                OperationKind.WAIT,
+                ready,
+                choice.start_time,
+                point,
+                point,
+                template.sequence_index,
+                template.block_id,
+            )
+            fixed += (waiting,)
+            fixed_index.add(waiting)
+            wait_count[robot] += 1
+        operation = _at_start(template, choice.start_time)
+        fixed += (operation,)
+        fixed_index.add(operation)
+        completion[robot] = operation.end_time
+        current_point[robot] = operation.end
+        next_index[robot] += 1
+        return DispatchState(
+            tuple(next_index),
+            tuple(completion),
+            tuple(current_point),
+            fixed,
+            tuple(wait_count),
+        )
+
+    def feasible_result(self, state: DispatchState) -> ScheduleResult:
+        return ScheduleResult(
+            ScheduleStatus.FEASIBLE,
+            tuple(sorted(state.fixed_operations, key=_operation_sort_key)),
+            max(state.completion, default=0.0),
+            state.completion,
+            directions=self.directions,
+        )
+
+    def deadlock_result(
+        self, state: DispatchState, choice_set: DispatchChoiceSet
+    ) -> ScheduleResult:
+        blockers_by_robot = dict(choice_set.blockers_by_robot)
+        blocker_ids_by_robot = dict(choice_set.blocker_ids_by_robot)
+        graph = build_wait_for_graph(blockers_by_robot)
+        cycles = wait_for_cycles(graph)
+        return ScheduleResult(
+            ScheduleStatus.DEADLOCK,
+            tuple(sorted(state.fixed_operations, key=_operation_sort_key)),
+            None,
+            state.completion,
+            graph,
+            tuple(
+                [f"wait-for cycles={cycles}"]
+                + [
+                    f"R{robot} blocked by {blocker_ids_by_robot.get(robot, ())}"
+                    for robot in sorted(blocker_ids_by_robot)
+                ]
+            ),
+            self.directions,
+        )
+
+
+def _optimized_dispatch_outcome(
+    templates_by_robot: Mapping[int, Sequence[Operation]],
+    config: ScientificConfig,
+    *,
+    directions=((), (), (), ()),
+    profile: SchedulerProfile | None = None,
+    initial_state: DispatchState | None = None,
+    forced_decisions: tuple[ForcedDispatchDecision, ...] = (),
+    collect_trace: bool = True,
+    choice_selector=None,
+) -> RolloutOutcome:
+    main_started = time.perf_counter()
+    templates, invalid = _validated_reference_templates(templates_by_robot, config)
+    start_state = DispatchState() if initial_state is None else initial_state
+    if invalid is not None:
+        return RolloutOutcome(
+            invalid,
+            RolloutTrace((), start_state.depth, start_state.depth, forced_decisions),
+            start_state,
+        )
+    if profile is not None:
+        profile.number_of_operations = sum(len(items) for items in templates.values())
+    suffix_started = time.perf_counter()
+    remaining_suffix = _remaining_processing_suffix(templates)
+    if profile is not None:
+        profile.remaining_processing_time += time.perf_counter() - suffix_started
+    kernel = _OptimizedDispatchKernel(
+        templates, remaining_suffix, config, directions, profile
+    )
+    try:
+        outcome = run_dispatch_rollout(
+            kernel,
+            initial_state=start_state,
+            forced_decisions=forced_decisions,
+            collect_trace=collect_trace,
+            choice_selector=choice_selector,
+        )
+    except ValueError as error:
+        outcome = RolloutOutcome(
+            _infeasible(str(error)),
+            RolloutTrace((), start_state.depth, start_state.depth, forced_decisions),
+            start_state,
+        )
+    except (OverflowError, ArithmeticError) as error:
+        outcome = RolloutOutcome(
+            ScheduleResult(ScheduleStatus.NUMERIC_FAILURE, diagnostics=(str(error),)),
+            RolloutTrace((), start_state.depth, start_state.depth, forced_decisions),
+            start_state,
+        )
+    if profile is not None:
+        profile.scheduler_main_loop_time += time.perf_counter() - main_started
+    return outcome
+
+
 def reference_schedule_from_templates_optimized(
     templates_by_robot: Mapping[int, Sequence[Operation]],
     config: ScientificConfig,
@@ -753,118 +984,13 @@ def reference_schedule_from_templates_optimized(
     profile: SchedulerProfile | None = None,
 ) -> ScheduleResult:
     """Semantics-equivalent list scheduler with indexed relevant fixed operations."""
-    main_started = time.perf_counter()
-    templates, invalid = _validated_reference_templates(templates_by_robot, config)
-    if invalid is not None:
-        return invalid
-    if profile is not None:
-        profile.number_of_operations = sum(len(items) for items in templates.values())
-    suffix_started = time.perf_counter()
-    remaining_suffix = _remaining_processing_suffix(templates)
-    if profile is not None:
-        profile.remaining_processing_time += time.perf_counter() - suffix_started
-
-    next_index = [0, 0, 0, 0]
-    completion = [0.0, 0.0, 0.0, 0.0]
-    current_point: list[tuple[float, float] | None] = [None, None, None, None]
-    fixed: list[Operation] = []
-    fixed_index = _RelevantFixedIndex()
-    wait_count = [0, 0, 0, 0]
-
-    try:
-        while any(next_index[robot] < len(templates[robot]) for robot in range(4)):
-            choices = []
-            blockers_by_robot: dict[int, tuple[int, ...]] = {}
-            blocker_ids_by_robot: dict[int, tuple[str, ...]] = {}
-            for robot in range(4):
-                if next_index[robot] >= len(templates[robot]):
-                    continue
-                template = templates[robot][next_index[robot]]
-                relevant = fixed_index.relevant(robot, completion[robot], config)
-                start, blockers, blocker_ids = earliest_safe_start_optimized(
-                    template,
-                    completion[robot],
-                    relevant,
-                    config,
-                    profile=profile,
-                )
-                blockers_by_robot[robot] = blockers
-                blocker_ids_by_robot[robot] = blocker_ids
-                remaining_started = time.perf_counter()
-                remaining_processing = remaining_suffix[robot][next_index[robot]]
-                if profile is not None:
-                    profile.remaining_processing_time += time.perf_counter() - remaining_started
-                if math.isfinite(start):
-                    choices.append(
-                        (
-                            start,
-                            -remaining_processing,
-                            -completion[robot],
-                            robot,
-                            template,
-                        )
-                    )
-            if not choices:
-                graph = build_wait_for_graph(blockers_by_robot)
-                cycles = wait_for_cycles(graph)
-                result = ScheduleResult(
-                    ScheduleStatus.DEADLOCK,
-                    tuple(sorted(fixed, key=_operation_sort_key)),
-                    None,
-                    tuple(completion),
-                    graph,
-                    tuple(
-                        [f"wait-for cycles={cycles}"]
-                        + [
-                            f"R{robot} blocked by {blocker_ids_by_robot.get(robot, ())}"
-                            for robot in sorted(blocker_ids_by_robot)
-                        ]
-                    ),
-                    directions,
-                )
-                if profile is not None:
-                    profile.scheduler_main_loop_time += time.perf_counter() - main_started
-                return result
-
-            start, _, _, robot, template = min(choices, key=lambda item: item[:4])
-            ready = completion[robot]
-            if start > ready:
-                point = current_point[robot] if current_point[robot] is not None else template.start
-                waiting = Operation(
-                    f"R{robot}:WAIT:{wait_count[robot]}",
-                    robot,
-                    OperationKind.WAIT,
-                    ready,
-                    start,
-                    point,
-                    point,
-                    template.sequence_index,
-                    template.block_id,
-                )
-                fixed.append(waiting)
-                fixed_index.add(waiting)
-                wait_count[robot] += 1
-            operation = _at_start(template, start)
-            fixed.append(operation)
-            fixed_index.add(operation)
-            completion[robot] = operation.end_time
-            current_point[robot] = operation.end
-            next_index[robot] += 1
-    except ValueError as error:
-        return _infeasible(str(error))
-    except (OverflowError, ArithmeticError) as error:
-        return ScheduleResult(ScheduleStatus.NUMERIC_FAILURE, diagnostics=(str(error),))
-
-    result = ScheduleResult(
-        ScheduleStatus.FEASIBLE,
-        tuple(sorted(fixed, key=_operation_sort_key)),
-        max(completion, default=0.0),
-        tuple(completion),
+    return _optimized_dispatch_outcome(
+        templates_by_robot,
+        config,
         directions=directions,
-    )
-    if profile is not None:
-        profile.scheduler_main_loop_time += time.perf_counter() - main_started
-    return result
+        profile=profile,
+        collect_trace=False,
+    ).result
 
 
 def reference_schedule_from_templates(
@@ -1132,34 +1258,141 @@ def _bounded_dispatch_recovery(
     )
 
 
+def _limited_discrepancy_dispatch_recovery(
+    templates_by_robot: Mapping[int, Sequence[Operation]],
+    config: ScientificConfig,
+    baseline: RolloutOutcome,
+    *,
+    rollout_budget: int,
+    profile: SchedulerProfile | None = None,
+) -> ScheduleResult:
+    """Bound complete alternative continuations, independent of template depth."""
+    if baseline.result.status is not ScheduleStatus.DEADLOCK:
+        return baseline.result
+
+    def rollout_from_snapshot(
+        state: DispatchState,
+        decision: ForcedDispatchDecision,
+        causal_blocker_operation_ids: tuple[str, ...],
+    ) -> RolloutOutcome:
+        blockers = frozenset(causal_blocker_operation_ids)
+
+        def causal_selector(_state, choices):
+            if blockers and choices[0].operation_id in blockers and len(choices) >= 2:
+                return 1
+            return 0
+
+        return _optimized_dispatch_outcome(
+            templates_by_robot,
+            config,
+            directions=baseline.result.directions,
+            profile=profile,
+            initial_state=state,
+            forced_decisions=(decision,),
+            collect_trace=True,
+            choice_selector=causal_selector if blockers else None,
+        )
+
+    summary = limited_discrepancy_recovery(
+        baseline,
+        rollout_budget=rollout_budget,
+        rollout_from_snapshot=rollout_from_snapshot,
+    )
+    numeric = summary.result.status is ScheduleStatus.NUMERIC_FAILURE
+    recovered = summary.result.status is ScheduleStatus.FEASIBLE
+    diagnostics = baseline.result.diagnostics + (
+        "baseline DEADLOCK",
+        f"recovery_rollouts={summary.recovery_rollouts}",
+        f"rollout_budget={summary.rollout_budget}",
+        f"max_discrepancies_used={summary.max_discrepancies_used}",
+        f"branch_points_considered={summary.branch_points_considered}",
+        f"recovery_exhausted={not summary.frontier_exhausted}",
+        f"frontier_exhausted={summary.frontier_exhausted}",
+    )
+    if numeric:
+        diagnostics += tuple(
+            item
+            for item in summary.result.diagnostics
+            if item not in diagnostics
+        )
+    return replace(
+        summary.result,
+        source="LIMITED_DISCREPANCY_RECOVERY" if recovered else "BASELINE",
+        diagnostics=diagnostics,
+        baseline_deadlock=True,
+        recovery_exhausted=not summary.frontier_exhausted,
+        frontier_exhausted=summary.frontier_exhausted,
+        recovery_rollouts=summary.recovery_rollouts,
+        rollout_budget=summary.rollout_budget,
+        max_discrepancies_used=summary.max_discrepancies_used,
+        branch_points_considered=summary.branch_points_considered,
+    )
+
+
 def reference_schedule_from_templates_formal(
-    templates_by_robot, config: ScientificConfig, *, scope: FormalScope = FORMAL_SCOPE_V1,
+    templates_by_robot, config: ScientificConfig, *, scope: FormalScope = ACTIVE_FORMAL_SCOPE,
     directions=((), (), (), ()), profile: SchedulerProfile | None = None,
 ) -> ScheduleResult:
     """Formal dispatch policy for operation fixtures; no parent-coverage claim."""
     scope.validate_implemented()
-    baseline = reference_schedule_from_templates_optimized(
-        templates_by_robot, config, directions=directions, profile=profile
-    )
-    result = _bounded_dispatch_recovery(
-        templates_by_robot, config, baseline,
-        state_budget=scope.deadlock_state_budget, profile=profile,
-    ) if baseline.status is ScheduleStatus.DEADLOCK else baseline
-    return replace(result, reference_policy_id=scope.reference_scheduler_policy_id,
-                   scope_id=scope.scope_id, scope_hash=scope.scope_hash,
-                   state_budget=scope.deadlock_state_budget)
+    if scope.deadlock_policy_id == FORMAL_BOUNDED_DISPATCH_POLICY_V1:
+        if scope.deadlock_state_budget is None:
+            raise ValueError("V1 bounded dispatch policy requires a state budget")
+        baseline = reference_schedule_from_templates_optimized(
+            templates_by_robot, config, directions=directions, profile=profile
+        )
+        result = _bounded_dispatch_recovery(
+            templates_by_robot, config, baseline,
+            state_budget=scope.deadlock_state_budget, profile=profile,
+        ) if baseline.status is ScheduleStatus.DEADLOCK else baseline
+        return replace(
+            result,
+            reference_policy_id=scope.reference_scheduler_policy_id,
+            scope_id=scope.scope_id,
+            scope_hash=scope.scope_hash,
+            state_budget=scope.deadlock_state_budget,
+        )
+    if scope.deadlock_policy_id == FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1:
+        if scope.deadlock_rollout_budget is None:
+            raise ValueError("V1.1 limited-discrepancy policy requires a rollout budget")
+        baseline_outcome = _optimized_dispatch_outcome(
+            templates_by_robot,
+            config,
+            directions=directions,
+            profile=profile,
+            collect_trace=True,
+        )
+        result = (
+            _limited_discrepancy_dispatch_recovery(
+                templates_by_robot,
+                config,
+                baseline_outcome,
+                rollout_budget=scope.deadlock_rollout_budget,
+                profile=profile,
+            )
+            if baseline_outcome.result.status is ScheduleStatus.DEADLOCK
+            else baseline_outcome.result
+        )
+        return replace(
+            result,
+            reference_policy_id=scope.reference_scheduler_policy_id,
+            scope_id=scope.scope_id,
+            scope_hash=scope.scope_hash,
+            rollout_budget=scope.deadlock_rollout_budget,
+        )
+    raise ValueError(f"unsupported formal deadlock policy: {scope.deadlock_policy_id}")
 
 
 def reference_schedule_formal(
     solution: CanonicalSolution, config: ScientificConfig, *,
-    scope: FormalScope = FORMAL_SCOPE_V1,
+    scope: FormalScope = ACTIVE_FORMAL_SCOPE,
     orientations: Mapping[int, Sequence[int]] | None = None,
     profile: SchedulerProfile | None = None,
 ) -> ScheduleResult:
     """The common formal evaluator. Development callbacks/X providers are absent."""
     scope.validate_implemented()
     if any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns):
-        result = _infeasible("FORMAL_SCOPE_V1: optional X_SPLIT is EXCLUDED")
+        result = _infeasible(f"{scope.scope_id}: optional X_SPLIT is EXCLUDED")
     else:
         def dispatch(templates, cfg, *, directions, profile):
             return reference_schedule_from_templates_formal(
@@ -1168,14 +1401,19 @@ def reference_schedule_formal(
         result = _reference_schedule_with(
             solution, config, dispatch, orientations=orientations, profile=profile
         )
-    return replace(result, reference_policy_id=scope.reference_scheduler_policy_id,
-                   scope_id=scope.scope_id, scope_hash=scope.scope_hash,
-                   state_budget=scope.deadlock_state_budget)
+    return replace(
+        result,
+        reference_policy_id=scope.reference_scheduler_policy_id,
+        scope_id=scope.scope_id,
+        scope_hash=scope.scope_hash,
+        state_budget=scope.deadlock_state_budget or 0,
+        rollout_budget=scope.deadlock_rollout_budget or 0,
+    )
 
 
 @dataclass(frozen=True)
 class FormalReferenceEvaluator:
-    scope: FormalScope = FORMAL_SCOPE_V1
+    scope: FormalScope = ACTIVE_FORMAL_SCOPE
     deadlock_observer: DeadlockObserver | None = None
 
     def __call__(self, solution, config, *, orientations=None):

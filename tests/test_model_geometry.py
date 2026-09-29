@@ -5,9 +5,17 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
     from dataclasses import FrozenInstanceError, replace
     import hashlib
     import pytest
-    from mrta_reference.model import FORMAL_SCOPE_V1, FormalScope, ScientificConfig, RunScientificIdentity
+    from mrta_reference.model import (
+        ACTIVE_FORMAL_SCOPE,
+        FORMAL_SCOPE_V1,
+        FORMAL_SCOPE_V1_1,
+        FormalScope,
+        ScientificConfig,
+        RunScientificIdentity,
+    )
     from mrta_reference.provenance import SourceProvenance
     scope = FORMAL_SCOPE_V1
+    assert scope.scope_hash == "8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9"
     assert scope.scope_hash == FormalScope().scope_hash
     assert scope.scope_hash == hashlib.sha256(scope.canonical_json.encode()).hexdigest()
     for change in (
@@ -22,6 +30,26 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
             mutated.validate_implemented()
     with pytest.raises(FrozenInstanceError):
         scope.deadlock_state_budget = 32
+    assert ACTIVE_FORMAL_SCOPE is FORMAL_SCOPE_V1_1
+    assert FORMAL_SCOPE_V1_1.scope_hash != FORMAL_SCOPE_V1.scope_hash
+    assert FORMAL_SCOPE_V1_1.deadlock_budget_unit == "COMPLETE_ALTERNATIVE_ROLLOUTS"
+    assert FORMAL_SCOPE_V1_1.deadlock_rollout_budget == 32
+    for field in (
+        "pattern_domain",
+        "optional_x_split_policy",
+        "y_split_rule_id",
+        "max_split_per_parent",
+        "terminal_policy",
+        "empty_route_policy",
+        "initial_deployment_policy",
+        "open_route_policy_id",
+        "objective_policy_id",
+        "certifier_policy_id",
+        "interference_policy_id",
+    ):
+        assert getattr(FORMAL_SCOPE_V1_1, field) == getattr(FORMAL_SCOPE_V1, field)
+    FORMAL_SCOPE_V1.validate_implemented()
+    FORMAL_SCOPE_V1_1.validate_implemented()
     first = RunScientificIdentity.from_scope(
         scope, ScientificConfig(),
         SourceProvenance("luckyfishanddog/DRL", "commit-a", "tree-a", False, True),

@@ -34,9 +34,12 @@ from .model import (
     WeldingBlock,
     FormalScope,
     FORMAL_SCOPE_V1,
+    FORMAL_SCOPE_V1_1,
+    ACTIVE_FORMAL_SCOPE,
     RunScientificIdentity,
     DEVELOPMENT_NO_REPAIR_V1,
     FORMAL_BOUNDED_DISPATCH_POLICY_V1,
+    FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
 )
 from .oracle import (
     TinyOracleResult,
@@ -75,11 +78,13 @@ from .scheduler import (
 )
 
 __all__ = [
-    "FormalScope", "FORMAL_SCOPE_V1", "RunScientificIdentity",
+    "FormalScope", "FORMAL_SCOPE_V1", "FORMAL_SCOPE_V1_1",
+    "ACTIVE_FORMAL_SCOPE", "RunScientificIdentity",
     "REPOSITORY_ID", "SOURCE_PROVENANCE_POLICY_V1", "SourceProvenance",
     "SourceProvenanceError", "canonicalize_repository_url",
     "compute_source_tree_hash", "resolve_source_provenance",
     "DEVELOPMENT_NO_REPAIR_V1", "FORMAL_BOUNDED_DISPATCH_POLICY_V1",
+    "FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1",
     "reference_schedule_formal", "reference_schedule_from_templates_formal",
     "FormalReferenceEvaluator",
     "CertificationReport",

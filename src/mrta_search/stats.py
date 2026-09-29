@@ -201,6 +201,12 @@ class SearchStats:
                 "scope_id": schedule.scope_id, "scope_hash": schedule.scope_hash,
                 "reference_policy_id": schedule.reference_policy_id,
                 "expanded_states": schedule.expanded_states,
+                "state_budget": schedule.state_budget,
+                "recovery_rollouts": schedule.recovery_rollouts,
+                "rollout_budget": schedule.rollout_budget,
+                "max_discrepancies_used": schedule.max_discrepancies_used,
+                "branch_points_considered": schedule.branch_points_considered,
+                "frontier_exhausted": schedule.frontier_exhausted,
                 "baseline_deadlock": schedule.baseline_deadlock,
             })
         if initialization:

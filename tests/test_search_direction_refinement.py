@@ -120,21 +120,22 @@ def test_search_iteration_total_reference_cap_includes_refinement_and_replays() 
 
 def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
     from dataclasses import replace
-    from mrta_reference.model import FORMAL_SCOPE_V1
+    from mrta_reference.model import FORMAL_SCOPE_V1_1
     from mrta_reference.scheduler import reference_schedule_formal
+    scope = FORMAL_SCOPE_V1_1
     config = SearchConfig(max_iterations=4)
     results = []
     for algorithm_label, seed in (("SA-OI-ALNS", 19), ("unrelated-caller", 99), ("replay", 19)):
         result = run_bounded_sa_oi(Q3, FAST, config, seed=seed,
-                                  scope=FORMAL_SCOPE_V1, source_commit="test-commit",
+                                  scope=scope, source_commit="test-commit",
                                   allow_unverified_source=True)
         results.append(result)
         assert result.final_certification.certified
         assert result.stats.direction_refinement_calls > 0
-        assert result.stats.scientific_identity.scope_hash == FORMAL_SCOPE_V1.scope_hash
+        assert result.stats.scientific_identity.scope_hash == scope.scope_hash
         assert {row["initialization"] for row in result.stats.reference_records} == {True, False}
-        assert all(row["scope_hash"] == FORMAL_SCOPE_V1.scope_hash
-                   and row["reference_policy_id"] == FORMAL_SCOPE_V1.reference_scheduler_policy_id
+        assert all(row["scope_hash"] == scope.scope_hash
+                   and row["reference_policy_id"] == scope.reference_scheduler_policy_id
                    for row in result.stats.reference_records)
     first, _, replay = results
     assert first.best_solution.canonical_json == replay.best_solution.canonical_json
@@ -146,46 +147,47 @@ def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
     assert first.stats.final_operator_weights == replay.stats.final_operator_weights
     fixed = first.initialization.solution
     directions = dict(enumerate(first.initialization.directions))
-    expected = reference_schedule_formal(fixed, FAST, orientations=directions)
+    expected = reference_schedule_formal(fixed, FAST, scope=scope, orientations=directions)
     for other in reversed(results):
-        reference_schedule_formal(other.best_solution, FAST, orientations=dict(enumerate(other.best_directions)))
-        actual = reference_schedule_formal(replace(fixed, revision=99), FAST,
+        reference_schedule_formal(other.best_solution, FAST, scope=scope,
+                                  orientations=dict(enumerate(other.best_directions)))
+        actual = reference_schedule_formal(replace(fixed, revision=99), FAST, scope=scope,
                                             orientations=dict(reversed(tuple(directions.items()))))
         assert actual == expected
     with pytest.raises(ValueError, match="matching formal"):
-        run_bounded_sa_oi(Q3, FAST, config, scope=FORMAL_SCOPE_V1, source_commit="test",
+        run_bounded_sa_oi(Q3, FAST, config, scope=scope, source_commit="test",
                           reference_evaluator=reference_schedule)
 
 
 def test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnostics(monkeypatch):
     from mrta_reference import certifier
-    from mrta_reference.scope import FORMAL_SCOPE_V1
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1
     from mrta_reference.scheduler import FormalReferenceEvaluator
     baseline = run_bounded_sa_oi(Q3, FAST, SearchConfig(max_iterations=0),
-                                 scope=FORMAL_SCOPE_V1, source_commit="test",
+                                 scope=FORMAL_SCOPE_V1_1, source_commit="test",
                                  allow_unverified_source=True)
     monkeypatch.setattr(certifier, "certify_schedule", lambda *a, **k:
                         certifier.CertificationReport(False, ("forced formal failure",), None))
-    stats = SearchStats(FORMAL_SCOPE_V1.scope_id, 0)
+    stats = SearchStats(FORMAL_SCOPE_V1_1.scope_id, 0)
     result = refine_directions_bounded(
         baseline.best_solution, baseline.best_directions, baseline.best_schedule, FAST,
-        max_calls=1, reference_evaluator=FormalReferenceEvaluator(), scope=FORMAL_SCOPE_V1, stats=stats,
+        max_calls=1, reference_evaluator=FormalReferenceEvaluator(), scope=FORMAL_SCOPE_V1_1, stats=stats,
     )
     assert result.statuses == (ScheduleStatus.NUMERIC_FAILURE,)
     assert stats.nref == stats.n_numeric_failure == 1 and stats.n_feasible == 0
-    assert stats.reference_records[0]["scope_hash"] == FORMAL_SCOPE_V1.scope_hash
+    assert stats.reference_records[0]["scope_hash"] == FORMAL_SCOPE_V1_1.scope_hash
     assert "forced formal failure" in stats.reference_records[0]["diagnostics"]
 
 
 def test_formal_result_rejects_unverified_source_provenance():
     from mrta_reference.provenance import SourceProvenanceError
-    from mrta_reference.scope import FORMAL_SCOPE_V1
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1
     with pytest.raises(SourceProvenanceError, match="verified"):
         run_bounded_sa_oi(
             Q3,
             FAST,
             SearchConfig(max_iterations=0),
-            scope=FORMAL_SCOPE_V1,
+            scope=FORMAL_SCOPE_V1_1,
             source_commit="UNVERIFIED_TEST_SOURCE",
             allow_unverified_source=True,
             formal_result=True,
@@ -199,12 +201,12 @@ def test_formal_result_rejects_unverified_source_provenance():
 ))
 def test_formal_q1_q6_regression(name, expected, monkeypatch):
     from pathlib import Path
-    from mrta_reference.scope import FORMAL_SCOPE_V1
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
     from profile_scheduler import quality_fixture
     parents, seed, iterations = quality_fixture(name)
     result = run_bounded_sa_oi(parents, FAST, SearchConfig(max_iterations=iterations),
-                               seed=seed, scope=FORMAL_SCOPE_V1, source_commit="test",
+                               seed=seed, scope=FORMAL_SCOPE_V1_1, source_commit="test",
                                allow_unverified_source=True)
     assert result.final_certification.certified
     assert result.best_schedule.cmax == pytest.approx(expected)

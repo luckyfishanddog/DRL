@@ -53,3 +53,12 @@ def test_stats_status_invariant_percentiles_moves_and_anytime_completion_semanti
     assert checkpoints[1.0]["cmax"] == 12.0
     assert checkpoints[5.0]["cmax"] == 10.0
     assert stats.valid_by_move[MoveType.SWAP.value] == 1
+
+
+def test_anytime_checkpoint_never_backfills_an_improvement_completed_after_deadline() -> None:
+    stats = SearchStats("FORMAL_SCOPE_V1_1", 0)
+    stats.record_best(4.8, 12.0)
+    stats.record_best(7.0, 9.0)
+    checkpoints = stats.anytime((5.0, 7.0))
+    assert checkpoints[5.0] == {"cmax": 12.0, "reason": None}
+    assert checkpoints[7.0] == {"cmax": 9.0, "reason": None}

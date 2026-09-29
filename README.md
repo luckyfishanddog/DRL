@@ -1,6 +1,6 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1 = FROZEN`; the Pre-Phase3 provenance and F4 release audit has passed. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1_1 = ACTIVE`; V1 remains a reproducible historical scope superseded before formal experiments. This research is isolated from the repository's legacy V9/V10/PPO experiments.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
@@ -29,10 +29,10 @@ Implemented:
 - one unified complete-candidate pipeline for atomic and repaired LNS solutions;
 - bounded certified schedule-aware single-flip direction refinement inside the total reference budget;
 - makespan-first C0-C4 screening, Kdp direction rerank, Kref reference evaluation, and seeded SA acceptance;
-- split initialization/search scheduler timings, wall-clock overshoot records, anytime checkpoints, and micro gap decomposition;
+- split initialization/search scheduler timings, wall-clock overshoot records, deadline-safe anytime checkpoints, and micro gap decomposition;
 - adversarial and regression tests.
 
-Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` and X_SPLIT search remain inactive. Formal evaluation enables bounded deterministic DEADLOCK recovery with 16 states. The implemented ALNS layer is the minimal development backbone, not a formal frozen algorithm or tuned benchmark.
+Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` and X_SPLIT search remain inactive. Formal evaluation enables deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS layer is the minimal development backbone, not a formal frozen algorithm or tuned benchmark.
 
 ## Development and formal scope
 
@@ -40,11 +40,13 @@ Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WA
 
 Development optimum notation is `Cmax_OPT_Y_CURRENT`, qualified by the current dispatch+ESS enumeration domain. It is not final full-problem `Cmax_OPT`. A limit-hit result is not optimal. Tests and certification of returned schedules do not establish general continuous-time optimality; the plan's `EXACT_SCHEDULER_VALIDITY_GATE` requires a dominance proof or explicitly limited independent validation before final exact claims.
 
-`FORMAL_SCOPE_V1 = FROZEN`: F1 excludes optional X_SPLIT; F2/F3 use the explicit task-layer `TASK_HORIZON_RELEASE_V1` assumption (empty robots undeployed; active robots initially legal; occupancy ends after final POST); F4 uses `FORMAL_BOUNDED_DISPATCH_POLICY_V1`, baseline-first deterministic DFS with 16 popped-prefix states only after DEADLOCK. Bx is a spatial/load prior, not a split domain.
+`FORMAL_SCOPE_V1` is frozen historical evidence. Its F4 uses 16 popped-prefix states and is depth-censored on large schedules. Its identity and evaluator remain replayable.
 
-See [scope contract](docs/FORMAL_SCOPE_V1.md) and [gate evidence](docs/FORMAL_SCOPE_GATE_V1_20260928.md). Scope hash: `8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9`.
+`FORMAL_SCOPE_V1_1 = ACTIVE`: F1 still excludes optional X_SPLIT; F2/F3 retain `TASK_HORIZON_RELEASE_V1`; only F4 changes to `FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1`. Baseline FEASIBLE output is untouched. Baseline DEADLOCK invokes at most 32 deterministic complete alternative rollouts, each ending in FEASIBLE or DEADLOCK regardless of template depth. Bx remains a spatial/load prior, not a split domain.
 
-The Pre-Phase3 release audit retained budget 16 under the frozen local-plateau rule. In 31 unique development baseline-DEADLOCK states (one N=50 and 30 N=100), budgets 16 through 1024 recovered none; budget 2048 recovered one certified handover-heavy/N100 state. This validates deterministic monotonic behavior and also confirms that bounded recovery is intentionally weak on large states. See [release audit](docs/PRE_PHASE3_RELEASE_AUDIT_20260929.md) and the replayable [development corpus](data/development/f4_deadlock_stress_corpus.json).
+V1 hash: `8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9`. Active V1.1 hash: `5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc`. See the [historical scope contract](docs/FORMAL_SCOPE_V1.md), [V1 gate evidence](docs/FORMAL_SCOPE_GATE_V1_20260928.md), and [V1.1 F4 closure](docs/FORMAL_SCOPE_V1_1_F4_CLOSURE_20260929.md).
+
+The existing 31-state development corpus was replayed at B=1/2/4/8/16/32 complete rollouts. Certified recoveries were 0/0/0/0/1/9. The known N=100 case that first required 2048 prefix states under V1 recovered in 14 complete rollouts. Budget 32 was selected because the 16→32 curve still changed materially; remaining failures stay DEADLOCK. The measured recovery p50/p95 at B=32 was 13.581/37.369 s, so the evaluator cost is an explicit limitation rather than a hidden search advantage. See the replayable [development corpus](data/development/f4_deadlock_stress_corpus.json).
 
 This is task-level weld allocation, sequencing, direction, and theoretical coordination. Deployment/retract/parking transitions require lower-level validation; no full physical parking or 3D collision-free execution claim is made. `mrta_exact` remains development-only. Formal results must be reevaluated and certified; development results are not relabelled.
 
@@ -83,6 +85,7 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_reference/solution.py`: canonicalization and official metrics.
 - `src/mrta_reference/candidate.py`: complete atomic candidate moves and deterministic replay/deduplication.
 - `src/mrta_reference/scheduler.py`: legacy/optimized reference scheduling, development profiling, WAIT insertion, and deadlock diagnostics/hook.
+- `src/mrta_reference/dispatch_recovery.py`: immutable dispatch snapshots, deterministic branch traces, stable state identity, and complete-rollout recovery frontier.
 - `src/mrta_reference/certifier.py`: independent reconstruction and certification.
 - `src/mrta_reference/oracle.py`: independent tiny exhaustive dispatch oracle and reference comparison.
 - `src/mrta_exact/lower_bounds.py`: analytical LB0.
@@ -102,15 +105,15 @@ Run the repository and DRL suites together from the repository root:
 ## Formal API
 
 ```python
-from mrta_reference import FORMAL_SCOPE_V1, reference_schedule_formal, certify_schedule
+from mrta_reference import FORMAL_SCOPE_V1_1, reference_schedule_formal, certify_schedule
 from mrta_search import run_bounded_sa_oi
 
 schedule = reference_schedule_formal(solution, config, orientations=directions)
-certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1)
+certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1_1)
 # A publishable FORMAL_RESULT rechecks a clean standalone
 # luckyfishanddog/DRL worktree; an enclosing repository HEAD is rejected.
 result = run_bounded_sa_oi(
-    parents, config, scope=FORMAL_SCOPE_V1, formal_result=True
+    parents, config, scope=FORMAL_SCOPE_V1_1, formal_result=True
 )
 ```
 
@@ -119,12 +122,13 @@ Explicit scope binds initialization, C4, direction refinement, and final certifi
 Development gate commands (repository root; stdout JSON lines, no dataset):
 
 ```powershell
-& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-gate calibration
-& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-gate quality
-& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-gate smoke
+& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-v1-1 replay
+& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-v1-1 calibration
+& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-v1-1 quality
+& 'D:\pybullet_test\.venv\Scripts\python.exe' DRL/scripts/profile_scheduler.py --formal-scope-v1-1 smoke
 ```
 
-The fixed recovery budget does not guarantee recovery: more than 15 non-WAIT templates cannot reach a complete leaf in the 16-state DFS. DEADLOCK remains a policy outcome, not mathematical infeasibility. Tests, E1–E4, Q1–Q6 and the family smoke cover the published policy.
+The fixed recovery budget does not guarantee recovery. Every attempted V1.1 alternative is a complete continuation, so template depth cannot prevent it from reaching FEASIBLE or DEADLOCK; the bounded set of alternatives can still miss a feasible dispatch. DEADLOCK remains a policy outcome, not mathematical infeasibility. Tests, E1–E4, Q1–Q6 and the family smoke cover the active policy.
 
 ## Reproducibility identity
 
