@@ -126,7 +126,8 @@ def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
     results = []
     for algorithm_label, seed in (("SA-OI-ALNS", 19), ("unrelated-caller", 99), ("replay", 19)):
         result = run_bounded_sa_oi(Q3, FAST, config, seed=seed,
-                                  scope=FORMAL_SCOPE_V1, source_commit="test-commit")
+                                  scope=FORMAL_SCOPE_V1, source_commit="test-commit",
+                                  allow_unverified_source=True)
         results.append(result)
         assert result.final_certification.certified
         assert result.stats.direction_refinement_calls > 0
@@ -161,7 +162,8 @@ def test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnos
     from mrta_reference.scope import FORMAL_SCOPE_V1
     from mrta_reference.scheduler import FormalReferenceEvaluator
     baseline = run_bounded_sa_oi(Q3, FAST, SearchConfig(max_iterations=0),
-                                 scope=FORMAL_SCOPE_V1, source_commit="test")
+                                 scope=FORMAL_SCOPE_V1, source_commit="test",
+                                 allow_unverified_source=True)
     monkeypatch.setattr(certifier, "certify_schedule", lambda *a, **k:
                         certifier.CertificationReport(False, ("forced formal failure",), None))
     stats = SearchStats(FORMAL_SCOPE_V1.scope_id, 0)
@@ -173,6 +175,21 @@ def test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnos
     assert stats.nref == stats.n_numeric_failure == 1 and stats.n_feasible == 0
     assert stats.reference_records[0]["scope_hash"] == FORMAL_SCOPE_V1.scope_hash
     assert "forced formal failure" in stats.reference_records[0]["diagnostics"]
+
+
+def test_formal_result_rejects_unverified_source_provenance():
+    from mrta_reference.provenance import SourceProvenanceError
+    from mrta_reference.scope import FORMAL_SCOPE_V1
+    with pytest.raises(SourceProvenanceError, match="verified"):
+        run_bounded_sa_oi(
+            Q3,
+            FAST,
+            SearchConfig(max_iterations=0),
+            scope=FORMAL_SCOPE_V1,
+            source_commit="UNVERIFIED_TEST_SOURCE",
+            allow_unverified_source=True,
+            formal_result=True,
+        )
 
 
 @pytest.mark.parametrize("name,expected", (
@@ -187,7 +204,8 @@ def test_formal_q1_q6_regression(name, expected, monkeypatch):
     from profile_scheduler import quality_fixture
     parents, seed, iterations = quality_fixture(name)
     result = run_bounded_sa_oi(parents, FAST, SearchConfig(max_iterations=iterations),
-                               seed=seed, scope=FORMAL_SCOPE_V1, source_commit="test")
+                               seed=seed, scope=FORMAL_SCOPE_V1, source_commit="test",
+                               allow_unverified_source=True)
     assert result.final_certification.certified
     assert result.best_schedule.cmax == pytest.approx(expected)
     assert result.best_schedule.cmax < result.initialization.schedule.cmax

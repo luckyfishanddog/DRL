@@ -4,6 +4,8 @@ FORMAL_SCOPE_GATE_STATUS = PASS
 FORMAL_SCOPE_V1 = FROZEN  
 唯一下一阶段：Phase 3 — Adapted HGA / Adapted WAG common-model。当前轮次到此为止，没有实现 HGA/WAG。
 
+> 2026-09-29 后续审计修复了本报告当时把外层 Git HEAD 写入 `source_commit` 的 provenance 问题，并完成 F4 large-state stress；历史 gate 测量保持不改写，release 结论见 [PRE_PHASE3_RELEASE_AUDIT_20260929](PRE_PHASE3_RELEASE_AUDIT_20260929.md)。
+
 ## A. 真实仓库与 baseline
 
 HEAD：`0935ad8a723057084be190e31c6be4733ce3cb62`。已执行 `git status --short`、`git rev-parse HEAD`；DRL 整体为未跟踪目录，不是独立 Git 仓库。外层已有大量用户暂存删除、未暂存修改、未跟踪代码；未执行 reset/checkout/clean，也未提交。source_commit 是当前 HEAD，不声称包含这些未提交实现；运行元数据另记 source_worktree_dirty=true。

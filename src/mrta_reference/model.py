@@ -13,6 +13,7 @@ from .scope import (
     FormalScope, FORMAL_SCOPE_V1, RunScientificIdentity,
     DEVELOPMENT_NO_REPAIR_V1, FORMAL_BOUNDED_DISPATCH_POLICY_V1,
 )
+from .provenance import SourceProvenance
 
 
 class Rail(str, Enum):

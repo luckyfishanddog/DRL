@@ -1,6 +1,6 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1 = FROZEN`. This research is isolated from the repository's legacy V9/V10/PPO experiments.
+`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1 = FROZEN`; the Pre-Phase3 provenance and F4 release audit has passed. This research is isolated from the repository's legacy V9/V10/PPO experiments.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
@@ -44,6 +44,8 @@ Development optimum notation is `Cmax_OPT_Y_CURRENT`, qualified by the current d
 
 See [scope contract](docs/FORMAL_SCOPE_V1.md) and [gate evidence](docs/FORMAL_SCOPE_GATE_V1_20260928.md). Scope hash: `8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9`.
 
+The Pre-Phase3 release audit retained budget 16 under the frozen local-plateau rule. In 31 unique development baseline-DEADLOCK states (one N=50 and 30 N=100), budgets 16 through 1024 recovered none; budget 2048 recovered one certified handover-heavy/N100 state. This validates deterministic monotonic behavior and also confirms that bounded recovery is intentionally weak on large states. See [release audit](docs/PRE_PHASE3_RELEASE_AUDIT_20260929.md) and the replayable [development corpus](data/development/f4_deadlock_stress_corpus.json).
+
 This is task-level weld allocation, sequencing, direction, and theoretical coordination. Deployment/retract/parking transitions require lower-level validation; no full physical parking or 3D collision-free execution claim is made. `mrta_exact` remains development-only. Formal results must be reevaluated and certified; development results are not relabelled.
 
 Next: Phase 3 — Adapted HGA / Adapted WAG common-model, beginning with paper-aligned sanity checks. Adapted HGA/WAG, LB_LP, MLP/GAT, ranker dataset, formal VALIDATION/ID_TEST/OOD, and final exact validation remain unfinished. Paper experiments are not complete.
@@ -75,6 +77,7 @@ Run the repository and DRL suites together from the repository root:
 ## Module overview
 
 - `src/mrta_reference/scope.py`: unique immutable formal scope, canonical scope hash, and RunScientificIdentity.
+- `src/mrta_reference/provenance.py`: fail-closed DRL root/remote/HEAD verification and deterministic scientific source-tree hash.
 - `src/mrta_reference/model.py`: dataclasses, enums, scientific configuration, and config hash.
 - `src/mrta_reference/geometry.py`: eligibility, split geometry, frozen handover centers, direction DP, and analytic conflict geometry.
 - `src/mrta_reference/solution.py`: canonicalization and official metrics.
@@ -104,11 +107,14 @@ from mrta_search import run_bounded_sa_oi
 
 schedule = reference_schedule_formal(solution, config, orientations=directions)
 certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1)
-result = run_bounded_sa_oi(parents, config, scope=FORMAL_SCOPE_V1,
-                          source_commit=actual_git_head)
+# A publishable FORMAL_RESULT rechecks a clean standalone
+# luckyfishanddog/DRL worktree; an enclosing repository HEAD is rejected.
+result = run_bounded_sa_oi(
+    parents, config, scope=FORMAL_SCOPE_V1, formal_result=True
+)
 ```
 
-Explicit scope binds initialization, C4, direction refinement, and final certification to the same evaluator; a development callback is rejected in a formal run. Historical `reference_schedule`/slow/optimized retain `DEVELOPMENT_NO_REPAIR_V1`. `RunScientificIdentity` is available on `result.stats.scientific_identity`.
+Explicit scope binds initialization, C4, direction refinement, and final certification to the same evaluator; a development callback is rejected in a formal run. Historical `reference_schedule`/slow/optimized retain `DEVELOPMENT_NO_REPAIR_V1`. `RunScientificIdentity` is available on `result.stats.scientific_identity` and contains scope/config identity plus repository id, commit, source-tree hash, dirty state, and commit verification. Nested-workspace smoke must explicitly opt into unverified provenance and remains `development_only=true`; it cannot emit a formal result.
 
 Development gate commands (repository root; stdout JSON lines, no dataset):
 

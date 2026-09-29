@@ -38,6 +38,10 @@ DeadlockRepair = Callable[
     ],
     ScheduleResult | None,
 ]
+DeadlockObserver = Callable[
+    [CanonicalSolution, ScientificConfig, tuple[tuple[int, ...], ...], ScheduleResult],
+    None,
+]
 
 
 @dataclass
@@ -1172,9 +1176,23 @@ def reference_schedule_formal(
 @dataclass(frozen=True)
 class FormalReferenceEvaluator:
     scope: FormalScope = FORMAL_SCOPE_V1
+    deadlock_observer: DeadlockObserver | None = None
 
     def __call__(self, solution, config, *, orientations=None):
-        return reference_schedule_formal(solution, config, scope=self.scope, orientations=orientations)
+        result = reference_schedule_formal(
+            solution, config, scope=self.scope, orientations=orientations
+        )
+        if self.deadlock_observer is not None and result.baseline_deadlock:
+            explicit = tuple(tuple(values) for values in result.directions)
+            baseline = reference_schedule_optimized(
+                solution,
+                config,
+                orientations={robot: explicit[robot] for robot in range(4)},
+            )
+            if baseline.status is not ScheduleStatus.DEADLOCK:
+                raise RuntimeError("formal baseline_deadlock provenance could not be replayed")
+            self.deadlock_observer(solution, config, explicit, baseline)
+        return result
 
 
 def resolve_reference_evaluator(scope: FormalScope | None, evaluator=None):
