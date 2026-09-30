@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 import hashlib
 import json
+import math
 import time
 from typing import Any, Mapping, Sequence
 
@@ -19,6 +20,8 @@ from mrta_reference.model import (
 )
 from mrta_reference.scheduler import FormalReferenceEvaluator
 from mrta_reference.solution import official_metrics
+from mrta_reference.geometry import oriented_endpoints
+from mrta_reference.solution import block_map
 from mrta_search.direction import (
     ConstrainedDirectionResult,
     DirectionStatus,
@@ -71,6 +74,20 @@ class BaselineAccounting:
     construction_time: float = 0.0
     factorial_local_search_time: float = 0.0
     population_management_time: float = 0.0
+    vnd_pass_cap_hits: int = 0
+    vnd_candidate_cap_hits: int = 0
+    initialization_reference_limit_hits: int = 0
+    population_survival_events: int = 0
+    optional_y_mutations_attempted: int = 0
+    optional_y_mutations_accepted: int = 0
+    factorial_window_cap_hits: int = 0
+    factorial_call_cap_hits: int = 0
+    wag_variant_cap_hits: int = 0
+    route_combination_cap_hits: int = 0
+    move_calls: int = 0
+    swap_calls: int = 0
+    lns_calls: int = 0
+    optional_y_toggle_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +129,9 @@ class BaselineResult:
     scope_id: str
     scope_hash: str
     method_config_hash: str
+    termination_reason: str
+    initial_candidate: EvaluatedCandidate | None
+    initial_reference_calls: int
 
     @property
     def final_certified(self) -> bool:
@@ -122,6 +142,66 @@ def canonical_config_hash(config: Any) -> str:
     payload = asdict(config)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def solution_telemetry(
+    solution: CanonicalSolution,
+    directions: DirectionVectors,
+    config: ScientificConfig,
+) -> dict[str, Any]:
+    """Return method-independent structural telemetry for one certified seed."""
+    blocks = block_map(solution, config)
+    process_loads = []
+    route_empty = []
+    route_hashes = []
+    for route in solution.routes:
+        process_loads.append(
+            sum(config.process_time(blocks[item].length) for item in route.block_ids)
+        )
+        empty = 0.0
+        for index in range(1, len(route.block_ids)):
+            previous = blocks[route.block_ids[index - 1]]
+            current = blocks[route.block_ids[index]]
+            _, previous_end = oriented_endpoints(
+                previous, directions[route.robot_id][index - 1]
+            )
+            current_start, _ = oriented_endpoints(
+                current, directions[route.robot_id][index]
+            )
+            empty += math.dist(previous_end, current_start) / config.empty_speed
+        route_empty.append(empty)
+        encoded = json.dumps(
+            list(route.block_ids), separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        route_hashes.append(hashlib.sha256(encoded).hexdigest())
+    return {
+        "initial_solution_hash": solution.canonical_hash,
+        "initial_pattern_count": len(solution.patterns),
+        "initial_optional_split_count": sum(
+            pattern.kind.value != "WHOLE" and not pattern.mandatory
+            for pattern in solution.patterns
+        ),
+        "initial_robot_block_counts": [
+            len(route.block_ids) for route in solution.routes
+        ],
+        "initial_robot_process_loads": process_loads,
+        "initial_route_proxy_costs": route_empty,
+        "initial_route_empty_travel_proxy": route_empty,
+        "initial_total_empty_travel_proxy": sum(route_empty),
+        "initial_route_hashes": route_hashes,
+        "initial_routes": [list(route.block_ids) for route in solution.routes],
+        "initial_directions": [list(vector) for vector in directions],
+        "initial_patterns": [
+            {
+                "parent_id": pattern.parent_id,
+                "kind": pattern.kind.value,
+                "t": pattern.t,
+                "point_id": pattern.point_id,
+                "mandatory": pattern.mandatory,
+            }
+            for pattern in solution.patterns
+        ],
+    }
 
 
 class CommonBaselineEvaluator:
@@ -164,6 +244,30 @@ class CommonBaselineEvaluator:
     def reject_construction(self, message: str) -> None:
         self.accounting.construction_rejected += 1
         self.failure_diagnostics.append(message)
+
+    def inject_certified(
+        self, candidate: EvaluatedCandidate, *, source: str
+    ) -> EvaluatedCandidate:
+        """Install an externally certified seed without charging evaluator calls."""
+        if (
+            candidate.status is not BaselineStatus.COMPLETED
+            or candidate.directions is None
+            or candidate.schedule is None
+            or candidate.certification is None
+            or not candidate.certification.certified
+            or candidate.metrics is None
+        ):
+            raise ValueError("common seed must be a certified completed candidate")
+        if candidate.solution.parents != self.parents:
+            raise ValueError("common seed parents do not match evaluator instance")
+        injected = replace(
+            candidate,
+            source=source,
+            completed_at=self.elapsed,
+            diagnostics=(),
+        )
+        self._record_best(injected)
+        return injected
 
     def _record_best(self, candidate: EvaluatedCandidate) -> None:
         if candidate.metrics is None:
@@ -337,6 +441,9 @@ class CommonBaselineEvaluator:
         method_config_hash: str,
         iterations: int,
         initialization_time: float,
+        termination_reason: str = "COMPLETED_OTHER",
+        initial_candidate: EvaluatedCandidate | None = None,
+        initial_reference_calls: int = 0,
         diagnostics: Sequence[str] = (),
     ) -> BaselineResult:
         runtime = self.elapsed
@@ -374,5 +481,7 @@ class CommonBaselineEvaluator:
             scope_id=self.scope.scope_id,
             scope_hash=self.scope.scope_hash,
             method_config_hash=method_config_hash,
+            termination_reason=termination_reason,
+            initial_candidate=initial_candidate,
+            initial_reference_calls=initial_reference_calls,
         )
-

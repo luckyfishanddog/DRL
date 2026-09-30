@@ -12,6 +12,7 @@ from mrta_search.direction import ConstrainedDirectionResult, DirectionStatus, o
 from mrta_search.neighborhood import ScreenedCandidate
 from mrta_search.pipeline import DirectionEvaluatedCandidate, SearchConfig, SearchStatus, evaluate_iteration, micro_gap_decomposition, rerank_c3, run_bounded_sa_oi, sa_accept
 from mrta_search.stats import SearchStats
+from scripts.run_phase3_baseline_smoke import phase3_alns_config
 
 
 FAST = ScientificConfig(weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
@@ -28,6 +29,25 @@ def _base():
         {2: ("a::whole", "b::whole"), 3: ("c::whole", "d::whole")},
         FAST,
     )
+
+
+def test_phase3_comparison_config_overrides_legacy_iteration_cap():
+    assert SearchConfig().max_iterations == 100
+    comparison = phase3_alns_config(30.0)
+    assert comparison.time_limit == 30.0
+    assert comparison.max_iterations >= 100000
+    assert comparison.checkpoints == (5.0, 30.0, 60.0)
+
+
+def test_explicit_iteration_safety_cap_is_reported():
+    result = run_bounded_sa_oi(
+        _base().parents,
+        FAST,
+        SearchConfig(max_iterations=0, time_limit=30.0),
+        seed=20260929,
+    )
+    assert result.status is SearchStatus.COMPLETED
+    assert result.termination_reason == "ITERATION_LIMIT"
 
 
 def test_c3_exact_direction_rerank_changes_kref_shortlist() -> None:

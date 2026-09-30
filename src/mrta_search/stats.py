@@ -17,10 +17,11 @@ ACTIVE_MOVE_TYPES = (
     MoveType.SPLIT_DEACTIVATE,
     MoveType.SPLIT_POINT_SWITCH,
 )
+TRACKED_MOVE_TYPES = ACTIVE_MOVE_TYPES + (MoveType.TWO_OPT_STAR,)
 
 
 def _move_counter() -> dict[str, int]:
-    return {move.value: 0 for move in ACTIVE_MOVE_TYPES}
+    return {move.value: 0 for move in TRACKED_MOVE_TYPES}
 
 
 def _family_counter() -> dict[str, int]:

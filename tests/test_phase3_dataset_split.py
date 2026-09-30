@@ -12,7 +12,9 @@ from mrta_data.phase3_split import (
     ROLE_TRAIN,
     ROLE_VALIDATION,
     build_phase3_split_manifest,
+    build_phase3_diagnostic_set,
     assert_solver_access_allowed,
+    validate_phase3_diagnostic_set,
     validate_phase3_split_manifest,
 )
 
@@ -100,3 +102,23 @@ def test_id_test_solver_access_is_rejected_before_workbook_loading():
     with pytest.raises(PermissionError, match="solver access forbidden"):
         assert_solver_access_allowed(payload, (id_test,))
 
+
+def test_phase3_diagnostic_set_is_solver_independent_deterministic_and_consumed_only():
+    dataset = json.loads(
+        (ROOT / "data/manifests/PPO_DATASET_MANIFEST_V1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    split = _build()
+    first = build_phase3_diagnostic_set(dataset, split)
+    second = build_phase3_diagnostic_set(dataset, split)
+    assert first == second
+    validate_phase3_diagnostic_set(first, split)
+    assert len(first["instances"]) == 6
+    assert len({item["relative_path"] for item in first["instances"]}) == 6
+    assert {item["phase3_role"] for item in first["instances"]} == {
+        ROLE_DEVELOPMENT
+    }
+    assert [item["tier"] for item in first["instances"]].count("small") == 2
+    assert [item["tier"] for item in first["instances"]].count("medium") == 2
+    assert [item["tier"] for item in first["instances"]].count("large") == 2

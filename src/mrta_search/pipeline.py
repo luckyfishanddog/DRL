@@ -16,6 +16,7 @@ from mrta_reference.model import (
     CanonicalSolution,
     OfficialMetrics,
     ParentWeld,
+    MoveType,
     ScheduleResult,
     ScheduleStatus,
     ScientificConfig,
@@ -40,6 +41,7 @@ from .direction import (
 from .initialization import (
     InitializationResult,
     InitializationStatus,
+    InitializationStrategy,
     build_initial_solution,
 )
 from .lns import (
@@ -60,7 +62,7 @@ from .neighborhood import (
     generate_raw_attempts,
     screen_raw_attempts,
 )
-from .stats import SearchStats
+from .stats import ACTIVE_MOVE_TYPES, SearchStats
 
 
 REFERENCE_POLICY_ID = DEVELOPMENT_NO_REPAIR_V1
@@ -97,14 +99,17 @@ class SearchConfig:
     max_iterations: int = 100
     time_limit: float | None = None
     checkpoints: tuple[float, ...] = (1.0, 5.0, 30.0)
+    enable_two_opt_star: bool = False
 
     def __post_init__(self) -> None:
         if not (1 <= self.kref <= self.kdp <= self.m):
             raise ValueError("require 1 <= Kref <= Kdp <= M")
         if self.insertion_limit < 2:
             raise ValueError("I_init must be at least 2")
-        if not (1 <= self.construction_budget <= 4):
-            raise ValueError("B_init_pool must be between 1 and 4")
+        if not (1 <= self.construction_budget <= len(InitializationStrategy)):
+            raise ValueError(
+                f"B_init_pool must be between 1 and {len(InitializationStrategy)}"
+            )
         if not (1 <= self.kinit_ref <= self.construction_budget):
             raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
         if self.feasibility_bootstrap_budget not in (0, 1):
@@ -192,6 +197,7 @@ class SearchResult:
     stats: SearchStats
     anytime: dict[float, dict[str, object]]
     runtime: float
+    termination_reason: str
 
 
 @dataclass(frozen=True)
@@ -323,6 +329,11 @@ def evaluate_iteration(
         m=atomic_budget,
         seed=seed,
         stats=stats,
+        moves=(
+            ACTIVE_MOVE_TYPES + (MoveType.TWO_OPT_STAR,)
+            if search_config.enable_two_opt_star
+            else ACTIVE_MOVE_TYPES
+        ),
     )
     stats.attempted_by_family[CandidateSourceKind.ATOMIC.value] += len(raw)
     stats.constructed_by_family[CandidateSourceKind.ATOMIC.value] += sum(
@@ -520,6 +531,7 @@ def run_bounded_sa_oi(
     source_commit: str | None = None,
     allow_unverified_source: bool = False,
     formal_result: bool = False,
+    initialization_override: InitializationResult | None = None,
 ) -> SearchResult:
     started = time.perf_counter()
     reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
@@ -548,18 +560,31 @@ def run_bounded_sa_oi(
     stats.run_started = started
     stats.requested_budget = search_config.time_limit
     rng = random.Random(seed)
-    initialization = build_initial_solution(
-        parents,
-        config,
-        stats,
-        insertion_limit=search_config.insertion_limit,
-        construction_budget=search_config.construction_budget,
-        kinit_ref=search_config.kinit_ref,
-        feasibility_bootstrap_budget=search_config.feasibility_bootstrap_budget,
-        portfolio=True,
-        reference_evaluator=reference_evaluator,
-        scope=scope,
-    )
+    if initialization_override is None:
+        initialization = build_initial_solution(
+            parents,
+            config,
+            stats,
+            insertion_limit=search_config.insertion_limit,
+            construction_budget=search_config.construction_budget,
+            kinit_ref=search_config.kinit_ref,
+            feasibility_bootstrap_budget=search_config.feasibility_bootstrap_budget,
+            portfolio=True,
+            reference_evaluator=reference_evaluator,
+            scope=scope,
+        )
+    else:
+        initialization = initialization_override
+        if (
+            initialization.status is not InitializationStatus.SUCCESS
+            or initialization.solution is None
+            or initialization.solution.parents != tuple(parents)
+            or initialization.directions is None
+            or initialization.schedule is None
+            or initialization.certification is None
+            or not initialization.certification.certified
+        ):
+            raise ValueError("initialization_override must be a matching certified seed")
     if initialization.status is not InitializationStatus.SUCCESS:
         runtime = time.perf_counter() - started
         stats.actual_runtime = runtime
@@ -587,6 +612,7 @@ def run_bounded_sa_oi(
             stats,
             stats.anytime(search_config.checkpoints),
             runtime,
+            status.value,
         )
 
     assert initialization.solution is not None
@@ -627,6 +653,7 @@ def run_bounded_sa_oi(
             stats.operator_pair_global_bests[label] += 1
         adaptive.record(pair, reward)
 
+    termination_reason = "ITERATION_LIMIT"
     for iteration in range(search_config.max_iterations):
         if (
             iteration > 0
@@ -634,6 +661,7 @@ def run_bounded_sa_oi(
             search_config.time_limit is not None
             and time.perf_counter() - started >= search_config.time_limit
         ):
+            termination_reason = "TIME_LIMIT"
             break
         iteration_calls_before = stats.nref
         result = evaluate_iteration(
@@ -786,6 +814,8 @@ def run_bounded_sa_oi(
         if final_certification.certified
         else SearchStatus.NUMERIC_FAILURE
     )
+    if status is SearchStatus.NUMERIC_FAILURE:
+        termination_reason = "NUMERIC_FAILURE"
     stats.operator_sequence = list(adaptive.selection_history)
     stats.final_operator_weights = {
         f"{pair[0].value}+{pair[1].value}": weight
@@ -805,6 +835,7 @@ def run_bounded_sa_oi(
         stats,
         stats.anytime(search_config.checkpoints),
         runtime,
+        termination_reason,
     )
 
 

@@ -25,7 +25,7 @@ from mrta_reference.model import (
 from mrta_reference.solution import block_map
 
 from .direction import DirectionVectors
-from .stats import ACTIVE_MOVE_TYPES, SearchStats
+from .stats import ACTIVE_MOVE_TYPES, TRACKED_MOVE_TYPES, SearchStats
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,10 @@ def balanced_move_attempt_order(
 
 
 def applicable_move_mask(
-    solution: CanonicalSolution, config: ScientificConfig
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    *,
+    enable_two_opt_star: bool = False,
 ) -> dict[MoveType, bool]:
     routes = [route.block_ids for route in solution.routes]
     blocks = block_map(solution, config)
@@ -157,6 +160,10 @@ def applicable_move_mask(
         MoveType.INTER_RELOCATE: inter,
         MoveType.SWAP: swap,
         MoveType.TWO_OPT: intra,
+        MoveType.TWO_OPT_STAR: enable_two_opt_star and any(
+            len(routes[left]) + len(routes[right]) > 0
+            for left, right in ((0, 1), (2, 3))
+        ),
         MoveType.SPLIT_ACTIVATE: activate,
         MoveType.SPLIT_DEACTIVATE: deactivate,
         MoveType.SPLIT_POINT_SWITCH: switch,
@@ -168,7 +175,7 @@ def _parent_id(block_id: str) -> str:
 
 
 def _local_rng(seed: int, revision: int, move: MoveType, ordinal: int) -> random.Random:
-    move_index = ACTIVE_MOVE_TYPES.index(move)
+    move_index = TRACKED_MOVE_TYPES.index(move)
     return random.Random(seed + 1_000_003 * revision + 10_007 * move_index + 97 * ordinal)
 
 
@@ -260,6 +267,35 @@ def make_raw_candidate(
         lo, hi = sorted(rng.sample(range(len(routes[robot])), 2))
         affected = tuple(_parent_id(block) for block in routes[robot][lo : hi + 1])
         candidate = CandidateMove(key(affected, robot, robot, (lo, hi), ()))
+    elif move is MoveType.TWO_OPT_STAR:
+        choices = [
+            pair
+            for pair in ((0, 1), (2, 3))
+            if len(routes[pair[0]]) + len(routes[pair[1]]) > 0
+        ]
+        if not choices:
+            return RawAttempt(move, None, "NO_ACTIVE_SAME_RAIL_PAIR")
+        source_robot, destination_robot = rng.choice(choices)
+        source_cut = rng.randrange(len(routes[source_robot]) + 1)
+        destination_cut = rng.randrange(len(routes[destination_robot]) + 1)
+        affected = tuple(
+            _parent_id(block)
+            for block in (
+                routes[source_robot][source_cut:]
+                + routes[destination_robot][destination_cut:]
+            )
+        )
+        if not affected:
+            return RawAttempt(move, None, "EMPTY_SUFFIX_EXCHANGE")
+        candidate = CandidateMove(
+            key(
+                affected,
+                source_robot,
+                destination_robot,
+                (source_cut,),
+                (destination_cut,),
+            )
+        )
     elif move is MoveType.SPLIT_ACTIVATE:
         choices = []
         for parent_id, pattern in patterns.items():
@@ -355,16 +391,21 @@ def generate_raw_attempts(
     m: int,
     seed: int,
     stats: SearchStats,
+    moves: tuple[MoveType, ...] = ACTIVE_MOVE_TYPES,
 ) -> tuple[RawAttempt, ...]:
     started = time.perf_counter()
-    mask = applicable_move_mask(solution, config)
-    applicable = tuple(move for move in ACTIVE_MOVE_TYPES if mask[move])
+    mask = applicable_move_mask(
+        solution,
+        config,
+        enable_two_opt_star=MoveType.TWO_OPT_STAR in moves,
+    )
+    applicable = tuple(move for move in moves if mask[move])
     for move in applicable:
         stats.applicable_by_move[move.value] += 1
     order = balanced_move_attempt_order(
         m, seed + solution.revision, applicable
     )
-    ordinals = {move: 0 for move in ACTIVE_MOVE_TYPES}
+    ordinals = {move: 0 for move in moves}
     attempts = []
     for move in order:
         stats.raw_attempts += 1
@@ -452,6 +493,23 @@ def _obvious_move_error(
         lo, hi = key.source_positions
         if not (0 <= lo <= hi < len(routes[source])):
             return "2-opt route index out of range"
+    elif key.move_type is MoveType.TWO_OPT_STAR:
+        if (
+            source is None
+            or destination is None
+            or source == destination
+            or {source, destination} not in ({0, 1}, {2, 3})
+            or len(key.source_positions) != 1
+            or len(key.destination_positions) != 1
+        ):
+            return "bad same-rail 2-opt* shape"
+        source_cut = key.source_positions[0]
+        destination_cut = key.destination_positions[0]
+        if not (
+            0 <= source_cut <= len(routes[source])
+            and 0 <= destination_cut <= len(routes[destination])
+        ):
+            return "2-opt* cut index out of range"
     elif key.move_type is MoveType.SPLIT_ACTIVATE:
         if source is None or destination is None or len(key.source_positions) != 1 or len(key.destination_positions) != 1:
             return "bad split activation shape"

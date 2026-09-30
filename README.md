@@ -23,8 +23,8 @@ Implemented:
 - independent coordination scheduler using dispatch interleaving enumeration and earliest-safe-start placement;
 - analytical LB0, exact/reference comparison, and explicit enumeration limits;
 - initial-orientation-constrained exact empty-travel direction DP;
-- bounded four-strategy deterministic initial portfolio with capped reference evaluation;
-- state-aware balanced hard-budget generation for seven atomic neighborhood moves;
+- bounded deterministic initial portfolio with the V3 four-robot rail-monotone balanced bootstrap and capped feasibility-direction evaluation;
+- state-aware balanced hard-budget generation for the historical seven atomic moves plus an ablatable same-rail `TWO_OPT_STAR` route-tail exchange;
 - parent-level random/critical-load destroy, greedy/regret-2 repair, and reproducible adaptive operator-pair weights;
 - one unified complete-candidate pipeline for atomic and repaired LNS solutions;
 - bounded certified schedule-aware single-flip direction refinement inside the total reference budget;
@@ -35,7 +35,7 @@ Implemented:
 - paper-aligned `ADAPTED_HGA_V1` and `ADAPTED_WAG_VNS_V1`, each using its own native initialization/search and the shared direction/evaluator/certifier path;
 - adversarial and regression tests.
 
-Not implemented in this research: formal full-scope exact, LB_LP, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` and X_SPLIT search remain inactive. Formal evaluation enables deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS and baseline layers are development comparison backbones, not a formally frozen benchmark protocol.
+Not implemented in this research: formal full-scope exact, LB_LP, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` is enabled only in the Phase 3-2A V3 production candidate and remains switchable for ablation; X_SPLIT search remains inactive. Formal evaluation enables deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS and baseline layers are development comparison backbones, not a formally frozen benchmark protocol.
 
 ## Development and formal scope
 
@@ -55,7 +55,7 @@ F4 is final for Phase 3 and later common-model comparisons. HGA/WAG/ALNS behavio
 
 This is task-level weld allocation, sequencing, direction, and theoretical coordination. Deployment/retract/parking transitions require lower-level validation; no full physical parking or 3D collision-free execution claim is made. `mrta_exact` remains development-only. Formal results must be reevaluated and certified; development results are not relabelled.
 
-`FINAL_F4_RELEASE_STATUS = PASS` and `PHASE3_AUTHORIZED = YES` remain unchanged. Phase 3-0 found 96 frozen PPO workbooks containing 2942 valid unique platform instances and froze `PPO_DATASET_MANIFEST_V1`. Phase 3-0.5 closed the N=55 initialization failure with one deterministic rail-serial feasibility bootstrap that is called only after the normal portfolio fails. The solver-independent 20-instance development set achieved 20/20 certified initializations, and the N=10/55/90 V2 smoke achieved 3/3 certified initializations and search entry. Therefore `PPO_DATA_INTAKE_STATUS = PASS`, `PPO_ALNS_INITIALIZATION_STATUS = PASS`, and Phase 3-1 Adapted HGA/WAG is authorized. `FORMAL_SCOPE_V1_1` and B32 were not changed.
+`FINAL_F4_RELEASE_STATUS = PASS` and `PHASE3_AUTHORIZED = YES` remain unchanged. Phase 3-0 found 96 frozen PPO workbooks containing 2942 valid unique platform instances and froze `PPO_DATASET_MANIFEST_V1`. Phase 3-1 completed the Adapted HGA/WAG implementations. Phase 3-2A then closed the comparison-timing bug, froze a six-workbook DEVELOPMENT_CONSUMED diagnostic set, completed 54 native and 18 common-seed runs, applied the predeclared 10% rule as CASE B, and completed 30 post-fix runs. The current production proposed method is `SA_OI_ALNS_INIT_POLICY_V3` with `RAIL_MONOTONE_BALANCED_BOOTSTRAP` in the bounded portfolio and same-rail `TWO_OPT_STAR` enabled. This is mechanism evidence, not a superiority claim. `PHASE3_FAIRNESS_BACKBONE_STATUS = PASS`, `PHASE3_2B_AUTHORIZED = YES`, and the next phase is VALIDATION common-model comparison; ID_TEST remains sealed. `FORMAL_SCOPE_V1_1` and B32 were not changed.
 
 Reference statuses are `FEASIBLE`, `DEADLOCK`, `INFEASIBLE`, and `NUMERIC_FAILURE`. Only FEASIBLE has a reference Cmax; DEADLOCK is a failure of the deterministic scheduling policy, not mathematical infeasibility. Numeric failures are not normal negative training examples.
 
@@ -97,8 +97,8 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_exact/scheduler.py`: independent dispatch+ESS coordination enumeration.
 - `src/mrta_exact/solver.py`: Y-only exact micro backbone, full directions, limits, and comparison metrics.
 - `src/mrta_search/direction.py`: initial-feasibility-constrained direction DP and bounded schedule-aware refinement.
-- `src/mrta_search/initialization.py`: deterministic bounded initial portfolio plus one-call rail-serial feasibility bootstrap.
-- `src/mrta_search/neighborhood.py`: balanced seven-move raw proposal and cheap screening.
+- `src/mrta_search/initialization.py`: deterministic bounded V2/V3 initial portfolio, rail-monotone balancing, bounded feasibility-direction fallback, and historical rail-serial fallback.
+- `src/mrta_search/neighborhood.py`: balanced atomic proposal and cheap screening, including ablatable same-rail `TWO_OPT_STAR`.
 - `src/mrta_search/lns.py`: complete-candidate identity, parent destroy, bounded repair, and adaptive operator state.
 - `src/mrta_search/pipeline.py`: unified atomic/LNS Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
 - `src/mrta_search/stats.py`: structured counters, timings, invariants, and anytime records.
@@ -109,7 +109,7 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_baselines/wag_vns.py`: Adapted WAG three-stage route construction plus MOVE/SWAP/LNS VNS and optional-Y toggle.
 - `scripts/audit_ppo_instances.py`: local read-only PPO inventory and manifest CLI.
 - `scripts/run_ppo_smoke.py`: manifest-driven SA-OI-ALNS compatibility smoke CLI.
-- `scripts/run_phase3_baseline_smoke.py`: three-method DEVELOPMENT_CONSUMED PPO smoke with common provenance, checkpoints, and accounting.
+- `scripts/run_phase3_baseline_smoke.py`: Phase 3 smoke plus resumable native/common-seed/post-fix DEVELOPMENT_CONSUMED diagnostics with 5/30/60 checkpoints and unified telemetry.
 - `scripts/profile_phase2b1.py`: deterministic development-only N=20/50/100 smoke driver.
 - `scripts/profile_scheduler.py`: formal gate regression, method-independent direct sampling, final B32/B64/B128 calibration, historical replay, evaluator profiling, N=100 usability gates, Q1–Q6, and development-family smoke driver.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
@@ -142,6 +142,8 @@ $env:PYTHONPATH='src'
 ```
 
 See [baseline source mapping](docs/PHASE3_BASELINE_SOURCE_MAPPING_20260930.md), [Phase 3-1 implementation handoff](docs/PHASE3_HGA_WAG_BASELINE_IMPLEMENTATION_20260930.md), [split manifest](data/manifests/PPO_PHASE3_DATA_SPLIT_V1.json), and [development smoke](data/development/phase3_baseline_smoke_v1.json).
+
+Phase 3-2A evidence is in [the fairness/backbone handoff](docs/PHASE3_FAIR_TIMING_AND_BACKBONE_DIAGNOSTIC_20260930.md), [the six-instance diagnostic manifest](data/manifests/PPO_PHASE3_DIAGNOSTIC_SET_V1.json), and [the complete development artifact](data/development/phase3_fairness_diagnostic_v1.json). The diagnostic used only frozen `DEVELOPMENT_CONSUMED` roles; historical directory names such as `data/VALIDATION` or `data/ID_TEST` did not grant VALIDATION/ID_TEST access.
 
 ## Formal API
 

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from mrta_reference.certifier import certify_schedule
+from mrta_reference.geometry import robot_is_eligible
 from mrta_reference.model import ParentWeld, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind
-from mrta_reference.scheduler import reference_schedule
+from mrta_reference.scheduler import reference_schedule, reference_schedule_formal
+from mrta_reference.scope import FORMAL_SCOPE_V1_1
+from mrta_reference.solution import block_map
 import pytest
 
 from mrta_search.initialization import (
     RAIL_SERIAL_BOOTSTRAP,
     InitializationStatus,
+    _construct_rail_monotone_balanced_bootstrap,
+    _patterns,
     bounded_insertion_positions,
     build_initial_solution,
 )
@@ -176,3 +182,70 @@ def test_feasibility_bootstrap_budget_can_be_disabled_and_is_validated() -> None
             _stats(),
             feasibility_bootstrap_budget=2,
         )
+
+
+def _v3_fixture():
+    upper = tuple(
+        ParentWeld(f"u{i}", (1.0 + i * 3.0, 9.0), (2.0 + i * 3.0, 9.0))
+        for i in range(4)
+    )
+    lower = tuple(
+        ParentWeld(f"l{i}", (1.5 + i * 3.0, 3.0), (2.5 + i * 3.0, 3.0))
+        for i in range(4)
+    )
+    return upper + lower
+
+
+def test_v3_monotone_balanced_bootstrap_is_deterministic_canonical_and_certified():
+    parents = _v3_fixture()
+    patterns = _patterns(parents, FAST)
+    first = _construct_rail_monotone_balanced_bootstrap(parents, patterns, FAST)
+    second = _construct_rail_monotone_balanced_bootstrap(parents, patterns, FAST)
+    assert first == second
+    assert first.patterns == patterns
+    assert all(first.routes[robot].block_ids for robot in range(4))
+    blocks = block_map(first, FAST)
+    assigned = [block for route in first.routes for block in route.block_ids]
+    assert len(assigned) == len(set(assigned)) == len(blocks)
+    assert all(
+        robot_is_eligible(blocks[block], route.robot_id, FAST)
+        for route in first.routes
+        for block in route.block_ids
+    )
+    midpoint = lambda block_id: sum(blocks[block_id].start[0:1] + blocks[block_id].end[0:1]) / 2.0
+    assert list(first.routes[0].block_ids) == sorted(first.routes[0].block_ids, key=midpoint)
+    assert list(first.routes[1].block_ids) == sorted(first.routes[1].block_ids, key=midpoint, reverse=True)
+    assert list(first.routes[2].block_ids) == sorted(first.routes[2].block_ids, key=midpoint)
+    assert list(first.routes[3].block_ids) == sorted(first.routes[3].block_ids, key=midpoint, reverse=True)
+
+    result = build_initial_solution(
+        parents,
+        FAST,
+        _stats(),
+        construction_budget=5,
+        kinit_ref=5,
+        portfolio=True,
+        scope=FORMAL_SCOPE_V1_1,
+    )
+    assert result.status is InitializationStatus.SUCCESS
+    assert result.certification is not None and result.certification.certified
+    assert result.solution is not None
+    assert result.solution.patterns == patterns
+
+
+def test_v3_flexible_rail_assignment_is_deterministic_and_preserves_patterns():
+    parents = _v3_fixture() + (
+        ParentWeld("flex", (6.0, 6.0), (7.0, 6.0)),
+    )
+    patterns = _patterns(parents, FAST)
+    first = _construct_rail_monotone_balanced_bootstrap(parents, patterns, FAST)
+    second = _construct_rail_monotone_balanced_bootstrap(parents, patterns, FAST)
+    assert first == second
+    assert first.patterns == patterns
+    occurrences = [
+        route.robot_id
+        for route in first.routes
+        if "flex::whole" in route.block_ids
+    ]
+    assert len(occurrences) == 1
+    assert occurrences[0] in (0, 1, 2, 3)

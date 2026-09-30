@@ -206,3 +206,57 @@ def test_state_aware_applicable_mask_balances_only_possible_moves_and_keeps_hard
     split_mask = applicable_move_mask(split, FAST)
     assert split_mask[MoveType.SPLIT_DEACTIVATE]
     assert split_mask[MoveType.SPLIT_POINT_SWITCH]
+
+
+def test_two_opt_star_swaps_same_rail_suffixes_without_pattern_mutation():
+    solution = _base()
+    move = CandidateMove(
+        _key(0, MoveType.TWO_OPT_STAR, ("b", "d"), 2, 3, (1,), (1,))
+    )
+    candidate = apply_candidate(solution, move, FAST)
+    assert candidate.routes[2].block_ids == ("a::whole", "d::whole")
+    assert candidate.routes[3].block_ids == ("c::whole", "b::whole")
+    assert candidate.patterns == solution.patterns
+    assigned = [block for route in candidate.routes for block in route.block_ids]
+    assert len(assigned) == len(set(assigned)) == 4
+    assert candidate == apply_candidate(solution, move, FAST)
+
+
+def test_two_opt_star_is_deterministic_ablatable_same_rail_and_cheap_rejects_cross_rail():
+    solution = _base()
+    off_stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 17)
+    off = generate_raw_attempts(solution, FAST, m=16, seed=17, stats=off_stats)
+    assert all(item.move_type is not MoveType.TWO_OPT_STAR for item in off)
+
+    moves = ACTIVE_MOVE_TYPES + (MoveType.TWO_OPT_STAR,)
+    first_stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 17)
+    second_stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 17)
+    first = generate_raw_attempts(
+        solution, FAST, m=16, seed=17, stats=first_stats, moves=moves
+    )
+    second = generate_raw_attempts(
+        solution, FAST, m=16, seed=17, stats=second_stats, moves=moves
+    )
+    assert first == second
+    generated = [item for item in first if item.move_type is MoveType.TWO_OPT_STAR]
+    assert generated
+    assert all(
+        item.candidate is None
+        or {item.candidate.key.source_robot_id, item.candidate.key.destination_robot_id}
+        in ({0, 1}, {2, 3})
+        for item in generated
+    )
+
+    cross_rail = CandidateMove(
+        _key(0, MoveType.TWO_OPT_STAR, ("a", "c"), 2, 0, (0,), (0,))
+    )
+    directions = optimize_directions_with_initial_feasibility(solution, FAST).directions
+    screened = screen_raw_attempts(
+        solution,
+        directions,
+        (RawAttempt(MoveType.TWO_OPT_STAR, cross_rail),),
+        FAST,
+        first_stats,
+    )
+    assert screened == ()
+    assert first_stats.rejection_reasons["CHEAP_INVALID:bad same-rail 2-opt* shape"] == 1

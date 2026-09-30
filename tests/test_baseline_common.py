@@ -4,6 +4,7 @@ from mrta_baselines.common import (
     BaselineBestEvent,
     BaselineStatus,
     CommonBaselineEvaluator,
+    solution_telemetry,
 )
 from mrta_reference.model import ParentWeld, Route, ScientificConfig, SplitKind, SplitPattern
 from mrta_reference.scope import FORMAL_SCOPE_V1_1
@@ -74,4 +75,15 @@ def test_failure_has_no_penalty_cmax_and_is_separately_classified():
     assert result.status is BaselineStatus.INITIALIZATION_FAILED
     assert result.metrics is None
     assert result.solution is None
+    assert result.termination_reason == "COMPLETED_OTHER"
 
+
+def test_initial_solution_telemetry_hash_is_canonical_deterministic_and_source_free():
+    config, _, solution = _solution()
+    directions = ((0,), (), (0,), ())
+    first = solution_telemetry(solution, directions, config)
+    second = solution_telemetry(solution, directions, config)
+    assert first == second
+    assert first["initial_solution_hash"] == solution.canonical_hash
+    assert first["initial_robot_block_counts"] == [1, 0, 1, 0]
+    assert len(first["initial_route_hashes"]) == 4

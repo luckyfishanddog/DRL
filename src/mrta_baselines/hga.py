@@ -385,6 +385,8 @@ def hga_vnd(
                     if deadline is not None and time.perf_counter() >= deadline:
                         return current
                     if candidate_operations >= candidate_cap:
+                        if accounting is not None:
+                            accounting.vnd_candidate_cap_hits += 1
                         return current
                     candidate_operations += 1
                     if accounting is not None:
@@ -404,6 +406,8 @@ def hga_vnd(
                 break
         if not changed:
             break
+    if passes >= max_passes and changed and accounting is not None:
+        accounting.vnd_pass_cap_hits += 1
     return current
 
 
@@ -617,6 +621,7 @@ def run_adapted_hga(
     time_limit: float,
     scope: FormalScope,
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
+    common_seed: EvaluatedCandidate | None = None,
 ) -> BaselineResult:
     rng = random.Random(seed)
     evaluator = CommonBaselineEvaluator(
@@ -628,7 +633,18 @@ def run_adapted_hga(
     )
     population: list[_Individual] = []
     init_started = time.perf_counter()
-    for index in range(hga_config.mu):
+    if common_seed is not None:
+        injected = evaluator.inject_certified(
+            common_seed, source="HGA_COMMON_CERTIFIED_SEED"
+        )
+        population.append(
+            _Individual(
+                injected.solution,
+                hga_surrogate(injected.solution, scientific_config),
+                injected,
+            )
+        )
+    for index in range(1 if common_seed is not None else 0, hga_config.mu):
         if evaluator.expired:
             break
         construct_started = time.perf_counter()
@@ -639,10 +655,16 @@ def run_adapted_hga(
                 else initialize_hga_solution(parents, scientific_config, rng)
             )
             native_evaluated = None
-            if index < hga_config.initialization_reference_limit and not evaluator.expired:
+            if (
+                common_seed is None
+                and index < hga_config.initialization_reference_limit
+                and not evaluator.expired
+            ):
                 native_evaluated = evaluator.evaluate(
                     solution, source=f"HGA_INITIALIZATION_{index}_NATIVE"
                 )
+            elif common_seed is None and index >= hga_config.initialization_reference_limit:
+                evaluator.accounting.initialization_reference_limit_hits += 1
             native_hash = solution.canonical_hash
             local_started = time.perf_counter()
             solution = hga_vnd(
@@ -662,12 +684,18 @@ def run_adapted_hga(
         individual = _Individual(solution, hga_surrogate(solution, scientific_config))
         if solution.canonical_hash == native_hash:
             individual.evaluated = native_evaluated
-        elif index < hga_config.initialization_reference_limit and not evaluator.expired:
+        elif (
+            common_seed is None
+            and index < hga_config.initialization_reference_limit
+            and not evaluator.expired
+        ):
             individual.evaluated = evaluator.evaluate(
                 solution, source=f"HGA_INITIALIZATION_{index}_VND"
             )
         population.append(individual)
     initialization_time = time.perf_counter() - init_started
+    initial_candidate = evaluator.best
+    initial_reference_calls = evaluator.accounting.reference_calls
 
     iterations = 0
     while (
@@ -684,7 +712,11 @@ def run_adapted_hga(
                 first.solution, second.solution, scientific_config, rng
             )
             if rng.random() < hga_config.pattern_mutation_probability:
+                evaluator.accounting.optional_y_mutations_attempted += 1
+                before_patterns = offspring.patterns
                 offspring = mutate_optional_y(offspring, scientific_config, rng)
+                if offspring.patterns != before_patterns:
+                    evaluator.accounting.optional_y_mutations_accepted += 1
         except (ArithmeticError, OverflowError, ValueError) as error:
             evaluator.reject_construction(f"HGA crossover iteration {iterations}: {error}")
             continue
@@ -710,12 +742,27 @@ def run_adapted_hga(
             evaluator.accounting.population_management_time += (
                 time.perf_counter() - management_started
             )
+            evaluator.accounting.population_survival_events += 1
+
+    if evaluator.best is None and evaluator.accounting.numeric_failure:
+        termination_reason = "NUMERIC_FAILURE"
+    elif evaluator.best is None:
+        termination_reason = "INITIALIZATION_FAILED"
+    elif evaluator.expired:
+        termination_reason = "TIME_LIMIT"
+    elif iterations >= hga_config.max_iterations:
+        termination_reason = "ITERATION_LIMIT"
+    else:
+        termination_reason = "COMPLETED_OTHER"
 
     return evaluator.finish(
         method_id=METHOD_ID,
         method_config_hash=canonical_config_hash(hga_config),
         iterations=iterations,
         initialization_time=initialization_time,
+        termination_reason=termination_reason,
+        initial_candidate=initial_candidate,
+        initial_reference_calls=initial_reference_calls,
         diagnostics=(
             "one four-quadrant HGA region seed adapts paper region division; paper start/return physics excluded",
             "ADAPTED_HGA_BIASED_FITNESS_V1",

@@ -4,6 +4,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
+import random
 import time
 
 from mrta_reference.certifier import CertificationReport, certify_schedule
@@ -35,6 +36,7 @@ from .direction import (
     ConstrainedDirectionResult,
     DirectionStatus,
     DirectionVectors,
+    _initial_error,
     optimize_directions_with_initial_feasibility,
 )
 from .stats import SearchStats
@@ -51,9 +53,11 @@ class InitializationStrategy(str, Enum):
     RAIL_BALANCED = "RAIL_BALANCED"
     X_ORDER_AWARE = "X_ORDER_AWARE"
     SPATIAL_SPREAD = "SPATIAL_SPREAD"
+    RAIL_MONOTONE_BALANCED = "RAIL_MONOTONE_BALANCED_BOOTSTRAP"
 
 
 RAIL_SERIAL_BOOTSTRAP = "RAIL_SERIAL_BOOTSTRAP"
+V3_DIRECTION_FEASIBILITY_REFERENCE_BUDGET = 4
 
 
 @dataclass(frozen=True)
@@ -141,6 +145,10 @@ def _construct(
     strategy: InitializationStrategy,
     legacy_robot_tie_first: bool = False,
 ) -> CanonicalSolution:
+    if strategy is InitializationStrategy.RAIL_MONOTONE_BALANCED:
+        return _construct_rail_monotone_balanced_bootstrap(
+            parents, patterns, config
+        )
     parent_by_id = {parent.parent_id: parent for parent in parents}
     all_blocks = {
         block.block_id: block
@@ -329,6 +337,135 @@ def _construct_rail_serial_bootstrap(
     )
 
 
+def _block_x_key(block: WeldingBlock) -> tuple[float, float, float, str]:
+    return (
+        min(block.start[0], block.end[0]),
+        (block.start[0] + block.end[0]) / 2.0,
+        max(block.start[0], block.end[0]),
+        block.block_id,
+    )
+
+
+def _construct_rail_monotone_balanced_bootstrap(
+    parents: Sequence[ParentWeld],
+    patterns: tuple[SplitPattern, ...],
+    config: ScientificConfig,
+) -> CanonicalSolution:
+    """Build the deterministic four-robot V3 monotone/load-balanced seed."""
+    parent_by_id = {parent.parent_id: parent for parent in parents}
+    blocks = tuple(
+        block
+        for pattern in patterns
+        for block in blocks_for_pattern(parent_by_id[pattern.parent_id], pattern, config)
+    )
+    rail_blocks: dict[int, list[WeldingBlock]] = {0: [], 1: []}
+    flexible: list[WeldingBlock] = []
+    rail_loads = [0.0, 0.0]
+    for block in blocks:
+        upper = any(robot_is_eligible(block, robot, config) for robot in (0, 1))
+        lower = any(robot_is_eligible(block, robot, config) for robot in (2, 3))
+        if upper and lower:
+            flexible.append(block)
+        elif upper:
+            rail_blocks[0].append(block)
+            rail_loads[0] += config.process_time(block.length)
+        elif lower:
+            rail_blocks[1].append(block)
+            rail_loads[1] += config.process_time(block.length)
+        else:
+            raise ValueError(f"{block.block_id}: no eligible rail for V3 bootstrap")
+
+    for block in sorted(flexible, key=_block_x_key):
+        rail = min((0, 1), key=lambda item: (rail_loads[item], item))
+        rail_blocks[rail].append(block)
+        rail_loads[rail] += config.process_time(block.length)
+
+    routes: list[tuple[str, ...]] = [(), (), (), ()]
+    for rail, (left_robot, right_robot) in enumerate(((0, 1), (2, 3))):
+        ordered = sorted(rail_blocks[rail], key=_block_x_key)
+        prefix_loads = [0.0]
+        for block in ordered:
+            prefix_loads.append(
+                prefix_loads[-1] + config.process_time(block.length)
+            )
+        total = prefix_loads[-1]
+        boundary = min(
+            range(len(ordered) + 1),
+            key=lambda index: (
+                max(prefix_loads[index], total - prefix_loads[index]),
+                abs(prefix_loads[index] - (total - prefix_loads[index])),
+                index,
+            ),
+        )
+        routes[left_robot] = tuple(block.block_id for block in ordered[:boundary])
+        routes[right_robot] = tuple(
+            block.block_id for block in reversed(ordered[boundary:])
+        )
+
+    return canonicalize(
+        parents,
+        patterns,
+        tuple(Route(robot, routes[robot]) for robot in range(4)),
+        config,
+        revision=0,
+    )
+
+
+def _direction_empty_travel(
+    solution: CanonicalSolution,
+    directions: DirectionVectors,
+    config: ScientificConfig,
+) -> float:
+    blocks = block_map(solution, config)
+    total = 0.0
+    for robot, route in enumerate(solution.routes):
+        for position in range(len(route.block_ids) - 1):
+            left = blocks[route.block_ids[position]]
+            right = blocks[route.block_ids[position + 1]]
+            _, left_end = oriented_endpoints(left, directions[robot][position])
+            right_start, _ = oriented_endpoints(
+                right, directions[robot][position + 1]
+            )
+            total += math.dist(left_end, right_start) / config.empty_speed
+    return total
+
+
+def _v3_direction_feasibility_candidates(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    *,
+    budget: int = V3_DIRECTION_FEASIBILITY_REFERENCE_BUDGET,
+) -> tuple[DirectionVectors, ...]:
+    """Return deterministic directions for feasibility only, not Cmax selection."""
+    if budget <= 0:
+        return ()
+    blocks = block_map(solution, config)
+    rng = random.Random(int(solution.canonical_hash[:16], 16))
+    result: list[DirectionVectors] = []
+    seen: set[DirectionVectors] = set()
+    attempts = 0
+    while len(result) < budget and attempts < 32 * budget:
+        attempts += 1
+        directions: DirectionVectors = tuple(
+            tuple(rng.randrange(2) for _ in route.block_ids)
+            for route in solution.routes
+        )  # type: ignore[assignment]
+        if directions in seen:
+            continue
+        seen.add(directions)
+        points = {
+            robot: oriented_endpoints(
+                blocks[route.block_ids[0]], directions[robot][0]
+            )[0]
+            for robot, route in enumerate(solution.routes)
+            if route.block_ids
+        }
+        if _initial_error(points, config) is not None:
+            continue
+        result.append(directions)
+    return tuple(result)
+
+
 def build_initial_solution(
     parents: Sequence[ParentWeld],
     config: ScientificConfig,
@@ -348,7 +485,9 @@ def build_initial_solution(
         raise ValueError("formal initialization requires the common certifier")
     strategies = tuple(InitializationStrategy)[:construction_budget]
     if construction_budget < 1 or construction_budget > len(InitializationStrategy):
-        raise ValueError("B_init_pool must be between 1 and 4")
+        raise ValueError(
+            f"B_init_pool must be between 1 and {len(InitializationStrategy)}"
+        )
     if not (1 <= kinit_ref <= construction_budget):
         raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
     if feasibility_bootstrap_budget not in (0, 1):
@@ -494,6 +633,87 @@ def build_initial_solution(
             ),
         )
         old_attempt = attempts[attempt_index]
+        if (
+            schedule.status is ScheduleStatus.DEADLOCK
+            and old_attempt.strategy
+            == InitializationStrategy.RAIL_MONOTONE_BALANCED.value
+        ):
+            for fallback_directions in _v3_direction_feasibility_candidates(
+                solution, config
+            ):
+                fallback_started = time.perf_counter()
+                try:
+                    fallback_schedule = reference_evaluator(
+                        solution,
+                        config,
+                        orientations={
+                            robot: fallback_directions[robot]
+                            for robot in range(4)
+                        },
+                    )
+                except (ArithmeticError, OverflowError, ValueError) as error:
+                    fallback_schedule = ScheduleResult(
+                        ScheduleStatus.NUMERIC_FAILURE,
+                        diagnostics=(str(error),),
+                    )
+                fallback_duration = time.perf_counter() - fallback_started
+                fallback_ended = time.perf_counter()
+                fallback_certification = None
+                if fallback_schedule.status is ScheduleStatus.FEASIBLE:
+                    cert_started = time.perf_counter()
+                    fallback_certification = (
+                        certifier(solution, fallback_schedule, config, scope=scope)
+                        if scope is not None
+                        else certifier(solution, fallback_schedule, config)
+                    )
+                    stats.certifier_time += time.perf_counter() - cert_started
+                    if not fallback_certification.certified:
+                        fallback_schedule = replace(
+                            fallback_schedule,
+                            status=ScheduleStatus.NUMERIC_FAILURE,
+                            cmax=None,
+                            diagnostics=(
+                                "V3 direction fallback certification failure: "
+                                + "; ".join(fallback_certification.errors),
+                            ),
+                            directions=fallback_directions,
+                        )
+                stats.record_reference(
+                    fallback_schedule.status,
+                    fallback_duration,
+                    initialization=True,
+                    schedule=fallback_schedule,
+                    reference_start=(
+                        None
+                        if stats.run_started is None
+                        else fallback_started - stats.run_started
+                    ),
+                    reference_end=(
+                        None
+                        if stats.run_started is None
+                        else fallback_ended - stats.run_started
+                    ),
+                )
+                schedule = fallback_schedule
+                certification = fallback_certification
+                if (
+                    schedule.status is ScheduleStatus.FEASIBLE
+                    and certification is not None
+                    and certification.certified
+                ):
+                    direction = ConstrainedDirectionResult(
+                        DirectionStatus.FEASIBLE,
+                        fallback_directions,
+                        _direction_empty_travel(
+                            solution, fallback_directions, config
+                        ),
+                        ("V3_DIRECTION_FEASIBILITY_FALLBACK",),
+                        direction.legal_first_combinations,
+                        direction.route_dp_calls,
+                    )
+                    break
+                if schedule.status is ScheduleStatus.NUMERIC_FAILURE:
+                    break
         attempt = InitializationAttempt(
             old_attempt.construction_index,
             solution,

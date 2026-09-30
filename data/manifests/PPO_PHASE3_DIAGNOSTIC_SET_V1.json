@@ -1,0 +1,70 @@
+{
+  "diagnostic_set_id": "PPO_PHASE3_DIAGNOSTIC_SET_V1",
+  "dataset_manifest_id": "PPO_DATASET_MANIFEST_V1",
+  "dataset_manifest_hash": "3a12fc59708fcd6adc20bb19ba44ba8ece585f8e0a81a93304694960f18f2a31",
+  "phase3_split_hash": "5b5e3a6d43b943c5bad03a9ecbadaefa74c6158b33036da6e0fc236e03af1c5a",
+  "selection_policy": "DEVELOPMENT_CONSUMED only; two instances per N20-30/N50-60/N80-90; closest to N25/N55/N85 then instance_geometry_hash; six distinct workbooks",
+  "instances": [
+    {
+      "tier": "small",
+      "target_weld_count": 25,
+      "instance_id": "data/PPO_TRAIN/seed_0760656368::g16_w025",
+      "relative_path": "data/PPO_TRAIN/seed_0760656368.xlsx",
+      "sheet_name": "g16_w025",
+      "actual_weld_count": 25,
+      "instance_geometry_hash": "0e0e20dd554cb5617d43d737cfde02867eef14619c223283254016003225659d",
+      "phase3_role": "DEVELOPMENT_CONSUMED"
+    },
+    {
+      "tier": "small",
+      "target_weld_count": 25,
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g19_w025",
+      "relative_path": "data/PPO_TRAIN/seed_1064648049.xlsx",
+      "sheet_name": "g19_w025",
+      "actual_weld_count": 25,
+      "instance_geometry_hash": "19ca974eeb3a9c3de586b5ada8ba3773ba629c9540ff4d48a77d7fc811b7e7c3",
+      "phase3_role": "DEVELOPMENT_CONSUMED"
+    },
+    {
+      "tier": "medium",
+      "target_weld_count": 55,
+      "instance_id": "data/VALIDATION/seed_0967455456::g27_w055",
+      "relative_path": "data/VALIDATION/seed_0967455456.xlsx",
+      "sheet_name": "g27_w055",
+      "actual_weld_count": 55,
+      "instance_geometry_hash": "00ec9cb45f83d42e3c60a600fd01837d1197f463c59eac08acd365a00dcab9a6",
+      "phase3_role": "DEVELOPMENT_CONSUMED"
+    },
+    {
+      "tier": "medium",
+      "target_weld_count": 55,
+      "instance_id": "data/PPO_TRAIN/seed_0457685429::g31_w055",
+      "relative_path": "data/PPO_TRAIN/seed_0457685429.xlsx",
+      "sheet_name": "g31_w055",
+      "actual_weld_count": 55,
+      "instance_geometry_hash": "12f653d8de19a92910fcb82dd9ee1687f2f7a7578e512f1372ab99a33ac3ba38",
+      "phase3_role": "DEVELOPMENT_CONSUMED"
+    },
+    {
+      "tier": "large",
+      "target_weld_count": 85,
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "relative_path": "data/PPO_TRAIN/seed_0211781140.xlsx",
+      "sheet_name": "g32_w085",
+      "actual_weld_count": 85,
+      "instance_geometry_hash": "0395e11300f687af90bdaced161afe6cd6adb5a21d41a1368a2fbcb8851bbb79",
+      "phase3_role": "DEVELOPMENT_CONSUMED"
+    },
+    {
+      "tier": "large",
+      "target_weld_count": 85,
+      "instance_id": "data/ID_TEST/seed_0401115467::g45_w085",
+      "relative_path": "data/ID_TEST/seed_0401115467.xlsx",
+      "sheet_name": "g45_w085",
+      "actual_weld_count": 85,
+      "instance_geometry_hash": "26d2b60dc62ec14b74854ade871b95c6a792b27db5dcbd2323eb2da27ca36720",
+      "phase3_role": "DEVELOPMENT_CONSUMED"
+    }
+  ],
+  "diagnostic_set_hash": "729e6864d379248238dc3caf43121210c16f2857939bced7be54fda944b1f704"
+}

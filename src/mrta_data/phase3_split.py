@@ -287,3 +287,93 @@ def assert_solver_access_allowed(
             raise PermissionError(
                 f"solver access forbidden for {path}: role={role_by_path[path]}"
             )
+
+
+def build_phase3_diagnostic_set(
+    dataset_manifest: Mapping[str, Any], split_manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Select two DEVELOPMENT_CONSUMED instances per size tier without solver data."""
+    role_by_path = {
+        str(item["relative_path"]): str(item["assigned_role"])
+        for item in split_manifest["workbooks"]
+    }
+    tiers = (
+        ("small", 20, 30, 25),
+        ("medium", 50, 60, 55),
+        ("large", 80, 90, 85),
+    )
+    selected: list[dict[str, Any]] = []
+    used_workbooks: set[str] = set()
+    for tier, lower, upper, target in tiers:
+        candidates = sorted(
+            (
+                entry
+                for entry in dataset_manifest["instances"]
+                if entry.get("validation_status") == "VALID"
+                and entry.get("duplicate_of") is None
+                and lower <= int(entry["actual_weld_count"]) <= upper
+                and role_by_path.get(str(entry["relative_path"])) == ROLE_DEVELOPMENT
+            ),
+            key=lambda item: (
+                abs(int(item["actual_weld_count"]) - target),
+                str(item["instance_geometry_hash"]),
+            ),
+        )
+        tier_selected = []
+        for entry in candidates:
+            path = str(entry["relative_path"])
+            if path in used_workbooks:
+                continue
+            tier_selected.append(
+                {
+                    "tier": tier,
+                    "target_weld_count": target,
+                    "instance_id": entry["instance_id"],
+                    "relative_path": path,
+                    "sheet_name": entry["sheet_name"],
+                    "actual_weld_count": int(entry["actual_weld_count"]),
+                    "instance_geometry_hash": entry["instance_geometry_hash"],
+                    "phase3_role": ROLE_DEVELOPMENT,
+                }
+            )
+            used_workbooks.add(path)
+            if len(tier_selected) == 2:
+                break
+        if len(tier_selected) != 2:
+            raise ValueError(f"unable to select two distinct {tier} diagnostic workbooks")
+        selected.extend(tier_selected)
+    payload: dict[str, Any] = {
+        "diagnostic_set_id": "PPO_PHASE3_DIAGNOSTIC_SET_V1",
+        "dataset_manifest_id": dataset_manifest["dataset_manifest_id"],
+        "dataset_manifest_hash": dataset_manifest["dataset_manifest_hash"],
+        "phase3_split_hash": split_manifest["phase3_split_hash"],
+        "selection_policy": (
+            "DEVELOPMENT_CONSUMED only; two instances per N20-30/N50-60/N80-90; "
+            "closest to N25/N55/N85 then instance_geometry_hash; six distinct workbooks"
+        ),
+        "instances": selected,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    payload["diagnostic_set_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return payload
+
+
+def validate_phase3_diagnostic_set(
+    payload: Mapping[str, Any], split_manifest: Mapping[str, Any]
+) -> None:
+    instances = list(payload["instances"])
+    if len(instances) != 6:
+        raise ValueError("diagnostic set must contain six instances")
+    paths = [str(item["relative_path"]) for item in instances]
+    if len(paths) != len(set(paths)):
+        raise ValueError("diagnostic instances must use distinct workbooks")
+    assert_solver_access_allowed(
+        split_manifest, paths, allowed_roles=(ROLE_DEVELOPMENT,)
+    )
+    counts = defaultdict(int)
+    for item in instances:
+        counts[str(item["tier"])] += 1
+        if item["phase3_role"] != ROLE_DEVELOPMENT:
+            raise ValueError("diagnostic role must be DEVELOPMENT_CONSUMED")
+    if dict(counts) != {"small": 2, "medium": 2, "large": 2}:
+        raise ValueError("diagnostic set must contain two instances per tier")

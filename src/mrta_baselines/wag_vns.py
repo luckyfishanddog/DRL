@@ -25,7 +25,13 @@ from mrta_reference.model import (
 )
 from mrta_reference.solution import block_map, canonicalize
 
-from .common import BaselineResult, CommonBaselineEvaluator, canonical_config_hash
+from .common import (
+    BaselineAccounting,
+    BaselineResult,
+    CommonBaselineEvaluator,
+    EvaluatedCandidate,
+    canonical_config_hash,
+)
 
 
 METHOD_ID = "ADAPTED_WAG_VNS_V1"
@@ -211,6 +217,7 @@ def factorial_edge_combination(
     max_windows: int,
     max_factorial_calls: int,
     deadline: float | None = None,
+    accounting: BaselineAccounting | None = None,
 ) -> tuple[tuple[str, ...], int, int]:
     """Enumerate the paper permutation/direction neighborhood for each window."""
     current = tuple(route)
@@ -222,6 +229,8 @@ def factorial_edge_combination(
         last_start -= 1
     starts = list(range(max(0, last_start) + 1))
     if not exact:
+        if len(starts) > max_windows and accounting is not None:
+            accounting.factorial_window_cap_hits += 1
         starts = starts[:max_windows]
     calls = 0
     windows = 0
@@ -241,6 +250,8 @@ def factorial_edge_combination(
                     return current, calls, windows
                 direction_combinations = 2 ** len(permutation)
                 if not exact and calls + direction_combinations > max_factorial_calls:
+                    if accounting is not None:
+                        accounting.factorial_call_cap_hits += 1
                     return current, calls, windows
                 calls += direction_combinations
                 candidate = current[:start] + permutation + current[stop:]
@@ -264,6 +275,7 @@ def improved_route_set(
     wag_config: AdaptedWAGConfig,
     *,
     deadline: float | None = None,
+    accounting: BaselineAccounting | None = None,
 ) -> tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], int]:
     exact = wag_config.factorial_mode == "PAPER_EXACT"
     nearest = nearest_addition(block_ids, robot, blocks, config)
@@ -280,6 +292,7 @@ def improved_route_set(
         max_windows=wag_config.max_windows,
         max_factorial_calls=wag_config.max_factorial_calls,
         deadline=deadline,
+        accounting=accounting,
     )
     i_r2 = two_opt(farthest, blocks, config, consider_final_edge=False)
     i_r2, calls2, _ = factorial_edge_combination(
@@ -292,6 +305,7 @@ def improved_route_set(
         max_windows=wag_config.max_windows,
         max_factorial_calls=wag_config.max_factorial_calls,
         deadline=deadline,
+        accounting=accounting,
     )
     i_r3 = two_opt(i_r2, blocks, config, consider_final_edge=True)
     i_r3, calls3, _ = factorial_edge_combination(
@@ -304,6 +318,7 @@ def improved_route_set(
         max_windows=wag_config.max_windows,
         max_factorial_calls=wag_config.max_factorial_calls,
         deadline=deadline,
+        accounting=accounting,
     )
     return (i_r1, i_r2, i_r3), calls1 + calls2 + calls3
 
@@ -338,6 +353,7 @@ def generate_wag_assignments(
     config: ScientificConfig,
     *,
     max_variants: int,
+    accounting: BaselineAccounting | None = None,
 ) -> tuple[CanonicalSolution, ...]:
     blocks = _blocks_for(parents, patterns, config)
     rail_groups: dict[str, list[str]] = {"UPPER": [], "LOWER": []}
@@ -379,7 +395,7 @@ def generate_wag_assignments(
     )
     result = []
     seen = set()
-    for upper_offset, lower_offset in offsets:
+    for offset_index, (upper_offset, lower_offset) in enumerate(offsets):
         ub = min(len(upper_order), max(0, upper_boundary + upper_offset))
         lb = min(len(lower_order), max(0, lower_boundary + lower_offset))
         routes = (
@@ -393,6 +409,8 @@ def generate_wag_assignments(
             seen.add(solution.canonical_hash)
             result.append(solution)
         if len(result) >= max_variants:
+            if offset_index + 1 < len(offsets) and accounting is not None:
+                accounting.wag_variant_cap_hits += 1
             break
     return tuple(result)
 
@@ -403,6 +421,7 @@ def _route_combinations(
     wag_config: AdaptedWAGConfig,
     *,
     deadline: float,
+    accounting: BaselineAccounting | None = None,
 ) -> tuple[list[CanonicalSolution], int]:
     blocks = block_map(assignment, config)
     variants = []
@@ -415,6 +434,7 @@ def _route_combinations(
             config,
             wag_config,
             deadline=deadline,
+            accounting=accounting,
         )
         variants.append(route_set)
         factorial_calls += calls
@@ -589,6 +609,7 @@ def _evaluate_routed_assignment(
         scientific_config,
         wag_config,
         deadline=evaluator.deadline,
+        accounting=evaluator.accounting,
     )
     elapsed = time.perf_counter() - construction_started
     evaluator.accounting.construction_time += elapsed
@@ -600,6 +621,8 @@ def _evaluate_routed_assignment(
         if evaluator.expired:
             break
         evaluator.evaluate(candidate, source=f"{source}_ROUTE_COMBINATION_{index}")
+    if len(combinations) > wag_config.max_route_combinations_per_wag:
+        evaluator.accounting.route_combination_cap_hits += 1
 
 
 def run_adapted_wag_vns(
@@ -611,6 +634,7 @@ def run_adapted_wag_vns(
     time_limit: float,
     scope: FormalScope,
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
+    common_seed: EvaluatedCandidate | None = None,
 ) -> BaselineResult:
     rng = random.Random(seed)
     evaluator = CommonBaselineEvaluator(
@@ -621,33 +645,41 @@ def run_adapted_wag_vns(
         checkpoints=checkpoints,
     )
     init_started = time.perf_counter()
-    try:
-        patterns = _initial_patterns(parents, scientific_config)
-        assignments = generate_wag_assignments(
-            parents,
-            patterns,
-            scientific_config,
-            max_variants=wag_config.max_wag_variants,
+    if common_seed is not None:
+        evaluator.inject_certified(
+            common_seed, source="WAG_COMMON_CERTIFIED_SEED"
         )
-    except (ArithmeticError, OverflowError, ValueError) as error:
-        evaluator.reject_construction(f"WAG initialization: {error}")
-        assignments = ()
-    for index, assignment in enumerate(assignments):
-        if evaluator.expired:
-            break
-        evaluator.evaluate(assignment, source=f"WAG_INITIAL_{index}_NATIVE")
-        if evaluator.expired:
-            break
-        _evaluate_routed_assignment(
-            assignment,
-            scientific_config,
-            wag_config,
-            evaluator,
-            source=f"WAG_INITIAL_{index}",
-        )
-        if evaluator.best is not None:
-            break
+    else:
+        try:
+            patterns = _initial_patterns(parents, scientific_config)
+            assignments = generate_wag_assignments(
+                parents,
+                patterns,
+                scientific_config,
+                max_variants=wag_config.max_wag_variants,
+                accounting=evaluator.accounting,
+            )
+        except (ArithmeticError, OverflowError, ValueError) as error:
+            evaluator.reject_construction(f"WAG initialization: {error}")
+            assignments = ()
+        for index, assignment in enumerate(assignments):
+            if evaluator.expired:
+                break
+            evaluator.evaluate(assignment, source=f"WAG_INITIAL_{index}_NATIVE")
+            if evaluator.expired:
+                break
+            _evaluate_routed_assignment(
+                assignment,
+                scientific_config,
+                wag_config,
+                evaluator,
+                source=f"WAG_INITIAL_{index}",
+            )
+            if evaluator.best is not None:
+                break
     initialization_time = time.perf_counter() - init_started
+    initial_candidate = evaluator.best
+    initial_reference_calls = evaluator.accounting.reference_calls
 
     iterations = 0
     while (
@@ -675,6 +707,7 @@ def run_adapted_wag_vns(
             )
         operator = rng.randrange(3)
         if operator == 0:
+            evaluator.accounting.move_calls += 1
             candidates = wag_move_candidates(
                 best_solution,
                 scientific_config,
@@ -684,6 +717,7 @@ def run_adapted_wag_vns(
             )
             name = "MOVE"
         elif operator == 1:
+            evaluator.accounting.swap_calls += 1
             candidates = wag_swap_candidates(
                 best_solution,
                 scientific_config,
@@ -693,6 +727,7 @@ def run_adapted_wag_vns(
             )
             name = "SWAP"
         else:
+            evaluator.accounting.lns_calls += 1
             candidates = wag_lns_candidates(
                 best_solution,
                 scientific_config,
@@ -702,6 +737,7 @@ def run_adapted_wag_vns(
             )
             name = "LNS"
         if iterations % 3 == 0:
+            evaluator.accounting.optional_y_toggle_attempts += 1
             optional = toggle_optional_y(best_solution, scientific_config)
             if optional is not None:
                 candidates = candidates + (optional,)
@@ -720,11 +756,25 @@ def run_adapted_wag_vns(
                 source=f"WAG_{name}_{iterations}_{index}",
             )
 
+    if evaluator.best is None and evaluator.accounting.numeric_failure:
+        termination_reason = "NUMERIC_FAILURE"
+    elif evaluator.best is None:
+        termination_reason = "INITIALIZATION_FAILED"
+    elif evaluator.expired:
+        termination_reason = "TIME_LIMIT"
+    elif iterations >= wag_config.imax:
+        termination_reason = "ITERATION_LIMIT"
+    else:
+        termination_reason = "COMPLETED_OTHER"
+
     return evaluator.finish(
         method_id=METHOD_ID,
         method_config_hash=canonical_config_hash(wag_config),
         iterations=iterations,
         initialization_time=initialization_time,
+        termination_reason=termination_reason,
+        initial_candidate=initial_candidate,
+        initial_reference_calls=initial_reference_calls,
         diagnostics=(
             "paper three-robot conflict scheduler is excluded from common-model fitness",
             "ADAPTED_WAG_ASSIGNMENT_V1",
