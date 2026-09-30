@@ -272,7 +272,7 @@ def _construct_rail_serial_bootstrap(
     patterns: tuple[SplitPattern, ...],
     config: ScientificConfig,
 ) -> CanonicalSolution:
-    """Build one deterministic, interference-safe feasibility fallback.
+    """Build one deterministic, feasibility-oriented fallback.
 
     The normal portfolio uses both robots on each rail.  If every selected
     construction deadlocks, this bounded fallback activates only the left

@@ -31,9 +31,11 @@ Implemented:
 - makespan-first C0-C4 screening, Kdp direction rerank, Kref reference evaluation, and seeded SA acceptance;
 - split initialization/search scheduler timings, wall-clock overshoot records, deadline-safe anytime checkpoints, and micro gap decomposition;
 - fail-closed, lazy-Excel intake for the two observed frozen PPO family schemas, with per-instance geometry/formal validation, hashes, duplicate analysis, and deterministic smoke selection;
+- workbook-level Phase 3 role freeze with DEVELOPMENT_CONSUMED/TRAIN_POOL/VALIDATION/ID_TEST isolation;
+- paper-aligned `ADAPTED_HGA_V1` and `ADAPTED_WAG_VNS_V1`, each using its own native initialization/search and the shared direction/evaluator/certifier path;
 - adversarial and regression tests.
 
-Not implemented in this research: formal full-scope exact, LB_LP, adapted HGA/WAG, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` and X_SPLIT search remain inactive. Formal evaluation enables deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS layer is the minimal development backbone, not a formal frozen algorithm or tuned benchmark.
+Not implemented in this research: formal full-scope exact, LB_LP, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` and X_SPLIT search remain inactive. Formal evaluation enables deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS and baseline layers are development comparison backbones, not a formally frozen benchmark protocol.
 
 ## Development and formal scope
 
@@ -101,8 +103,13 @@ Run the repository and DRL suites together from the repository root:
 - `src/mrta_search/pipeline.py`: unified atomic/LNS Kdp/Kref evaluator pipeline, SA engine, and micro decomposition.
 - `src/mrta_search/stats.py`: structured counters, timings, invariants, and anytime records.
 - `src/mrta_data/ppo_instances.py`: optional frozen PPO workbook discovery, schema inspection, loading, validation, metrics, manifests, and smoke-set selection; it never generates, filters, clips, or moves welds.
+- `src/mrta_data/phase3_split.py`: deterministic solver-independent workbook descriptors, role assignment, validation, and fail-closed ID_TEST access check.
+- `src/mrta_baselines/common.py`: shared baseline result, timing/accounting, direction DP, formal evaluator, certifier, and official-metric path.
+- `src/mrta_baselines/hga.py`: Adapted HGA population, route crossover, M1--M6 VND, optional-Y mutation, diversity, and survival.
+- `src/mrta_baselines/wag_vns.py`: Adapted WAG three-stage route construction plus MOVE/SWAP/LNS VNS and optional-Y toggle.
 - `scripts/audit_ppo_instances.py`: local read-only PPO inventory and manifest CLI.
 - `scripts/run_ppo_smoke.py`: manifest-driven SA-OI-ALNS compatibility smoke CLI.
+- `scripts/run_phase3_baseline_smoke.py`: three-method DEVELOPMENT_CONSUMED PPO smoke with common provenance, checkpoints, and accounting.
 - `scripts/profile_phase2b1.py`: deterministic development-only N=20/50/100 smoke driver.
 - `scripts/profile_scheduler.py`: formal gate regression, method-independent direct sampling, final B32/B64/B128 calibration, historical replay, evaluator profiling, N=100 usability gates, Q1–Q6, and development-family smoke driver.
 - `tests/`: boundary, adversarial, oracle, and deterministic regression tests.
@@ -126,6 +133,15 @@ $env:PYTHONPATH='src'
 The frozen intake manifest is [PPO_DATASET_MANIFEST_V1](data/manifests/PPO_DATASET_MANIFEST_V1.json). [PPO_PHASE3_SMOKESET_V1](data/manifests/PPO_PHASE3_SMOKESET_V1.json) remains historical. The current initialization-development and compatibility selections are [PPO_INIT_BOOTSTRAP_DEVSET_V1](data/manifests/PPO_INIT_BOOTSTRAP_DEVSET_V1.json) and [PPO_PHASE3_SMOKESET_V2](data/manifests/PPO_PHASE3_SMOKESET_V2.json). Dataset identity is separate from `FORMAL_SCOPE_V1_1.scope_hash`.
 
 The Phase 3 main operating range is `10 <= N <= 90`: 2893 of 2942 valid unique instances are in range. The remaining 49 (1.6655%) stay valid in the manifest as large-scale stress/out-of-main-range data and do not block Phase 3. Future TRAIN/VALIDATION/TEST assignment must isolate complete workbooks/generation-seed families; every workbook listed as development-consumed in `PPO_INIT_BOOTSTRAP_DEVSET_V1` is excluded from untouched TEST.
+
+`PPO_PHASE3_DATA_SPLIT_V1` freezes all 96 workbooks before baseline performance runs: 23 DEVELOPMENT_CONSUMED, 43 TRAIN_POOL, 15 VALIDATION, and 15 untouched ID_TEST. Historical directory names do not override these roles, and every sheet inherits its workbook role. The first 30-second three-method smoke used only three distinct DEVELOPMENT_CONSUMED workbooks (N=25/55/85) and produced 27/27 certified runs; it is development evidence, not a formal comparison.
+
+```powershell
+$env:PYTHONPATH='src'
+& 'D:\pybullet_test\.venv\Scripts\python.exe' scripts\run_phase3_baseline_smoke.py --ppo-root 'D:\pybullet_test\MRTA_GA\ppo' --budget 30 --source-commit-label '<LOCAL_REVISION_LABEL>'
+```
+
+See [baseline source mapping](docs/PHASE3_BASELINE_SOURCE_MAPPING_20260930.md), [Phase 3-1 implementation handoff](docs/PHASE3_HGA_WAG_BASELINE_IMPLEMENTATION_20260930.md), [split manifest](data/manifests/PPO_PHASE3_DATA_SPLIT_V1.json), and [development smoke](data/development/phase3_baseline_smoke_v1.json).
 
 ## Formal API
 
