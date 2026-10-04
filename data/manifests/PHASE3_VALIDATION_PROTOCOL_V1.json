@@ -1,0 +1,158 @@
+{
+  "aggregation_policy": {
+    "backbone_ratio": "A_i / min(H_i, W_i)",
+    "instance_method_seed_count": 5,
+    "median_Cmax_60_requires": "5/5 certified checkpoint values"
+  },
+  "checkpoints": [
+    5.0,
+    30.0,
+    60.0
+  ],
+  "dataset_manifest_hash": "3a12fc59708fcd6adc20bb19ba44ba8ece585f8e0a81a93304694960f18f2a31",
+  "initialization_timing": "included in wall clock",
+  "methods": [
+    {
+      "method_config": {
+        "adaptive_reaction": 0.2,
+        "adaptive_segment_length": 20,
+        "checkpoints": [
+          5.0,
+          30.0,
+          60.0
+        ],
+        "construction_budget": 5,
+        "cooling_rate": 0.995,
+        "destroy_q_max": 8,
+        "destroy_q_min": 2,
+        "destroy_rho": 0.15,
+        "direction_refinement_budget": 4,
+        "enable_two_opt_star": false,
+        "feasibility_bootstrap_budget": 1,
+        "insertion_limit": 8,
+        "kdp": 8,
+        "kinit_ref": 5,
+        "kref": 2,
+        "kref_total": 4,
+        "m": 64,
+        "m_atomic": null,
+        "m_lns": 16,
+        "max_iterations": 100000,
+        "repair_evaluation_cap": 4096,
+        "repair_insertion_limit": 8,
+        "reward_accepted_improvement": 4.0,
+        "reward_accepted_non_improvement": 1.0,
+        "reward_evaluation_failed": 0.0,
+        "reward_global_best": 8.0,
+        "reward_rejected": 0.0,
+        "t0": 0.05,
+        "time_limit": 60.0,
+        "tmin": 1e-06
+      },
+      "method_config_hash": "53a83e8b45d91732116a64ade3bfb0bd701988c2804e2b4827339fce7130f9db",
+      "method_id": "SA_OI_ALNS_INIT_POLICY_V3_TWO_OPT_STAR_OFF"
+    },
+    {
+      "method_config": {
+        "alpha": 20,
+        "initialization_reference_limit": 20,
+        "lambda_size": 10,
+        "max_iterations": 200000,
+        "mu": 20,
+        "pattern_mutation_probability": 0.15,
+        "vnd_candidate_cap": 256,
+        "vnd_max_passes": 2
+      },
+      "method_config_hash": "a1748ac615fd93270dbeb75361c14a32ca3018cca805c33361cb90309d903847",
+      "method_id": "ADAPTED_HGA_V1"
+    },
+    {
+      "method_config": {
+        "factorial_mode": "COMMON_MODEL_BOUNDED",
+        "factorial_window": 5,
+        "imax": 500,
+        "max_factorial_calls": 30720,
+        "max_route_combinations_per_wag": 3,
+        "max_wag_variants": 10,
+        "max_windows": 8,
+        "n": 10,
+        "p": 0.5
+      },
+      "method_config_hash": "469c79808f2cb6c2e9d6af0c5252555ea803e0c9f500f9e8652162d071e17f67",
+      "method_id": "ADAPTED_WAG_VNS_V1"
+    }
+  ],
+  "overshoot_policy": "a started formal reference evaluation may finish; post-deadline improvements must not backfill checkpoints",
+  "phase3_split_hash": "5b5e3a6d43b943c5bad03a9ecbadaefa74c6158b33036da6e0fc236e03af1c5a",
+  "protocol_id": "PHASE3_VALIDATION_PROTOCOL_V1",
+  "release_rule": {
+    "certifier_mismatch_count": 0,
+    "complete_certified_runs": 180,
+    "instances_with_ratio_at_most_1_10_min": 8,
+    "iteration_limit_forbidden": true,
+    "median_ratio_max": 1.1,
+    "numeric_failure_count": 0,
+    "tier_median_ratio_max": 1.15
+  },
+  "scope_hash": "5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc",
+  "scope_id": "FORMAL_SCOPE_V1_1",
+  "seed_set_id": "PHASE3_VALIDATION_SEEDS_V1",
+  "seeds": [
+    20260928,
+    20260929,
+    20260930,
+    20261001,
+    20261002
+  ],
+  "selection_policy": {
+    "descriptor_fields": [
+      "normalized_N",
+      "total_weld_length",
+      "bbox_coverage",
+      "x_coverage",
+      "y_coverage",
+      "cross_y6_count",
+      "upper_lower_imbalance",
+      "left_right_imbalance"
+    ],
+    "first": "minimum |N-target|, tie instance_geometry_hash",
+    "main_range": [
+      10,
+      90
+    ],
+    "normalization": "per-tier candidate-pool min-max",
+    "solver_metrics_forbidden": true,
+    "subsequent": "farthest-first maximum minimum Euclidean descriptor distance; ties by |N-target| then instance_geometry_hash",
+    "tiers": [
+      {
+        "preferred_N": [
+          20,
+          30
+        ],
+        "target_N": 25,
+        "tier": "SMALL"
+      },
+      {
+        "preferred_N": [
+          50,
+          60
+        ],
+        "target_N": 55,
+        "tier": "MEDIUM"
+      },
+      {
+        "preferred_N": [
+          80,
+          90
+        ],
+        "target_N": 85,
+        "tier": "LARGE"
+      }
+    ],
+    "workbook_limit": 1
+  },
+  "time_limit": 60.0,
+  "trajectory_policy": "one 60-second native trajectory per method-instance-seed",
+  "validation_protocol_hash": "3d797f7d9ddb0c57b751bdaff50e451c3f67b54410023bf9953b1a89229ac2d2",
+  "validation_set_hash": "ed7550654accddad3e029915fe3b31881292ab4341dd275f846db1b218bb5df3"
+}

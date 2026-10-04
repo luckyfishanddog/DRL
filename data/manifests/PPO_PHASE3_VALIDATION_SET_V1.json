@@ -1,0 +1,451 @@
+{
+  "dataset_manifest_hash": "3a12fc59708fcd6adc20bb19ba44ba8ece585f8e0a81a93304694960f18f2a31",
+  "instances": [
+    {
+      "N": 25,
+      "actual_weld_count": 25,
+      "descriptor": {
+        "bbox_coverage": 0.8044859236569017,
+        "cross_y6_count": 1.0,
+        "left_right_imbalance": 0.2841405361919329,
+        "normalized_N": 25.0,
+        "total_weld_length": 39.95260665092889,
+        "upper_lower_imbalance": 0.25292755360637603,
+        "x_coverage": 0.87332160830245,
+        "y_coverage": 0.9211794555509166
+      },
+      "instance_geometry_hash": "23894bfab8397864704d18cf9b62832a0ef4246b020ab3d013748380472d045c",
+      "instance_id": "data/PPO_TRAIN/seed_1867256633::g15_w025",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.024509843716702128,
+        "cross_y6_count": 0.0,
+        "left_right_imbalance": 0.9109269520180023,
+        "normalized_N": 0.0,
+        "total_weld_length": 0.0,
+        "upper_lower_imbalance": 0.3075589348306051,
+        "x_coverage": 0.0,
+        "y_coverage": 0.4804525269958225
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_1867256633.xlsx",
+      "selection_ordinal": 1,
+      "sheet_name": "g15_w025",
+      "target_weld_count": 25,
+      "tier": "SMALL",
+      "workbook_path": "data/PPO_TRAIN/seed_1867256633.xlsx"
+    },
+    {
+      "N": 27,
+      "actual_weld_count": 27,
+      "descriptor": {
+        "bbox_coverage": 0.839936299449404,
+        "cross_y6_count": 2.0,
+        "left_right_imbalance": 0.07315608299044632,
+        "normalized_N": 27.0,
+        "total_weld_length": 57.267252485970744,
+        "upper_lower_imbalance": 0.5345299445248867,
+        "x_coverage": 0.9527232885511001,
+        "y_coverage": 0.8816162148474166
+      },
+      "instance_geometry_hash": "2cb134234b954e5d7b4a63796a6809435188a45841733489996b865b330624e4",
+      "instance_id": "data/PPO_TRAIN/seed_1871665270::g15_w027",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.39569941591952335,
+        "cross_y6_count": 1.0,
+        "left_right_imbalance": 0.21722555736323493,
+        "normalized_N": 0.4,
+        "total_weld_length": 0.7185825218667412,
+        "upper_lower_imbalance": 1.0,
+        "x_coverage": 1.0,
+        "y_coverage": 0.12291523513955019
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_1871665270.xlsx",
+      "selection_ordinal": 2,
+      "sheet_name": "g15_w027",
+      "target_weld_count": 25,
+      "tier": "SMALL",
+      "workbook_path": "data/PPO_TRAIN/seed_1871665270.xlsx"
+    },
+    {
+      "N": 30,
+      "actual_weld_count": 30,
+      "descriptor": {
+        "bbox_coverage": 0.8976498894895248,
+        "cross_y6_count": 1.0,
+        "left_right_imbalance": 0.1438892051880916,
+        "normalized_N": 30.0,
+        "total_weld_length": 63.043367948848974,
+        "upper_lower_imbalance": 0.2915114447958361,
+        "x_coverage": 0.91721414896385,
+        "y_coverage": 0.9786699109510835
+      },
+      "instance_geometry_hash": "2fbef409e5827d268d7a8d63027e1d4ddae6b4ffa4885591c55159055de2043d",
+      "instance_id": "data/ID_TEST/seed_0533728435::g19_w030",
+      "normalized_descriptor": {
+        "bbox_coverage": 1.0,
+        "cross_y6_count": 0.0,
+        "left_right_imbalance": 0.44979087093131004,
+        "normalized_N": 1.0,
+        "total_weld_length": 0.9582995600003419,
+        "upper_lower_imbalance": 0.40243409063615754,
+        "x_coverage": 0.5527910810444874,
+        "y_coverage": 1.0
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/ID_TEST/seed_0533728435.xlsx",
+      "selection_ordinal": 3,
+      "sheet_name": "g19_w030",
+      "target_weld_count": 25,
+      "tier": "SMALL",
+      "workbook_path": "data/ID_TEST/seed_0533728435.xlsx"
+    },
+    {
+      "N": 27,
+      "actual_weld_count": 27,
+      "descriptor": {
+        "bbox_coverage": 0.8021451165991598,
+        "cross_y6_count": 1.0,
+        "left_right_imbalance": 0.007088440925982846,
+        "normalized_N": 27.0,
+        "total_weld_length": 61.390721176586936,
+        "upper_lower_imbalance": 0.12784928232351797,
+        "x_coverage": 0.9241142998471,
+        "y_coverage": 0.8680150461170001
+      },
+      "instance_geometry_hash": "997fb2d99d2ab552acb37ce239d85478f71a23cfc49fd0c44441e6b9bc5bce3d",
+      "instance_id": "data/ID_TEST/seed_2013829876::g15_w027",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.0,
+        "cross_y6_count": 0.0,
+        "left_right_imbalance": 0.0,
+        "normalized_N": 0.4,
+        "total_weld_length": 0.8897123595065517,
+        "upper_lower_imbalance": 0.0,
+        "x_coverage": 0.6396929055605666,
+        "y_coverage": 0.0
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/ID_TEST/seed_2013829876.xlsx",
+      "selection_ordinal": 4,
+      "sheet_name": "g15_w027",
+      "target_weld_count": 25,
+      "tier": "SMALL",
+      "workbook_path": "data/ID_TEST/seed_2013829876.xlsx"
+    },
+    {
+      "N": 55,
+      "actual_weld_count": 55,
+      "descriptor": {
+        "bbox_coverage": 0.8810680287422871,
+        "cross_y6_count": 9.0,
+        "left_right_imbalance": 0.01635024245871476,
+        "normalized_N": 55.0,
+        "total_weld_length": 71.68386170487224,
+        "upper_lower_imbalance": 0.022133901511717825,
+        "x_coverage": 0.9175309098246499,
+        "y_coverage": 0.9602597790527501
+      },
+      "instance_geometry_hash": "0d29ed9b58cc521e3137129c27d9b67b664958e049bfbb8be6e5281f222660ee",
+      "instance_id": "data/PPO_TRAIN/seed_0088690758::g26_w055",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.5507688640250525,
+        "cross_y6_count": 1.0,
+        "left_right_imbalance": 0.04027159181787134,
+        "normalized_N": 0.5,
+        "total_weld_length": 0.24098052257294653,
+        "upper_lower_imbalance": 0.045657729823916,
+        "x_coverage": 0.2997088492368364,
+        "y_coverage": 0.7897347079767045
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_0088690758.xlsx",
+      "selection_ordinal": 5,
+      "sheet_name": "g26_w055",
+      "target_weld_count": 55,
+      "tier": "MEDIUM",
+      "workbook_path": "data/PPO_TRAIN/seed_0088690758.xlsx"
+    },
+    {
+      "N": 52,
+      "actual_weld_count": 52,
+      "descriptor": {
+        "bbox_coverage": 0.8412872285785431,
+        "cross_y6_count": 3.0,
+        "left_right_imbalance": 0.38251599181360113,
+        "normalized_N": 52.0,
+        "total_weld_length": 74.29828808554379,
+        "upper_lower_imbalance": 0.1378476044802645,
+        "x_coverage": 0.9807867224179001,
+        "y_coverage": 0.8577677586260001
+      },
+      "instance_geometry_hash": "0eb509ee0fff179ccd2d57e84d5c3a0c632212c647a4da23757dfc1098fe0968",
+      "instance_id": "data/PPO_TRAIN/seed_1916546866::g26_w052",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.36075918436303334,
+        "cross_y6_count": 0.3333333333333333,
+        "left_right_imbalance": 0.9751889144384415,
+        "normalized_N": 0.2,
+        "total_weld_length": 0.28355043874324715,
+        "upper_lower_imbalance": 0.35561186976298703,
+        "x_coverage": 0.8686678808732131,
+        "y_coverage": 0.0
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_1916546866.xlsx",
+      "selection_ordinal": 6,
+      "sheet_name": "g26_w052",
+      "target_weld_count": 55,
+      "tier": "MEDIUM",
+      "workbook_path": "data/PPO_TRAIN/seed_1916546866.xlsx"
+    },
+    {
+      "N": 60,
+      "actual_weld_count": 60,
+      "descriptor": {
+        "bbox_coverage": 0.948346798396933,
+        "cross_y6_count": 1.0,
+        "left_right_imbalance": 0.11012870690716889,
+        "normalized_N": 60.0,
+        "total_weld_length": 118.298953388169,
+        "upper_lower_imbalance": 0.24449945742316084,
+        "x_coverage": 0.9750358781547501,
+        "y_coverage": 0.9726275921165835
+      },
+      "instance_geometry_hash": "fc536e9828a431d3830877a0d29bb2953605473f3e3b449eb1499e30feef9323",
+      "instance_id": "data/PPO_TRAIN/seed_1702002874::g32_w060",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.8721203053614435,
+        "cross_y6_count": 0.1111111111111111,
+        "left_right_imbalance": 0.2797126401848574,
+        "normalized_N": 1.0,
+        "total_weld_length": 1.0,
+        "upper_lower_imbalance": 0.6412926707724347,
+        "x_coverage": 0.8169414916464535,
+        "y_coverage": 0.8850327731100532
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_1702002874.xlsx",
+      "selection_ordinal": 7,
+      "sheet_name": "g32_w060",
+      "target_weld_count": 55,
+      "tier": "MEDIUM",
+      "workbook_path": "data/PPO_TRAIN/seed_1702002874.xlsx"
+    },
+    {
+      "N": 50,
+      "actual_weld_count": 50,
+      "descriptor": {
+        "bbox_coverage": 0.9083568563601248,
+        "cross_y6_count": 3.0,
+        "left_right_imbalance": 0.12475134698002234,
+        "normalized_N": 50.0,
+        "total_weld_length": 76.55515010842899,
+        "upper_lower_imbalance": 0.37841395637141956,
+        "x_coverage": 0.9236689240735,
+        "y_coverage": 0.9834225583276668
+      },
+      "instance_geometry_hash": "86d33e594c6e9c58718df86f14bfd8f17f1ab01dd969a7b8de4083bc51d96b81",
+      "instance_id": "data/PPO_TRAIN/seed_0463639632::g20_w050",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.6811116769567822,
+        "cross_y6_count": 0.3333333333333333,
+        "left_right_imbalance": 0.3170480805711907,
+        "normalized_N": 0.0,
+        "total_weld_length": 0.3202982423274047,
+        "upper_lower_imbalance": 1.0,
+        "x_coverage": 0.3549176672098533,
+        "y_coverage": 0.9682115362257744
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_0463639632.xlsx",
+      "selection_ordinal": 8,
+      "sheet_name": "g20_w050",
+      "target_weld_count": 55,
+      "tier": "MEDIUM",
+      "workbook_path": "data/PPO_TRAIN/seed_0463639632.xlsx"
+    },
+    {
+      "N": 85,
+      "actual_weld_count": 85,
+      "descriptor": {
+        "bbox_coverage": 0.9400287963800706,
+        "cross_y6_count": 3.0,
+        "left_right_imbalance": 0.1306294672218896,
+        "normalized_N": 85.0,
+        "total_weld_length": 110.51645358549582,
+        "upper_lower_imbalance": 0.07798328762811405,
+        "x_coverage": 0.98415854897485,
+        "y_coverage": 0.9551599154010834
+      },
+      "instance_geometry_hash": "e1efea909d4099cd8baf24ad31b3f34cc2ca420746f4b2d048d1382516707bd1",
+      "instance_id": "data/PPO_TRAIN/seed_0817833068::g44_w085",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.8715233977178235,
+        "cross_y6_count": 0.0,
+        "left_right_imbalance": 0.3305811269207638,
+        "normalized_N": 0.9090909090909091,
+        "total_weld_length": 0.4834950424777759,
+        "upper_lower_imbalance": 0.3969156210506883,
+        "x_coverage": 1.0,
+        "y_coverage": 0.5430350822288988
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_0817833068.xlsx",
+      "selection_ordinal": 9,
+      "sheet_name": "g44_w085",
+      "target_weld_count": 85,
+      "tier": "LARGE",
+      "workbook_path": "data/PPO_TRAIN/seed_0817833068.xlsx"
+    },
+    {
+      "N": 75,
+      "actual_weld_count": 75,
+      "descriptor": {
+        "bbox_coverage": 0.8788798928947344,
+        "cross_y6_count": 5.0,
+        "left_right_imbalance": 0.09733161967641124,
+        "normalized_N": 75.0,
+        "total_weld_length": 82.77597414629868,
+        "upper_lower_imbalance": 0.04699652819781978,
+        "x_coverage": 0.9512722506763,
+        "y_coverage": 0.9238994328594168
+      },
+      "instance_geometry_hash": "507094f652f697e7d77180bb99b0b2d5501d4e04a7b03593f4864eb7897823d8",
+      "instance_id": "data/PPO_TRAIN/seed_2091884649::g43_w075",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.0,
+        "cross_y6_count": 1.0,
+        "left_right_imbalance": 0.0,
+        "normalized_N": 0.0,
+        "total_weld_length": 0.0,
+        "upper_lower_imbalance": 0.1732394077579349,
+        "x_coverage": 0.4622596275765616,
+        "y_coverage": 0.0
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_2091884649.xlsx",
+      "selection_ordinal": 10,
+      "sheet_name": "g43_w075",
+      "target_weld_count": 85,
+      "tier": "LARGE",
+      "workbook_path": "data/PPO_TRAIN/seed_2091884649.xlsx"
+    },
+    {
+      "N": 75,
+      "actual_weld_count": 75,
+      "descriptor": {
+        "bbox_coverage": 0.8898264283577844,
+        "cross_y6_count": 3.0,
+        "left_right_imbalance": 0.13756978864590294,
+        "normalized_N": 75.0,
+        "total_weld_length": 125.37802635180084,
+        "upper_lower_imbalance": 0.1615309760102125,
+        "x_coverage": 0.9230020876320999,
+        "y_coverage": 0.9640567884744167
+      },
+      "instance_geometry_hash": "d219d4fa840755cc3c90680e74d18e74f815c7f4b55c0d791793d23ccfc8ac55",
+      "instance_id": "data/VALIDATION/seed_2145450783::g41_w075",
+      "normalized_descriptor": {
+        "bbox_coverage": 0.15601525515962333,
+        "cross_y6_count": 0.0,
+        "left_right_imbalance": 0.3994846581297717,
+        "normalized_N": 0.0,
+        "total_weld_length": 0.7425207298917481,
+        "upper_lower_imbalance": 1.0,
+        "x_coverage": 0.0,
+        "y_coverage": 0.6975852941303963
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/VALIDATION/seed_2145450783.xlsx",
+      "selection_ordinal": 11,
+      "sheet_name": "g41_w075",
+      "target_weld_count": 85,
+      "tier": "LARGE",
+      "workbook_path": "data/VALIDATION/seed_2145450783.xlsx"
+    },
+    {
+      "N": 75,
+      "actual_weld_count": 75,
+      "descriptor": {
+        "bbox_coverage": 0.949043130789966,
+        "cross_y6_count": 4.0,
+        "left_right_imbalance": 0.1062381557424559,
+        "normalized_N": 75.0,
+        "total_weld_length": 140.15087358070653,
+        "upper_lower_imbalance": 0.11597979750613109,
+        "x_coverage": 0.9669651894361,
+        "y_coverage": 0.9814656630435833
+      },
+      "instance_geometry_hash": "86f09e97a5acf8ec5069c43a71d6176846e41692203463f98d7abc8e420458df",
+      "instance_id": "data/PPO_TRAIN/seed_0600641460::g45_w075",
+      "normalized_descriptor": {
+        "bbox_coverage": 1.0,
+        "cross_y6_count": 0.5,
+        "left_right_imbalance": 0.08842411587271784,
+        "normalized_N": 0.0,
+        "total_weld_length": 1.0,
+        "upper_lower_imbalance": 0.6711913311963116,
+        "x_coverage": 0.7188627471038557,
+        "y_coverage": 1.0
+      },
+      "phase3_role": "VALIDATION",
+      "relative_path": "data/PPO_TRAIN/seed_0600641460.xlsx",
+      "selection_ordinal": 12,
+      "sheet_name": "g45_w075",
+      "target_weld_count": 85,
+      "tier": "LARGE",
+      "workbook_path": "data/PPO_TRAIN/seed_0600641460.xlsx"
+    }
+  ],
+  "phase3_split_hash": "5b5e3a6d43b943c5bad03a9ecbadaefa74c6158b33036da6e0fc236e03af1c5a",
+  "selection_policy": {
+    "descriptor_fields": [
+      "normalized_N",
+      "total_weld_length",
+      "bbox_coverage",
+      "x_coverage",
+      "y_coverage",
+      "cross_y6_count",
+      "upper_lower_imbalance",
+      "left_right_imbalance"
+    ],
+    "first": "minimum |N-target|, tie instance_geometry_hash",
+    "main_range": [
+      10,
+      90
+    ],
+    "normalization": "per-tier candidate-pool min-max",
+    "solver_metrics_forbidden": true,
+    "subsequent": "farthest-first maximum minimum Euclidean descriptor distance; ties by |N-target| then instance_geometry_hash",
+    "tiers": [
+      {
+        "preferred_N": [
+          20,
+          30
+        ],
+        "target_N": 25,
+        "tier": "SMALL"
+      },
+      {
+        "preferred_N": [
+          50,
+          60
+        ],
+        "target_N": 55,
+        "tier": "MEDIUM"
+      },
+      {
+        "preferred_N": [
+          80,
+          90
+        ],
+        "target_N": 85,
+        "tier": "LARGE"
+      }
+    ],
+    "workbook_limit": 1
+  },
+  "selection_policy_id": "PPO_PHASE3_VALIDATION_SELECTION_V1",
+  "validation_set_hash": "ed7550654accddad3e029915fe3b31881292ab4341dd275f846db1b218bb5df3"
+}
