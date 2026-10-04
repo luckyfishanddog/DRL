@@ -18,6 +18,7 @@ from mrta_reference.model import (
     Operation,
     OperationKind,
     ParentWeld,
+    Rail,
     ScheduleStatus,
     ScientificConfig,
     SplitKind,
@@ -379,7 +380,7 @@ def test_x_split_provider_is_rejected_by_current_scope() -> None:
         scope_id = EXACT_Y_SCOPE_CURRENT_SEMANTICS
 
         def patterns_for(self, parent, config):
-            return (SplitPattern(parent.parent_id, SplitKind.X_SPLIT, 0.5, "x"),)
+            return (SplitPattern(parent.parent_id, SplitKind.X_SPLIT, 0.5, "x", rail=Rail.UPPER),)
 
     parent = ParentWeld("p", (0.0, 2.0), (2.0, 2.0))
     with pytest.raises(ValueError, match="X_SPLIT is excluded"):

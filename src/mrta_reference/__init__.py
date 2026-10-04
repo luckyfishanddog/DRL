@@ -7,11 +7,13 @@ from .geometry import (
     XSplitValidator,
     continuous_interference,
     frozen_handover_centers,
+    finite_x_split_validator,
     generate_x_split_patterns,
     generate_y_split_patterns,
     optimize_directions,
     whole_eligible_rails,
     x_split_relation,
+    x_split_geometry_metadata,
 )
 from .model import (
     CandidateKey,
@@ -35,6 +37,7 @@ from .model import (
     FormalScope,
     FORMAL_SCOPE_V1,
     FORMAL_SCOPE_V1_1,
+    EXPERIMENTAL_X_SPLIT_SCOPE_V1,
     ACTIVE_FORMAL_SCOPE,
     RunScientificIdentity,
     DEVELOPMENT_NO_REPAIR_V1,
@@ -79,6 +82,7 @@ from .scheduler import (
 
 __all__ = [
     "FormalScope", "FORMAL_SCOPE_V1", "FORMAL_SCOPE_V1_1",
+    "EXPERIMENTAL_X_SPLIT_SCOPE_V1",
     "ACTIVE_FORMAL_SCOPE", "RunScientificIdentity",
     "REPOSITORY_ID", "SOURCE_PROVENANCE_POLICY_V1", "SourceProvenance",
     "SourceProvenanceError", "canonicalize_repository_url",
@@ -122,6 +126,7 @@ __all__ = [
     "earliest_safe_start_optimized",
     "earliest_safe_start_slow",
     "frozen_handover_centers",
+    "finite_x_split_validator",
     "generate_x_split_patterns",
     "generate_y_split_patterns",
     "official_metrics",
@@ -138,4 +143,5 @@ __all__ = [
     "wait_for_cycles",
     "whole_eligible_rails",
     "x_split_relation",
+    "x_split_geometry_metadata",
 ]

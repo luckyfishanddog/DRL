@@ -61,6 +61,7 @@ class FormalScope:
         if self.canonical_json not in {
             FORMAL_SCOPE_V1.canonical_json,
             FORMAL_SCOPE_V1_1.canonical_json,
+            EXPERIMENTAL_X_SPLIT_SCOPE_V1.canonical_json,
         }:
             raise ValueError("unsupported formal scope; policy changes require implementation and validation")
 
@@ -77,6 +78,13 @@ FORMAL_SCOPE_V1_1 = replace(
     dispatch_recovery_order_id=LIMITED_DISCREPANCY_RECENT_BRANCH_FIRST_V1,
     reference_scheduler_policy_id=FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
     state_count_policy_id="COMPLETE_ALTERNATIVE_ROLLOUTS_V1",
+)
+
+EXPERIMENTAL_X_SPLIT_SCOPE_V1 = replace(
+    FORMAL_SCOPE_V1_1,
+    scope_id="EXPERIMENTAL_X_SPLIT_SCOPE_V1",
+    pattern_domain=("WHOLE", "Y_SPLIT", "X_SPLIT"),
+    optional_x_split_policy="FINITE_GEOMETRIC_X_SPLIT_V1",
 )
 
 ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V1_1

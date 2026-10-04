@@ -6,21 +6,31 @@ from dataclasses import replace
 import pytest
 
 from mrta_reference.certifier import certify_schedule
-from mrta_reference.geometry import continuous_interference, operations_conflict, same_rail_order_violation
+from mrta_reference.geometry import (
+    continuous_interference,
+    finite_x_split_validator,
+    generate_x_split_patterns,
+    operations_conflict,
+    same_rail_order_violation,
+)
 from mrta_reference.model import (
     Operation,
     OperationKind,
     ParentWeld,
+    Rail,
     ScheduleStatus,
     ScientificConfig,
     SplitKind,
     SplitPattern,
+    EXPERIMENTAL_X_SPLIT_SCOPE_V1,
+    FORMAL_SCOPE_V1_1,
 )
 from mrta_reference.scheduler import (
     build_operation_templates,
     build_robot_routes,
     earliest_safe_start,
     reference_schedule,
+    reference_schedule_formal,
     reference_schedule_from_templates,
     wait_for_cycles,
 )
@@ -74,7 +84,7 @@ def test_formal_x_excluded_even_with_valid_legacy_validator():
     from mrta_reference.model import CanonicalSolution, Route, FORMAL_SCOPE_V1_1
     from mrta_reference.scheduler import reference_schedule_formal
     parent = ParentWeld("x", (1, 8), (5, 8))
-    pattern = SplitPattern("x", SplitKind.X_SPLIT, 0.5, "explicit-x")
+    pattern = SplitPattern("x", SplitKind.X_SPLIT, 0.5, "explicit-x", rail=Rail.UPPER)
     solution = CanonicalSolution((parent,), (pattern,), (Route(0, ("x::0",)), Route(1, ("x::1",)), Route(2, ()), Route(3, ())))
     formal = reference_schedule_formal(solution, CONFIG)
     assert formal.status is ScheduleStatus.INFEASIBLE
@@ -82,6 +92,143 @@ def test_formal_x_excluded_even_with_valid_legacy_validator():
     fake = replace(formal, status=ScheduleStatus.FEASIBLE, cmax=0)
     assert not certify_schedule(solution, fake, CONFIG, scope=FORMAL_SCOPE_V1_1,
                                 x_split_validator=lambda *args: True).certified
+
+
+def test_experimental_x_scope_certifies_processing_and_shared_point_wait() -> None:
+    parent = ParentWeld("xgate", (0.0, 8.0), (4.0, 8.0))
+    pattern = next(
+        item
+        for item in generate_x_split_patterns(parent, 2.0, CONFIG, rail=Rail.UPPER)
+        if item.point_id == "BX_CENTER"
+    )
+    validator = finite_x_split_validator((parent,), CONFIG)
+    solution = canonicalize(
+        (parent,),
+        (pattern,),
+        {0: ("xgate::0",), 1: ("xgate::1",)},
+        CONFIG,
+        x_split_validator=validator,
+    )
+    schedule = reference_schedule_formal(
+        solution,
+        CONFIG,
+        scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
+        orientations={0: (0,), 1: (1,), 2: (), 3: ()},
+    )
+    assert schedule.status is ScheduleStatus.FEASIBLE
+    report = certify_schedule(
+        solution,
+        schedule,
+        CONFIG,
+        scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
+    )
+    assert report.certified, report.errors
+    assert sum(op.kind is OperationKind.SETUP for op in schedule.operations) == 2
+    assert sum(op.kind is OperationKind.POST for op in schedule.operations) == 2
+    split_process = sum(
+        op.duration
+        for op in schedule.operations
+        if op.kind in (OperationKind.SETUP, OperationKind.WELD, OperationKind.POST)
+    )
+    assert split_process == pytest.approx(CONFIG.process_time(parent.length) + CONFIG.t_pre + CONFIG.t_post)
+    assert any(op.kind is OperationKind.WAIT and op.duration > 0.0 for op in schedule.operations)
+    rejected = reference_schedule_formal(solution, CONFIG, scope=FORMAL_SCOPE_V1_1)
+    assert rejected.status is ScheduleStatus.INFEASIBLE
+    assert "EXCLUDED" in rejected.diagnostics[0]
+
+
+def test_phase3x_controlled_fixtures_f1_to_f8() -> None:
+    def whole_and_x(length: float):
+        parent = ParentWeld(f"p{length}", (0.0, 8.0), (length, 8.0))
+        whole = canonicalize(
+            (parent,),
+            (SplitPattern(parent.parent_id, SplitKind.WHOLE),),
+            {0: (f"{parent.parent_id}::whole",)},
+            CONFIG,
+        )
+        patterns = generate_x_split_patterns(
+            parent, length / 2.0, CONFIG, rail=Rail.UPPER
+        )
+        center = next((item for item in patterns if item.point_id == "BX_CENTER"), None)
+        if center is None:
+            return parent, whole, None
+        split = canonicalize(
+            (parent,),
+            (center,),
+            {0: (f"{parent.parent_id}::0",), 1: (f"{parent.parent_id}::1",)},
+            CONFIG,
+            x_split_validator=finite_x_split_validator((parent,), CONFIG),
+        )
+        return parent, whole, split
+
+    # F1: long X-span remains legally WHOLE; X_SPLIT is optional, never forced.
+    long_parent, long_whole, long_split = whole_and_x(12.0)
+    assert long_whole.patterns[0].kind is SplitKind.WHOLE
+    assert long_split is not None
+
+    # F2/F3: a sub-10m parent can benefit from finite X load sharing.
+    short_parent, short_whole, short_split = whole_and_x(8.0)
+    assert short_parent.length < 10.0 and short_split is not None
+    whole_schedule = reference_schedule_formal(
+        short_whole, CONFIG, scope=FORMAL_SCOPE_V1_1
+    )
+    outward = reference_schedule_formal(
+        short_split,
+        CONFIG,
+        scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
+        orientations={0: (0,), 1: (0,), 2: (), 3: ()},
+    )
+    assert outward.feasible and outward.cmax < whole_schedule.cmax
+
+    # F4: minimum-size children plus coordination can make X no better.
+    _, tiny_whole, tiny_split = whole_and_x(0.4)
+    assert tiny_split is not None
+    tiny_x = reference_schedule_formal(
+        tiny_split,
+        CONFIG,
+        scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
+        orientations={0: (0,), 1: (0,), 2: (), 3: ()},
+    )
+    assert reference_schedule_formal(tiny_whole, CONFIG, scope=FORMAL_SCOPE_V1_1).feasible
+    assert not tiny_x.feasible
+
+    # F5/F6: the shared point is checked; direction changes WAIT without changing legality.
+    _, _, medium_split = whole_and_x(4.0)
+    assert medium_split is not None
+    inward = reference_schedule_formal(
+        medium_split,
+        CONFIG,
+        scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
+        orientations={0: (0,), 1: (1,), 2: (), 3: ()},
+    )
+    assert any(op.kind is OperationKind.WAIT for op in inward.operations)
+    independent = canonicalize(
+        (
+            ParentWeld("ind-left", (0.0, 8.0), (2.0, 8.0)),
+            ParentWeld("ind-right", (2.0, 8.0), (4.0, 8.0)),
+        ),
+        (
+            SplitPattern("ind-left", SplitKind.WHOLE),
+            SplitPattern("ind-right", SplitKind.WHOLE),
+        ),
+        {0: ("ind-left::whole",), 1: ("ind-right::whole",)},
+        CONFIG,
+    )
+    aligned_without_x = reference_schedule_formal(
+        independent,
+        CONFIG,
+        scope=FORMAL_SCOPE_V1_1,
+        orientations={0: (0,), 1: (0,), 2: (), 3: ()},
+    )
+    assert not any(pattern.kind is SplitKind.X_SPLIT for pattern in independent.patterns)
+    assert aligned_without_x.feasible
+    assert not any(op.kind is OperationKind.WAIT for op in aligned_without_x.operations)
+
+    # F7/F8: negligible X-span and sub-Lmin children generate no candidates.
+    vertical = ParentWeld("vertical-fixture", (2.0, 7.0), (2.0, 9.0))
+    too_short = ParentWeld("short-fixture", (0.0, 8.0), (0.3, 8.0))
+    assert generate_x_split_patterns(vertical, 2.0, CONFIG, rail=Rail.UPPER) == ()
+    assert generate_x_split_patterns(too_short, 0.15, CONFIG, rail=Rail.UPPER) == ()
 
 
 def _operation(

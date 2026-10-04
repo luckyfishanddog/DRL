@@ -10,6 +10,7 @@ from mrta_reference.model import (
     MoveType,
     OperationKind,
     ParentWeld,
+    Rail,
     Route,
     ScientificAmbiguityError,
     ScientificConfig,
@@ -57,7 +58,7 @@ def test_parent_has_exactly_one_mutually_exclusive_pattern_and_complete_coverage
     with pytest.raises(ValueError, match="more than one"):
         canonicalize(
             (parent,),
-            (SplitPattern("p", SplitKind.WHOLE), SplitPattern("p", SplitKind.X_SPLIT, 0.5, "x")),
+            (SplitPattern("p", SplitKind.WHOLE), SplitPattern("p", SplitKind.X_SPLIT, 0.5, "x", rail=Rail.UPPER)),
             {0: ("p::whole",)},
             CONFIG,
         )
@@ -104,7 +105,7 @@ def test_same_robot_consecutive_children_canonicalize_to_whole_before_processing
     parent = ParentWeld("p", (1, 8), (3, 8))
     solution = canonicalize(
         (parent,),
-        (SplitPattern("p", SplitKind.X_SPLIT, 0.5, "given"),),
+        (SplitPattern("p", SplitKind.X_SPLIT, 0.5, "given", rail=Rail.UPPER),),
         {0: ("p::0", "p::1")},
         CONFIG,
     )
@@ -117,7 +118,7 @@ def test_same_robot_consecutive_children_canonicalize_to_whole_before_processing
 
 def test_retained_x_split_formal_validation_is_fail_closed() -> None:
     parent = ParentWeld("p", (1.0, 8.0), (3.0, 8.0))
-    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.4, "test-t40")
+    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.4, "test-t40", rail=Rail.UPPER)
     routes = {0: ("p::0",), 1: ("p::1",)}
 
     with pytest.raises(ScientificAmbiguityError, match="XSplitValidator"):
@@ -153,7 +154,7 @@ def test_retained_x_split_formal_validation_is_fail_closed() -> None:
 
 def test_x_split_merged_to_whole_does_not_require_validator() -> None:
     parent = ParentWeld("p", (1.0, 8.0), (3.0, 8.0))
-    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.4, "unfrozen")
+    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.4, "unfrozen", rail=Rail.UPPER)
     merged = canonicalize(
         (parent,), (pattern,), {0: ("p::1", "p::0")}, CONFIG
     )
@@ -167,18 +168,18 @@ def test_x_children_only_merge_when_same_robot_and_consecutive() -> None:
         ParentWeld("separator", (5.0, 8.0), (6.0, 8.0)),
     )
     patterns = (
-        SplitPattern("p", SplitKind.X_SPLIT, 0.5, "test-mid"),
+        SplitPattern("p", SplitKind.X_SPLIT, 0.5, "test-mid", rail=Rail.UPPER),
         SplitPattern("separator", SplitKind.WHOLE),
     )
     validator = lambda _parent, pattern, _config: pattern.point_id == "test-mid"
-    separated = canonicalize(
-        parents,
-        patterns,
-        {0: ("p::0", "separator::whole", "p::1")},
-        CONFIG,
-        x_split_validator=validator,
-    )
-    assert separated.patterns[0].kind is SplitKind.X_SPLIT
+    with pytest.raises(ValueError, match="spatial children"):
+        canonicalize(
+            parents,
+            patterns,
+            {0: ("p::0", "separator::whole", "p::1")},
+            CONFIG,
+            x_split_validator=validator,
+        )
     different_robots = canonicalize(
         parents,
         patterns,
@@ -212,7 +213,7 @@ def test_mandatory_y_handover_is_derived_and_x_cannot_replace_it() -> None:
     with pytest.raises(ValueError, match="requires Y_SPLIT"):
         canonicalize(
             (parent,),
-            (SplitPattern("cross", SplitKind.X_SPLIT, 0.5, "x"),),
+            (SplitPattern("cross", SplitKind.X_SPLIT, 0.5, "x", rail=Rail.UPPER),),
             {0: ("cross::0",), 1: ("cross::1",)},
             CONFIG,
         )
@@ -258,9 +259,9 @@ def test_all_route_move_types_are_complete_atomic_transforms() -> None:
 
 def test_split_activate_switch_deactivate_and_canonical_duplicate_detection() -> None:
     solution = _whole_solution()
-    activated_pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.4, "x40")
+    activated_pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.4, "x40", rail=Rail.UPPER)
     activate = CandidateMove(
-        _key(MoveType.SPLIT_ACTIVATE, ("a",), 0, 1, (0,), (0,), pattern=activated_pattern),
+        _key(MoveType.SPLIT_ACTIVATE, ("a",), 0, 0, (0,), (0, 0), pattern=activated_pattern),
         split_pattern=activated_pattern,
     )
     split_solution = apply_candidate(
@@ -269,7 +270,7 @@ def test_split_activate_switch_deactivate_and_canonical_duplicate_detection() ->
     assert split_solution.routes[0].block_ids == ("a::0", "b::whole")
     assert split_solution.routes[1].block_ids[0] == "a::1"
 
-    switched_pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.6, "x60")
+    switched_pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.6, "x60", rail=Rail.UPPER)
     switch = CandidateMove(
         _key(MoveType.SPLIT_POINT_SWITCH, ("a",), None, None, (), (), revision=1, pattern=switched_pattern),
         split_pattern=switched_pattern,
@@ -308,7 +309,7 @@ def test_candidate_payload_cannot_disagree_with_its_key() -> None:
     with pytest.raises(ValueError, match="affected-parent identity"):
         apply_candidate(solution, wrong_parent, CONFIG)
 
-    pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.4, "x40")
+    pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.4, "x40", rail=Rail.UPPER)
     wrong_split_key = CandidateKey(
         0,
         MoveType.SPLIT_ACTIVATE,

@@ -8,6 +8,7 @@ import time
 
 from .geometry import (
     XSplitValidator,
+    finite_x_split_validator,
     forbidden_start_intervals,
     operations_conflict,
     optimize_directions,
@@ -1752,15 +1753,26 @@ def reference_schedule_formal(
 ) -> ScheduleResult:
     """The common formal evaluator. Development callbacks/X providers are absent."""
     scope.validate_implemented()
-    if any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns):
+    has_x = any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
+    if has_x and scope.optional_x_split_policy == "EXCLUDED":
         result = _infeasible(f"{scope.scope_id}: optional X_SPLIT is EXCLUDED")
     else:
+        x_validator = (
+            finite_x_split_validator(solution.parents, config)
+            if has_x
+            else None
+        )
         def dispatch(templates, cfg, *, directions, profile):
             return reference_schedule_from_templates_formal(
                 templates, cfg, scope=scope, directions=directions, profile=profile
             )
         result = _reference_schedule_with(
-            solution, config, dispatch, orientations=orientations, profile=profile
+            solution,
+            config,
+            dispatch,
+            orientations=orientations,
+            x_split_validator=x_validator,
+            profile=profile,
         )
     return replace(
         result,
@@ -1787,6 +1799,11 @@ class FormalReferenceEvaluator:
                 solution,
                 config,
                 orientations={robot: explicit[robot] for robot in range(4)},
+                x_split_validator=(
+                    finite_x_split_validator(solution.parents, config)
+                    if any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
+                    else None
+                ),
             )
             if baseline.status is not ScheduleStatus.DEADLOCK:
                 raise RuntimeError("formal baseline_deadlock provenance could not be replayed")

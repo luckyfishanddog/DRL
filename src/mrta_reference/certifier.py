@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import math
 from collections.abc import Callable
 
+from .geometry import finite_x_split_validator
+
 from .model import (
     CanonicalSolution,
     Operation,
@@ -173,7 +175,10 @@ def certify_schedule(
             scope.scope_id, scope.scope_hash, scope.reference_scheduler_policy_id
         ):
             errors.append("formal evaluator identity mismatch")
-        if any(p.kind is SplitKind.X_SPLIT for p in solution.patterns):
+        if (
+            scope.optional_x_split_policy == "EXCLUDED"
+            and any(p.kind is SplitKind.X_SPLIT for p in solution.patterns)
+        ):
             return CertificationReport(
                 False,
                 (f"{scope.scope_id}: optional X_SPLIT is EXCLUDED",),
@@ -264,26 +269,45 @@ def certify_schedule(
                     or max(parent.start[1], parent.end[1]) <= config.by[1] + config.numeric_epsilon
                 ):
                     errors.append(f"{parent.parent_id}: X split cannot replace mandatory Y handover")
+                if x_split_validator is None and scope is not None:
+                    x_split_validator = finite_x_split_validator(solution.parents, config)
                 if x_split_validator is None:
-                    raise ScientificAmbiguityError(
-                        "retained X_SPLIT requires an explicit formal XSplitValidator"
-                    )
+                    raise ScientificAmbiguityError("retained X_SPLIT requires an explicit formal XSplitValidator")
                 if not x_split_validator(parent, pattern, config):
                     errors.append(
                         f"{pattern.pattern_id}: rejected by explicit XSplitValidator"
                     )
-            blocks[f"{parent.parent_id}::0"] = (
-                parent.parent_id, parent.start, point, first_length
-            )
-            blocks[f"{parent.parent_id}::1"] = (
-                parent.parent_id, point, parent.end, second_length
-            )
+            first = (parent.parent_id, parent.start, point, first_length)
+            second = (parent.parent_id, point, parent.end, second_length)
+            if pattern.kind is SplitKind.X_SPLIT and (
+                (parent.start[0] + point[0]) / 2.0
+                > (point[0] + parent.end[0]) / 2.0
+            ):
+                first, second = second, first
+            blocks[f"{parent.parent_id}::0"] = first
+            blocks[f"{parent.parent_id}::1"] = second
 
     if set(pattern_by_id) != set(parent_by_id):
         errors.append("parent pattern coverage mismatch")
     assigned = [block for route in solution.routes for block in route.block_ids]
     if len(assigned) != len(set(assigned)) or set(assigned) != set(blocks):
         errors.append("welding block coverage mismatch")
+    assigned_robot = {
+        block_id: route.robot_id
+        for route in solution.routes
+        for block_id in route.block_ids
+    }
+    for pattern in solution.patterns:
+        if pattern.kind is SplitKind.X_SPLIT:
+            expected = (0, 1) if pattern.rail is Rail.UPPER else (2, 3)
+            actual = (
+                assigned_robot.get(f"{pattern.parent_id}::0"),
+                assigned_robot.get(f"{pattern.parent_id}::1"),
+            )
+            if actual != expected:
+                errors.append(
+                    f"{pattern.parent_id}: X_SPLIT spatial assignment must be R{expected[0]}/R{expected[1]}"
+                )
     for route in solution.routes:
         for left, right in zip(route.block_ids, route.block_ids[1:]):
             if left.endswith("::0") and right == left[:-1] + "1":

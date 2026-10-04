@@ -20,6 +20,7 @@ from mrta_reference.model import (
     ScheduleResult,
     ScheduleStatus,
     ScientificConfig,
+    SplitKind,
 )
 from mrta_reference.scheduler import reference_schedule
 from mrta_reference.scheduler import resolve_reference_evaluator
@@ -296,6 +297,12 @@ def _move_name(candidate: CompleteSearchCandidate | ScreenedCandidate) -> str | 
     return candidate.candidate.key.move_type.value
 
 
+def _x_patterns(solution: CanonicalSolution):
+    return tuple(
+        pattern for pattern in solution.patterns if pattern.kind is SplitKind.X_SPLIT
+    )
+
+
 ReferenceEvaluator = Callable[..., ScheduleResult]
 
 
@@ -311,6 +318,7 @@ def evaluate_iteration(
     current_schedule: ScheduleResult | None = None,
     adaptive_state: AdaptiveOperatorState | None = None,
     scope: FormalScope | None = None,
+    enable_x_split: bool = False,
 ) -> IterationResult:
     reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     attempts_before = stats.raw_attempts
@@ -334,12 +342,29 @@ def evaluate_iteration(
             if search_config.enable_two_opt_star
             else ACTIVE_MOVE_TYPES
         ),
+        enable_x_split=enable_x_split,
     )
     stats.attempted_by_family[CandidateSourceKind.ATOMIC.value] += len(raw)
     stats.constructed_by_family[CandidateSourceKind.ATOMIC.value] += sum(
         attempt.candidate is not None for attempt in raw
     )
-    screened = screen_raw_attempts(current, current_directions, raw, config, stats)
+    for attempt in raw:
+        pattern = None if attempt.candidate is None else attempt.candidate.split_pattern
+        if pattern is not None and pattern.kind is SplitKind.X_SPLIT:
+            stats.x_pattern_candidates_generated += 1
+            if pattern.point_id is not None:
+                stats.x_pattern_source_counts[pattern.point_id] += 1
+    screened = screen_raw_attempts(
+        current,
+        current_directions,
+        raw,
+        config,
+        stats,
+        enable_x_split=enable_x_split,
+    )
+    stats.x_pattern_candidates_cheap_feasible += sum(
+        bool(_x_patterns(item.solution)) for item in screened
+    )
     complete: list[CompleteSearchCandidate] = []
     seen_solutions: set[str] = {current.canonical_hash}
     for item in screened:
@@ -424,6 +449,8 @@ def evaluate_iteration(
         if move_name is not None:
             stats.c3_by_move[move_name] += 1
         c3.append(DirectionEvaluatedCandidate(candidate, cheap_rank, direction))
+        if _x_patterns(candidate.solution):
+            stats.x_pattern_candidates_c3 += 1
     shortlist = rerank_c3(
         [item for item in c3 if item.direction.total_empty_travel is not None],
         search_config.kref,
@@ -435,6 +462,9 @@ def evaluate_iteration(
     for item in shortlist:
         move_name = _move_name(item.screened)
         family = _family_of(item.screened)
+        has_x = bool(_x_patterns(_solution_of(item.screened)))
+        if has_x:
+            stats.x_pattern_candidates_reference_evaluated += 1
         stats.c4_by_family[family] += 1
         if move_name is not None:
             stats.c4_by_move[move_name] += 1
@@ -483,6 +513,8 @@ def evaluate_iteration(
             stats.certifier_time += time.perf_counter() - cert_started
             if certification.certified:
                 metrics = official_metrics(_solution_of(item.screened), schedule, config)
+                if has_x:
+                    stats.x_pattern_candidates_certified += 1
             else:
                 effective_status = ScheduleStatus.NUMERIC_FAILURE
                 schedule = replace(
@@ -532,8 +564,13 @@ def run_bounded_sa_oi(
     allow_unverified_source: bool = False,
     formal_result: bool = False,
     initialization_override: InitializationResult | None = None,
+    enable_x_split: bool = False,
 ) -> SearchResult:
     started = time.perf_counter()
+    if enable_x_split and (
+        scope is None or scope.optional_x_split_policy != "FINITE_GEOMETRIC_X_SPLIT_V1"
+    ):
+        raise ValueError("X_SPLIT search requires EXPERIMENTAL_X_SPLIT_SCOPE_V1")
     reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     stats = SearchStats(EXACT_Y_SCOPE_CURRENT_SEMANTICS if scope is None else scope.scope_id, seed)
     if scope is not None:
@@ -675,6 +712,7 @@ def run_bounded_sa_oi(
             current_schedule=current_schedule,
             adaptive_state=adaptive,
             scope=scope,
+            enable_x_split=enable_x_split,
         )
         stats.iterations += 1
         proposal = result.proposal
@@ -769,6 +807,9 @@ def run_bounded_sa_oi(
         family = _family_of(candidate)
         move_name = _move_name(candidate)
         stats.accepted_by_family[family] += 1
+        accepted_has_x = bool(_x_patterns(_solution_of(candidate)))
+        if accepted_has_x:
+            stats.x_pattern_candidates_accepted += 1
         if move_name is not None:
             stats.accepted_by_move[move_name] += 1
         current_solution = _solution_of(candidate)
@@ -789,6 +830,8 @@ def run_bounded_sa_oi(
                 stats.best_improvement_by_move[move_name] += 1
             stats.best_improvement_cmax.append(best_metrics.cmax)
             stats.record_best(time.perf_counter() - started, best_metrics.cmax)
+            if accepted_has_x:
+                stats.x_pattern_global_best_updates += 1
         if global_best:
             reward = search_config.reward_global_best
         elif current_metrics.cmax < current_before.cmax - 1.0e-9 * max(

@@ -125,6 +125,14 @@ class SearchStats:
         default_factory=list
     )
     best_improvement_cmax: list[float] = field(default_factory=list)
+    x_pattern_candidates_generated: int = 0
+    x_pattern_candidates_cheap_feasible: int = 0
+    x_pattern_candidates_c3: int = 0
+    x_pattern_candidates_reference_evaluated: int = 0
+    x_pattern_candidates_certified: int = 0
+    x_pattern_candidates_accepted: int = 0
+    x_pattern_global_best_updates: int = 0
+    x_pattern_source_counts: Counter[str] = field(default_factory=Counter)
 
     @property
     def valid_by_move(self) -> dict[str, int]:

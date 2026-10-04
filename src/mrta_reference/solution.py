@@ -3,7 +3,12 @@ from __future__ import annotations
 import math
 from typing import Mapping, Sequence
 
-from .geometry import XSplitValidator, blocks_for_pattern, whole_eligible_rails
+from .geometry import (
+    XSplitValidator,
+    blocks_for_pattern,
+    finite_x_split_validator,
+    whole_eligible_rails,
+)
 from .model import (
     CanonicalSolution,
     OfficialMetrics,
@@ -104,6 +109,27 @@ def canonicalize(
     if missing_blocks or extra_blocks:
         raise ValueError(f"parent coverage failure; missing={missing_blocks}, extra={extra_blocks}")
 
+    assigned_robot = {
+        block_id: robot
+        for robot, block_ids in enumerate(current_routes)
+        for block_id in block_ids
+    }
+    for pattern in ordered_patterns:
+        if pattern.kind is not SplitKind.X_SPLIT:
+            continue
+        if pattern.rail is None:
+            raise ValueError("X_SPLIT requires an explicit rail")
+        expected_robots = (0, 1) if pattern.rail.value == "UPPER" else (2, 3)
+        actual_robots = (
+            assigned_robot.get(f"{pattern.parent_id}::0"),
+            assigned_robot.get(f"{pattern.parent_id}::1"),
+        )
+        if actual_robots != expected_robots:
+            raise ValueError(
+                f"{pattern.parent_id}: X_SPLIT spatial children require "
+                f"R{expected_robots[0]}/R{expected_robots[1]}, got {actual_robots}"
+            )
+
     result_routes = tuple(Route(robot, tuple(current_routes[robot])) for robot in range(4))
     return CanonicalSolution(ordered_parents, ordered_patterns, result_routes, revision)
 
@@ -114,6 +140,10 @@ def block_map(
     *,
     x_split_validator: XSplitValidator | None = None,
 ):
+    if x_split_validator is None and any(
+        pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns
+    ):
+        x_split_validator = finite_x_split_validator(solution.parents, config)
     parents = {parent.parent_id: parent for parent in solution.parents}
     result = {}
     for pattern in solution.patterns:

@@ -8,12 +8,33 @@ import pytest
 from mrta_data.phase3_split import ROLE_ID_TEST, ROLE_TRAIN, ROLE_VALIDATION
 from mrta_search.stats import SearchStats
 from scripts import run_phase3_validation as validation
+from scripts import run_phase3x_xsplit_gate as phase3x
 
 
 def _manifests():
     dataset = validation._read_json(validation.DATASET_PATH)
     split = validation._read_json(validation.SPLIT_PATH)
     return dataset, split
+
+
+def test_phase3x_runner_freezes_budget_arms_seeds_and_rejects_non_development_roles():
+    _, split = _manifests()
+    config = phase3x.gate_search_config()
+    assert config.time_limit == 60.0
+    assert config.enable_two_opt_star is False
+    assert phase3x.SEEDS == (20261004, 20261005, 20261006)
+    assert phase3x.ARMS == ("NO_X_CONTROL", "FINITE_X_DOMAIN")
+    role_rows = {
+        row["assigned_role"]: row["relative_path"]
+        for row in split["workbooks"]
+        if row["assigned_role"] in {ROLE_TRAIN, ROLE_VALIDATION, ROLE_ID_TEST}
+    }
+    assert set(role_rows) == {ROLE_TRAIN, ROLE_VALIDATION, ROLE_ID_TEST}
+    for path in role_rows.values():
+        with pytest.raises(PermissionError, match="DEVELOPMENT_CONSUMED only"):
+            phase3x.assert_development_access(split, (path,))
+    consumed = split["development_consumed_workbooks"][0]
+    phase3x.assert_development_access(split, (consumed,))
 
 
 def test_validation_selection_is_deterministic_unique_4_4_4_and_role_only():

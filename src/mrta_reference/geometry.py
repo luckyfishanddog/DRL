@@ -83,18 +83,45 @@ def generate_x_split_patterns(
     center: float,
     config: ScientificConfig,
     provider: XSplitCandidateProvider | None = None,
+    *,
+    rail: Rail | None = None,
 ) -> tuple[SplitPattern, ...]:
-    """Validate caller-provided X candidates; no default enumeration is invented."""
-    if provider is None:
-        raise ScientificAmbiguityError(
-            "optional X_SPLIT candidate enumeration is not frozen; provide an explicit provider"
+    """Return the finite, rail-specific geometric X candidate set."""
+    eligible = whole_eligible_rails(parent.start, parent.end, config)
+    if rail is None:
+        if provider is None:
+            raise ScientificAmbiguityError("X_SPLIT enumeration requires an explicit rail")
+        # Retain the historical development-provider interface for old callers.
+        if len(eligible) != 1:
+            raise ScientificAmbiguityError("legacy X_SPLIT provider requires one eligible rail")
+        rail = next(iter(eligible))
+    if rail not in eligible:
+        return ()
+    dx = parent.end[0] - parent.start[0]
+    if abs(dx) <= config.numeric_epsilon:
+        return ()
+    sources = (
+        tuple(provider(parent, center, config))
+        if provider is not None
+        else (
+            ((center - config.delta_x - parent.start[0]) / dx, "BX_LOWER"),
+            ((center - parent.start[0]) / dx, "BX_CENTER"),
+            ((center + config.delta_x - parent.start[0]) / dx, "BX_UPPER"),
+            (0.5, "MIDPOINT"),
         )
+    )
     candidates: list[SplitPattern] = []
     seen_t: list[float] = []
-    for t, point_id in sorted(provider(parent, center, config), key=lambda item: (item[0], item[1])):
+    for t, point_id in sorted(sources, key=lambda item: (item[0], item[1])):
+        if not (0.0 < t < 1.0):
+            continue
+        if t * parent.length + config.numeric_epsilon < config.min_child_length:
+            continue
+        if (1.0 - t) * parent.length + config.numeric_epsilon < config.min_child_length:
+            continue
         if any(abs(t - old_t) <= config.numeric_epsilon for old_t in seen_t):
             continue
-        pattern = SplitPattern(parent.parent_id, SplitKind.X_SPLIT, t, point_id)
+        pattern = SplitPattern(parent.parent_id, SplitKind.X_SPLIT, t, point_id, rail=rail)
         validate_split_pattern(parent, pattern, config)
         candidates.append(pattern)
         seen_t.append(t)
@@ -133,6 +160,8 @@ def validate_split_pattern(
             raise ValueError("X split cannot satisfy mandatory upper/lower handover")
         if not whole_eligible_rails(parent.start, parent.end, config):
             raise ValueError("a parent crossing both rails requires Y_SPLIT, not X_SPLIT")
+        if pattern.rail not in whole_eligible_rails(parent.start, parent.end, config):
+            raise ValueError("X_SPLIT rail is not WHOLE-eligible for the parent")
         if require_formal_x_validation and x_split_validator is None:
             raise ScientificAmbiguityError(
                 "retained X_SPLIT requires an explicit formal XSplitValidator"
@@ -164,13 +193,99 @@ def blocks_for_pattern(
         )
     assert pattern.t is not None
     split = parent.point(pattern.t)
-    blocks = (
-        WeldingBlock(parent.parent_id, f"{parent.parent_id}::0", 0.0, pattern.t, parent.start, split),
-        WeldingBlock(parent.parent_id, f"{parent.parent_id}::1", pattern.t, 1.0, split, parent.end),
-    )
+    first = WeldingBlock(parent.parent_id, f"{parent.parent_id}::0", 0.0, pattern.t, parent.start, split)
+    second = WeldingBlock(parent.parent_id, f"{parent.parent_id}::1", pattern.t, 1.0, split, parent.end)
+    if pattern.kind is SplitKind.X_SPLIT and (
+        (first.start[0] + first.end[0]) / 2.0
+        > (second.start[0] + second.end[0]) / 2.0
+    ):
+        blocks = (
+            WeldingBlock(parent.parent_id, first.block_id, second.u_start, second.u_end, second.start, second.end),
+            WeldingBlock(parent.parent_id, second.block_id, first.u_start, first.u_end, first.start, first.end),
+        )
+    else:
+        blocks = (first, second)
     if abs(sum(block.length for block in blocks) - parent.length) > config.numeric_epsilon * max(1.0, parent.length):
         raise ValueError("split length conservation failure")
     return blocks
+
+
+def finite_x_split_validator(
+    parents: Sequence[ParentWeld], config: ScientificConfig
+) -> XSplitValidator:
+    """Build a solver-independent validator using centers frozen for one instance."""
+    upper, lower = frozen_handover_centers(parents, config)
+
+    def validate(parent: ParentWeld, pattern: SplitPattern, cfg: ScientificConfig) -> bool:
+        if cfg != config or pattern.kind is not SplitKind.X_SPLIT or pattern.rail is None:
+            return False
+        center = upper if pattern.rail is Rail.UPPER else lower
+        return any(
+            candidate.pattern_id == pattern.pattern_id
+            and candidate.t is not None
+            and pattern.t is not None
+            and abs(candidate.t - pattern.t) <= cfg.numeric_epsilon
+            for candidate in generate_x_split_patterns(
+                parent, center, cfg, rail=pattern.rail
+            )
+        )
+
+    return validate
+
+
+def x_split_geometry_metadata(
+    parents: Sequence[ParentWeld], config: ScientificConfig
+) -> dict[str, object]:
+    """Compute X-domain opportunity metadata without scheduling or search."""
+    upper, lower = frozen_handover_centers(parents, config)
+    patterns_by_parent: dict[str, list[SplitPattern]] = {}
+    source_counts: dict[str, int] = {
+        "BX_LOWER": 0,
+        "BX_CENTER": 0,
+        "BX_UPPER": 0,
+        "MIDPOINT": 0,
+    }
+    for parent in parents:
+        for rail, center in ((Rail.UPPER, upper), (Rail.LOWER, lower)):
+            patterns = generate_x_split_patterns(parent, center, config, rail=rail)
+            if patterns:
+                patterns_by_parent.setdefault(parent.parent_id, []).extend(patterns)
+            for pattern in patterns:
+                assert pattern.point_id is not None
+                source_counts[pattern.point_id] += 1
+    parent_by_id = {parent.parent_id: parent for parent in parents}
+    splittable = [parent_by_id[parent_id] for parent_id in sorted(patterns_by_parent)]
+    process_times = [config.process_time(parent.length) for parent in splittable]
+    total_process = sum(config.process_time(parent.length) for parent in parents)
+    splittable_process = sum(process_times)
+    max_process = max(process_times, default=0.0)
+    spans = [abs(parent.end[0] - parent.start[0]) for parent in splittable]
+
+    def crosses(parent: ParentWeld, x: float) -> bool:
+        return (
+            (parent.start[0] - x) * (parent.end[0] - x)
+            < -(config.numeric_epsilon * config.numeric_epsilon)
+        )
+
+    return {
+        "x_up": upper,
+        "x_low": lower,
+        "x_splittable_parent_count": len(splittable),
+        "x_split_pattern_count": sum(len(items) for items in patterns_by_parent.values()),
+        "x_splittable_total_process_time": splittable_process,
+        "x_splittable_process_share": (
+            splittable_process / total_process if total_process else 0.0
+        ),
+        "max_x_splittable_parent_process_time": max_process,
+        "max_x_splittable_parent_process_share": (
+            max_process / total_process if total_process else 0.0
+        ),
+        "max_x_span": max(spans, default=0.0),
+        "mean_x_span": (sum(spans) / len(spans) if spans else 0.0),
+        "count_cross_x_up": sum(crosses(parent, upper) for parent in parents),
+        "count_cross_x_low": sum(crosses(parent, lower) for parent in parents),
+        "x_split_source_counts": source_counts,
+    }
 
 
 def frozen_handover_centers(

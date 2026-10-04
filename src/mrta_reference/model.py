@@ -11,6 +11,7 @@ Point = tuple[float, float]
 
 from .scope import (
     FormalScope, FORMAL_SCOPE_V1, FORMAL_SCOPE_V1_1, ACTIVE_FORMAL_SCOPE,
+    EXPERIMENTAL_X_SPLIT_SCOPE_V1,
     RunScientificIdentity, DEVELOPMENT_NO_REPAIR_V1,
     FORMAL_BOUNDED_DISPATCH_POLICY_V1,
     FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
@@ -165,6 +166,7 @@ class SplitPattern:
     t: float | None = None
     point_id: str | None = None
     mandatory: bool = False
+    rail: Rail | None = None
 
     def __post_init__(self) -> None:
         if self.kind is SplitKind.WHOLE:
@@ -172,16 +174,25 @@ class SplitPattern:
                 raise ValueError("WHOLE cannot carry a split point")
             if self.mandatory:
                 raise ValueError("WHOLE cannot be marked mandatory split")
+            if self.rail is not None:
+                raise ValueError("WHOLE cannot carry a rail association")
         else:
             if self.t is None or not math.isfinite(self.t) or not (0.0 < self.t < 1.0):
                 raise ValueError("split pattern requires an interior finite t")
             if not self.point_id:
                 raise ValueError("split pattern requires a stable point_id")
+            if self.kind is SplitKind.Y_SPLIT and self.rail is not None:
+                raise ValueError("Y_SPLIT cannot carry a single-rail association")
+            if self.kind is SplitKind.X_SPLIT and self.rail is None:
+                raise ValueError("X_SPLIT requires an explicit rail association")
 
     @property
     def pattern_id(self) -> str:
         if self.kind is SplitKind.WHOLE:
             return f"{self.parent_id}:WHOLE"
+        if self.kind is SplitKind.X_SPLIT:
+            assert self.rail is not None
+            return f"{self.parent_id}:{self.kind.value}:{self.rail.value}:{self.point_id}"
         return f"{self.parent_id}:{self.kind.value}:{self.point_id}"
 
 
@@ -326,14 +337,23 @@ class CanonicalSolution:
             raise ValueError("canonical routes must contain robots 0,1,2,3 in order")
 
     def canonical_payload(self) -> dict[str, object]:
+        patterns = []
+        for pattern in self.patterns:
+            row: list[object] = [
+                pattern.parent_id,
+                pattern.kind.value,
+                pattern.t,
+                pattern.point_id,
+                pattern.mandatory,
+            ]
+            if pattern.rail is not None:
+                row.append(pattern.rail.value)
+            patterns.append(row)
         return {
             "parents": [
                 [p.parent_id, list(p.start), list(p.end)] for p in self.parents
             ],
-            "patterns": [
-                [p.parent_id, p.kind.value, p.t, p.point_id, p.mandatory]
-                for p in self.patterns
-            ],
+            "patterns": patterns,
             "routes": [[r.robot_id, list(r.block_ids)] for r in self.routes],
         }
 

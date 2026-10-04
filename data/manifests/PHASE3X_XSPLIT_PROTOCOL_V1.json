@@ -1,0 +1,100 @@
+{
+  "arms": {
+    "FINITE_X_DOMAIN": {
+      "scope_id": "EXPERIMENTAL_X_SPLIT_SCOPE_V1",
+      "x_split_access": true
+    },
+    "NO_X_CONTROL": {
+      "scope_id": "FORMAL_SCOPE_V1_1",
+      "x_split_access": false
+    }
+  },
+  "common_seed": {
+    "construction_excluded_from_search_seconds": true,
+    "scope_id": "FORMAL_SCOPE_V1_1",
+    "solver_seed": 20261004
+  },
+  "evidence_role": "DEVELOPMENT_MECHANISM_GATE_NOT_FORMAL_RESULT",
+  "expected_run_count": 72,
+  "experimental_scope": {
+    "active_formal_scope_changed": false,
+    "scope_hash": "28236ee1caa75ce669af2a62ddbd28e2c557ed4b00eb5d4a1d8a29335aa209c8",
+    "scope_id": "EXPERIMENTAL_X_SPLIT_SCOPE_V1"
+  },
+  "forbidden_data_roles": [
+    "TRAIN_POOL",
+    "VALIDATION",
+    "ID_TEST"
+  ],
+  "gate_set_hash": "4bfe998a9caef567a66db24a77e9a598b24bda4be7967e51d0484c1548558c93",
+  "historical_scope": {
+    "scope_hash": "5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc",
+    "scope_id": "FORMAL_SCOPE_V1_1",
+    "unchanged": true
+  },
+  "id_test_status": "SEALED",
+  "phase3x_protocol_hash": "73fb5ff0c17d53439eacd097b79a19a0a98e6ebad762bd7ba21d9d7cc66b7c18",
+  "protocol_id": "PHASE3X_XSPLIT_PROTOCOL_V1",
+  "runner_sha256": "bde7515426fc8a204f65a20db506edb85fb9c25eec9a325fa7ff0da3d81837cf",
+  "scientific_config_hash": "791fd398c8819030bfae9ebaa65d11efe57a3dd37b327ad516d37c78310aff0e",
+  "search_config": {
+    "adaptive_reaction": 0.2,
+    "adaptive_segment_length": 20,
+    "checkpoints": [
+      5.0,
+      30.0,
+      60.0
+    ],
+    "construction_budget": 5,
+    "cooling_rate": 0.995,
+    "destroy_q_max": 8,
+    "destroy_q_min": 2,
+    "destroy_rho": 0.15,
+    "direction_refinement_budget": 4,
+    "enable_two_opt_star": false,
+    "feasibility_bootstrap_budget": 1,
+    "insertion_limit": 8,
+    "kdp": 8,
+    "kinit_ref": 5,
+    "kref": 2,
+    "kref_total": 4,
+    "m": 64,
+    "m_atomic": null,
+    "m_lns": 16,
+    "max_iterations": 100000,
+    "repair_evaluation_cap": 4096,
+    "repair_insertion_limit": 8,
+    "reward_accepted_improvement": 4.0,
+    "reward_accepted_non_improvement": 1.0,
+    "reward_evaluation_failed": 0.0,
+    "reward_global_best": 8.0,
+    "reward_rejected": 0.0,
+    "t0": 0.05,
+    "time_limit": 60.0,
+    "tmin": 1e-06
+  },
+  "search_config_hash": "53a83e8b45d91732116a64ade3bfb0bd701988c2804e2b4827339fce7130f9db",
+  "search_seconds_per_arm": 60.0,
+  "solver_seeds": [
+    20261004,
+    20261005,
+    20261006
+  ],
+  "support_rule": {
+    "all_final_solutions_certified": true,
+    "instances_with_median_improvement_ge_0_01": 2,
+    "one_instance_has_certified_x_global_best_update": true,
+    "one_supporting_instance_N_ge_50": true,
+    "runs_without_numeric_failure": "72/72",
+    "semantic_tests_pass": true,
+    "supporting_final_best_contains_x_split": true,
+    "x_rich_distinct_workbooks_with_at_least_2_of_3_x_wins": 2
+  },
+  "x_split_processing_semantics": {
+    "cut_time": 0.0,
+    "extra_fixed_processing_per_accepted_split_seconds": 50.0,
+    "per_child_setup_weld_post": true,
+    "shared_split_point_interference_exception": false,
+    "split_time": 0.0
+  }
+}

@@ -151,6 +151,7 @@ from mrta_reference.geometry import (
     optimize_directions,
     whole_eligible_rails,
     x_split_relation,
+    x_split_geometry_metadata,
 )
 from mrta_reference.model import (
     ParentWeld,
@@ -211,16 +212,16 @@ def test_y_candidates_are_only_boundaries_center_midpoint_and_deterministically_
 
 def test_split_length_conservation_and_lmin_validation() -> None:
     parent = ParentWeld("p", (0.0, 8.0), (1.0, 8.0))
-    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.2, "given-x")
+    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.2, "given-x", rail=Rail.UPPER)
     blocks = blocks_for_pattern(parent, pattern, CONFIG)
     assert len(blocks) == 2
     assert sum(block.length for block in blocks) == pytest.approx(parent.length)
     assert min(block.length for block in blocks) >= CONFIG.min_child_length
     with pytest.raises(ValueError, match="Lmin"):
-        blocks_for_pattern(parent, SplitPattern("p", SplitKind.X_SPLIT, 0.19, "short"), CONFIG)
+        blocks_for_pattern(parent, SplitPattern("p", SplitKind.X_SPLIT, 0.19, "short", rail=Rail.UPPER), CONFIG)
 
     exactly = blocks_for_pattern(
-        parent, SplitPattern("p", SplitKind.X_SPLIT, 0.2, "exact-lmin"), CONFIG
+        parent, SplitPattern("p", SplitKind.X_SPLIT, 0.2, "exact-lmin", rail=Rail.UPPER), CONFIG
     )
     assert exactly[0].length == pytest.approx(CONFIG.min_child_length)
     with pytest.raises(ValueError, match="Lmin"):
@@ -231,6 +232,7 @@ def test_split_length_conservation_and_lmin_validation() -> None:
                 SplitKind.X_SPLIT,
                 CONFIG.min_child_length - 2.0 * CONFIG.numeric_epsilon,
                 "just-below-lmin",
+                rail=Rail.UPPER,
             ),
             CONFIG,
         )
@@ -243,19 +245,19 @@ def test_zero_and_near_zero_parent_lengths_are_handled_numerically() -> None:
     with pytest.raises(ValueError, match="Lmin"):
         blocks_for_pattern(
             near_zero,
-            SplitPattern("near-zero", SplitKind.X_SPLIT, 0.5, "mid"),
+            SplitPattern("near-zero", SplitKind.X_SPLIT, 0.5, "mid", rail=Rail.LOWER),
             CONFIG,
         )
 
 
-def test_x_split_given_point_relation_without_invented_candidate_enumeration() -> None:
+def test_x_split_given_point_relation_and_explicit_rail_enumeration() -> None:
     parent = ParentWeld("x", (0.0, 8.0), (4.0, 8.0))
-    pattern = SplitPattern("x", SplitKind.X_SPLIT, 0.75, "caller-supplied")
+    pattern = SplitPattern("x", SplitKind.X_SPLIT, 0.75, "caller-supplied", rail=Rail.UPPER)
     blocks = blocks_for_pattern(parent, pattern, CONFIG)
     assert blocks[0].end == (3.0, 8.0)
     assert x_split_relation(blocks[0].end, 3.1, CONFIG) == "IN_BX"
     assert x_split_relation((2.0, 8.0), 3.1, CONFIG) == "LEFT_OF_BX"
-    with pytest.raises(ScientificAmbiguityError, match="not frozen"):
+    with pytest.raises(ScientificAmbiguityError, match="explicit rail"):
         generate_x_split_patterns(parent, 3.1, CONFIG)
     supplied = generate_x_split_patterns(
         parent,
@@ -264,6 +266,49 @@ def test_x_split_given_point_relation_without_invented_candidate_enumeration() -
         provider=lambda *_: ((0.75, "caller-supplied"),),
     )
     assert supplied == (pattern,)
+
+
+def test_finite_x_candidates_are_deterministic_geometry_only_and_deduplicated() -> None:
+    parent = ParentWeld("finite-x", (1.0, 8.0), (5.0, 8.0))
+    first = generate_x_split_patterns(parent, 3.0, CONFIG, rail=Rail.UPPER)
+    second = generate_x_split_patterns(parent, 3.0, CONFIG, rail=Rail.UPPER)
+    assert first == second
+    assert [item.point_id for item in first] == ["BX_LOWER", "BX_CENTER", "BX_UPPER"]
+    assert [item.t for item in first] == pytest.approx([0.45, 0.5, 0.55])
+    assert all(item.rail is Rail.UPPER for item in first)
+    assert all(parent.point(item.t)[0] != 10.0 for item in first if item.t is not None)
+
+
+def test_x_candidate_filter_has_no_wait_input_and_rejects_no_span_and_short_children() -> None:
+    vertical = ParentWeld("vertical", (2.0, 7.0), (2.0, 9.0))
+    assert generate_x_split_patterns(vertical, 2.0, CONFIG, rail=Rail.UPPER) == ()
+    short = ParentWeld("short", (0.0, 8.0), (0.3, 8.0))
+    assert generate_x_split_patterns(short, 0.15, CONFIG, rail=Rail.UPPER) == ()
+
+
+def test_x_blocks_use_spatial_left_right_identity_for_reversed_parent() -> None:
+    parent = ParentWeld("reverse", (5.0, 8.0), (1.0, 8.0))
+    pattern = generate_x_split_patterns(parent, 3.0, CONFIG, rail=Rail.UPPER)[1]
+    left, right = blocks_for_pattern(parent, pattern, CONFIG)
+    assert left.block_id.endswith("::0")
+    assert right.block_id.endswith("::1")
+    assert sum(left.start[0:1] + left.end[0:1]) / 2.0 < sum(right.start[0:1] + right.end[0:1]) / 2.0
+    assert left.u_start > right.u_start
+
+
+def test_static_x_geometry_metadata_counts_unique_parents_and_candidate_sources() -> None:
+    parents = (
+        ParentWeld("upper", (0.0, 8.0), (4.0, 8.0)),
+        ParentWeld("lower", (0.0, 2.0), (2.0, 2.0)),
+        ParentWeld("vertical", (7.0, 8.0), (7.0, 10.0)),
+    )
+    metadata = x_split_geometry_metadata(parents, CONFIG)
+    assert metadata["x_splittable_parent_count"] == 2
+    assert metadata["x_split_pattern_count"] >= 4
+    assert 0.0 < metadata["x_splittable_process_share"] < 1.0
+    assert metadata["max_x_span"] == pytest.approx(4.0)
+    assert metadata["mean_x_span"] == pytest.approx(3.0)
+    assert sum(metadata["x_split_source_counts"].values()) == metadata["x_split_pattern_count"]
 
 
 def test_weighted_median_is_leftmost_deterministic_and_clipped() -> None:

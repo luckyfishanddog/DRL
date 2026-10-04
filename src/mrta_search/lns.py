@@ -6,7 +6,11 @@ import math
 import random
 from typing import Mapping, Sequence
 
-from mrta_reference.geometry import oriented_endpoints, robot_is_eligible
+from mrta_reference.geometry import (
+    finite_x_split_validator,
+    oriented_endpoints,
+    robot_is_eligible,
+)
 from mrta_reference.model import (
     CandidateMove,
     CanonicalSolution,
@@ -325,7 +329,11 @@ def _parent_alternatives(
 
     placements: list[tuple[int, int, int]] = []
     first = parent_blocks[0]
-    for robot in range(4):
+    first_robots = range(4)
+    if pattern.kind is SplitKind.X_SPLIT:
+        assert pattern.rail is not None
+        first_robots = (0,) if pattern.rail.value == "UPPER" else (2,)
+    for robot in first_robots:
         if not robot_is_eligible(first, robot, config):
             continue
         for position in bounded_insertion_positions(len(routes[robot]), insertion_limit):
@@ -353,7 +361,11 @@ def _parent_alternatives(
             continue
 
         second = parent_blocks[1]
-        for robot2 in range(4):
+        second_robots = range(4)
+        if pattern.kind is SplitKind.X_SPLIT:
+            assert pattern.rail is not None
+            second_robots = (1,) if pattern.rail.value == "UPPER" else (3,)
+        for robot2 in second_robots:
             if evaluated >= remaining_budget:
                 break
             if not robot_is_eligible(second, robot2, config):
@@ -513,6 +525,11 @@ def repair_partial_state(
             tuple(Route(robot, routes[robot]) for robot in range(4)),
             config,
             revision=current.revision + 1,
+            x_split_validator=(
+                finite_x_split_validator(current.parents, config)
+                if any(pattern.kind is SplitKind.X_SPLIT for pattern in partial.patterns)
+                else None
+            ),
         )
         solution_blocks = block_map(solution, config)
         if any(

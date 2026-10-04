@@ -81,14 +81,22 @@ def apply_candidate(
         pattern = candidate.split_pattern
         if pattern is None or pattern.kind is SplitKind.WHOLE or source is None or destination is None:
             raise ValueError("split activation requires a concrete non-WHOLE pattern and destinations")
-        if len(key.source_positions) != 1 or len(key.destination_positions) != 1:
+        required_destinations = 2 if pattern.kind is SplitKind.X_SPLIT else 1
+        if len(key.source_positions) != 1 or len(key.destination_positions) != required_destinations:
             raise ValueError("split activation requires exact positions")
         _require_affected(candidate, (pattern.parent_id,))
         whole = f"{pattern.parent_id}::whole"
         if routes[source][key.source_positions[0]] != whole:
             raise ValueError("split activation source is not the parent WHOLE block")
-        routes[source][key.source_positions[0]] = f"{pattern.parent_id}::0"
-        routes[destination].insert(key.destination_positions[0], f"{pattern.parent_id}::1")
+        if pattern.kind is SplitKind.X_SPLIT:
+            routes[source].pop(key.source_positions[0])
+            assert pattern.rail is not None
+            left_robot, right_robot = ((0, 1) if pattern.rail.value == "UPPER" else (2, 3))
+            routes[left_robot].insert(key.destination_positions[0], f"{pattern.parent_id}::0")
+            routes[right_robot].insert(key.destination_positions[1], f"{pattern.parent_id}::1")
+        else:
+            routes[source][key.source_positions[0]] = f"{pattern.parent_id}::0"
+            routes[destination].insert(key.destination_positions[0], f"{pattern.parent_id}::1")
     elif key.move_type is MoveType.SPLIT_DEACTIVATE:
         parent_id = key.affected_parent_ids[0]
         _require_affected(candidate, (parent_id,))

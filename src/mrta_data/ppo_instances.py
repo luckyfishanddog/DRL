@@ -623,6 +623,14 @@ def formal_compatibility_metrics(instance: PPOPlatformInstance) -> dict[str, int
     return result
 
 
+def x_split_geometry_metrics(instance: PPOPlatformInstance) -> dict[str, object]:
+    """Return solver-independent finite X_SPLIT opportunity metadata."""
+    from mrta_reference.geometry import x_split_geometry_metadata
+    from mrta_reference.model import ScientificConfig
+
+    return x_split_geometry_metadata(to_parent_welds(instance), ScientificConfig())
+
+
 def _manifest_entry(instance: PPOPlatformInstance) -> dict[str, Any]:
     validation = validate_ppo_platform_instance(instance)
     metrics = geometry_metrics(instance)

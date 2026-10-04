@@ -260,3 +260,43 @@ def test_two_opt_star_is_deterministic_ablatable_same_rail_and_cheap_rejects_cro
     )
     assert screened == ()
     assert first_stats.rejection_reasons["CHEAP_INVALID:bad same-rail 2-opt* shape"] == 1
+
+
+def test_finite_x_pattern_switch_uses_fixed_same_rail_spatial_assignment() -> None:
+    parent = ParentWeld("x", (1.0, 8.0), (5.0, 8.0))
+    solution = canonicalize(
+        (parent,),
+        (SplitPattern("x", SplitKind.WHOLE),),
+        {0: ("x::whole",)},
+        FAST,
+    )
+    directions = optimize_directions_with_initial_feasibility(solution, FAST).directions
+    stats = SearchStats("EXPERIMENTAL_X_SPLIT_SCOPE_V1", 20261004)
+    attempts = generate_raw_attempts(
+        solution,
+        FAST,
+        m=14,
+        seed=20261004,
+        stats=stats,
+        enable_x_split=True,
+    )
+    x_attempts = tuple(
+        item
+        for item in attempts
+        if item.candidate is not None
+        and item.candidate.split_pattern is not None
+        and item.candidate.split_pattern.kind is SplitKind.X_SPLIT
+    )
+    assert x_attempts
+    screened = screen_raw_attempts(
+        solution,
+        directions,
+        x_attempts,
+        FAST,
+        stats,
+        enable_x_split=True,
+    )
+    assert screened
+    for item in screened:
+        assert "x::0" in item.solution.routes[0].block_ids
+        assert "x::1" in item.solution.routes[1].block_ids
