@@ -245,3 +245,215 @@ def test_release_rule_exact_1_10_1_15_and_8_of_12_boundaries():
     assert tier_failure["DETERMINISTIC_BACKBONE_STATUS"] == (
         "NEEDS_CANDIDATE_POOL_AUDIT"
     )
+
+
+# Phase 3-X2 is an independent bounded diagnostic, not a production search change.
+from dataclasses import replace
+from types import SimpleNamespace
+from scripts import run_phase3x2_x_oracle_audit as x2
+from mrta_reference.model import ParentWeld, Rail, ScientificConfig, SplitKind, SplitPattern, ScheduleStatus
+from mrta_reference.scope import FORMAL_SCOPE_V1_1, EXPERIMENTAL_X_SPLIT_SCOPE_V1
+from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.solution import canonicalize
+from mrta_reference.certifier import certify_schedule, CertificationReport
+from mrta_search.direction import optimize_directions_with_initial_feasibility
+from mrta_search.initialization import InitializationResult, InitializationStatus
+
+
+@pytest.fixture(scope="module")
+def x2_frozen_context():
+    return x2.build_context(Path("D:/pybullet_test/MRTA_GA/ppo"))
+
+
+def test_x2_same_frozen_539_census_and_common_seed_hashes(x2_frozen_context):
+    ctx = x2_frozen_context
+    rows = ctx["census"]["patterns"]
+    assert len(rows) == 539
+    assert len({(r["instance_id"], r["parent_id"], r["rail"], r["t"]) for r in rows}) == 539
+    replay = []
+    for info in ctx["instances"].values():
+        replay.extend(x2.pattern_census(info["entry"], info["parents"], ScientificConfig()))
+        previous = ctx["history"]["common_seeds"][info["entry"]["instance_id"]]
+        assert info["common"].solution.canonical_hash == previous["common_seed_hash"]
+        assert info["common"].schedule.cmax == previous["common_seed_cmax"]
+        assert info["common"].certification.certified
+    assert ctx["census_hash"] == x2.digest({"census_id": "X_PATTERN_CENSUS_V1", "patterns": replay})
+    assert ctx["gate"]["xsplit_gate_set_hash"] == x2.GATE_HASH
+    assert EXPERIMENTAL_X_SPLIT_SCOPE_V1.scope_hash == x2.SCOPE_HASH
+    assert sum(r["source"] == "MIDPOINT" for r in rows) == 424
+    assert x2.build_protocol(ctx) == x2.build_protocol(ctx)
+
+
+def _x2_fixture():
+    config = ScientificConfig()
+    parents = (
+        ParentWeld("p", (4., 8.), (12., 8.)),
+        ParentWeld("a", (0., 9.), (1., 9.)),
+        ParentWeld("b", (2., 9.), (3., 9.)),
+        ParentWeld("c", (15., 9.), (16., 9.)),
+        ParentWeld("d", (17., 9.), (18., 9.)),
+    )
+    solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                            {0: ("a::whole", "p::whole", "b::whole"), 1: ("c::whole", "d::whole")}, config)
+    direction = optimize_directions_with_initial_feasibility(solution, config)
+    schedule = reference_schedule_formal(solution, config, scope=FORMAL_SCOPE_V1_1,
+                                        orientations={r: direction.directions[r] for r in range(4)})
+    certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1_1)
+    assert certificate.certified
+    common = InitializationResult(InitializationStatus.SUCCESS, solution, direction.directions, schedule, certificate, ())
+    row = next(r for r in x2.pattern_census({"instance_id": "fixture"}, parents, config)
+               if r["parent_id"] == "p" and r["t"] == 0.5)
+    return {"common": common}, row
+
+
+def test_x2_enumerates_all_pairs_after_removing_whole_and_fixed_assignment(monkeypatch):
+    import random
+    monkeypatch.setattr(random, "randrange", lambda *a: pytest.fail("audit sampled randomly"))
+    info, row = _x2_fixture()
+    common = info["common"].solution
+    pattern = x2.pattern_from_row(row)
+    grid = x2.insertion_grid(common, pattern)
+    assert grid == tuple((l, r) for l in range(3) for r in range(3))
+    validator = x2.finite_x_split_validator(common.parents, ScientificConfig())
+    for pos in grid:
+        solution = x2.construct_insertion(common, pattern, pos, ScientificConfig(), validator)
+        assert solution.routes[0].block_ids[pos[0]] == "p::0"
+        assert solution.routes[1].block_ids[pos[1]] == "p::1"
+        assert all("p::whole" not in r.block_ids for r in solution.routes)
+        assert len([b for r in solution.routes for b in r.block_ids]) == len(common.parents) + 1
+    lower = ParentWeld("low", (2., 3.), (8., 3.))
+    base = canonicalize((lower,), (SplitPattern("low", SplitKind.WHOLE),), {3: ("low::whole",)}, ScientificConfig())
+    low_row = x2.pattern_census({"instance_id": "lower"}, (lower,), ScientificConfig())[0]
+    candidate = x2.construct_insertion(base, x2.pattern_from_row(low_row), (0, 0), ScientificConfig(),
+                                     x2.finite_x_split_validator((lower,), ScientificConfig()))
+    assert candidate.routes[2].block_ids == ("low::0",)
+    assert candidate.routes[3].block_ids == ("low::1",)
+
+
+def test_x2_all_valid_pairs_cheap_scored_caps_and_formal_access_without_mutation():
+    info, row = _x2_fixture()
+    before = info["common"].solution.canonical_json
+    result = x2.audit_pattern(info, row)
+    assert result["total_insertion_pairs"] == 9
+    assert result["canonical_valid_pairs"] == result["cheap_scored_pairs"] == result["cheap_valid_pairs"] == 9
+    assert result["dp_evaluated_pairs"] == 9
+    assert result["direction_feasible_pairs"] > 0
+    assert 1 <= result["reference_evaluated_pairs"] <= 4
+    assert result["reference_status_counts"]["FEASIBLE"] > 0
+    assert result["best"]["certified"]
+    assert info["common"].solution.canonical_json == before
+    best = x2.solution_from_payload(result["best"]["canonical_solution"], ScientificConfig())
+    assert best.canonical_hash == result["best"]["solution_hash"]
+    assert reference_schedule_formal(best, ScientificConfig(), scope=FORMAL_SCOPE_V1_1).status is ScheduleStatus.INFEASIBLE
+    accepted = reference_schedule_formal(best, ScientificConfig(), scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
+                                        orientations={r: tuple(result["best"]["directions"][r]) for r in range(4)})
+    assert accepted.feasible
+
+
+def test_x2_top16_top4_canonical_ties_are_order_invariant():
+    candidates = [x2.InsertionCandidate(SimpleNamespace(canonical_hash=f"{i:03}"), (i, 0),
+                                        (100., 20., 10., 10., f"{i:03}")) for i in range(40)]
+    assert [c.positions[0] for c in x2.shortlist_cheap(list(reversed(candidates)))] == list(range(16))
+    directed = [(c, SimpleNamespace(total_empty_travel=3.)) for c in candidates]
+    assert [c.positions[0] for c, _ in x2.shortlist_direction(list(reversed(directed)))] == list(range(4))
+
+
+def test_x2_cache_preserves_scientific_outputs_and_full_replay():
+    info, row = _x2_fixture()
+    cache = x2.AuditCache()
+    a = x2.audit_pattern(info, row, cache)
+    b = x2.audit_pattern(info, row, cache)
+    c = x2.audit_pattern(info, row, x2.AuditCache(enabled=False))
+    assert x2.scientific_payload(a) == x2.scientific_payload(b) == x2.scientific_payload(c)
+    assert b["cache"]["direction"] > 0 and b["cache"]["reference"] > 0
+    assert x2.digest(x2.scientific_payload(a)) == x2.digest(x2.scientific_payload(c))
+
+
+def test_x2_execution_fails_immediately_on_certifier_mismatch():
+    info, row = _x2_fixture()
+    with pytest.raises(x2.AuditFailure, match="certifier FAIL"):
+        x2.audit_pattern(info, row, certifier=lambda *a, **k: CertificationReport(False, ("forced mismatch",), None))
+
+
+def test_x2_execution_fails_on_numeric_failure_and_scope_mismatch():
+    info, row = _x2_fixture()
+    def numeric(*a, **kw):
+        return replace(reference_schedule_formal(*a, **kw), status=ScheduleStatus.NUMERIC_FAILURE)
+    with pytest.raises(x2.AuditFailure, match="NUMERIC_FAILURE"):
+        x2.audit_pattern(info, row, reference_evaluator=numeric)
+    def mismatched(*a, **kw):
+        return replace(reference_schedule_formal(*a, **kw), scope_hash="wrong")
+    with pytest.raises(x2.AuditFailure, match="scope/policy mismatch"):
+        x2.audit_pattern(info, row, reference_evaluator=mismatched)
+
+
+@pytest.mark.parametrize("role", (ROLE_TRAIN, ROLE_VALIDATION, ROLE_ID_TEST))
+def test_x2_data_role_rejected_even_if_consumed_list_is_inconsistent(role):
+    split = {"development_consumed_workbooks": ["forbidden.xlsx"],
+             "workbooks": [{"relative_path": "forbidden.xlsx", "assigned_role": role}]}
+    with pytest.raises(PermissionError, match="DEVELOPMENT_CONSUMED only"):
+        x2.assert_development_roles(split, ["forbidden.xlsx"])
+
+
+def _potential_rows():
+    return [{"instance_id": str(i), "workbook": str(i), "N": 55 if i else 25,
+             "one_step_x_improvement": .01, "best_x_certified": True, "best_x_xspan": 2.} for i in range(2)]
+
+
+def test_x2_stage_a_exact_threshold_two_workbooks_N_and_span_rules():
+    assert x2.stage_a_rule(_potential_rows())["X_ONE_STEP_POTENTIAL"] == "PRESENT"
+    for field, values in (("one_step_x_improvement", (.009999999, .01)),
+                          ("workbook", ("same", "same")), ("N", (25, 25)),
+                          ("best_x_xspan", (1.9999, 1.9999)),
+                          ("best_x_certified", (False, True))):
+        rows = _potential_rows()
+        for row, value in zip(rows, values):
+            row[field] = value
+        assert x2.stage_a_rule(rows)["X_ONE_STEP_POTENTIAL"] == "NOT_ESTABLISHED"
+
+
+def _retention_records():
+    records = []
+    for iid in ("a", "b"):
+        for seed in phase3x.SEEDS:
+            records.extend([
+                {"instance_id": iid, "workbook": iid, "solver_seed": seed, "arm": "NO_X_FROM_COMMON", "cmax_at_60": 100., "x_split_parent_count": 0},
+                {"instance_id": iid, "workbook": iid, "solver_seed": seed, "arm": "FINITE_X_FROM_BEST_X", "cmax_at_60": 99., "x_split_parent_count": 1},
+            ])
+    return records
+
+
+def test_x2_stage_b_exact_retention_rule_and_four_final_cases():
+    records = _retention_records()
+    adequate = x2.stage_b_rule(records)
+    assert adequate["X_SEARCH_RETENTION"] == "ADEQUATE"
+    for r in records:
+        if r["arm"] == "FINITE_X_FROM_BEST_X" and r["solver_seed"] == phase3x.SEEDS[-1]:
+            r["cmax_at_60"] = 101.
+    assert x2.stage_b_rule(records)["X_SEARCH_RETENTION"] == "ADEQUATE"  # exactly 2/3
+    for r in records:
+        if r["instance_id"] == "a" and r["solver_seed"] == phase3x.SEEDS[0] and r["arm"] == "FINITE_X_FROM_BEST_X":
+            r["cmax_at_60"] = 101.
+    assert x2.stage_b_rule(records)["X_SEARCH_RETENTION"] == "WEAK"
+    absent = {"X_ONE_STEP_POTENTIAL": "NOT_ESTABLISHED"}
+    present = {"X_ONE_STEP_POTENTIAL": "PRESENT"}
+    assert x2.final_decision(absent, None)["case"] == 1
+    assert x2.final_decision(present, {"X_SEARCH_RETENTION": "WEAK"})["case"] == 2
+    assert x2.final_decision(present, adequate)["case"] == 3
+    assert x2.final_decision(present, adequate, failed=True)["case"] == 4
+    assert x2.final_decision(absent, None, complete=False)["X_DOMAIN_VALUE_STATUS"] == "UNRESOLVED"
+
+
+def test_x2_stage_b_not_triggered_for_absent_potential(monkeypatch):
+    monkeypatch.setattr(x2, "run_bounded_sa_oi", lambda *a, **k: pytest.fail("Stage B must not run"))
+    x2.run_stage_b({"stage_a": {"X_ONE_STEP_POTENTIAL": "NOT_ESTABLISHED"}}, {})
+
+
+def test_x2_resume_rejects_protocol_census_identity_and_duplicates():
+    protocol = {"protocol_hash": "p", "x_pattern_census_hash": "x", "x_pattern_census": {"patterns": []}}
+    a = x2.new_artifact(protocol)
+    x2.validate_resume(a, protocol)
+    with pytest.raises(x2.AuditFailure, match="protocol/census"):
+        x2.validate_resume(dict(a, protocol_hash="changed"), protocol)
+    with pytest.raises(x2.AuditFailure, match="unknown pattern"):
+        x2.validate_resume(dict(a, pattern_records=[{"instance_id": "bad", "pattern_id": "bad"}]), protocol)

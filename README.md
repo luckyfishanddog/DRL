@@ -4,6 +4,8 @@
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
+Latest research decision — [Phase 3-X2 deterministic bounded X audit](docs/PHASE3X2_X_ORACLE_POTENTIAL_AUDIT_20261005.md): all 539 frozen patterns were audited; 63 patterns across eight workbooks established certified one-step improvements >=1%. The 66-run X-seeded retention audit met its frozen rule (CASE 3: `PRESENT / ADEQUATE / SUPPORTED`), so `FORMAL_SCOPE_V2_AUTHORIZED = YES`. Historical Phase 3-X remains `NOT_SUPPORTED / WEAK ACCESS / V2 NO`. **ACTIVE scope remains V1.1 until Phase 3-Y core closure**; next is `Phase 3-Y — FORMAL_SCOPE_V2 Core Closure + common-domain HGA/WAG/ALNS adaptation`. Old Phase 3 VALIDATION is V2 model-development-consumed, not untouched V2 validation; no data repartition was performed and ID_TEST remains sealed.
+
 ## Current scope
 
 Implemented:
