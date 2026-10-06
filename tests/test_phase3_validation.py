@@ -20,6 +20,228 @@ from mrta_search.stats import SearchStats
 from scripts import run_phase3_validation as validation
 from scripts import run_phase3x_xsplit_gate as phase3x
 from scripts import run_phase3y_v2_core as phase3y
+from scripts import run_phase3z_v2_validation as phase3z
+
+
+def test_z_frozen_metadata_configs_and_new_seeds():
+    roles, selected, yr = phase3z.frozen_metadata()
+    assert len(selected["instances"]) == 12
+    assert phase3z.SEEDS == (20261011, 20261012, 20261013, 20261014, 20261015)
+    assert not set(phase3z.SEEDS) & {20261005, 20261006, 20261007}
+    configs = phase3z.method_configs()
+    alns = configs[phase3z.METHODS[0]]
+    assert (alns.m, alns.kdp, alns.kref, alns.kref_total, alns.m_lns) == (64, 8, 2, 4, 16)
+    assert not alns.enable_two_opt_star
+    assert alns.max_iterations == 100000 and alns.time_limit == 60
+    assert alns.checkpoints == (5, 30, 60)
+    assert configs[phase3z.METHODS[1]] == phase3y.method_configs()[phase3z.METHODS[1]]
+    assert configs[phase3z.METHODS[2]] == phase3y.method_configs()[phase3z.METHODS[2]]
+
+
+@pytest.mark.parametrize("role", (ROLE_V2_DEVELOPMENT, ROLE_V2_TRAIN, ROLE_ID_TEST_SEALED))
+def test_z_rejects_other_roles_before_workbook_loader(role):
+    roles = phase3z.read_json(phase3z.ROLES_PATH)
+    entry = next(r for r in roles["workbooks"] if r["new_v2_role"] == role)
+    def forbidden(*args, **kwargs):
+        pytest.fail("prohibited workbook-facing loader was called")
+    with pytest.raises(PermissionError):
+        phase3z.load_validation_parents(roles, entry, Path("unused"), loader=forbidden)
+
+
+@pytest.mark.parametrize("folder", ("ID_TEST", "PPO_TRAIN"))
+def test_z_role_not_folder_authorizes_validation(monkeypatch, folder):
+    from types import SimpleNamespace
+    roles, selection, _ = phase3z.frozen_metadata()
+    entry = next(r for r in selection["instances"] if folder in r["relative_path"])
+    calls = []
+    def fake_loader(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(raw_file_sha256=entry["workbook_sha256"])
+    monkeypatch.setattr(phase3z, "instance_geometry_hash", lambda _: entry["instance_geometry_hash"])
+    monkeypatch.setattr(phase3z, "to_parent_welds", lambda _: [None] * entry["N"])
+    assert len(phase3z.load_validation_parents(roles, entry, Path("unused"), loader=fake_loader)) == entry["N"]
+    assert len(calls) == 1
+
+
+def test_z_single_trajectory_checkpoints_no_backfill():
+    events = [(5, 120), (5.001, 110), (30, 100), (30.001, 90), (60, 80), (60.001, 70)]
+    assert phase3z.checkpoint_values(events) == {"cmax_at_5": 120, "cmax_at_30": 100, "cmax_at_60": 80}
+    assert phase3z.checkpoint_values([(61, 1)]) == {"cmax_at_5": None, "cmax_at_30": None, "cmax_at_60": None}
+    assert phase3z.checkpoint_values(events)["cmax_at_60"] != min(c for _, c in events)
+
+
+def test_z_deterministic_interleaved_order():
+    entries = phase3z.read_json(phase3z.VALIDATION_PATH)["instances"]
+    order = phase3z.run_order(entries)
+    assert len(order) == 180
+    assert len({(r["instance_id"], r["method_id"], r["solver_seed"]) for r in order}) == 180
+    assert [r["method_id"] for r in order[:3]] == list(phase3z.METHODS)
+    assert [r["method_id"] for r in order[3:6]] == list(phase3z.METHODS[1:] + phase3z.METHODS[:1])
+    assert order == phase3z.run_order(entries)
+
+
+def _z_protocol():
+    # Metadata fixture only, not a formal protocol and never used for a solver.
+    return phase3z.build_protocol(require_verified=False)
+
+
+@pytest.mark.parametrize("field", ("phase3z_protocol_hash", "scope_hash", "v2_validation_set_hash",
+                                  "instance_geometry_hash", "method_config_hash", "source_tree_hash", "source_commit"))
+def test_z_exact_resume_rejects_every_identity_mismatch(field):
+    protocol = _z_protocol()
+    key = phase3z.run_key(protocol, protocol["instances"][0], phase3z.METHODS[0], phase3z.SEEDS[0])
+    artifact = {"protocol": protocol, "records": [{"run_key": key,
+                 "run_key_hash": phase3z.digest(key), "execution_status": "COMPLETED"}]}
+    assert len(phase3z.validate_resume(artifact, protocol)) == 1
+    key[field] = "MISMATCH"
+    artifact["records"][0]["run_key_hash"] = phase3z.digest(key)
+    with pytest.raises(ValueError):
+        phase3z.validate_resume(artifact, protocol)
+
+
+def test_z_resume_rejects_conflicting_record_identity_and_duplicates():
+    protocol = _z_protocol()
+    key = phase3z.run_key(protocol, protocol["instances"][0], phase3z.METHODS[0], phase3z.SEEDS[0])
+    row = {"run_key": key, "run_key_hash": phase3z.digest(key), "execution_status": "COMPLETED"}
+    with pytest.raises(ValueError):
+        phase3z.validate_resume({"protocol": protocol, "records": [{**row, "source_tree_hash": "wrong"}]}, protocol)
+    with pytest.raises(ValueError):
+        phase3z.validate_resume({"protocol": protocol, "records": [row, row]}, protocol)
+
+
+def test_z_instance_medians_require_five_distinct_certified_seeds():
+    rows = [{"solver_seed": seed, "final_certified": True, "cmax_at_60": value}
+            for seed, value in zip(phase3z.SEEDS, (10, 20, 30, 40, 50))]
+    assert phase3z.complete_median(rows, "cmax_at_60") == 30
+    assert phase3z.complete_median(rows[:-1], "cmax_at_60") is None
+    rows[-1]["cmax_at_60"] = None
+    assert phase3z.complete_median(rows, "cmax_at_60") is None
+    rows[-1]["cmax_at_60"] = 50
+    rows[-1]["final_certified"] = False
+    assert phase3z.complete_median(rows, "cmax_at_60") is None
+
+
+def _z_ratios(values):
+    return [{"R": value, "tier": ("SMALL", "MEDIUM", "LARGE")[index // 4]}
+            for index, value in enumerate(values)]
+
+
+def test_z_competition_boundaries_and_performance_failure_is_separate():
+    decision = phase3z.competition_decision(_z_ratios([1.10] * 8 + [1.15] * 4), execution_pass=True)
+    assert decision["passed"] and decision["count_R_le_1_10"] == 8
+    assert decision["median_R"] == 1.10 and decision["tier_median_R"]["LARGE"] == 1.15
+    assert not phase3z.competition_decision(_z_ratios([1.10] * 7 + [1.11] * 5), execution_pass=True)["passed"]
+    assert not phase3z.competition_decision(_z_ratios([1.10] * 8 + [1.150001] * 4), execution_pass=True)["passed"]
+    assert phase3z.competition_decision(_z_ratios([1.2] * 12), execution_pass=True)["status"] == "NEEDS_CANDIDATE_POOL_AUDIT"
+    assert phase3z.competition_decision(_z_ratios([1] * 12), execution_pass=False)["status"] == "NOT_EVALUABLE"
+
+
+def test_z_provenance_blocks_before_solver_or_loader(monkeypatch):
+    protocol = _z_protocol()
+    protocol["protocol_status"] = "BLOCKED_BY_PROVENANCE"
+    with pytest.raises(phase3z.SourceProvenanceError):
+        phase3z.verify_protocol(protocol)
+
+
+def test_z_raw_counter_telemetry_preserved():
+    from collections import Counter
+    stats = SearchStats("FORMAL_SCOPE_V2", 1)
+    stats.init_status_counts = Counter({"FEASIBLE": 3})
+    result = phase3z.json_ready(stats)
+    assert result["init_status_counts"] == {"FEASIBLE": 3}
+    json.dumps(result, allow_nan=False)
+
+
+def test_z_atomic_result_roundtrip(tmp_path):
+    path = tmp_path / "result.json"
+    phase3z.atomic_json(path, {"records": []})
+    phase3z.atomic_json(path, {"records": [1]})
+    assert phase3z.read_json(path) == {"records": [1]}
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_z_protocol_roundtrip_preserves_exact_config_identity(tmp_path):
+    protocol = _z_protocol()
+    path = tmp_path / "protocol.json"
+    phase3z.atomic_json(path, protocol)
+    assert phase3z.read_json(path) == protocol
+    assert phase3z.protocol_hash(phase3z.read_json(path)) == protocol["phase3z_protocol_hash"]
+
+
+def _z_synthetic_complete_records():
+    protocol = _z_protocol()
+    # Pure aggregation fixture, not evidence or authorization for a solver.
+    protocol["protocol_status"] = "FROZEN"
+    protocol["provenance"].update(commit_verified=True, worktree_dirty=False)
+    protocol["phase3z_protocol_hash"] = phase3z.protocol_hash(protocol)
+    entries = {e["instance_id"]: e for e in protocol["instances"]}
+    rows = []
+    for order in protocol["run_order"]:
+        entry = entries[order["instance_id"]]
+        key = phase3z.run_key(protocol, entry, order["method_id"], order["solver_seed"])
+        cmax = dict(zip(phase3z.METHODS, (100, 80, 120)))[order["method_id"]]
+        row = {**key, "run_key": key, "run_key_hash": phase3z.digest(key),
+               "execution_status": "COMPLETED", "tier": entry["tier"],
+               "final_certified": True, "best_events": [(1, cmax), (61, 1)],
+               "cmax_at_5": cmax, "cmax_at_30": cmax, "cmax_at_60": cmax,
+               "final_cmax": 1, "numeric_failure_count": 0, "certifier_mismatch_count": 0,
+               "pattern_catalog_hash": "synthetic_shared_catalog", "termination_reason": "TIME_LIMIT",
+               "time_to_first_certified": 1, "actual_runtime": 63, "overshoot": 3,
+               "reference_calls": 10, "scheduler_time": 40,
+               "cap_hit_telemetry": dict.fromkeys(phase3z.CAP_FIELDS, 0)}
+        for prefix in ("x", "y"):
+            for field in ("reference_evaluated", "certified", "accepted", "global_best_updates"):
+                row[f"{prefix}_pattern_{field}"] = 0
+            row[f"legal_{prefix}_pattern_count"] = 0
+        rows.append(row)
+    return protocol, rows
+
+
+def test_z_ratio_formula_uses_checkpoint_not_overshoot_and_performance_not_execution():
+    protocol, rows = _z_synthetic_complete_records()
+    summary = phase3z.summarize(protocol, rows, {stage: {"returncode": 0} for stage in ("before", "after")})
+    assert summary["decision"]["PHASE3Z_EXECUTION_STATUS"] == "PASS"
+    assert summary["decision"]["DETERMINISTIC_V2_BACKBONE_STATUS"] == "NEEDS_CANDIDATE_POOL_AUDIT"
+    assert all(r["R"] == 100 / min(80, 120) for r in summary["ratios"])
+    assert summary["method_summaries"][0]["median_overshoot"] == 3
+
+
+def test_z_duplicate_missing_run_and_early_alns_cap_fail_execution():
+    protocol, rows = _z_synthetic_complete_records()
+    regressions = {stage: {"returncode": 0} for stage in ("before", "after")}
+    duplicated = [*rows[:-1], rows[0]]
+    assert phase3z.summarize(protocol, duplicated, regressions)["decision"]["PHASE3Z_EXECUTION_STATUS"] == "FAIL"
+    next(r for r in rows if r["method_id"] == phase3z.METHODS[0])["termination_reason"] = "ITERATION_LIMIT"
+    assert phase3z.summarize(protocol, rows, regressions)["decision"]["PHASE3Z_EXECUTION_STATUS"] == "FAIL"
+
+
+def test_z_numeric_mismatch_or_postregression_failure_cannot_pass():
+    protocol, rows = _z_synthetic_complete_records()
+    regressions = {stage: {"returncode": 0} for stage in ("before", "after")}
+    for field in ("numeric_failure_count", "certifier_mismatch_count"):
+        rows[0][field] = 1
+        assert phase3z.summarize(protocol, rows, regressions)["decision"]["PHASE3Z_EXECUTION_STATUS"] == "FAIL"
+        rows[0][field] = 0
+    regressions["after"]["returncode"] = 1
+    assert phase3z.summarize(protocol, rows, regressions)["decision"]["PHASE3Z_EXECUTION_STATUS"] == "FAIL"
+
+
+def test_z_observer_preserves_direction_result_and_restores_on_exception():
+    import mrta_search.direction as direction
+    original = direction._fixed_first_dp
+    expected = original([], 0, phase3z.ScientificConfig())
+    with pytest.raises(RuntimeError):
+        with phase3z.direction_call_observer() as count:
+            assert direction._fixed_first_dp([], 0, phase3z.ScientificConfig()) == expected
+            assert count["route_dp_calls"] == 1
+            raise RuntimeError("synthetic interruption")
+    assert direction._fixed_first_dp is original
+
+
+def test_z_editable_install_from_other_checkout_is_rejected(monkeypatch, tmp_path):
+    monkeypatch.setattr(phase3z, "ROOT", tmp_path)
+    with pytest.raises(phase3z.SourceProvenanceError, match="outside executing checkout"):
+        phase3z.verify_imported_source()
 
 
 def _manifests():
@@ -344,7 +566,18 @@ from mrta_search.initialization import InitializationResult, InitializationStatu
 
 @pytest.fixture(scope="module")
 def x2_frozen_context():
-    return x2.build_context(Path("D:/pybullet_test/MRTA_GA/ppo"))
+    from mrta_reference.provenance import SourceProvenance, REPOSITORY_ID, compute_source_tree_hash
+    native = x2.historical.run_bounded_sa_oi
+    def development_replay(*args, **kwargs):
+        label = kwargs.pop("source_commit")
+        kwargs["source_provenance"] = SourceProvenance(
+            REPOSITORY_ID, label, compute_source_tree_hash(phase3z.ROOT), True, False)
+        return native(*args, **kwargs)
+    # Replay frozen historical development evidence without claiming its label
+    # is the current verified Git commit. Production provenance remains intact.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(x2.historical, "run_bounded_sa_oi", development_replay)
+        yield x2.build_context(Path("D:/pybullet_test/MRTA_GA/ppo"))
 
 
 def test_x2_same_frozen_539_census_and_common_seed_hashes(x2_frozen_context):

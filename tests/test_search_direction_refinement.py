@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
+from mrta_reference.provenance import SourceProvenance, REPOSITORY_ID, compute_source_tree_hash
+
+
+def _development_provenance(label):
+    # A unit-test label is not a claim about the actual standalone Git HEAD.
+    return SourceProvenance(REPOSITORY_ID, label,
+                            compute_source_tree_hash(Path(__file__).resolve().parents[1]), True, False)
 
 from mrta_exact import solve_exact_micro
 from mrta_reference.model import ParentWeld, ScheduleResult, ScheduleStatus, ScientificConfig
@@ -127,7 +135,7 @@ def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
     results = []
     for algorithm_label, seed in (("SA-OI-ALNS", 19), ("unrelated-caller", 99), ("replay", 19)):
         result = run_bounded_sa_oi(Q3, FAST, config, seed=seed,
-                                  scope=scope, source_commit="test-commit",
+                                  scope=scope, source_provenance=_development_provenance("test-commit"),
                                   allow_unverified_source=True)
         results.append(result)
         assert result.final_certification.certified
@@ -155,7 +163,7 @@ def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
                                             orientations=dict(reversed(tuple(directions.items()))))
         assert actual == expected
     with pytest.raises(ValueError, match="matching formal"):
-        run_bounded_sa_oi(Q3, FAST, config, scope=scope, source_commit="test",
+        run_bounded_sa_oi(Q3, FAST, config, scope=scope, source_provenance=_development_provenance("test"),
                           reference_evaluator=reference_schedule)
 
 
@@ -164,7 +172,7 @@ def test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnos
     from mrta_reference.scope import FORMAL_SCOPE_V1_1
     from mrta_reference.scheduler import FormalReferenceEvaluator
     baseline = run_bounded_sa_oi(Q3, FAST, SearchConfig(max_iterations=0),
-                                 scope=FORMAL_SCOPE_V1_1, source_commit="test",
+                                 scope=FORMAL_SCOPE_V1_1, source_provenance=_development_provenance("test"),
                                  allow_unverified_source=True)
     monkeypatch.setattr(certifier, "certify_schedule", lambda *a, **k:
                         certifier.CertificationReport(False, ("forced formal failure",), None))
@@ -206,7 +214,7 @@ def test_formal_q1_q6_regression(name, expected, monkeypatch):
     from profile_scheduler import quality_fixture
     parents, seed, iterations = quality_fixture(name)
     result = run_bounded_sa_oi(parents, FAST, SearchConfig(max_iterations=iterations),
-                               seed=seed, scope=FORMAL_SCOPE_V1_1, source_commit="test",
+                               seed=seed, scope=FORMAL_SCOPE_V1_1, source_provenance=_development_provenance("test"),
                                allow_unverified_source=True)
     assert result.final_certification.certified
     assert result.best_schedule.cmax == pytest.approx(expected)

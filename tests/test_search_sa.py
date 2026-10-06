@@ -3,6 +3,13 @@ from __future__ import annotations
 import random
 
 import pytest
+from pathlib import Path
+from mrta_reference.provenance import SourceProvenance, REPOSITORY_ID, compute_source_tree_hash
+
+
+def _development_provenance():
+    return SourceProvenance(REPOSITORY_ID, "YR_TEST_FIXTURE",
+                            compute_source_tree_hash(Path(__file__).resolve().parents[1]), True, False)
 
 from mrta_exact import exact_schedule_from_templates, solve_exact_micro
 from mrta_reference.model import CandidateKey, CandidateMove, MoveType, OperationKind, ParentWeld, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind, SplitPattern
@@ -106,7 +113,7 @@ def test_yr_c4_empty_family_and_unique_exploit_fallback():
 def test_yr_v1_default_remains_global_shortlist_and_identical_trajectory():
     from mrta_reference.scope import FORMAL_SCOPE_V1_1
     config = SearchConfig(m=32, kdp=8, kref=2, max_iterations=3)
-    kwargs = dict(seed=7, scope=FORMAL_SCOPE_V1_1, allow_unverified_source=True, source_commit="YR_TEST_FIXTURE")
+    kwargs = dict(seed=7, scope=FORMAL_SCOPE_V1_1, source_provenance=_development_provenance())
     default = run_bounded_sa_oi(_base().parents, FAST, config, **kwargs)
     legacy = run_bounded_sa_oi(_base().parents, FAST, config, family_access_policy=False, **kwargs)
     assert default.best_solution.canonical_hash == legacy.best_solution.canonical_hash
@@ -120,7 +127,7 @@ def test_yr_v2_funnel_monotone_caps_and_first_access_times():
     parents = (ParentWeld("access", (1.0, 2.0), (5.0, 2.0)),)
     result = run_bounded_sa_oi(parents, FAST, SearchConfig(max_iterations=4),
                               seed=20261005, scope=FORMAL_SCOPE_V2,
-                              enable_x_split=True, allow_unverified_source=True, source_commit="YR_TEST_FIXTURE")
+                              enable_x_split=True, source_provenance=_development_provenance())
     stats = result.stats
     assert max(stats.per_iteration_kdp) <= 8
     assert max(stats.per_iteration_nref) <= 4
