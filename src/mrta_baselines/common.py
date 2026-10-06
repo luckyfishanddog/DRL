@@ -105,6 +105,10 @@ class BaselineAccounting:
     y_pattern_certified: int = 0
     y_pattern_accepted: int = 0
     y_pattern_global_best_updates: int = 0
+    first_x_proposal_time: float | None = None
+    first_x_c2_time: float | None = None
+    first_x_reference_time: float | None = None
+    pattern_transition_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -353,6 +357,8 @@ class CommonBaselineEvaluator:
 
         orientations = {robot: direction.directions[robot] for robot in range(4)}
         scheduler_started = time.perf_counter()
+        if has_x and self.accounting.first_x_reference_time is None:
+            self.accounting.first_x_reference_time = scheduler_started - self.started
         try:
             schedule = self.reference_evaluator(
                 solution, self.config, orientations=orientations

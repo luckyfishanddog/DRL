@@ -171,7 +171,7 @@ def test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnos
     stats = SearchStats(FORMAL_SCOPE_V1_1.scope_id, 0)
     result = refine_directions_bounded(
         baseline.best_solution, baseline.best_directions, baseline.best_schedule, FAST,
-        max_calls=1, reference_evaluator=FormalReferenceEvaluator(), scope=FORMAL_SCOPE_V1_1, stats=stats,
+        max_calls=1, reference_evaluator=FormalReferenceEvaluator(FORMAL_SCOPE_V1_1), scope=FORMAL_SCOPE_V1_1, stats=stats,
     )
     assert result.statuses == (ScheduleStatus.NUMERIC_FAILURE,)
     assert stats.nref == stats.n_numeric_failure == 1 and stats.n_feasible == 0

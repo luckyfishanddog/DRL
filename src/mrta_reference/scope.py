@@ -105,7 +105,7 @@ FORMAL_SCOPE_V2 = replace(
     combined_xy_split_policy_id="EXCLUDED_V1",
 )
 
-ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V1_1
+ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V2
 
 
 @dataclass(frozen=True)

@@ -70,6 +70,9 @@ from .stats import ACTIVE_MOVE_TYPES, SearchStats
 REFERENCE_POLICY_ID = DEVELOPMENT_NO_REPAIR_V1
 SA_OI_ALNS_V2_METHOD_ID = "SA_OI_ALNS_V2"
 PATTERN_TRANSITION_BALANCED_FAMILY_V1 = "PATTERN_TRANSITION_BALANCED_FAMILY_V1"
+V2_C2_PATTERN_FAMILY_STRATIFIED_V1 = "V2_C2_PATTERN_FAMILY_STRATIFIED_V1"
+V2_C4_FAMILY_EXPLORE_EXPLOIT_V1 = "V2_C4_FAMILY_EXPLORE_EXPLOIT_V1"
+DECISION_FAMILIES = ("STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X")
 
 
 @dataclass(frozen=True)
@@ -251,6 +254,60 @@ def rerank_c3(
     return tuple(sorted(candidates, key=lambda item: item.rerank_key)[:kref])
 
 
+def decision_family(candidate: CompleteSearchCandidate | ScreenedCandidate | CandidateMove) -> str:
+    """Classify the explicit transition, never patterns retained in the solution."""
+    if isinstance(candidate, CompleteSearchCandidate):
+        move = candidate.atomic_move
+    elif isinstance(candidate, ScreenedCandidate):
+        move = candidate.candidate
+    else:
+        move = candidate
+    if move is None:
+        return "STRUCTURAL"
+    if move.key.move_type is MoveType.SPLIT_DEACTIVATE:
+        return "TARGET_WHOLE"
+    if move.split_pattern is not None:
+        return {
+            SplitKind.WHOLE: "TARGET_WHOLE",
+            SplitKind.Y_SPLIT: "TARGET_Y",
+            SplitKind.X_SPLIT: "TARGET_X",
+        }[move.split_pattern.kind]
+    return "STRUCTURAL"
+
+
+def select_c2_by_family(candidates, kdp: int, *, seed: int, iteration: int):
+    ranked = sorted(candidates, key=lambda item: item.cheap_score)
+    families = DECISION_FAMILIES
+    if kdp < len(families):
+        offset = (seed + iteration) % len(families)
+        families = families[offset:] + families[:offset]
+    selected = []
+    for family in families:
+        candidate = next((row for row in ranked if decision_family(row) == family), None)
+        if candidate is not None and len(selected) < kdp:
+            selected.append(candidate)
+    selected_ids = {id(row) for row in selected}
+    selected.extend(row for row in ranked if id(row) not in selected_ids)
+    return tuple(selected[:kdp])
+
+
+def select_c4_by_family(candidates, kref: int, *, seed: int, iteration: int):
+    ranked = sorted(candidates, key=lambda item: item.rerank_key)
+    if kref <= 1 or len(ranked) <= 1:
+        return tuple(ranked[:kref])
+    selected = [ranked[0]]
+    offset = (seed + iteration) % len(DECISION_FAMILIES)
+    for family in DECISION_FAMILIES[offset:] + DECISION_FAMILIES[:offset]:
+        candidate = next((row for row in ranked if row is not selected[0]
+                          and decision_family(row.screened) == family), None)
+        if candidate is not None:
+            selected.append(candidate)
+            break
+    selected_ids = {id(row) for row in selected}
+    selected.extend(row for row in ranked if id(row) not in selected_ids)
+    return tuple(selected[:kref])
+
+
 def _proposal(
     candidates: Sequence[ReferenceEvaluatedCandidate],
 ) -> ReferenceEvaluatedCandidate | None:
@@ -328,7 +385,11 @@ def evaluate_iteration(
     adaptive_state: AdaptiveOperatorState | None = None,
     scope: FormalScope | None = None,
     enable_x_split: bool = False,
+    family_access_policy: bool | None = None,
 ) -> IterationResult:
+    family_access = scope == FORMAL_SCOPE_V2 if family_access_policy is None else family_access_policy
+    if family_access and scope != FORMAL_SCOPE_V2:
+        raise ValueError("decision-family access policies require FORMAL_SCOPE_V2")
     reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     attempts_before = stats.raw_attempts
     atomic_budget = (
@@ -360,7 +421,10 @@ def evaluate_iteration(
     )
     for attempt in raw:
         pattern = None if attempt.candidate is None else attempt.candidate.split_pattern
+        if attempt.candidate is not None:
+            stats.decision_family_funnel[decision_family(attempt.candidate)]["generated"] += 1
         if pattern is not None and pattern.kind is SplitKind.X_SPLIT:
+            stats.mark_first_x("proposal")
             stats.x_pattern_candidates_generated += 1
             if pattern.point_id is not None:
                 stats.x_pattern_source_counts[pattern.point_id] += 1
@@ -384,12 +448,14 @@ def evaluate_iteration(
     complete: list[CompleteSearchCandidate] = []
     seen_solutions: set[str] = {current.canonical_hash}
     for item in screened:
+        stats.decision_family_funnel[decision_family(item)]["constructed"] += 1
         candidate = atomic_complete_candidate(current, current_directions, item, config)
         if candidate.solution.canonical_hash in seen_solutions:
             stats.duplicates += 1
             continue
         seen_solutions.add(candidate.solution.canonical_hash)
         complete.append(candidate)
+        stats.decision_family_funnel[decision_family(candidate)]["cheap_valid"] += 1
         stats.valid_by_family[CandidateSourceKind.ATOMIC.value] += 1
 
     if current_schedule is not None and search_config.m_lns:
@@ -406,6 +472,7 @@ def evaluate_iteration(
             q_max=search_config.destroy_q_max,
         )
         for ordinal in range(search_config.m_lns):
+            stats.decision_family_funnel["STRUCTURAL"]["generated"] += 1
             stats.raw_attempts += 1
             stats.attempted_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
             pair = adaptive_state.select(lns_rng)
@@ -440,22 +507,35 @@ def evaluate_iteration(
             stats.constructed += 1
             stats.constructed_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
             candidate = repaired.candidate
+            stats.decision_family_funnel["STRUCTURAL"]["constructed"] += 1
             if candidate.solution.canonical_hash in seen_solutions:
                 stats.duplicates += 1
                 stats.rejection_reasons["DUPLICATE_CANONICAL_SOLUTION"] += 1
                 continue
             seen_solutions.add(candidate.solution.canonical_hash)
             complete.append(candidate)
+            stats.decision_family_funnel["STRUCTURAL"]["cheap_valid"] += 1
             stats.cheap_feasible += 1
             stats.valid_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
 
     cheap_ranked = tuple(sorted(complete, key=lambda item: item.cheap_score))
-    c2 = cheap_ranked[: search_config.kdp]
+    c2 = (
+        select_c2_by_family(cheap_ranked, search_config.kdp, seed=stats.seed, iteration=stats.iterations)
+        if family_access else cheap_ranked[: search_config.kdp]
+    )
     stats.kdp_count += len(c2)
     stats.per_iteration_kdp.append(len(c2))
 
     c3 = []
-    for cheap_rank, candidate in enumerate(c2):
+    global_ranks = {id(row): rank for rank, row in enumerate(cheap_ranked)}
+    for candidate in c2:
+        cheap_rank = global_ranks[id(candidate)]
+        decision = decision_family(candidate)
+        funnel = stats.decision_family_funnel[decision]
+        funnel["C2_selected"] += 1
+        funnel["direction_evaluated"] += 1
+        if decision == "TARGET_X":
+            stats.mark_first_x("c2")
         started = time.perf_counter()
         direction = optimize_directions_with_initial_feasibility(
             candidate.solution, config
@@ -465,19 +545,24 @@ def evaluate_iteration(
         if move_name is not None:
             stats.c3_by_move[move_name] += 1
         c3.append(DirectionEvaluatedCandidate(candidate, cheap_rank, direction))
+        funnel["direction_feasible"] += int(direction.total_empty_travel is not None)
         if _x_patterns(candidate.solution):
             stats.x_pattern_candidates_c3 += 1
         if _y_patterns(candidate.solution):
             stats.y_pattern_candidates_c3 += 1
-    shortlist = rerank_c3(
-        [item for item in c3 if item.direction.total_empty_travel is not None],
-        search_config.kref,
+    feasible_c3 = [item for item in c3 if item.direction.total_empty_travel is not None]
+    shortlist = (
+        select_c4_by_family(feasible_c3, search_config.kref, seed=stats.seed, iteration=stats.iterations)
+        if family_access else rerank_c3(feasible_c3, search_config.kref)
     )
 
     cache: dict[tuple[object, ...], ReferenceEvaluatedCandidate] = {}
     c4 = []
     calls_before = stats.nref
     for item in shortlist:
+        decision = decision_family(item.screened)
+        funnel = stats.decision_family_funnel[decision]
+        funnel["C4_selected"] += 1
         move_name = _move_name(item.screened)
         family = _family_of(item.screened)
         has_x = bool(_x_patterns(_solution_of(item.screened)))
@@ -511,6 +596,9 @@ def evaluate_iteration(
             robot: item.direction.directions[robot] for robot in range(4)
         }
         started = time.perf_counter()
+        funnel["reference_evaluated"] += 1
+        if decision == "TARGET_X":
+            stats.mark_first_x("reference")
         try:
             schedule = reference_evaluator(
                 item.screened.solution,
@@ -533,6 +621,7 @@ def evaluate_iteration(
             certification = certify_schedule(_solution_of(item.screened), schedule, config, scope=scope)
             stats.certifier_time += time.perf_counter() - cert_started
             if certification.certified:
+                funnel["certified"] += 1
                 metrics = official_metrics(_solution_of(item.screened), schedule, config)
                 if has_x:
                     stats.x_pattern_candidates_certified += 1
@@ -588,6 +677,7 @@ def run_bounded_sa_oi(
     formal_result: bool = False,
     initialization_override: InitializationResult | None = None,
     enable_x_split: bool = False,
+    family_access_policy: bool | None = None,
 ) -> SearchResult:
     started = time.perf_counter()
     if enable_x_split and (
@@ -736,6 +826,7 @@ def run_bounded_sa_oi(
             adaptive_state=adaptive,
             scope=scope,
             enable_x_split=enable_x_split,
+            family_access_policy=family_access_policy,
         )
         stats.iterations += 1
         proposal = result.proposal
@@ -830,6 +921,7 @@ def run_bounded_sa_oi(
         family = _family_of(candidate)
         move_name = _move_name(candidate)
         stats.accepted_by_family[family] += 1
+        stats.decision_family_funnel[decision_family(candidate)]["accepted"] += 1
         accepted_has_x = bool(_x_patterns(_solution_of(candidate)))
         accepted_has_y = bool(_y_patterns(_solution_of(candidate)))
         if accepted_has_x:
@@ -844,6 +936,7 @@ def run_bounded_sa_oi(
         current_metrics = proposal.metrics
         global_best = current_metrics.compare(best_metrics) < 0
         if global_best:
+            stats.decision_family_funnel[decision_family(candidate)]["global_best_update"] += 1
             best_solution = current_solution
             best_directions = current_directions
             best_schedule = current_schedule

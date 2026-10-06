@@ -140,6 +140,22 @@ class SearchStats:
     y_pattern_candidates_certified: int = 0
     y_pattern_candidates_accepted: int = 0
     y_pattern_global_best_updates: int = 0
+    decision_family_funnel: dict[str, Counter[str]] = field(default_factory=lambda: {
+        family: Counter({stage: 0 for stage in (
+            "generated", "constructed", "cheap_valid", "C2_selected",
+            "direction_evaluated", "direction_feasible", "C4_selected",
+            "reference_evaluated", "certified", "accepted", "global_best_update",
+        )}) for family in ("STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X")
+    })
+    first_x_proposal_time: float | None = None
+    first_x_c2_time: float | None = None
+    first_x_reference_time: float | None = None
+
+    def mark_first_x(self, stage: str) -> None:
+        import time
+        field_name = f"first_x_{stage}_time"
+        if self.run_started is not None and getattr(self, field_name) is None:
+            setattr(self, field_name, time.perf_counter() - self.run_started)
 
     @property
     def valid_by_move(self) -> dict[str, int]:

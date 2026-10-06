@@ -672,6 +672,7 @@ def transition_legal_pattern(
     scope: FormalScope,
     *,
     family_ordinal: int,
+    cyclic_family_priority: bool = False,
 ) -> tuple[CanonicalSolution | None, SplitKind | None]:
     catalog = build_legal_pattern_catalog(solution.parents, config, scope)
     current = {pattern.parent_id: pattern for pattern in solution.patterns}
@@ -689,7 +690,12 @@ def transition_legal_pattern(
     )
     if not families:
         return None, None
-    target_kind = families[family_ordinal % len(families)]
+    if cyclic_family_priority:
+        order = (SplitKind.WHOLE, SplitKind.Y_SPLIT, SplitKind.X_SPLIT)
+        offset = family_ordinal % len(order)
+        target_kind = next(kind for kind in order[offset:] + order[:offset] if by_kind[kind])
+    else:
+        target_kind = families[family_ordinal % len(families)]
     options = sorted(
         by_kind[target_kind], key=lambda item: (item[0].parent_id, item[1].pattern_id)
     )
@@ -748,9 +754,13 @@ def run_adapted_wag_vns(
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
     common_seed: EvaluatedCandidate | None = None,
     method_id: str = METHOD_ID,
+    pattern_access_policy: bool | None = None,
 ) -> BaselineResult:
     rng = random.Random(seed)
     v2 = scope.x_split_rule_id is not None
+    repaired_access = (v2 and method_id == METHOD_ID_V2) if pattern_access_policy is None else pattern_access_policy
+    if repaired_access and not v2:
+        raise ValueError("pattern-first access requires FORMAL_SCOPE_V2")
     evaluator = CommonBaselineEvaluator(
         parents,
         scientific_config,
@@ -814,6 +824,40 @@ def run_adapted_wag_vns(
     ):
         iterations += 1
         best_solution = evaluator.best.solution
+        if repaired_access:
+            transition_started = evaluator.elapsed
+            optional, proposed_kind = transition_legal_pattern(
+                best_solution, scientific_config, rng, scope,
+                family_ordinal=seed + iterations - 1,
+                cyclic_family_priority=True,
+            )
+            evaluator.accounting.construction_time += evaluator.elapsed - transition_started
+            evaluator.accounting.pattern_transition_proposals += int(proposed_kind is not None)
+            evaluator.accounting.x_pattern_proposals += int(proposed_kind is SplitKind.X_SPLIT)
+            evaluator.accounting.y_pattern_proposals += int(proposed_kind is SplitKind.Y_SPLIT)
+            if proposed_kind is SplitKind.X_SPLIT and evaluator.accounting.first_x_proposal_time is None:
+                evaluator.accounting.first_x_proposal_time = evaluator.elapsed
+            trace = {
+                "iteration": iterations - 1,
+                "family_ordinal": (seed + iterations - 1) % 3,
+                "target_kind": None if proposed_kind is None else proposed_kind.value,
+                "proposal_time": evaluator.elapsed,
+                "constructed": optional is not None,
+                "evaluation_started": None,
+                "reference_evaluated": False,
+                "status": None,
+            }
+            evaluator.accounting.pattern_transition_trace.append(trace)
+            if optional is not None and not evaluator.expired:
+                trace["evaluation_started"] = evaluator.elapsed
+                calls_before = evaluator.accounting.reference_calls
+                evaluated = evaluator.evaluate(optional, source=f"WAG_PATTERN_TRANSITION_{iterations}_DIRECT")
+                trace["reference_evaluated"] = evaluator.accounting.reference_calls > calls_before
+                trace["status"] = evaluated.status.value
+                trace["completed_at"] = evaluated.completed_at
+            if evaluator.expired:
+                break
+            best_solution = evaluator.best.solution
         if evaluator.best.schedule is not None:
             heavy = max(
                 range(4),
@@ -864,7 +908,7 @@ def run_adapted_wag_vns(
                 scope=scope if v2 else None,
             )
             name = "LNS"
-        if iterations % 3 == 0:
+        if not repaired_access and iterations % 3 == 0:
             evaluator.accounting.optional_y_toggle_attempts += 1
             if v2:
                 optional, proposed_kind = transition_legal_pattern(

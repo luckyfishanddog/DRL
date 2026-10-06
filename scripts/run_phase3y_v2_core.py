@@ -5,6 +5,9 @@ from dataclasses import asdict
 import hashlib
 import json
 import math
+import statistics
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -51,6 +54,8 @@ V2_ROLES_PATH = ROOT / "data/manifests/PPO_V2_DATA_ROLES_V1.json"
 V2_VALIDATION_PATH = ROOT / "data/manifests/PPO_V2_VALIDATION_SET_V1.json"
 PROTOCOL_PATH = ROOT / "data/manifests/PHASE3Y_V2_CORE_PROTOCOL_V1.json"
 ARTIFACT_PATH = ROOT / "data/development/phase3y_v2_common_domain_smoke_v1.json"
+YR_PROTOCOL_PATH = ROOT / "data/manifests/PHASE3YR_V2_ACCESS_PROTOCOL_V1.json"
+YR_ARTIFACT_PATH = ROOT / "data/development/phase3yr_v2_access_closure_v1.json"
 X_GATE_SET_PATH = ROOT / "data/manifests/PPO_X_SPLIT_GATE_SET_V1.json"
 
 METHOD_ALNS = "SA_OI_ALNS_V2"
@@ -749,8 +754,9 @@ def _run_key(
     entry: Mapping[str, Any],
     seed: int,
 ) -> dict[str, Any]:
+    protocol_field = "phase3yr_protocol_hash" if "phase3yr_protocol_hash" in protocol else "phase3y_protocol_hash"
     return {
-        "phase3y_protocol_hash": protocol["phase3y_protocol_hash"],
+        protocol_field: protocol[protocol_field],
         "scope_hash": FORMAL_SCOPE_V2.scope_hash,
         "catalog_hash": protocol["catalog_hashes"][str(entry["instance_id"])],
         "method_id": method_id,
@@ -906,6 +912,7 @@ def run_method(
     protocol: Mapping[str, Any],
     entry: Mapping[str, Any],
     seed: int,
+    repair_access: bool = False,
 ) -> dict[str, Any]:
     if method_id == METHOD_ALNS:
         result = run_bounded_sa_oi(
@@ -918,6 +925,7 @@ def run_method(
             allow_unverified_source=True,
             formal_result=False,
             enable_x_split=True,
+            family_access_policy=repair_access,
         )
         record = _alns_record(result, protocol=protocol, entry=entry, seed=seed)
     elif method_id == METHOD_HGA:
@@ -944,6 +952,7 @@ def run_method(
             scope=FORMAL_SCOPE_V2,
             checkpoints=CHECKPOINTS,
             method_id=METHOD_WAG,
+            pattern_access_policy=repair_access,
         )
         record = _baseline_record(
             result, protocol=protocol, entry=entry, seed=seed
@@ -952,6 +961,18 @@ def run_method(
         raise ValueError(f"unknown V2 method: {method_id}")
     if record["method_config_hash"] != method_config_hashes()[method_id]:
         raise RuntimeError("method config hash differs from frozen protocol")
+    if repair_access:
+        if method_id == METHOD_ALNS:
+            record["decision_family_funnel"] = {
+                family: dict(counts) for family, counts in result.stats.decision_family_funnel.items()
+            }
+            for field in ("first_x_proposal_time", "first_x_c2_time", "first_x_reference_time"):
+                record[field] = getattr(result.stats, field)
+            record["per_iteration_kdp"] = result.stats.per_iteration_kdp
+            record["per_iteration_reference_calls"] = result.stats.per_iteration_nref
+        else:
+            for field in ("first_x_proposal_time", "first_x_c2_time", "first_x_reference_time", "pattern_transition_trace"):
+                record[field] = result.accounting[field]
     return record
 
 
@@ -1083,6 +1104,239 @@ def run_smoke(ppo_root: Path) -> dict[str, Any]:
     return artifact
 
 
+def freeze_yr_protocol() -> dict[str, Any]:
+    old = _read_json(PROTOCOL_PATH)
+    failure = _read_json(ARTIFACT_PATH)
+    if failure["decision"]["PHASE3Y_EXECUTION_STATUS"] != "FAIL":
+        raise ValueError("Phase3-YR requires the historical Phase3-Y failure")
+    if _payload_hash(old, "phase3y_protocol_hash") != old["phase3y_protocol_hash"]:
+        raise ValueError("historical Phase3-Y protocol hash mismatch")
+    roles = _read_json(V2_ROLES_PATH)
+    validation = _read_json(V2_VALIDATION_PATH)
+    validate_v2_role_overlay(roles)
+    if roles["v2_data_roles_hash"] != old["v2_data_roles_hash"] or (
+        validation["v2_validation_set_hash"] != old["v2_validation_set_hash"]
+    ):
+        raise ValueError("frozen V2 data identities changed")
+    if FORMAL_SCOPE_V2.scope_hash != old["scope_hash"]:
+        raise ValueError("frozen V2 scope changed")
+    if method_config_hashes() != {
+        row["method_id"]: row["method_config_hash"] for row in old["methods"]
+    }:
+        raise ValueError("frozen method parameters changed")
+    protected = [
+        "data/manifests/PPO_V2_DATA_ROLES_V1.json",
+        "data/manifests/PPO_V2_VALIDATION_SET_V1.json",
+        "data/manifests/PHASE3Y_V2_CORE_PROTOCOL_V1.json",
+        "data/development/phase3y_v2_common_domain_smoke_v1.json",
+        "docs/PHASE3Y_FORMAL_SCOPE_V2_CORE_CLOSURE_20261005.md",
+        "src/mrta_baselines/hga.py",
+        "src/mrta_reference/geometry.py",
+        "src/mrta_reference/model.py",
+        "src/mrta_reference/scheduler.py",
+        "src/mrta_reference/certifier.py",
+        "src/mrta_reference/solution.py",
+        "src/mrta_search/direction.py",
+        "src/mrta_search/lns.py",
+        "src/mrta_search/neighborhood.py",
+    ]
+    payload = {
+        **{key: value for key, value in old.items() if key not in (
+            "protocol_id", "phase3y_protocol_hash", "scientific_source_tree_hash"
+        )},
+        "protocol_id": "PHASE3YR_V2_ACCESS_PROTOCOL_V1",
+        "source_phase3y_protocol_hash": old["phase3y_protocol_hash"],
+        "pre_repair_scientific_source_tree_hash": compute_source_tree_hash(ROOT),
+        "alns_c2_policy": "V2_C2_PATTERN_FAMILY_STRATIFIED_V1",
+        "alns_c4_policy": "V2_C4_FAMILY_EXPLORE_EXPLOIT_V1",
+        "alns_families": ["STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X"],
+        "alns_c4_rotation": "(solver_seed + zero_based_iteration) % 4",
+        "wag_transition_policy": "V2_PER_ITERATION_PATTERN_FIRST_SEEDED_FAMILY_V1",
+        "wag_family_rotation": "(solver_seed + zero_based_iteration) % 3; cyclic available fallback",
+        "scientific_config": asdict(ScientificConfig()),
+        "protected_file_sha256": {
+            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+            for path in protected
+        },
+        "historical_scope_hashes": {
+            "FORMAL_SCOPE_V1": FORMAL_SCOPE_V1.scope_hash,
+            "FORMAL_SCOPE_V1_1": FORMAL_SCOPE_V1_1.scope_hash,
+        },
+    }
+    payload["phase3yr_protocol_hash"] = _payload_hash(payload, "phase3yr_protocol_hash")
+    if YR_PROTOCOL_PATH.exists():
+        existing = _read_json(YR_PROTOCOL_PATH)
+        verify_yr_frozen(existing)
+        return existing
+    _write_json(YR_PROTOCOL_PATH, payload)
+    return payload
+
+
+def verify_yr_frozen(protocol: Mapping[str, Any]) -> None:
+    if _payload_hash(protocol, "phase3yr_protocol_hash") != protocol["phase3yr_protocol_hash"]:
+        raise ValueError("Phase3-YR protocol hash mismatch")
+    for path, expected in protocol["protected_file_sha256"].items():
+        if hashlib.sha256((ROOT / path).read_bytes()).hexdigest() != expected:
+            raise ValueError(f"Phase3-YR protected file changed: {path}")
+    if FORMAL_SCOPE_V2.scope_hash != protocol["scope_hash"]:
+        raise ValueError("V2 scientific definition changed")
+    for scope in (FORMAL_SCOPE_V1, FORMAL_SCOPE_V1_1):
+        if scope.scope_hash != protocol["historical_scope_hashes"][scope.scope_id]:
+            raise ValueError("historical scope definition changed")
+    if method_config_hashes() != {
+        row["method_id"]: row["method_config_hash"] for row in protocol["methods"]
+    }:
+        raise ValueError("method budget or parameter changed")
+
+
+def load_yr_parents(entry, roles, ppo_root):
+    # Role rejection happens before any workbook/instance is opened.
+    assert_v2_solver_access_allowed(
+        roles, (str(entry["relative_path"]),), allowed_roles=(ROLE_V2_DEVELOPMENT,)
+    )
+    return load_smoke_parents(entry, roles, ppo_root)
+
+
+def summarize_yr_records(records, protocol, regressions=None):
+    from mrta_reference.scope import ACTIVE_FORMAL_SCOPE
+    base = summarize_records(records, protocol)
+    smoke_pass = base.pop("PHASE3Y_EXECUTION_STATUS") == "PASS"
+    regressions = regressions or {}
+    pre = regressions.get("before_activation", {}).get("returncode") == 0
+    post = regressions.get("after_activation", {}).get("returncode") == 0
+    closed = smoke_pass and pre and post
+    regression_failed = any(row.get("returncode", 1) != 0 for row in regressions.values())
+    base.update({
+        "PHASE3YR_EXECUTION_STATUS": "PASS" if closed else ("PENDING_REGRESSION" if smoke_pass and not regression_failed else "FAIL"),
+        "SMOKE_GATE_STATUS": "PASS" if smoke_pass else "FAIL",
+        "FORMAL_SCOPE_V2_STATUS": "CLOSED" if closed else "OPEN",
+        "V2_SEARCH_ACCESS_STATUS": "CLOSED" if closed else "OPEN",
+        "PHASE3Z_V2_VALIDATION_AUTHORIZED": "YES" if closed else "NO",
+        "V2_VALIDATION_SET_STATUS": "FROZEN_UNTOUCHED",
+        "ACTIVE_FORMAL_SCOPE": ACTIVE_FORMAL_SCOPE.scope_id,
+        "FORMAL_SCOPE_V2_HASH": FORMAL_SCOPE_V2.scope_hash,
+        "NEXT_PHASE": "Phase 3-Z — V2 Common-Model Validation" if closed else "fix only the reported Phase3-YR blocker",
+    })
+    for label, method in (("ALNS", METHOD_ALNS), ("HGA", METHOD_HGA), ("WAG", METHOD_WAG)):
+        base[f"{label}_V2_ACCESS_STATUS"] = "PASS" if base["search_access"][method]["pass"] else "FAIL"
+    return base
+
+
+def summarize_yr_artifact():
+    protocol = _read_json(YR_PROTOCOL_PATH)
+    verify_yr_frozen(protocol)
+    artifact = _read_json(YR_ARTIFACT_PATH)
+    old = _read_json(ARTIFACT_PATH)
+    funnel = {
+        family: {
+            stage: sum(row["decision_family_funnel"][family][stage] for row in artifact["records"] if row["method_id"] == METHOD_ALNS)
+            for stage in ("generated", "constructed", "cheap_valid", "C2_selected", "direction_evaluated",
+                          "direction_feasible", "C4_selected", "reference_evaluated", "certified", "accepted", "global_best_update")
+        } for family in ("STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X")
+    }
+    artifact["access_analysis"] = {
+        "alns_decision_family_funnel": funnel,
+        "legacy_x_count_semantics": "candidates whose resulting solution contains X, including retained incumbent X; not TARGET_X classification",
+        "legacy_compatible_comparison": {
+            method: {
+                phase: {
+                    key: sum(row[key] for row in data["records"] if row["method_id"] == method)
+                    for key in ("x_pattern_proposals", "x_pattern_constructed", "x_pattern_direction_evaluated", "x_pattern_reference_evaluated")
+                } for phase, data in (("Phase3Y", old), ("Phase3YR", artifact))
+            } for method in METHODS
+        },
+        "first_x_time_summary": {},
+        "wag_direct_x_transition_funnel": {
+            "proposals": sum(trace["target_kind"] == "X_SPLIT" for row in artifact["records"] if row["method_id"] == METHOD_WAG for trace in row["pattern_transition_trace"]),
+            "constructed": sum(trace["target_kind"] == "X_SPLIT" and trace["constructed"] for row in artifact["records"] if row["method_id"] == METHOD_WAG for trace in row["pattern_transition_trace"]),
+            "reference_evaluated": sum(trace["target_kind"] == "X_SPLIT" and trace["reference_evaluated"] for row in artifact["records"] if row["method_id"] == METHOD_WAG for trace in row["pattern_transition_trace"]),
+        },
+    }
+    for method in METHODS:
+        times = {}
+        for field in ("first_x_proposal_time", "first_x_c2_time", "first_x_reference_time"):
+            values = [row[field] for row in artifact["records"] if row["method_id"] == method and row.get(field) is not None]
+            times[field] = None if not values else {"count": len(values), "min": min(values), "median": statistics.median(values), "max": max(values)}
+        artifact["access_analysis"]["first_x_time_summary"][method] = times
+    artifact["decision"] = summarize_yr_records(artifact["records"], protocol, artifact["regressions"])
+    artifact["closure_scientific_source_tree_hash"] = compute_source_tree_hash(ROOT)
+    _write_json(YR_ARTIFACT_PATH, artifact)
+    return artifact
+
+
+def run_yr_smoke(ppo_root):
+    protocol = _read_json(YR_PROTOCOL_PATH)
+    verify_yr_frozen(protocol)
+    roles = _read_json(V2_ROLES_PATH)
+    source = compute_source_tree_hash(ROOT)
+    if YR_ARTIFACT_PATH.exists():
+        artifact = _read_json(YR_ARTIFACT_PATH)
+        if artifact["phase3yr_protocol_hash"] != protocol["phase3yr_protocol_hash"]:
+            raise ValueError("existing YR artifact uses a different protocol")
+        if artifact["execution_scientific_source_tree_hash"] != source:
+            raise ValueError("YR implementation changed after smoke started")
+    else:
+        artifact = {
+            "artifact_id": "PHASE3YR_V2_ACCESS_CLOSURE_V1",
+            "phase3yr_protocol_hash": protocol["phase3yr_protocol_hash"],
+            "source_phase3y_protocol_hash": protocol["source_phase3y_protocol_hash"],
+            "execution_scientific_source_tree_hash": source,
+            "records": [], "regressions": {}, "decision": None,
+        }
+    records = artifact["records"]
+    completed = {row["run_key_hash"] for row in records}
+    for entry in protocol["instances"]:
+        parents = load_yr_parents(entry, roles, ppo_root)
+        if pattern_catalog_hash(parents, ScientificConfig(), FORMAL_SCOPE_V2) != protocol["catalog_hashes"][entry["instance_id"]]:
+            raise ValueError("YR catalog differs from frozen Phase3-Y catalog")
+        for method in METHODS:
+            for seed in protocol["seeds"]:
+                key_hash = hashlib.sha256(_canonical_json(_run_key(protocol, method, entry, seed)).encode()).hexdigest()
+                if key_hash in completed:
+                    continue
+                record = run_method(method, parents, protocol=protocol, entry=entry, seed=seed, repair_access=True)
+                records.append(record)
+                completed.add(key_hash)
+                artifact["decision"] = summarize_yr_records(records, protocol, artifact["regressions"])
+                _write_json(YR_ARTIFACT_PATH, artifact)
+                print(f"YR {len(records)}/54 {entry['mechanism_id']} {method} seed={seed} certified={record['final_certified']} x_ref={record['x_pattern_reference_evaluated']}", flush=True)
+    verify_yr_frozen(protocol)
+    artifact["decision"] = summarize_yr_records(records, protocol, artifact["regressions"])
+    _write_json(YR_ARTIFACT_PATH, artifact)
+    return artifact
+
+
+def run_yr_regression(*, after_activation):
+    from mrta_reference.scope import ACTIVE_FORMAL_SCOPE
+    protocol = _read_json(YR_PROTOCOL_PATH)
+    verify_yr_frozen(protocol)
+    artifact = _read_json(YR_ARTIFACT_PATH)
+    stage = "after_activation" if after_activation else "before_activation"
+    expected = FORMAL_SCOPE_V2 if after_activation else FORMAL_SCOPE_V1_1
+    if ACTIVE_FORMAL_SCOPE != expected:
+        raise ValueError(f"{stage} regression has unexpected ACTIVE scope")
+    completed = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    print(completed.stdout, flush=True)
+    if completed.stderr:
+        print(completed.stderr, flush=True)
+    if "regression_attempts" not in artifact:
+        artifact["regression_attempts"] = [
+            {"stage": name, **row} for name, row in artifact["regressions"].items()
+        ]
+    artifact["regressions"][stage] = {
+        "returncode": completed.returncode, "stdout": completed.stdout,
+        "stderr": completed.stderr, "active_scope": ACTIVE_FORMAL_SCOPE.scope_id,
+        "scientific_source_tree_hash": compute_source_tree_hash(ROOT),
+    }
+    artifact["regression_attempts"].append({"stage": stage, **artifact["regressions"][stage]})
+    artifact["decision"] = summarize_yr_records(artifact["records"], protocol, artifact["regressions"])
+    _write_json(YR_ARTIFACT_PATH, artifact)
+    return artifact
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase3-Y FORMAL_SCOPE_V2 core closure")
     parser.add_argument(
@@ -1092,11 +1346,24 @@ def main() -> None:
     parser.add_argument("--verify-core", action="store_true")
     parser.add_argument("--freeze-protocol", action="store_true")
     parser.add_argument("--run", action="store_true")
+    parser.add_argument("--freeze-yr-protocol", action="store_true")
+    parser.add_argument("--run-yr", action="store_true")
+    parser.add_argument("--regress-yr", action="store_true")
+    parser.add_argument("--after-activation", action="store_true")
+    parser.add_argument("--summarize-yr", action="store_true")
     args = parser.parse_args()
-    selected = sum((args.freeze_data, args.verify_core, args.freeze_protocol, args.run))
+    selected = sum((args.freeze_data, args.verify_core, args.freeze_protocol, args.run, args.freeze_yr_protocol, args.run_yr, args.regress_yr, args.summarize_yr))
     if selected != 1:
         parser.error("select exactly one action")
-    if args.freeze_data:
+    if args.summarize_yr:
+        output = summarize_yr_artifact()["decision"]
+    elif args.run_yr:
+        output = run_yr_smoke(args.ppo_root)["decision"]
+    elif args.regress_yr:
+        output = run_yr_regression(after_activation=args.after_activation)["decision"]
+    elif args.freeze_yr_protocol:
+        output = freeze_yr_protocol()
+    elif args.freeze_data:
         roles, validation = freeze_data(args.ppo_root)
         output = {
             "v2_data_roles_hash": roles["v2_data_roles_hash"],

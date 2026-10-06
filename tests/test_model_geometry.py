@@ -33,7 +33,7 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
             mutated.validate_implemented()
     with pytest.raises(FrozenInstanceError):
         scope.deadlock_state_budget = 32
-    assert ACTIVE_FORMAL_SCOPE is FORMAL_SCOPE_V1_1
+    assert ACTIVE_FORMAL_SCOPE is FORMAL_SCOPE_V2
     assert FORMAL_SCOPE_V1_1.scope_hash != FORMAL_SCOPE_V1.scope_hash
     assert FORMAL_SCOPE_V1_1.deadlock_budget_unit == "COMPLETE_ALTERNATIVE_ROLLOUTS"
     assert FORMAL_SCOPE_V1_1.deadlock_rollout_budget == 32

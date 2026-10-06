@@ -1,12 +1,12 @@
 # FORMAL_SCOPE_V2 — Candidate Formal Definition
 
-`FORMAL_SCOPE_V2_STATUS = OPEN`
+`FORMAL_SCOPE_V2_STATUS = CLOSED`
 
-`ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V1_1`
+`ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V2`
 
 `FORMAL_SCOPE_V2_HASH = 16f6110a7384d585fa539777b059e0a297da4fa394a3b4b545ebe967ece54599`
 
-This document freezes the machine-readable meaning of the V2 candidate scope. It does not activate V2. Activation requires the complete Phase 3-Y gate; the first frozen common-domain smoke failed only its X-search-access gate, so V1.1 remains active.
+This document freezes the machine-readable meaning of V2. The initial Phase 3-Y smoke failed its X-search-access gate and remains historical FAIL. On 2026-10-06, Phase 3-YR repaired generic decision-family access and passed the same 54-run gate, followed by full regression before and after activation. V2 is now active; the scientific definition and hash below are unchanged.
 
 ## 1. Task and pattern domain
 
@@ -118,11 +118,10 @@ V2 canonical JSON:
 
 ## 11. Activation status
 
-The candidate definition and implementation are available, but the first Phase 3-Y common-domain smoke did not meet the frozen X-access threshold for SA-OI-ALNS_V2 and ADAPTED_WAG_VNS_V2. Therefore:
+The first Phase 3-Y common-domain smoke remains FAIL. Phase 3-YR used the same instances, seeds, budgets, catalog and access gate. All three methods passed access, 54/54 final schedules were certified, numeric failures and mismatches were zero, and both required regressions passed (287 tests). Activation changes only ACTIVE and this status/history; the scientific definition is unchanged. See [Phase 3-YR closure](PHASE3YR_V2_SEARCH_ACCESS_CLOSURE_20261006.md).
 
-`FORMAL_SCOPE_V2_STATUS = OPEN`
+`FORMAL_SCOPE_V2_STATUS = CLOSED`
 
-`ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V1_1`
+`ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V2`
 
-`PHASE3Z_V2_VALIDATION_AUTHORIZED = NO`
-
+`PHASE3Z_V2_VALIDATION_AUTHORIZED = YES`

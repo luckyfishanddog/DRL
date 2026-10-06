@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
+
+import pytest
 
 from mrta_baselines.wag_vns import (
     AdaptedWAGConfig,
@@ -19,6 +22,105 @@ from mrta_baselines.wag_vns import (
 from mrta_reference.geometry import robot_is_eligible
 from mrta_reference.model import ParentWeld, ScientificConfig, SplitKind
 from mrta_reference.solution import block_map
+
+
+def test_yr_wag_seed_rotation_uses_full_family_order_with_available_fallback():
+    from mrta_baselines.wag_vns import transition_legal_pattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    config = ScientificConfig()
+    parents = (ParentWeld("both", (1.0, 5.9), (5.0, 7.0)),)
+    solution = generate_wag_assignments(parents, _initial_patterns(parents, config, scope=FORMAL_SCOPE_V2),
+                                       config, max_variants=1, scope=FORMAL_SCOPE_V2)[0]
+    kinds = []
+    for seed in (20261005, 20261006, 20261007):
+        first = transition_legal_pattern(solution, config, random.Random(seed), FORMAL_SCOPE_V2,
+                                        family_ordinal=seed, cyclic_family_priority=True)
+        replay = transition_legal_pattern(solution, config, random.Random(seed), FORMAL_SCOPE_V2,
+                                         family_ordinal=seed, cyclic_family_priority=True)
+        assert first[0].canonical_hash == replay[0].canonical_hash
+        kinds.append(first[1])
+    assert SplitKind.Y_SPLIT in kinds and SplitKind.X_SPLIT in kinds
+
+
+@pytest.mark.parametrize("v2", (False, True))
+def test_yr_wag_per_iteration_pattern_first_and_v1_old_trigger(monkeypatch, v2):
+    from mrta_baselines import wag_vns as wag
+    from mrta_baselines.common import CommonBaselineEvaluator
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1, FORMAL_SCOPE_V2
+    scope = FORMAL_SCOPE_V2 if v2 else FORMAL_SCOPE_V1_1
+    config = ScientificConfig(weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
+    parents = (ParentWeld("both", (1.0, 5.9), (5.0, 7.0)),)
+    solution = generate_wag_assignments(parents, _initial_patterns(parents, config, scope=scope if v2 else None),
+                                       config, max_variants=1, scope=scope if v2 else None)[0]
+    seed_candidate = CommonBaselineEvaluator(parents, config, scope, time_limit=60).evaluate(solution, source="fixture")
+    events = []
+    original_evaluate = CommonBaselineEvaluator.evaluate
+    def evaluate(self, assignment, *, source):
+        events.append(source)
+        return original_evaluate(self, assignment, source=source)
+    monkeypatch.setattr(CommonBaselineEvaluator, "evaluate", evaluate)
+    def heavy(*args, **kwargs):
+        events.append("HEAVY")
+    monkeypatch.setattr(wag, "_evaluate_routed_assignment", heavy)
+    def candidates(solution, *args, **kwargs):
+        events.append("OPERATOR")
+        return (solution,)
+    for name in ("wag_move_candidates", "wag_swap_candidates", "wag_lns_candidates"):
+        monkeypatch.setattr(wag, name, candidates)
+    original_toggle = wag.toggle_optional_y
+    def toggle(*args):
+        events.append("OLD_Y")
+        return original_toggle(*args)
+    monkeypatch.setattr(wag, "toggle_optional_y", toggle)
+    result = wag.run_adapted_wag_vns(parents, config, replace(AdaptedWAGConfig(), imax=3), seed=20261006,
+                                    time_limit=60, scope=scope, common_seed=seed_candidate,
+                                    method_id=wag.METHOD_ID_V2 if v2 else wag.METHOD_ID)
+    assert result.iterations == 3
+    if v2:
+        trace = result.accounting["pattern_transition_trace"]
+        assert len(trace) == 3
+        assert result.accounting["pattern_transition_proposals"] == 3
+        assert events[0] == "WAG_PATTERN_TRANSITION_1_DIRECT"
+        for iteration in (1, 2, 3):
+            idx = events.index(f"WAG_PATTERN_TRANSITION_{iteration}_DIRECT")
+            assert events[idx + 1] == "OPERATOR"
+        assert "OLD_Y" not in events
+        assert all(row["evaluation_started"] >= row["proposal_time"] for row in trace)
+    else:
+        assert not result.accounting["pattern_transition_trace"]
+        assert events.count("OLD_Y") == 1
+        assert not any("PATTERN_TRANSITION" in event for event in events)
+
+
+def test_yr_wag_direct_transition_consumes_same_deadline_before_heavy(monkeypatch):
+    from mrta_baselines import wag_vns as wag
+    from mrta_baselines.common import CommonBaselineEvaluator
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    config = ScientificConfig(weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
+    parents = (ParentWeld("one", (1.0, 2.0), (5.0, 2.0)),)
+    solution = generate_wag_assignments(parents, _initial_patterns(parents, config, scope=FORMAL_SCOPE_V2),
+                                       config, max_variants=1, scope=FORMAL_SCOPE_V2)[0]
+    seed_candidate = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V2, time_limit=60).evaluate(solution, source="fixture")
+    class CostlyTransitionEvaluator(CommonBaselineEvaluator):
+        exhausted = False
+        @property
+        def expired(self):
+            return self.exhausted or super().expired
+        def evaluate(self, assignment, *, source):
+            result = super().evaluate(assignment, source=source)
+            if "TRANSITION" in source:
+                self.exhausted = True
+            return result
+    monkeypatch.setattr(wag, "CommonBaselineEvaluator", CostlyTransitionEvaluator)
+    def forbidden(*args, **kwargs):
+        pytest.fail("heavy operator started after transition exhausted the shared deadline")
+    for name in ("wag_move_candidates", "wag_swap_candidates", "wag_lns_candidates", "_evaluate_routed_assignment"):
+        monkeypatch.setattr(wag, name, forbidden)
+    result = wag.run_adapted_wag_vns(parents, config, AdaptedWAGConfig(), seed=20261006, time_limit=60,
+                                    scope=FORMAL_SCOPE_V2, common_seed=seed_candidate, method_id=wag.METHOD_ID_V2)
+    assert result.iterations == 1
+    assert result.termination_reason == "TIME_LIMIT"
+    assert len(result.accounting["pattern_transition_trace"]) == 1
 
 
 def _parents():
@@ -118,4 +220,3 @@ def test_common_model_bounded_defaults_preserve_paper_parameters():
     config = AdaptedWAGConfig()
     assert (config.n, config.p, config.imax, config.factorial_window) == (10, 0.5, 500, 5)
     assert config.factorial_mode == "COMMON_MODEL_BOUNDED"
-

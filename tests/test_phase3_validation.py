@@ -28,6 +28,43 @@ def _manifests():
     return dataset, split
 
 
+@pytest.mark.parametrize("role", (ROLE_V2_VALIDATION, ROLE_V2_TRAIN, ROLE_ID_TEST_SEALED))
+def test_yr_runner_rejects_sealed_roles_before_workbook_load(monkeypatch, role):
+    roles = phase3y._read_json(phase3y.V2_ROLES_PATH)
+    row = next(item for item in roles["workbooks"] if item["new_v2_role"] == role)
+    def forbidden(*args, **kwargs):
+        pytest.fail("workbook load reached before role rejection")
+    monkeypatch.setattr(phase3y, "load_smoke_parents", forbidden)
+    with pytest.raises(PermissionError):
+        phase3y.load_yr_parents(row, roles, Path("D:/pybullet_test/MRTA_GA/ppo"))
+
+
+def test_yr_protocol_preserves_all_frozen_science_data_and_hga():
+    protocol = phase3y._read_json(phase3y.YR_PROTOCOL_PATH)
+    old = phase3y._read_json(phase3y.PROTOCOL_PATH)
+    phase3y.verify_yr_frozen(protocol)
+    assert protocol["source_phase3y_protocol_hash"] == old["phase3y_protocol_hash"]
+    for field in ("scope_hash", "catalog_hashes", "methods", "instances", "seeds",
+                  "checkpoints_seconds", "time_limit_seconds", "access_gate",
+                  "v2_data_roles_hash", "v2_validation_set_hash"):
+        assert protocol[field] == old[field]
+    assert protocol["phase3yr_protocol_hash"] == phase3y._payload_hash(protocol, "phase3yr_protocol_hash")
+    assert phase3y._read_json(phase3y.ARTIFACT_PATH)["decision"]["PHASE3Y_EXECUTION_STATUS"] == "FAIL"
+
+
+@pytest.mark.parametrize("zero_count,passed", ((0, True), (1, True), (2, True), (3, False), (4, False), (5, False)))
+def test_yr_gate_retains_maximum_two_zero_positive_instances(zero_count, passed):
+    protocol = phase3y._read_json(phase3y.YR_PROTOCOL_PATH)
+    old_records = phase3y._read_json(phase3y.ARTIFACT_PATH)["records"]
+    positive = protocol["access_gate"]["positive_mechanism_instances"]
+    records = [{**row, "x_pattern_reference_evaluated": int(row["mechanism_id"] not in positive[:zero_count])}
+               for row in old_records]
+    summary = phase3y.summarize_yr_records(records, protocol)
+    assert summary["search_access_pass"] is passed
+    assert summary["PHASE3YR_EXECUTION_STATUS"] == ("PENDING_REGRESSION" if passed else "FAIL")
+    assert summary["PHASE3Z_V2_VALIDATION_AUTHORIZED"] == "NO"
+
+
 def test_phase3x_runner_freezes_budget_arms_seeds_and_rejects_non_development_roles():
     _, split = _manifests()
     config = phase3x.gate_search_config()

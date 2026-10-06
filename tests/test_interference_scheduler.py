@@ -51,7 +51,7 @@ def test_formal_task_horizon_empty_initial_post_and_same_rail_release():
                ParentWeld("right", (10, 10), (1, 10)))
     solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
                             {0: ("left::whole",), 1: ("right::whole",)}, cfg)
-    schedule = reference_schedule_formal(solution, cfg, orientations={0: (0,), 1: (0,)})
+    schedule = reference_schedule_formal(solution, cfg, scope=FORMAL_SCOPE_V1_1, orientations={0: (0,), 1: (0,)})
     assert schedule.feasible
     assert schedule.canonical_json() == reference_schedule_slow(
         solution, cfg, orientations={0: (0,), 1: (0,)}).canonical_json()
@@ -71,14 +71,14 @@ def test_formal_task_horizon_empty_initial_post_and_same_rail_release():
     touching = Operation("touch", 1, OperationKind.WAIT, 3, 3, (3, 10), (3, 10), 0)
     assert operations_conflict(post, touching, cfg)  # closed final POST endpoint
     empty = canonicalize((), (), {}, cfg)
-    result = reference_schedule_formal(empty, cfg)
+    result = reference_schedule_formal(empty, cfg, scope=FORMAL_SCOPE_V1_1)
     assert result.operations == () and result.cmax == 0
     assert certify_schedule(empty, result, cfg, scope=FORMAL_SCOPE_V1_1).certified
     wrong_order = canonicalize(parents, solution.patterns,
                               {1: ("left::whole",), 0: ("right::whole",)}, cfg)
-    assert reference_schedule_formal(wrong_order, cfg, orientations={0: (0,), 1: (0,)}).status is ScheduleStatus.INFEASIBLE
+    assert reference_schedule_formal(wrong_order, cfg, scope=FORMAL_SCOPE_V1_1, orientations={0: (0,), 1: (0,)}).status is ScheduleStatus.INFEASIBLE
     single = canonicalize(parents[:1], solution.patterns[:1], {1: ("left::whole",)}, cfg)
-    result = reference_schedule_formal(single, cfg)
+    result = reference_schedule_formal(single, cfg, scope=FORMAL_SCOPE_V1_1)
     assert result.feasible and result.robot_completion[0] == 0
     assert certify_schedule(single, result, cfg, scope=FORMAL_SCOPE_V1_1).certified
 
@@ -89,7 +89,7 @@ def test_formal_x_excluded_even_with_valid_legacy_validator():
     parent = ParentWeld("x", (1, 8), (5, 8))
     pattern = SplitPattern("x", SplitKind.X_SPLIT, 0.5, "explicit-x", rail=Rail.UPPER)
     solution = CanonicalSolution((parent,), (pattern,), (Route(0, ("x::0",)), Route(1, ("x::1",)), Route(2, ()), Route(3, ())))
-    formal = reference_schedule_formal(solution, CONFIG)
+    formal = reference_schedule_formal(solution, CONFIG, scope=FORMAL_SCOPE_V1_1)
     assert formal.status is ScheduleStatus.INFEASIBLE
     assert "EXCLUDED" in formal.diagnostics[0]
     fake = replace(formal, status=ScheduleStatus.FEASIBLE, cmax=0)

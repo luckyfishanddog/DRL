@@ -1,10 +1,10 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-`DRL` contains the Phase 1.1 reference evaluator, Phase 2A exact micro validation backbone, Phase 2B-1 bounded SA-OI neighborhood search, Phase 2B-1.5 scheduler performance closure, and the Phase 2B-2 minimal deterministic SA-OI-ALNS backbone for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V1_1 = FINAL ACTIVE SCOPE FOR PHASE 3`; V1 remains a reproducible historical scope superseded before formal experiments. The final method-independent F4 calibration retained B32, so scientific Phase 3 scope is authorized. The scientific core remains isolated from legacy PPO solver code; Phase 3 data intake now reads only the already-frozen platform Excel outputs through an optional adapter.
+`DRL` contains the reference evaluator and deterministic SA-OI-ALNS/HGA/WAG backbones for multi-robot weld allocation and sequencing. `FORMAL_SCOPE_V2 = ACTIVE`; V1 and V1.1 remain frozen historical scopes. V2 preserves the method-independent B32 evaluator and uses a shared WHOLE/Y/X legal catalog. The scientific core remains isolated from legacy PPO solver code; data intake reads the already-frozen platform Excel outputs through an optional adapter.
 
 The authoritative plan is [多机器人焊缝分配与排序实验方案](docs/多机器人焊缝分配与排序实验方案.md). Phase handoffs describe the implementation at their respective dates, not competing plans.
 
-Latest research decision — [Phase 3-X2 deterministic bounded X audit](docs/PHASE3X2_X_ORACLE_POTENTIAL_AUDIT_20261005.md): all 539 frozen patterns were audited; 63 patterns across eight workbooks established certified one-step improvements >=1%. The 66-run X-seeded retention audit met its frozen rule (CASE 3: `PRESENT / ADEQUATE / SUPPORTED`), so `FORMAL_SCOPE_V2_AUTHORIZED = YES`. Historical Phase 3-X remains `NOT_SUPPORTED / WEAK ACCESS / V2 NO`. **ACTIVE scope remains V1.1 until Phase 3-Y core closure**; next is `Phase 3-Y — FORMAL_SCOPE_V2 Core Closure + common-domain HGA/WAG/ALNS adaptation`. Old Phase 3 VALIDATION is V2 model-development-consumed, not untouched V2 validation; no data repartition was performed and ID_TEST remains sealed.
+Latest research decision — [Phase 3-YR search-access closure](docs/PHASE3YR_V2_SEARCH_ACCESS_CLOSURE_20261006.md): the initial [Phase 3-Y smoke](docs/PHASE3Y_FORMAL_SCOPE_V2_CORE_CLOSURE_20261005.md) remains FAIL for search access. Phase 3-YR repaired generic ALNS decision-family shortlists and WAG pattern-access scheduling, passed the unchanged access gate with 54/54 certified final schedules, and passed full regression before and after V2 activation. `SA_OI_ALNS_V2`, `ADAPTED_HGA_V2`, and `ADAPTED_WAG_VNS_V2` share the same WHOLE/Y/X catalog. The 12 frozen V2_VALIDATION instances remain untouched, 31 workbooks remain V2_TRAIN_POOL, and ID_TEST remains sealed. Next: **Phase 3-Z — V2 Common-Model Validation**. Historical Phase 3-X negative evidence and Phase 3-X2 authorization remain unchanged; these development results do not rank the algorithms.
 
 ## Current scope
 
@@ -13,7 +13,7 @@ Implemented:
 - immutable scientific configuration and reproducibility hash;
 - parent weld, welding block, WHOLE/X_SPLIT/Y_SPLIT, route, operation, schedule, candidate, and metric models;
 - deterministic Y-handover candidates and frozen weighted-median `x_up`/`x_low`;
-- historical fail-closed X validator support; formal scope explicitly excludes X_SPLIT;
+- historical V1/V1.1 fail-closed X exclusion and formal V2 finite-catalog X membership validation;
 - canonicalization and deterministic solution identity;
 - open-route direction dynamic programming;
 - analytic continuous-time interference and same-rail non-passing checks;
@@ -37,7 +37,7 @@ Implemented:
 - paper-aligned `ADAPTED_HGA_V1` and `ADAPTED_WAG_VNS_V1`, each using its own native initialization/search and the shared direction/evaluator/certifier path;
 - adversarial and regression tests.
 
-Not implemented in this research: formal full-scope exact, LB_LP, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` is implemented and tested but is `ABLATION_ONLY / EXPERIMENTAL_OPERATOR`: Phase 3-2A DEVELOPMENT evidence showed no aggregate advantage for V3 ON, so the Phase 3-2B proposed backbone fixes it OFF. X_SPLIT search remains inactive. Formal evaluation enables deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS and baseline layers are development comparison backbones, not a final ID_TEST result.
+Not implemented in this research: formal full-scope exact, LB_LP, MLP/GAT/rankers, PPO, ranker datasets, or formal experiments. `TWO_OPT_STAR` is implemented and tested but remains OFF in the proposed backbone and is available only for ablation. V2 enables finite-catalog optional X_SPLIT search. Formal evaluation retains deterministic limited-discrepancy recovery with 32 complete alternative rollouts. The implemented ALNS and baseline layers are development comparison backbones, not a final ID_TEST result.
 
 ## Development and formal scope
 
@@ -47,9 +47,9 @@ Development optimum notation is `Cmax_OPT_Y_CURRENT`, qualified by the current d
 
 `FORMAL_SCOPE_V1` is frozen historical evidence. Its F4 uses 16 popped-prefix states and is depth-censored on large schedules. Its identity and evaluator remain replayable.
 
-`FORMAL_SCOPE_V1_1 = ACTIVE`: F1 still excludes optional X_SPLIT; F2/F3 retain `TASK_HORIZON_RELEASE_V1`; only F4 changes to `FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1`. Baseline FEASIBLE output is untouched. Baseline DEADLOCK invokes at most 32 deterministic complete alternative rollouts, each ending in FEASIBLE or DEADLOCK regardless of template depth. Bx remains a spatial/load prior, not a split domain.
+`FORMAL_SCOPE_V1_1 = FROZEN HISTORICAL`: it excludes optional X_SPLIT and retains its published F1–F4 semantics. `FORMAL_SCOPE_V2 = ACTIVE`: WHOLE/Y/X catalog membership and explicit X assignment/processing/shared-point policies extend V1.1; terminal, empty-route, continuous interference, objective and B32 recovery remain unchanged. See [FORMAL_SCOPE_V2](docs/FORMAL_SCOPE_V2.md).
 
-V1 hash: `8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9`. Active V1.1 hash: `5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc`. See the [historical scope contract](docs/FORMAL_SCOPE_V1.md), [V1 gate evidence](docs/FORMAL_SCOPE_GATE_V1_20260928.md), and [V1.1 F4 closure](docs/FORMAL_SCOPE_V1_1_F4_CLOSURE_20260929.md).
+V1 hash: `8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9`. Historical V1.1 hash: `5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc`. Active V2 hash: `16f6110a7384d585fa539777b059e0a297da4fa394a3b4b545ebe967ece54599`. See the [historical scope contract](docs/FORMAL_SCOPE_V1.md), [V1 gate evidence](docs/FORMAL_SCOPE_GATE_V1_20260928.md), and [V1.1 F4 closure](docs/FORMAL_SCOPE_V1_1_F4_CLOSURE_20260929.md).
 
 The final release budget was selected only from the method-independent direct-sampling corpus: 12 development strata, 256 attempts per stratum, and the first eight unique baseline-DEADLOCK states per stratum produced 96 frozen states. B32/B64/B128 each recovered 6/96 certified schedules; B32 therefore provides 100% of B128 coverage and its N100 end-to-end p95 was 5.147 s, satisfying the predeclared 8 s gate. The selected budget remains 32 and no V1.2 is created. The older 31-state ALNS-derived corpus remains an external regression only: B32/B64/B128 recovered 9/15/15 certified schedules. See the [method-independent corpus](data/development/f4_method_independent_calibration_v1.json), [historical stress corpus](data/development/f4_deadlock_stress_corpus.json), and [final release handoff](docs/FINAL_F4_RELEASE_CALIBRATION_20260929.md).
 
@@ -153,16 +153,14 @@ Phase 3-2A evidence is in [the fairness/backbone handoff](docs/PHASE3_FAIR_TIMIN
 ## Formal API
 
 ```python
-from mrta_reference import FORMAL_SCOPE_V1_1, reference_schedule_formal, certify_schedule
-from mrta_search import run_bounded_sa_oi
+from mrta_reference import FORMAL_SCOPE_V2, reference_schedule_formal, certify_schedule
+from mrta_search import run_sa_oi_alns_v2
 
-schedule = reference_schedule_formal(solution, config, orientations=directions)
-certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V1_1)
+schedule = reference_schedule_formal(solution, config, scope=FORMAL_SCOPE_V2, orientations=directions)
+certificate = certify_schedule(solution, schedule, config, scope=FORMAL_SCOPE_V2)
 # A publishable FORMAL_RESULT rechecks a clean standalone
 # luckyfishanddog/DRL worktree; an enclosing repository HEAD is rejected.
-result = run_bounded_sa_oi(
-    parents, config, scope=FORMAL_SCOPE_V1_1, formal_result=True
-)
+result = run_sa_oi_alns_v2(parents, config, formal_result=True)
 ```
 
 Explicit scope binds initialization, C4, direction refinement, and final certification to the same evaluator; a development callback is rejected in a formal run. Historical `reference_schedule`/slow/optimized retain `DEVELOPMENT_NO_REPAIR_V1`. `RunScientificIdentity` is available on `result.stats.scientific_identity` and contains scope/config identity plus repository id, commit, source-tree hash, dirty state, and commit verification. Nested-workspace smoke must explicitly opt into unverified provenance and remains `development_only=true`; it cannot emit a formal result.

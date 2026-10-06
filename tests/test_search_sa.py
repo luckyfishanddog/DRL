@@ -31,6 +31,107 @@ def _base():
     )
 
 
+def _family_candidates():
+    from dataclasses import replace
+    base = _base()
+    rows = []
+    # The global cheap order deliberately starves the three pattern families.
+    for rank in range(12):
+        key = CandidateKey(0, MoveType.INTRA_RELOCATE, ("a",), 2, 2, (0,), (rank,))
+        rows.append(ScreenedCandidate(CandidateMove(key), base, (rank,), float(rank), 0.0, 0))
+    for ordinal, kind in enumerate((SplitKind.WHOLE, SplitKind.Y_SPLIT, SplitKind.X_SPLIT)):
+        move_type = MoveType.SPLIT_DEACTIVATE if kind is SplitKind.WHOLE else MoveType.SPLIT_ACTIVATE
+        key = CandidateKey(0, move_type, ("a",), 2, 3, (), (ordinal,))
+        from mrta_reference.model import Rail
+        pattern = None if kind is SplitKind.WHOLE else SplitPattern(
+            "a", kind, t=0.5, point_id="MIDPOINT",
+            rail=Rail.LOWER if kind is SplitKind.X_SPLIT else None,
+        )
+        rows.append(ScreenedCandidate(CandidateMove(key, split_pattern=pattern), base,
+                                     (100 + ordinal,), float(100 + ordinal), 0.0, 0))
+    return rows
+
+
+def test_yr_classifies_explicit_transition_and_structural_lns():
+    from dataclasses import replace
+    from mrta_search.lns import CandidateSourceKind, atomic_complete_candidate
+    from mrta_search.pipeline import decision_family
+    rows = _family_candidates()
+    assert [decision_family(row) for row in rows[-3:]] == ["TARGET_WHOLE", "TARGET_Y", "TARGET_X"]
+    complete = atomic_complete_candidate(_base(), ((), (), (0, 0), (0, 0)), rows[0], FAST)
+    assert decision_family(complete) == "STRUCTURAL"
+    lns = replace(complete, source_kind=CandidateSourceKind.LNS_REPAIRED, atomic_move=None)
+    assert decision_family(lns) == "STRUCTURAL"
+    # An incumbent containing X does not turn a structural move into TARGET_X.
+    x_incumbent = replace(rows[0].solution, patterns=(rows[-1].candidate.split_pattern,))
+    assert decision_family(replace(rows[0], solution=x_incumbent)) == "STRUCTURAL"
+
+
+def test_yr_c2_one_per_family_and_remaining_global_fill_with_original_scores():
+    from mrta_search.pipeline import decision_family, select_c2_by_family
+    rows = _family_candidates()
+    selected = select_c2_by_family(list(reversed(rows)), 8, seed=20261005, iteration=0)
+    assert len(selected) == SearchConfig().kdp == 8
+    assert [decision_family(row) for row in selected[:4]] == ["STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X"]
+    assert selected[4:] == tuple(rows[1:5])
+    assert len({id(row) for row in selected}) == 8
+    assert select_c2_by_family(rows[:12], 8, seed=1, iteration=0) == tuple(rows[:8])
+    assert [row.cheap_score for row in rows] == [(i,) for i in range(12)] + [(100,), (101,), (102,)]
+
+
+@pytest.mark.parametrize("seed", (20261005, 20261006, 20261007))
+@pytest.mark.parametrize("iteration", range(4))
+def test_yr_c4_global_exploit_and_deterministic_family_explore(seed, iteration):
+    from mrta_search.pipeline import DECISION_FAMILIES, decision_family, select_c4_by_family
+    rows = _family_candidates()
+    direction = ConstrainedDirectionResult(DirectionStatus.FEASIBLE, ((), (), (0, 0), (0, 0)), 1.0)
+    directed = [DirectionEvaluatedCandidate(row, rank, direction) for rank, row in enumerate(rows)]
+    selected = select_c4_by_family(directed, 2, seed=seed, iteration=iteration)
+    assert len(selected) == SearchConfig().kref == 2
+    assert selected[0] is directed[0]
+    assert decision_family(selected[1].screened) == DECISION_FAMILIES[(seed + iteration) % 4]
+    assert selected[0] is not selected[1]
+    assert select_c4_by_family(list(reversed(directed)), 2, seed=seed, iteration=iteration) == selected
+
+
+def test_yr_c4_empty_family_and_unique_exploit_fallback():
+    from mrta_search.pipeline import select_c4_by_family
+    rows = _family_candidates()
+    direction = ConstrainedDirectionResult(DirectionStatus.FEASIBLE, ((), (), (0, 0), (0, 0)), 1.0)
+    directed = [DirectionEvaluatedCandidate(row, rank, direction) for rank, row in enumerate(rows[:3])]
+    assert select_c4_by_family(directed, 2, seed=3, iteration=0) == tuple(directed[:2])
+    assert select_c4_by_family(directed[:1], 2, seed=0, iteration=0) == tuple(directed[:1])
+
+
+def test_yr_v1_default_remains_global_shortlist_and_identical_trajectory():
+    from mrta_reference.scope import FORMAL_SCOPE_V1_1
+    config = SearchConfig(m=32, kdp=8, kref=2, max_iterations=3)
+    kwargs = dict(seed=7, scope=FORMAL_SCOPE_V1_1, allow_unverified_source=True, source_commit="YR_TEST_FIXTURE")
+    default = run_bounded_sa_oi(_base().parents, FAST, config, **kwargs)
+    legacy = run_bounded_sa_oi(_base().parents, FAST, config, family_access_policy=False, **kwargs)
+    assert default.best_solution.canonical_hash == legacy.best_solution.canonical_hash
+    assert default.best_schedule.canonical_json() == legacy.best_schedule.canonical_json()
+    assert default.stats.proposal_trajectory == legacy.stats.proposal_trajectory
+    assert default.stats.reference_status_sequence == legacy.stats.reference_status_sequence
+
+
+def test_yr_v2_funnel_monotone_caps_and_first_access_times():
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    parents = (ParentWeld("access", (1.0, 2.0), (5.0, 2.0)),)
+    result = run_bounded_sa_oi(parents, FAST, SearchConfig(max_iterations=4),
+                              seed=20261005, scope=FORMAL_SCOPE_V2,
+                              enable_x_split=True, allow_unverified_source=True, source_commit="YR_TEST_FIXTURE")
+    stats = result.stats
+    assert max(stats.per_iteration_kdp) <= 8
+    assert max(stats.per_iteration_nref) <= 4
+    for counts in stats.decision_family_funnel.values():
+        assert counts["C2_selected"] >= counts["direction_feasible"] >= counts["C4_selected"]
+        assert counts["C4_selected"] >= counts["reference_evaluated"] >= counts["certified"]
+        assert counts["certified"] >= counts["accepted"] >= counts["global_best_update"]
+    assert stats.decision_family_funnel["TARGET_X"]["C2_selected"] > 0
+    assert stats.first_x_proposal_time <= stats.first_x_c2_time
+
+
 def test_phase3_comparison_config_overrides_legacy_iteration_cap():
     assert SearchConfig().max_iterations == 100
     comparison = phase3_alns_config(30.0)
