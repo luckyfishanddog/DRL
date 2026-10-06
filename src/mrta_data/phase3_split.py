@@ -11,6 +11,10 @@ ROLE_DEVELOPMENT = "DEVELOPMENT_CONSUMED"
 ROLE_TRAIN = "TRAIN_POOL"
 ROLE_VALIDATION = "VALIDATION"
 ROLE_ID_TEST = "ID_TEST"
+ROLE_V2_DEVELOPMENT = "V2_MODEL_DEVELOPMENT_CONSUMED"
+ROLE_V2_TRAIN = "V2_TRAIN_POOL"
+ROLE_V2_VALIDATION = "V2_VALIDATION"
+ROLE_ID_TEST_SEALED = "ID_TEST_SEALED"
 ASSIGNED_ROLES = (ROLE_TRAIN, ROLE_VALIDATION, ROLE_ID_TEST)
 
 DESCRIPTOR_FIELDS = (
@@ -286,6 +290,50 @@ def assert_solver_access_allowed(
         if role_by_path[path] not in set(allowed_roles):
             raise PermissionError(
                 f"solver access forbidden for {path}: role={role_by_path[path]}"
+            )
+
+
+def validate_v2_role_overlay(payload: Mapping[str, Any]) -> None:
+    rows = list(payload.get("workbooks", ()))
+    paths = [str(item["relative_path"]) for item in rows]
+    if len(rows) != 96 or len(paths) != len(set(paths)):
+        raise ValueError("V2 role overlay must contain 96 unique workbooks")
+    roles = {str(item["new_v2_role"]) for item in rows}
+    allowed = {
+        ROLE_V2_DEVELOPMENT,
+        ROLE_V2_TRAIN,
+        ROLE_V2_VALIDATION,
+        ROLE_ID_TEST_SEALED,
+    }
+    if not roles <= allowed:
+        raise ValueError(f"unknown V2 roles: {sorted(roles - allowed)}")
+    for item in rows:
+        if (
+            item["old_role"] == ROLE_ID_TEST
+            and item["new_v2_role"] != ROLE_ID_TEST_SEALED
+        ):
+            raise ValueError("original ID_TEST workbook is not sealed")
+
+
+def assert_v2_solver_access_allowed(
+    payload: Mapping[str, Any],
+    workbook_paths: Sequence[str],
+    *,
+    allowed_roles: Sequence[str] = (ROLE_V2_DEVELOPMENT,),
+) -> None:
+    """Fail before workbook loading for every Phase3-Y/Phase3-Z solver path."""
+    validate_v2_role_overlay(payload)
+    role_by_path = {
+        str(item["relative_path"]): str(item["new_v2_role"])
+        for item in payload["workbooks"]
+    }
+    allowed = set(allowed_roles)
+    for path in workbook_paths:
+        if path not in role_by_path:
+            raise ValueError(f"workbook is absent from V2 role overlay: {path}")
+        if role_by_path[path] not in allowed:
+            raise PermissionError(
+                f"V2 solver access forbidden for {path}: role={role_by_path[path]}"
             )
 
 

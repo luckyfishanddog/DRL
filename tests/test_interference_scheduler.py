@@ -8,6 +8,7 @@ import pytest
 from mrta_reference.certifier import certify_schedule
 from mrta_reference.geometry import (
     continuous_interference,
+    build_legal_pattern_catalog,
     finite_x_split_validator,
     generate_x_split_patterns,
     operations_conflict,
@@ -24,7 +25,9 @@ from mrta_reference.model import (
     SplitPattern,
     EXPERIMENTAL_X_SPLIT_SCOPE_V1,
     FORMAL_SCOPE_V1_1,
+    FORMAL_SCOPE_V2,
 )
+from mrta_reference.solution import canonicalize, official_metrics
 from mrta_reference.scheduler import (
     build_operation_templates,
     build_robot_routes,
@@ -135,6 +138,63 @@ def test_experimental_x_scope_certifies_processing_and_shared_point_wait() -> No
     rejected = reference_schedule_formal(solution, CONFIG, scope=FORMAL_SCOPE_V1_1)
     assert rejected.status is ScheduleStatus.INFEASIBLE
     assert "EXCLUDED" in rejected.diagnostics[0]
+
+
+def test_v2_x_processing_shared_point_and_no_x_differential_compatibility() -> None:
+    parent = ParentWeld("v2-x", (0.0, 8.0), (4.0, 8.0))
+    catalog = build_legal_pattern_catalog((parent,), CONFIG, FORMAL_SCOPE_V2)
+    pattern = next(
+        item for item in catalog[parent.parent_id]
+        if item.kind is SplitKind.X_SPLIT and item.point_id == "BX_CENTER"
+    )
+    split = canonicalize(
+        (parent,),
+        (pattern,),
+        {0: ("v2-x::0",), 1: ("v2-x::1",)},
+        CONFIG,
+        scope=FORMAL_SCOPE_V2,
+    )
+    split_schedule = reference_schedule_formal(
+        split,
+        CONFIG,
+        scope=FORMAL_SCOPE_V2,
+        orientations={0: (0,), 1: (1,), 2: (), 3: ()},
+    )
+    assert split_schedule.status is ScheduleStatus.FEASIBLE
+    assert certify_schedule(
+        split, split_schedule, CONFIG, scope=FORMAL_SCOPE_V2
+    ).certified
+    processing = sum(
+        operation.duration
+        for operation in split_schedule.operations
+        if operation.kind in (OperationKind.SETUP, OperationKind.WELD, OperationKind.POST)
+    )
+    assert processing == pytest.approx(
+        CONFIG.process_time(parent.length) + CONFIG.t_pre + CONFIG.t_post
+    )
+    assert any(
+        operation.kind is OperationKind.WAIT and operation.duration > 0.0
+        for operation in split_schedule.operations
+    )
+
+    whole_pattern = SplitPattern(parent.parent_id, SplitKind.WHOLE)
+    whole = canonicalize(
+        (parent,), (whole_pattern,), {0: ("v2-x::whole",)}, CONFIG
+    )
+    directions = {0: (0,), 1: (), 2: (), 3: ()}
+    old = reference_schedule_formal(
+        whole, CONFIG, scope=FORMAL_SCOPE_V1_1, orientations=directions
+    )
+    new = reference_schedule_formal(
+        whole, CONFIG, scope=FORMAL_SCOPE_V2, orientations=directions
+    )
+    assert old.status is new.status is ScheduleStatus.FEASIBLE
+    assert old.cmax == new.cmax
+    assert old.operations == new.operations
+    assert old.wait_for_graph == new.wait_for_graph
+    assert official_metrics(whole, old, CONFIG) == official_metrics(whole, new, CONFIG)
+    assert certify_schedule(whole, old, CONFIG, scope=FORMAL_SCOPE_V1_1).certified
+    assert certify_schedule(whole, new, CONFIG, scope=FORMAL_SCOPE_V2).certified
 
 
 def test_phase3x_controlled_fixtures_f1_to_f8() -> None:

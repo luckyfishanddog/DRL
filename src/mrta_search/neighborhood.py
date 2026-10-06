@@ -8,6 +8,7 @@ import time
 from mrta_reference.candidate import apply_candidate
 from mrta_reference.geometry import (
     blocks_for_pattern,
+    build_legal_pattern_catalog,
     finite_x_split_validator,
     frozen_handover_centers,
     generate_x_split_patterns,
@@ -20,6 +21,7 @@ from mrta_reference.model import (
     CandidateKey,
     CandidateMove,
     CanonicalSolution,
+    FormalScope,
     MoveType,
     ScientificConfig,
     SplitKind,
@@ -97,6 +99,7 @@ def applicable_move_mask(
     *,
     enable_two_opt_star: bool = False,
     enable_x_split: bool = False,
+    scope: FormalScope | None = None,
 ) -> dict[MoveType, bool]:
     routes = [route.block_ids for route in solution.routes]
     blocks = block_map(solution, config)
@@ -135,17 +138,28 @@ def applicable_move_mask(
         for robot, route in enumerate(routes)
         for block_id in route
     }
+    catalog = (
+        build_legal_pattern_catalog(solution.parents, config, scope)
+        if scope is not None
+        else None
+    )
     x_up, x_low = frozen_handover_centers(solution.parents, config)
     for parent_id, pattern in patterns.items():
-        y_legal = generate_y_split_patterns(parents[parent_id], config)
+        options = None if catalog is None else catalog[parent_id]
+        y_legal = tuple(
+            item for item in (options or generate_y_split_patterns(parents[parent_id], config))
+            if item.kind is SplitKind.Y_SPLIT
+        )
         x_legal = (
-            tuple(
-                candidate
-                for rail, center in ((robot_rail(0), x_up), (robot_rail(2), x_low))
-                for candidate in generate_x_split_patterns(
-                    parents[parent_id], center, config, rail=rail
+            tuple(item for item in options if item.kind is SplitKind.X_SPLIT)
+            if options is not None
+            else tuple(
+                    candidate
+                    for rail, center in ((robot_rail(0), x_up), (robot_rail(2), x_low))
+                    for candidate in generate_x_split_patterns(
+                        parents[parent_id], center, config, rail=rail
+                    )
                 )
-            )
             if enable_x_split
             else ()
         )
@@ -210,17 +224,27 @@ def make_raw_candidate(
     seed: int,
     ordinal: int,
     enable_x_split: bool = False,
+    scope: FormalScope | None = None,
 ) -> RawAttempt:
     rng = _local_rng(seed, solution.revision, move, ordinal)
     routes = [route.block_ids for route in solution.routes]
     occurrences = [(robot, position, block) for robot, route in enumerate(routes) for position, block in enumerate(route)]
     parents = {parent.parent_id: parent for parent in solution.parents}
     patterns = {pattern.parent_id: pattern for pattern in solution.patterns}
+    catalog = (
+        build_legal_pattern_catalog(solution.parents, config, scope)
+        if scope is not None
+        else None
+    )
     x_up, x_low = frozen_handover_centers(solution.parents, config)
 
     def x_patterns(parent_id: str) -> tuple[SplitPattern, ...]:
         if not enable_x_split:
             return ()
+        if catalog is not None:
+            return tuple(
+                item for item in catalog[parent_id] if item.kind is SplitKind.X_SPLIT
+            )
         parent = parents[parent_id]
         return tuple(
             candidate
@@ -336,7 +360,14 @@ def make_raw_candidate(
         for parent_id, pattern in patterns.items():
             if pattern.kind is not SplitKind.WHOLE:
                 continue
-            alternatives = generate_y_split_patterns(parents[parent_id], config) + x_patterns(parent_id)
+            alternatives = (
+                tuple(
+                    item for item in catalog[parent_id]
+                    if item.kind is not SplitKind.WHOLE
+                )
+                if catalog is not None
+                else generate_y_split_patterns(parents[parent_id], config) + x_patterns(parent_id)
+            )
             if alternatives:
                 location = next(
                     (
@@ -351,8 +382,18 @@ def make_raw_candidate(
                     choices.append((parent_id, alternatives, location))
         if not choices:
             return RawAttempt(move, None, "NO_OPTIONAL_Y_ACTIVATION")
-        parent_id, alternatives, (source_robot, source_position) = rng.choice(choices)
-        pattern = rng.choice(alternatives)
+        families = tuple(
+            kind
+            for kind in (SplitKind.Y_SPLIT, SplitKind.X_SPLIT)
+            if any(any(item.kind is kind for item in choice[1]) for choice in choices)
+        )
+        target_kind = families[ordinal % len(families)]
+        family_choices = [
+            choice for choice in choices
+            if any(item.kind is target_kind for item in choice[1])
+        ]
+        parent_id, alternatives, (source_robot, source_position) = rng.choice(family_choices)
+        pattern = rng.choice(tuple(item for item in alternatives if item.kind is target_kind))
         if pattern.kind is SplitKind.X_SPLIT:
             assert pattern.rail is not None
             left_robot, right_robot = ((0, 1) if pattern.rail.value == "UPPER" else (2, 3))
@@ -414,9 +455,16 @@ def make_raw_candidate(
             if pattern.kind is SplitKind.WHOLE:
                 continue
             family = (
-                generate_y_split_patterns(parents[pattern.parent_id], config)
-                if pattern.kind is SplitKind.Y_SPLIT
-                else tuple(item for item in x_patterns(pattern.parent_id) if item.rail is pattern.rail)
+                tuple(
+                    item for item in catalog[pattern.parent_id]
+                    if item.kind is not SplitKind.WHOLE
+                )
+                if catalog is not None
+                else (
+                    generate_y_split_patterns(parents[pattern.parent_id], config)
+                    if pattern.kind is SplitKind.Y_SPLIT
+                    else tuple(item for item in x_patterns(pattern.parent_id) if item.rail is pattern.rail)
+                )
             )
             alternatives = tuple(
                 item
@@ -427,8 +475,18 @@ def make_raw_candidate(
                 choices.append((pattern, alternatives))
         if not choices:
             return RawAttempt(move, None, "NO_Y_POINT_SWITCH")
-        old, alternatives = rng.choice(choices)
-        pattern = rng.choice(alternatives)
+        families = tuple(
+            kind
+            for kind in (SplitKind.Y_SPLIT, SplitKind.X_SPLIT)
+            if any(any(item.kind is kind for item in choice[1]) for choice in choices)
+        )
+        target_kind = families[ordinal % len(families)]
+        family_choices = [
+            choice for choice in choices
+            if any(item.kind is target_kind for item in choice[1])
+        ]
+        old, alternatives = rng.choice(family_choices)
+        pattern = rng.choice(tuple(item for item in alternatives if item.kind is target_kind))
         candidate = CandidateMove(key((old.parent_id,), pattern=pattern), split_pattern=pattern)
     else:
         return RawAttempt(move, None, "INACTIVE_MOVE")
@@ -444,6 +502,7 @@ def generate_raw_attempts(
     stats: SearchStats,
     moves: tuple[MoveType, ...] = ACTIVE_MOVE_TYPES,
     enable_x_split: bool = False,
+    scope: FormalScope | None = None,
 ) -> tuple[RawAttempt, ...]:
     started = time.perf_counter()
     mask = applicable_move_mask(
@@ -451,6 +510,7 @@ def generate_raw_attempts(
         config,
         enable_two_opt_star=MoveType.TWO_OPT_STAR in moves,
         enable_x_split=enable_x_split,
+        scope=scope,
     )
     applicable = tuple(move for move in moves if mask[move])
     for move in applicable:
@@ -470,6 +530,7 @@ def generate_raw_attempts(
             seed=seed,
             ordinal=ordinals[move],
             enable_x_split=enable_x_split,
+            scope=scope,
         )
         ordinals[move] += 1
         if attempt.candidate is not None:
@@ -606,6 +667,7 @@ def screen_raw_attempts(
     stats: SearchStats,
     *,
     enable_x_split: bool = False,
+    scope: FormalScope | None = None,
 ) -> tuple[ScreenedCandidate, ...]:
     started = time.perf_counter()
     seen_keys: set[CandidateKey] = set()
@@ -654,8 +716,9 @@ def screen_raw_attempts(
                 candidate,
                 config,
                 x_split_validator=x_validator,
+                scope=scope,
             )
-            blocks = block_map(provisional, config)
+            blocks = block_map(provisional, config, scope=scope)
             if any(
                 not robot_is_eligible(blocks[block_id], route.robot_id, config)
                 for route in provisional.routes
@@ -676,7 +739,7 @@ def screen_raw_attempts(
             stats.rejection_reasons["DUPLICATE_CANONICAL_SOLUTION"] += 1
             continue
         seen_solutions.add(provisional.canonical_hash)
-        provisional_blocks = block_map(provisional, config)
+        provisional_blocks = block_map(provisional, config, scope=scope)
         loads = [
             sum(config.process_time(provisional_blocks[item].length) for item in route.block_ids)
             for route in provisional.routes

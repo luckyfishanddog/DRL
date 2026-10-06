@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 from .model import (
+    FormalScope,
     Operation,
     ParentWeld,
     Point,
@@ -21,6 +24,123 @@ XSplitCandidateProvider = Callable[
     [ParentWeld, float, ScientificConfig], Iterable[tuple[float, str]]
 ]
 XSplitValidator = Callable[[ParentWeld, SplitPattern, ScientificConfig], bool]
+
+
+def _pattern_order(pattern: SplitPattern) -> tuple[object, ...]:
+    kind_order = {SplitKind.WHOLE: 0, SplitKind.Y_SPLIT: 1, SplitKind.X_SPLIT: 2}
+    return (
+        kind_order[pattern.kind],
+        "" if pattern.rail is None else pattern.rail.value,
+        -1.0 if pattern.t is None else pattern.t,
+        pattern.point_id or "",
+        pattern.pattern_id,
+    )
+
+
+def build_legal_pattern_catalog(
+    parents: Sequence[ParentWeld],
+    config: ScientificConfig,
+    scope: FormalScope,
+) -> dict[str, tuple[SplitPattern, ...]]:
+    """Build the sole deterministic formal pattern domain for one instance."""
+    scope.validate_implemented()
+    ordered = tuple(sorted(parents, key=lambda item: item.parent_id))
+    if len({parent.parent_id for parent in ordered}) != len(ordered):
+        raise ValueError("duplicate parent_id in legal pattern catalog")
+    x_up, x_low = frozen_handover_centers(ordered, config)
+    result: dict[str, tuple[SplitPattern, ...]] = {}
+    for parent in ordered:
+        eligible = whole_eligible_rails(parent.start, parent.end, config)
+        y_patterns = generate_y_split_patterns(parent, config)
+        if not eligible:
+            if not y_patterns:
+                raise ValueError(f"{parent.parent_id}: mandatory Y family is empty")
+            options = list(y_patterns)
+        else:
+            options = [SplitPattern(parent.parent_id, SplitKind.WHOLE), *y_patterns]
+            if (
+                "X_SPLIT" in scope.pattern_domain
+                and scope.optional_x_split_policy == "FINITE_GEOMETRIC_X_SPLIT_V1"
+            ):
+                for rail, center in ((Rail.UPPER, x_up), (Rail.LOWER, x_low)):
+                    if rail in eligible:
+                        options.extend(
+                            generate_x_split_patterns(
+                                parent, center, config, rail=rail
+                            )
+                        )
+        deduplicated: dict[str, SplitPattern] = {}
+        for pattern in sorted(options, key=_pattern_order):
+            prior = deduplicated.get(pattern.pattern_id)
+            if prior is not None and prior != pattern:
+                raise ValueError(f"non-unique pattern identity: {pattern.pattern_id}")
+            deduplicated[pattern.pattern_id] = pattern
+        result[parent.parent_id] = tuple(
+            sorted(deduplicated.values(), key=_pattern_order)
+        )
+    return result
+
+
+def pattern_catalog_payload(
+    parents: Sequence[ParentWeld], config: ScientificConfig, scope: FormalScope
+) -> dict[str, object]:
+    catalog = build_legal_pattern_catalog(parents, config, scope)
+    return {
+        "scope_hash": scope.scope_hash,
+        "scientific_config_hash": config.scientific_hash,
+        "parents": [
+            [parent.parent_id, list(parent.start), list(parent.end)]
+            for parent in sorted(parents, key=lambda item: item.parent_id)
+        ],
+        "patterns": {
+            parent_id: [
+                [
+                    pattern.kind.value,
+                    pattern.t,
+                    pattern.point_id,
+                    pattern.mandatory,
+                    None if pattern.rail is None else pattern.rail.value,
+                ]
+                for pattern in patterns
+            ]
+            for parent_id, patterns in catalog.items()
+        },
+    }
+
+
+def pattern_catalog_hash(
+    parents: Sequence[ParentWeld], config: ScientificConfig, scope: FormalScope
+) -> str:
+    encoded = json.dumps(
+        pattern_catalog_payload(parents, config, scope),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def pattern_in_catalog(
+    parent: ParentWeld,
+    pattern: SplitPattern,
+    catalog: Mapping[str, Sequence[SplitPattern]],
+    config: ScientificConfig,
+) -> bool:
+    return any(
+        candidate.pattern_id == pattern.pattern_id
+        and candidate.kind is pattern.kind
+        and candidate.mandatory == pattern.mandatory
+        and candidate.rail is pattern.rail
+        and (
+            candidate.t is pattern.t is None
+            or (
+                candidate.t is not None
+                and pattern.t is not None
+                and abs(candidate.t - pattern.t) <= config.numeric_epsilon
+            )
+        )
+        for candidate in catalog.get(parent.parent_id, ())
+    )
 
 
 def whole_eligible_rails(

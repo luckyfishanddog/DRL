@@ -6,11 +6,14 @@ from typing import Mapping, Sequence
 from .geometry import (
     XSplitValidator,
     blocks_for_pattern,
+    build_legal_pattern_catalog,
     finite_x_split_validator,
+    pattern_in_catalog,
     whole_eligible_rails,
 )
 from .model import (
     CanonicalSolution,
+    FormalScope,
     OfficialMetrics,
     OperationKind,
     ParentWeld,
@@ -31,6 +34,7 @@ def canonicalize(
     *,
     revision: int = 0,
     x_split_validator: XSplitValidator | None = None,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution:
     ordered_parents = tuple(sorted(parents, key=lambda parent: parent.parent_id))
     if len({parent.parent_id for parent in ordered_parents}) != len(ordered_parents):
@@ -88,13 +92,27 @@ def canonicalize(
             )
         normalized_patterns.append(pattern)
     ordered_patterns = tuple(normalized_patterns)
+    formal_x_validator = x_split_validator
+    if scope is not None:
+        catalog = build_legal_pattern_catalog(ordered_parents, config, scope)
+        for parent, pattern in zip(ordered_parents, ordered_patterns):
+            if not pattern_in_catalog(parent, pattern, catalog, config):
+                raise ValueError(
+                    f"{scope.scope_id}: pattern is absent from legal catalog: "
+                    f"{pattern.pattern_id}"
+                )
+        formal_x_validator = (
+            finite_x_split_validator(ordered_parents, config)
+            if any(pattern.kind is SplitKind.X_SPLIT for pattern in ordered_patterns)
+            else None
+        )
     expected: dict[str, str] = {}
     for parent, pattern in zip(ordered_parents, ordered_patterns):
         for block in blocks_for_pattern(
             parent,
             pattern,
             config,
-            x_split_validator=x_split_validator,
+            x_split_validator=formal_x_validator,
             require_formal_x_validation=True,
         ):
             if block.block_id in expected:
@@ -139,7 +157,27 @@ def block_map(
     config: ScientificConfig,
     *,
     x_split_validator: XSplitValidator | None = None,
+    scope: FormalScope | None = None,
 ):
+    if scope is not None:
+        catalog = build_legal_pattern_catalog(solution.parents, config, scope)
+        parents_for_validation = {
+            parent.parent_id: parent for parent in solution.parents
+        }
+        for pattern in solution.patterns:
+            parent = parents_for_validation.get(pattern.parent_id)
+            if parent is None or not pattern_in_catalog(
+                parent, pattern, catalog, config
+            ):
+                raise ValueError(
+                    f"{scope.scope_id}: pattern is absent from legal catalog: "
+                    f"{pattern.pattern_id}"
+                )
+        x_split_validator = (
+            finite_x_split_validator(solution.parents, config)
+            if any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
+            else None
+        )
     if x_split_validator is None and any(
         pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns
     ):
@@ -164,10 +202,16 @@ def official_metrics(
     config: ScientificConfig,
     *,
     x_split_validator: XSplitValidator | None = None,
+    scope: FormalScope | None = None,
 ) -> OfficialMetrics:
     if not schedule.feasible or schedule.cmax is None:
         raise ValueError("official metrics require a feasible schedule")
-    blocks = block_map(solution, config, x_split_validator=x_split_validator)
+    blocks = block_map(
+        solution,
+        config,
+        x_split_validator=x_split_validator,
+        scope=scope,
+    )
     process_loads: list[float] = []
     total_empty = 0.0
     for route in solution.routes:

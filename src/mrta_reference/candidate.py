@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from .geometry import XSplitValidator
-from .model import CandidateMove, CanonicalSolution, MoveType, Route, ScientificConfig, SplitKind, SplitPattern
+from .model import CandidateMove, CanonicalSolution, FormalScope, MoveType, Route, ScientificConfig, SplitKind, SplitPattern
 from .solution import canonicalize
 
 
@@ -25,6 +25,7 @@ def apply_candidate(
     config: ScientificConfig,
     *,
     x_split_validator: XSplitValidator | None = None,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution:
     if candidate.key.current_solution_revision != solution.revision:
         raise ValueError("candidate revision does not match current solution")
@@ -134,6 +135,7 @@ def apply_candidate(
         config,
         revision=solution.revision + 1,
         x_split_validator=x_split_validator,
+        scope=scope,
     )
 
 
@@ -143,6 +145,7 @@ def deduplicate_candidates(
     config: ScientificConfig,
     *,
     x_split_validator: XSplitValidator | None = None,
+    scope: FormalScope | None = None,
 ) -> tuple[tuple[CandidateMove, CanonicalSolution], ...]:
     seen_keys = set()
     seen_hashes = set()
@@ -156,6 +159,7 @@ def deduplicate_candidates(
             candidate,
             config,
             x_split_validator=x_split_validator,
+            scope=scope,
         )
         if provisional.canonical_hash in seen_hashes:
             continue

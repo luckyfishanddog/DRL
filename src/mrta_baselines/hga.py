@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 
 from mrta_reference.geometry import (
     blocks_for_pattern,
+    build_legal_pattern_catalog,
     generate_y_split_patterns,
     oriented_endpoints,
     robot_is_eligible,
@@ -23,6 +24,7 @@ from mrta_reference.model import (
     SplitPattern,
     WeldingBlock,
 )
+from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
 
 from .common import (
@@ -34,6 +36,7 @@ from .common import (
 
 
 METHOD_ID = "ADAPTED_HGA_V1"
+METHOD_ID_V2 = "ADAPTED_HGA_V2"
 PAPER_CORE_ID = "HGA_PAPER_CORE_V1"
 
 
@@ -67,8 +70,13 @@ class _Individual:
 
 
 def legal_pattern_options(
-    parent: ParentWeld, config: ScientificConfig
+    parent: ParentWeld,
+    config: ScientificConfig,
+    *,
+    catalog: Mapping[str, Sequence[SplitPattern]] | None = None,
 ) -> tuple[SplitPattern, ...]:
+    if catalog is not None:
+        return tuple(catalog[parent.parent_id])
     y = tuple(generate_y_split_patterns(parent, config))
     if whole_eligible_rails(parent.start, parent.end, config):
         return (SplitPattern(parent.parent_id, SplitKind.WHOLE),) + y
@@ -78,11 +86,14 @@ def legal_pattern_options(
 
 
 def initial_patterns(
-    parents: Sequence[ParentWeld], config: ScientificConfig
+    parents: Sequence[ParentWeld],
+    config: ScientificConfig,
+    *,
+    catalog: Mapping[str, Sequence[SplitPattern]] | None = None,
 ) -> tuple[SplitPattern, ...]:
     result = []
     for parent in sorted(parents, key=lambda item: item.parent_id):
-        options = legal_pattern_options(parent, config)
+        options = legal_pattern_options(parent, config, catalog=catalog)
         whole = next((value for value in options if value.kind is SplitKind.WHOLE), None)
         result.append(whole if whole is not None else options[0])
     return tuple(result)
@@ -176,8 +187,10 @@ def initialize_hga_solution(
     rng: random.Random,
     *,
     patterns: Sequence[SplitPattern] | None = None,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution:
-    selected = tuple(patterns or initial_patterns(parents, config))
+    catalog = None if scope is None else build_legal_pattern_catalog(parents, config, scope)
+    selected = tuple(patterns or initial_patterns(parents, config, catalog=catalog))
     blocks = _blocks_for(parents, selected, config)
     pending = list(blocks)
     routes: list[list[str]] = [[] for _ in range(4)]
@@ -189,7 +202,8 @@ def initialize_hga_solution(
         )
         routes[robot].insert(position, block_id)
     return canonicalize(
-        parents, selected, {robot: tuple(route) for robot, route in enumerate(routes)}, config
+        parents, selected, {robot: tuple(route) for robot, route in enumerate(routes)}, config,
+        scope=scope,
     )
 
 
@@ -198,9 +212,11 @@ def initialize_hga_region_seed(
     config: ScientificConfig,
     *,
     patterns: Sequence[SplitPattern] | None = None,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution:
     """Adapt the paper's region decomposition to two rails and four robots."""
-    selected = tuple(patterns or initial_patterns(parents, config))
+    catalog = None if scope is None else build_legal_pattern_catalog(parents, config, scope)
+    selected = tuple(patterns or initial_patterns(parents, config, catalog=catalog))
     blocks = _blocks_for(parents, selected, config)
     rail_groups: list[list[str]] = [[], []]
     flexible: list[str] = []
@@ -248,7 +264,8 @@ def initialize_hga_region_seed(
         routes[2 * rail] = ordered[:boundary]
         routes[2 * rail + 1] = ordered[boundary:]
     return canonicalize(
-        parents, selected, {robot: tuple(route) for robot, route in enumerate(routes)}, config
+        parents, selected, {robot: tuple(route) for robot, route in enumerate(routes)}, config,
+        scope=scope,
     )
 
 
@@ -277,6 +294,8 @@ def apply_hga_neighborhood(
     u: str,
     v: str,
     config: ScientificConfig,
+    *,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution | None:
     """Apply paper neighborhoods M1-M6 to the common four-route encoding."""
     routes = [list(route.block_ids) for route in solution.routes]
@@ -332,6 +351,7 @@ def apply_hga_neighborhood(
             solution.patterns,
             {robot: tuple(route) for robot, route in enumerate(routes)},
             config,
+            scope=scope,
         )
     except ValueError:
         return None
@@ -365,6 +385,7 @@ def hga_vnd(
     candidate_cap: int,
     deadline: float | None = None,
     accounting=None,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution:
     current = solution
     current_score = hga_surrogate(current, config)
@@ -391,7 +412,9 @@ def hga_vnd(
                     candidate_operations += 1
                     if accounting is not None:
                         accounting.cheap_candidate_operations += 1
-                    candidate = apply_hga_neighborhood(current, move, u, v, config)
+                    candidate = apply_hga_neighborhood(
+                        current, move, u, v, config, scope=scope
+                    )
                     if candidate is None:
                         continue
                     score = hga_surrogate(candidate, config)
@@ -419,10 +442,21 @@ def _repair_routes(
     rng: random.Random,
     *,
     shuffle_missing: bool,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution:
     blocks = _blocks_for(parents, patterns, config)
     expected = set(blocks)
     routes: list[list[str]] = [[] for _ in range(4)]
+    fixed_x_robot = {
+        f"{pattern.parent_id}::{child}": robot
+        for pattern in patterns
+        if pattern.kind is SplitKind.X_SPLIT
+        for child, robot in enumerate(
+            (0, 1)
+            if pattern.rail is not None and pattern.rail.value == "UPPER"
+            else (2, 3)
+        )
+    }
     seen: set[str] = set()
     for robot in range(4):
         for block_id in inherited[robot]:
@@ -430,6 +464,7 @@ def _repair_routes(
                 block_id in expected
                 and block_id not in seen
                 and robot_is_eligible(blocks[block_id], robot, config)
+                and fixed_x_robot.get(block_id, robot) == robot
             ):
                 routes[robot].append(block_id)
                 seen.add(block_id)
@@ -437,15 +472,32 @@ def _repair_routes(
     if shuffle_missing:
         rng.shuffle(missing)
     for block_id in missing:
-        robot, position = _best_insertion(
-            block_id, routes, blocks, config, shortest_route_only=False
-        )
+        if block_id in fixed_x_robot:
+            robot = fixed_x_robot[block_id]
+            before = _route_cost(routes[robot], blocks, config)
+            _, position = min(
+                (
+                    _route_cost(
+                        routes[robot][:position] + [block_id] + routes[robot][position:],
+                        blocks,
+                        config,
+                    ) - before,
+                    position,
+                )
+                for position in range(len(routes[robot]) + 1)
+            )
+        else:
+            robot, position = _best_insertion(
+                block_id, routes, blocks, config, shortest_route_only=False
+            )
         routes[robot].insert(position, block_id)
     # The common canonicalizer intentionally collapses consecutive siblings on
     # one robot to WHOLE.  A selected split chromosome must therefore repair
     # that representation artifact before canonicalization.
     for pattern in patterns:
         if pattern.kind is SplitKind.WHOLE:
+            continue
+        if pattern.kind is SplitKind.X_SPLIT:
             continue
         siblings = (f"{pattern.parent_id}::0", f"{pattern.parent_id}::1")
         locations = [_location(routes, block_id) for block_id in siblings]
@@ -472,6 +524,7 @@ def _repair_routes(
         patterns,
         {robot: tuple(route) for robot, route in enumerate(routes)},
         config,
+        scope=scope,
     )
 
 
@@ -480,6 +533,8 @@ def route_based_crossover(
     parent_b: CanonicalSolution,
     config: ScientificConfig,
     rng: random.Random,
+    *,
+    scope: FormalScope | None = None,
 ) -> CanonicalSolution:
     if parent_a.parents != parent_b.parents:
         raise ValueError("parents must describe the same instance")
@@ -504,6 +559,7 @@ def route_based_crossover(
         config,
         rng,
         shuffle_missing=True,
+        scope=scope,
     )
 
 
@@ -541,6 +597,53 @@ def mutate_optional_y(
         config,
         rng,
         shuffle_missing=False,
+    )
+
+
+def mutate_legal_pattern(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    rng: random.Random,
+    scope: FormalScope,
+    *,
+    family_ordinal: int,
+) -> tuple[CanonicalSolution, SplitKind | None]:
+    """One bounded, family-balanced transition from the shared formal catalog."""
+    catalog = build_legal_pattern_catalog(solution.parents, config, scope)
+    current = {pattern.parent_id: pattern for pattern in solution.patterns}
+    by_kind: dict[SplitKind, list[tuple[ParentWeld, SplitPattern]]] = {
+        kind: [] for kind in SplitKind
+    }
+    for parent in solution.parents:
+        for option in catalog[parent.parent_id]:
+            if option.pattern_id != current[parent.parent_id].pattern_id:
+                by_kind[option.kind].append((parent, option))
+    families = tuple(
+        kind
+        for kind in (SplitKind.WHOLE, SplitKind.Y_SPLIT, SplitKind.X_SPLIT)
+        if by_kind[kind]
+    )
+    if not families:
+        return solution, None
+    target_kind = families[family_ordinal % len(families)]
+    options = sorted(
+        by_kind[target_kind], key=lambda item: (item[0].parent_id, item[1].pattern_id)
+    )
+    parent, target = options[rng.randrange(len(options))]
+    current[parent.parent_id] = target
+    selected = tuple(current[item.parent_id] for item in solution.parents)
+    inherited = [list(route.block_ids) for route in solution.routes]
+    return (
+        _repair_routes(
+            solution.parents,
+            selected,
+            inherited,
+            config,
+            rng,
+            shuffle_missing=False,
+            scope=scope,
+        ),
+        target_kind,
     )
 
 
@@ -622,8 +725,10 @@ def run_adapted_hga(
     scope: FormalScope,
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
     common_seed: EvaluatedCandidate | None = None,
+    method_id: str = METHOD_ID,
 ) -> BaselineResult:
     rng = random.Random(seed)
+    v2 = scope.x_split_rule_id is not None
     evaluator = CommonBaselineEvaluator(
         parents,
         scientific_config,
@@ -631,6 +736,14 @@ def run_adapted_hga(
         time_limit=time_limit,
         checkpoints=checkpoints,
     )
+    if v2:
+        evaluator.accounting.legal_x_pattern_count = sum(
+            pattern.kind is SplitKind.X_SPLIT
+            for patterns in build_legal_pattern_catalog(
+                parents, scientific_config, scope
+            ).values()
+            for pattern in patterns
+        )
     population: list[_Individual] = []
     init_started = time.perf_counter()
     if common_seed is not None:
@@ -650,9 +763,13 @@ def run_adapted_hga(
         construct_started = time.perf_counter()
         try:
             solution = (
-                initialize_hga_region_seed(parents, scientific_config)
+                initialize_hga_region_seed(
+                    parents, scientific_config, scope=scope if v2 else None
+                )
                 if index == 0
-                else initialize_hga_solution(parents, scientific_config, rng)
+                else initialize_hga_solution(
+                    parents, scientific_config, rng, scope=scope if v2 else None
+                )
             )
             native_evaluated = None
             if (
@@ -675,6 +792,7 @@ def run_adapted_hga(
                 candidate_cap=hga_config.vnd_candidate_cap,
                 deadline=evaluator.deadline,
                 accounting=evaluator.accounting,
+                scope=scope if v2 else None,
             )
             evaluator.accounting.local_search_time += time.perf_counter() - local_started
         except (ArithmeticError, OverflowError, ValueError) as error:
@@ -709,12 +827,34 @@ def run_adapted_hga(
         crossover_started = time.perf_counter()
         try:
             offspring = route_based_crossover(
-                first.solution, second.solution, scientific_config, rng
+                first.solution,
+                second.solution,
+                scientific_config,
+                rng,
+                scope=scope if v2 else None,
             )
             if rng.random() < hga_config.pattern_mutation_probability:
                 evaluator.accounting.optional_y_mutations_attempted += 1
                 before_patterns = offspring.patterns
-                offspring = mutate_optional_y(offspring, scientific_config, rng)
+                if v2:
+                    offspring, proposed_kind = mutate_legal_pattern(
+                        offspring,
+                        scientific_config,
+                        rng,
+                        scope,
+                        family_ordinal=iterations,
+                    )
+                    evaluator.accounting.pattern_transition_proposals += int(
+                        proposed_kind is not None
+                    )
+                    evaluator.accounting.x_pattern_proposals += int(
+                        proposed_kind is SplitKind.X_SPLIT
+                    )
+                    evaluator.accounting.y_pattern_proposals += int(
+                        proposed_kind is SplitKind.Y_SPLIT
+                    )
+                else:
+                    offspring = mutate_optional_y(offspring, scientific_config, rng)
                 if offspring.patterns != before_patterns:
                     evaluator.accounting.optional_y_mutations_accepted += 1
         except (ArithmeticError, OverflowError, ValueError) as error:
@@ -730,6 +870,7 @@ def run_adapted_hga(
             candidate_cap=hga_config.vnd_candidate_cap,
             deadline=evaluator.deadline,
             accounting=evaluator.accounting,
+            scope=scope if v2 else None,
         )
         evaluator.accounting.local_search_time += time.perf_counter() - local_started
         evaluated = evaluator.evaluate(offspring, source=f"HGA_OFFSPRING_{iterations}")
@@ -756,7 +897,7 @@ def run_adapted_hga(
         termination_reason = "COMPLETED_OTHER"
 
     return evaluator.finish(
-        method_id=METHOD_ID,
+        method_id=method_id,
         method_config_hash=canonical_config_hash(hga_config),
         iterations=iterations,
         initialization_time=initialization_time,
@@ -767,4 +908,25 @@ def run_adapted_hga(
             "one four-quadrant HGA region seed adapts paper region division; paper start/return physics excluded",
             "ADAPTED_HGA_BIASED_FITNESS_V1",
         ),
+    )
+
+
+def run_adapted_hga_v2(
+    parents: Sequence[ParentWeld],
+    scientific_config: ScientificConfig,
+    hga_config: AdaptedHGAConfig,
+    *,
+    seed: int,
+    time_limit: float,
+    checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
+) -> BaselineResult:
+    return run_adapted_hga(
+        parents,
+        scientific_config,
+        hga_config,
+        seed=seed,
+        time_limit=time_limit,
+        scope=FORMAL_SCOPE_V2,
+        checkpoints=checkpoints,
+        method_id=METHOD_ID_V2,
     )

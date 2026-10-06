@@ -9,6 +9,7 @@ from typing import Mapping, Sequence
 
 from mrta_reference.geometry import (
     blocks_for_pattern,
+    build_legal_pattern_catalog,
     generate_y_split_patterns,
     robot_is_eligible,
     whole_eligible_rails,
@@ -24,6 +25,7 @@ from mrta_reference.model import (
     WeldingBlock,
 )
 from mrta_reference.solution import block_map, canonicalize
+from mrta_reference.scope import FORMAL_SCOPE_V2
 
 from .common import (
     BaselineAccounting,
@@ -35,6 +37,7 @@ from .common import (
 
 
 METHOD_ID = "ADAPTED_WAG_VNS_V1"
+METHOD_ID_V2 = "ADAPTED_WAG_VNS_V2"
 PAPER_CORE_ID = "WAG_PAPER_CORE_V1"
 
 
@@ -68,15 +71,27 @@ class AdaptedWAGConfig:
 
 
 def _initial_patterns(
-    parents: Sequence[ParentWeld], config: ScientificConfig
+    parents: Sequence[ParentWeld], config: ScientificConfig,
+    *,
+    scope: FormalScope | None = None,
 ) -> tuple[SplitPattern, ...]:
+    catalog = (
+        None if scope is None else build_legal_pattern_catalog(parents, config, scope)
+    )
     result = []
     for parent in sorted(parents, key=lambda item: item.parent_id):
-        whole = SplitPattern(parent.parent_id, SplitKind.WHOLE)
+        options = None if catalog is None else catalog[parent.parent_id]
+        whole = next(
+            (item for item in options or () if item.kind is SplitKind.WHOLE),
+            SplitPattern(parent.parent_id, SplitKind.WHOLE),
+        )
         if whole_eligible_rails(parent.start, parent.end, config):
             result.append(whole)
             continue
-        splits = generate_y_split_patterns(parent, config)
+        splits = tuple(
+            item for item in (options or generate_y_split_patterns(parent, config))
+            if item.kind is SplitKind.Y_SPLIT
+        )
         if not splits:
             raise ValueError(f"{parent.parent_id}: no legal WHOLE/Y_SPLIT pattern")
         result.append(splits[0])
@@ -354,11 +369,24 @@ def generate_wag_assignments(
     *,
     max_variants: int,
     accounting: BaselineAccounting | None = None,
+    scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
     blocks = _blocks_for(parents, patterns, config)
+    fixed_x_robot = {
+        f"{pattern.parent_id}::{child}": robot
+        for pattern in patterns
+        if pattern.kind is SplitKind.X_SPLIT
+        for child, robot in enumerate(
+            (0, 1)
+            if pattern.rail is not None and pattern.rail.value == "UPPER"
+            else (2, 3)
+        )
+    }
     rail_groups: dict[str, list[str]] = {"UPPER": [], "LOWER": []}
     flexible: list[str] = []
     for block_id, block in blocks.items():
+        if block_id in fixed_x_robot:
+            continue
         upper = any(robot_is_eligible(block, robot, config) for robot in (0, 1))
         lower = any(robot_is_eligible(block, robot, config) for robot in (2, 3))
         if upper and lower:
@@ -398,13 +426,20 @@ def generate_wag_assignments(
     for offset_index, (upper_offset, lower_offset) in enumerate(offsets):
         ub = min(len(upper_order), max(0, upper_boundary + upper_offset))
         lb = min(len(lower_order), max(0, lower_boundary + lower_offset))
-        routes = (
-            Route(0, upper_order[:ub]),
-            Route(1, upper_order[ub:]),
-            Route(2, lower_order[:lb]),
-            Route(3, lower_order[lb:]),
+        route_lists = [
+            list(upper_order[:ub]),
+            list(upper_order[ub:]),
+            list(lower_order[:lb]),
+            list(lower_order[lb:]),
+        ]
+        for block_id, robot in sorted(fixed_x_robot.items()):
+            route_lists[robot].append(block_id)
+        routes = tuple(
+            Route(robot, tuple(route_lists[robot])) for robot in range(4)
         )
-        solution = canonicalize(parents, patterns, routes, config)
+        solution = canonicalize(
+            parents, patterns, routes, config, scope=scope
+        )
         if solution.canonical_hash not in seen:
             seen.add(solution.canonical_hash)
             result.append(solution)
@@ -422,6 +457,7 @@ def _route_combinations(
     *,
     deadline: float,
     accounting: BaselineAccounting | None = None,
+    scope: FormalScope | None = None,
 ) -> tuple[list[CanonicalSolution], int]:
     blocks = block_map(assignment, config)
     variants = []
@@ -441,7 +477,9 @@ def _route_combinations(
     combinations = []
     for indices in itertools.product(range(3), repeat=4):
         routes = tuple(Route(robot, variants[robot][indices[robot]]) for robot in range(4))
-        solution = canonicalize(assignment.parents, assignment.patterns, routes, config)
+        solution = canonicalize(
+            assignment.parents, assignment.patterns, routes, config, scope=scope
+        )
         cost = max(
             (_route_cost(route.block_ids, blocks, config) for route in routes),
             default=0.0,
@@ -462,6 +500,7 @@ def wag_move_candidates(
     *,
     n: int,
     heavy_robot: int,
+    scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
     blocks = block_map(solution, config)
     if not solution.routes[heavy_robot].block_ids:
@@ -470,6 +509,12 @@ def wag_move_candidates(
     for _ in range(n):
         routes = [list(route.block_ids) for route in solution.routes]
         block_id = routes[heavy_robot][rng.randrange(len(routes[heavy_robot]))]
+        pattern = next(
+            item for item in solution.patterns
+            if item.parent_id == block_id.split("::", 1)[0]
+        )
+        if pattern.kind is SplitKind.X_SPLIT:
+            continue
         destinations = [
             robot
             for robot in _same_rail_neighbors(heavy_robot)
@@ -489,6 +534,7 @@ def wag_move_candidates(
                 solution.patterns,
                 {robot: tuple(route) for robot, route in enumerate(routes)},
                 config,
+                scope=scope,
             )
         )
     return tuple(result)
@@ -501,6 +547,7 @@ def wag_swap_candidates(
     *,
     n: int,
     heavy_robot: int,
+    scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
     blocks = block_map(solution, config)
     result = []
@@ -513,6 +560,14 @@ def wag_swap_candidates(
         routes = [list(route.block_ids) for route in solution.routes]
         left = routes[heavy_robot][rng.randrange(len(routes[heavy_robot]))]
         right = routes[neighbor][rng.randrange(len(routes[neighbor]))]
+        pattern_by_parent = {
+            item.parent_id: item for item in solution.patterns
+        }
+        if any(
+            pattern_by_parent[block.split("::", 1)[0]].kind is SplitKind.X_SPLIT
+            for block in (left, right)
+        ):
+            continue
         if not (
             robot_is_eligible(blocks[left], neighbor, config)
             and robot_is_eligible(blocks[right], heavy_robot, config)
@@ -527,6 +582,7 @@ def wag_swap_candidates(
                 solution.patterns,
                 {robot: tuple(route) for robot, route in enumerate(routes)},
                 config,
+                scope=scope,
             )
         )
     return tuple(result)
@@ -539,6 +595,7 @@ def wag_lns_candidates(
     *,
     p: float,
     max_variants: int,
+    scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
     routes = [list(route.block_ids) for route in solution.routes]
     removed = []
@@ -556,11 +613,22 @@ def wag_lns_candidates(
     loads = [
         sum(config.process_time(blocks[item].length) for item in route) for route in routes
     ]
+    pattern_by_parent = {item.parent_id: item for item in solution.patterns}
     for block_id in removed:
-        eligible = [
-            robot for robot in range(4) if robot_is_eligible(blocks[block_id], robot, config)
-        ]
-        robot = min(eligible, key=lambda item: (loads[item], item))
+        pattern = pattern_by_parent[block_id.split("::", 1)[0]]
+        if pattern.kind is SplitKind.X_SPLIT:
+            child = int(block_id.rsplit("::", 1)[1])
+            robot = (
+                (0, 1)[child]
+                if pattern.rail is not None and pattern.rail.value == "UPPER"
+                else (2, 3)[child]
+            )
+        else:
+            eligible = [
+                robot for robot in range(4)
+                if robot_is_eligible(blocks[block_id], robot, config)
+            ]
+            robot = min(eligible, key=lambda item: (loads[item], item))
         routes[robot].append(block_id)
         loads[robot] += config.process_time(blocks[block_id].length)
     base = canonicalize(
@@ -568,9 +636,11 @@ def wag_lns_candidates(
         solution.patterns,
         {robot: tuple(route) for robot, route in enumerate(routes)},
         config,
+        scope=scope,
     )
     return generate_wag_assignments(
-        solution.parents, solution.patterns, config, max_variants=max_variants
+        solution.parents, solution.patterns, config, max_variants=max_variants,
+        scope=scope,
     ) + (base,)
 
 
@@ -595,6 +665,47 @@ def toggle_optional_y(
     return None
 
 
+def transition_legal_pattern(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    rng: random.Random,
+    scope: FormalScope,
+    *,
+    family_ordinal: int,
+) -> tuple[CanonicalSolution | None, SplitKind | None]:
+    catalog = build_legal_pattern_catalog(solution.parents, config, scope)
+    current = {pattern.parent_id: pattern for pattern in solution.patterns}
+    by_kind: dict[SplitKind, list[tuple[ParentWeld, SplitPattern]]] = {
+        kind: [] for kind in SplitKind
+    }
+    for parent in solution.parents:
+        for option in catalog[parent.parent_id]:
+            if option.pattern_id != current[parent.parent_id].pattern_id:
+                by_kind[option.kind].append((parent, option))
+    families = tuple(
+        kind
+        for kind in (SplitKind.WHOLE, SplitKind.Y_SPLIT, SplitKind.X_SPLIT)
+        if by_kind[kind]
+    )
+    if not families:
+        return None, None
+    target_kind = families[family_ordinal % len(families)]
+    options = sorted(
+        by_kind[target_kind], key=lambda item: (item[0].parent_id, item[1].pattern_id)
+    )
+    parent, target = options[rng.randrange(len(options))]
+    current[parent.parent_id] = target
+    patterns = tuple(current[item.parent_id] for item in solution.parents)
+    generated = generate_wag_assignments(
+        solution.parents,
+        patterns,
+        config,
+        max_variants=1,
+        scope=scope,
+    )
+    return (generated[0] if generated else None), target_kind
+
+
 def _evaluate_routed_assignment(
     assignment: CanonicalSolution,
     scientific_config: ScientificConfig,
@@ -610,6 +721,7 @@ def _evaluate_routed_assignment(
         wag_config,
         deadline=evaluator.deadline,
         accounting=evaluator.accounting,
+        scope=evaluator.scope if evaluator.scope.x_split_rule_id is not None else None,
     )
     elapsed = time.perf_counter() - construction_started
     evaluator.accounting.construction_time += elapsed
@@ -635,8 +747,10 @@ def run_adapted_wag_vns(
     scope: FormalScope,
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
     common_seed: EvaluatedCandidate | None = None,
+    method_id: str = METHOD_ID,
 ) -> BaselineResult:
     rng = random.Random(seed)
+    v2 = scope.x_split_rule_id is not None
     evaluator = CommonBaselineEvaluator(
         parents,
         scientific_config,
@@ -644,6 +758,14 @@ def run_adapted_wag_vns(
         time_limit=time_limit,
         checkpoints=checkpoints,
     )
+    if v2:
+        evaluator.accounting.legal_x_pattern_count = sum(
+            pattern.kind is SplitKind.X_SPLIT
+            for patterns in build_legal_pattern_catalog(
+                parents, scientific_config, scope
+            ).values()
+            for pattern in patterns
+        )
     init_started = time.perf_counter()
     if common_seed is not None:
         evaluator.inject_certified(
@@ -651,13 +773,16 @@ def run_adapted_wag_vns(
         )
     else:
         try:
-            patterns = _initial_patterns(parents, scientific_config)
+            patterns = _initial_patterns(
+                parents, scientific_config, scope=scope if v2 else None
+            )
             assignments = generate_wag_assignments(
                 parents,
                 patterns,
                 scientific_config,
                 max_variants=wag_config.max_wag_variants,
                 accounting=evaluator.accounting,
+                scope=scope if v2 else None,
             )
         except (ArithmeticError, OverflowError, ValueError) as error:
             evaluator.reject_construction(f"WAG initialization: {error}")
@@ -714,6 +839,7 @@ def run_adapted_wag_vns(
                 rng,
                 n=wag_config.n,
                 heavy_robot=heavy,
+                scope=scope if v2 else None,
             )
             name = "MOVE"
         elif operator == 1:
@@ -724,6 +850,7 @@ def run_adapted_wag_vns(
                 rng,
                 n=wag_config.n,
                 heavy_robot=heavy,
+                scope=scope if v2 else None,
             )
             name = "SWAP"
         else:
@@ -734,11 +861,30 @@ def run_adapted_wag_vns(
                 rng,
                 p=wag_config.p,
                 max_variants=wag_config.max_wag_variants,
+                scope=scope if v2 else None,
             )
             name = "LNS"
         if iterations % 3 == 0:
             evaluator.accounting.optional_y_toggle_attempts += 1
-            optional = toggle_optional_y(best_solution, scientific_config)
+            if v2:
+                optional, proposed_kind = transition_legal_pattern(
+                    best_solution,
+                    scientific_config,
+                    rng,
+                    scope,
+                    family_ordinal=iterations // 3,
+                )
+                evaluator.accounting.pattern_transition_proposals += int(
+                    proposed_kind is not None
+                )
+                evaluator.accounting.x_pattern_proposals += int(
+                    proposed_kind is SplitKind.X_SPLIT
+                )
+                evaluator.accounting.y_pattern_proposals += int(
+                    proposed_kind is SplitKind.Y_SPLIT
+                )
+            else:
+                optional = toggle_optional_y(best_solution, scientific_config)
             if optional is not None:
                 candidates = candidates + (optional,)
         seen = set()
@@ -768,7 +914,7 @@ def run_adapted_wag_vns(
         termination_reason = "COMPLETED_OTHER"
 
     return evaluator.finish(
-        method_id=METHOD_ID,
+        method_id=method_id,
         method_config_hash=canonical_config_hash(wag_config),
         iterations=iterations,
         initialization_time=initialization_time,
@@ -779,4 +925,25 @@ def run_adapted_wag_vns(
             "paper three-robot conflict scheduler is excluded from common-model fitness",
             "ADAPTED_WAG_ASSIGNMENT_V1",
         ),
+    )
+
+
+def run_adapted_wag_vns_v2(
+    parents: Sequence[ParentWeld],
+    scientific_config: ScientificConfig,
+    wag_config: AdaptedWAGConfig,
+    *,
+    seed: int,
+    time_limit: float,
+    checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
+) -> BaselineResult:
+    return run_adapted_wag_vns(
+        parents,
+        scientific_config,
+        wag_config,
+        seed=seed,
+        time_limit=time_limit,
+        scope=FORMAL_SCOPE_V2,
+        checkpoints=checkpoints,
+        method_id=METHOD_ID_V2,
     )

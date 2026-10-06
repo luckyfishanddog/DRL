@@ -3,6 +3,7 @@
 from .candidate import apply_candidate, deduplicate_candidates
 from .certifier import CertificationReport, certify_schedule
 from .geometry import (
+    build_legal_pattern_catalog,
     DirectionResult,
     XSplitValidator,
     continuous_interference,
@@ -10,6 +11,9 @@ from .geometry import (
     finite_x_split_validator,
     generate_x_split_patterns,
     generate_y_split_patterns,
+    pattern_catalog_hash,
+    pattern_catalog_payload,
+    pattern_in_catalog,
     optimize_directions,
     whole_eligible_rails,
     x_split_relation,
@@ -37,6 +41,7 @@ from .model import (
     FormalScope,
     FORMAL_SCOPE_V1,
     FORMAL_SCOPE_V1_1,
+    FORMAL_SCOPE_V2,
     EXPERIMENTAL_X_SPLIT_SCOPE_V1,
     ACTIVE_FORMAL_SCOPE,
     RunScientificIdentity,
@@ -81,7 +86,7 @@ from .scheduler import (
 )
 
 __all__ = [
-    "FormalScope", "FORMAL_SCOPE_V1", "FORMAL_SCOPE_V1_1",
+    "FormalScope", "FORMAL_SCOPE_V1", "FORMAL_SCOPE_V1_1", "FORMAL_SCOPE_V2",
     "EXPERIMENTAL_X_SPLIT_SCOPE_V1",
     "ACTIVE_FORMAL_SCOPE", "RunScientificIdentity",
     "REPOSITORY_ID", "SOURCE_PROVENANCE_POLICY_V1", "SourceProvenance",
@@ -115,6 +120,7 @@ __all__ = [
     "WeldingBlock",
     "XSplitValidator",
     "apply_candidate",
+    "build_legal_pattern_catalog",
     "build_operation_templates",
     "build_robot_routes",
     "build_wait_for_graph",
@@ -129,6 +135,9 @@ __all__ = [
     "finite_x_split_validator",
     "generate_x_split_patterns",
     "generate_y_split_patterns",
+    "pattern_catalog_hash",
+    "pattern_catalog_payload",
+    "pattern_in_catalog",
     "official_metrics",
     "optimize_directions",
     "reference_schedule",

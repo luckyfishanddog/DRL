@@ -25,6 +25,7 @@ from mrta_reference.model import (
 from mrta_reference.scheduler import reference_schedule
 from mrta_reference.scheduler import resolve_reference_evaluator
 from mrta_reference.model import FormalScope, RunScientificIdentity, DEVELOPMENT_NO_REPAIR_V1
+from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.provenance import (
     SourceProvenance,
     SourceProvenanceError,
@@ -67,6 +68,8 @@ from .stats import ACTIVE_MOVE_TYPES, SearchStats
 
 
 REFERENCE_POLICY_ID = DEVELOPMENT_NO_REPAIR_V1
+SA_OI_ALNS_V2_METHOD_ID = "SA_OI_ALNS_V2"
+PATTERN_TRANSITION_BALANCED_FAMILY_V1 = "PATTERN_TRANSITION_BALANCED_FAMILY_V1"
 
 
 @dataclass(frozen=True)
@@ -303,6 +306,12 @@ def _x_patterns(solution: CanonicalSolution):
     )
 
 
+def _y_patterns(solution: CanonicalSolution):
+    return tuple(
+        pattern for pattern in solution.patterns if pattern.kind is SplitKind.Y_SPLIT
+    )
+
+
 ReferenceEvaluator = Callable[..., ScheduleResult]
 
 
@@ -343,6 +352,7 @@ def evaluate_iteration(
             else ACTIVE_MOVE_TYPES
         ),
         enable_x_split=enable_x_split,
+        scope=scope,
     )
     stats.attempted_by_family[CandidateSourceKind.ATOMIC.value] += len(raw)
     stats.constructed_by_family[CandidateSourceKind.ATOMIC.value] += sum(
@@ -354,6 +364,8 @@ def evaluate_iteration(
             stats.x_pattern_candidates_generated += 1
             if pattern.point_id is not None:
                 stats.x_pattern_source_counts[pattern.point_id] += 1
+        if pattern is not None and pattern.kind is SplitKind.Y_SPLIT:
+            stats.y_pattern_candidates_generated += 1
     screened = screen_raw_attempts(
         current,
         current_directions,
@@ -361,9 +373,13 @@ def evaluate_iteration(
         config,
         stats,
         enable_x_split=enable_x_split,
+        scope=scope,
     )
     stats.x_pattern_candidates_cheap_feasible += sum(
         bool(_x_patterns(item.solution)) for item in screened
+    )
+    stats.y_pattern_candidates_cheap_feasible += sum(
+        bool(_y_patterns(item.solution)) for item in screened
     )
     complete: list[CompleteSearchCandidate] = []
     seen_solutions: set[str] = {current.canonical_hash}
@@ -451,6 +467,8 @@ def evaluate_iteration(
         c3.append(DirectionEvaluatedCandidate(candidate, cheap_rank, direction))
         if _x_patterns(candidate.solution):
             stats.x_pattern_candidates_c3 += 1
+        if _y_patterns(candidate.solution):
+            stats.y_pattern_candidates_c3 += 1
     shortlist = rerank_c3(
         [item for item in c3 if item.direction.total_empty_travel is not None],
         search_config.kref,
@@ -465,6 +483,9 @@ def evaluate_iteration(
         has_x = bool(_x_patterns(_solution_of(item.screened)))
         if has_x:
             stats.x_pattern_candidates_reference_evaluated += 1
+        has_y = bool(_y_patterns(_solution_of(item.screened)))
+        if has_y:
+            stats.y_pattern_candidates_reference_evaluated += 1
         stats.c4_by_family[family] += 1
         if move_name is not None:
             stats.c4_by_move[move_name] += 1
@@ -515,6 +536,8 @@ def evaluate_iteration(
                 metrics = official_metrics(_solution_of(item.screened), schedule, config)
                 if has_x:
                     stats.x_pattern_candidates_certified += 1
+                if has_y:
+                    stats.y_pattern_candidates_certified += 1
             else:
                 effective_status = ScheduleStatus.NUMERIC_FAILURE
                 schedule = replace(
@@ -808,8 +831,11 @@ def run_bounded_sa_oi(
         move_name = _move_name(candidate)
         stats.accepted_by_family[family] += 1
         accepted_has_x = bool(_x_patterns(_solution_of(candidate)))
+        accepted_has_y = bool(_y_patterns(_solution_of(candidate)))
         if accepted_has_x:
             stats.x_pattern_candidates_accepted += 1
+        if accepted_has_y:
+            stats.y_pattern_candidates_accepted += 1
         if move_name is not None:
             stats.accepted_by_move[move_name] += 1
         current_solution = _solution_of(candidate)
@@ -832,6 +858,8 @@ def run_bounded_sa_oi(
             stats.record_best(time.perf_counter() - started, best_metrics.cmax)
             if accepted_has_x:
                 stats.x_pattern_global_best_updates += 1
+            if accepted_has_y:
+                stats.y_pattern_global_best_updates += 1
         if global_best:
             reward = search_config.reward_global_best
         elif current_metrics.cmax < current_before.cmax - 1.0e-9 * max(
@@ -879,6 +907,31 @@ def run_bounded_sa_oi(
         stats.anytime(search_config.checkpoints),
         runtime,
         termination_reason,
+    )
+
+
+def run_sa_oi_alns_v2(
+    parents: Sequence[ParentWeld],
+    config: ScientificConfig = ScientificConfig(),
+    search_config: SearchConfig = SearchConfig(),
+    *,
+    seed: int = 0,
+    source_provenance: SourceProvenance | None = None,
+    source_commit: str | None = None,
+    allow_unverified_source: bool = False,
+    formal_result: bool = False,
+) -> SearchResult:
+    return run_bounded_sa_oi(
+        parents,
+        config,
+        search_config,
+        seed=seed,
+        scope=FORMAL_SCOPE_V2,
+        source_provenance=source_provenance,
+        source_commit=source_commit,
+        allow_unverified_source=allow_unverified_source,
+        formal_result=formal_result,
+        enable_x_split=True,
     )
 
 

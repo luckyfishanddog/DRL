@@ -45,6 +45,9 @@ from .pipeline import (
     micro_gap_decomposition,
     rerank_c3,
     run_bounded_sa_oi,
+    run_sa_oi_alns_v2,
+    SA_OI_ALNS_V2_METHOD_ID,
+    PATTERN_TRANSITION_BALANCED_FAMILY_V1,
     sa_accept,
 )
 
@@ -85,6 +88,9 @@ __all__ = [
     "micro_gap_decomposition",
     "rerank_c3",
     "run_bounded_sa_oi",
+    "run_sa_oi_alns_v2",
+    "SA_OI_ALNS_V2_METHOD_ID",
+    "PATTERN_TRANSITION_BALANCED_FAMILY_V1",
     "sa_accept",
     "screen_raw_attempts",
 ]

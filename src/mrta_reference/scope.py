@@ -45,6 +45,11 @@ class FormalScope:
     dispatch_order_id: str = "DFS_ESS_REMAINING_PROCESS_COMPLETION_ROBOT_V1"
     recovery_selection_id: str = "CMAX_THEN_CANONICAL_SCHEDULE_JSON_V1"
     state_count_policy_id: str = "POPPED_PREFIX_INCLUDING_ROOT_AND_COMPLETE_V1"
+    x_split_rule_id: str | None = None
+    x_split_assignment_policy_id: str | None = None
+    x_split_processing_policy_id: str | None = None
+    x_split_shared_point_policy_id: str | None = None
+    combined_xy_split_policy_id: str | None = None
 
     @property
     def canonical_json(self) -> str:
@@ -62,6 +67,7 @@ class FormalScope:
             FORMAL_SCOPE_V1.canonical_json,
             FORMAL_SCOPE_V1_1.canonical_json,
             EXPERIMENTAL_X_SPLIT_SCOPE_V1.canonical_json,
+            FORMAL_SCOPE_V2.canonical_json,
         }:
             raise ValueError("unsupported formal scope; policy changes require implementation and validation")
 
@@ -85,6 +91,18 @@ EXPERIMENTAL_X_SPLIT_SCOPE_V1 = replace(
     scope_id="EXPERIMENTAL_X_SPLIT_SCOPE_V1",
     pattern_domain=("WHOLE", "Y_SPLIT", "X_SPLIT"),
     optional_x_split_policy="FINITE_GEOMETRIC_X_SPLIT_V1",
+)
+
+FORMAL_SCOPE_V2 = replace(
+    FORMAL_SCOPE_V1_1,
+    scope_id="FORMAL_SCOPE_V2",
+    pattern_domain=("WHOLE", "Y_SPLIT", "X_SPLIT"),
+    optional_x_split_policy="FINITE_GEOMETRIC_X_SPLIT_V1",
+    x_split_rule_id="BX_PM_DELTA_AND_MIDPOINT_LMIN_FROM_CONFIG_V1",
+    x_split_assignment_policy_id="SAME_RAIL_SPATIAL_LEFT_RIGHT_FIXED_PAIR_V1",
+    x_split_processing_policy_id="ZERO_SPLIT_TIME_PER_CHILD_SETUP_WELD_POST_V1",
+    x_split_shared_point_policy_id="NO_INTERFERENCE_EXCEPTION_V1",
+    combined_xy_split_policy_id="EXCLUDED_V1",
 )
 
 ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V1_1

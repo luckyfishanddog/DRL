@@ -19,6 +19,8 @@ from mrta_reference.model import (
 )
 from mrta_reference.solution import canonicalize
 from mrta_reference.scheduler import reference_schedule
+from mrta_reference.geometry import build_legal_pattern_catalog
+from mrta_reference.scope import FORMAL_SCOPE_V2
 
 
 CONFIG = ScientificConfig()
@@ -28,6 +30,44 @@ def _allow_test_x_split(parent, pattern, config) -> bool:
     """Test-only candidate set; production intentionally has no default."""
     del parent, config
     return pattern.point_id in {"x40", "x60"}
+
+
+def test_v2_catalog_membership_and_fixed_x_assignment_are_internal():
+    parent = ParentWeld("formal-x", (0.0, 8.0), (4.0, 8.0))
+    catalog = build_legal_pattern_catalog((parent,), CONFIG, FORMAL_SCOPE_V2)
+    pattern = next(
+        item for item in catalog[parent.parent_id]
+        if item.kind is SplitKind.X_SPLIT and item.point_id == "BX_CENTER"
+    )
+    accepted = canonicalize(
+        (parent,),
+        (pattern,),
+        {0: ("formal-x::0",), 1: ("formal-x::1",)},
+        CONFIG,
+        scope=FORMAL_SCOPE_V2,
+        x_split_validator=lambda *_: False,
+    )
+    assert accepted.patterns == (pattern,)
+    with pytest.raises(ValueError, match="spatial children"):
+        canonicalize(
+            (parent,),
+            (pattern,),
+            {0: ("formal-x::1",), 1: ("formal-x::0",)},
+            CONFIG,
+            scope=FORMAL_SCOPE_V2,
+        )
+    forged = SplitPattern(
+        parent.parent_id, SplitKind.X_SPLIT, 0.4, "FORGED", rail=Rail.UPPER
+    )
+    with pytest.raises(ValueError, match="absent from legal catalog"):
+        canonicalize(
+            (parent,),
+            (forged,),
+            {0: ("formal-x::0",), 1: ("formal-x::1",)},
+            CONFIG,
+            scope=FORMAL_SCOPE_V2,
+            x_split_validator=lambda *_: True,
+        )
 
 
 def _whole_solution():

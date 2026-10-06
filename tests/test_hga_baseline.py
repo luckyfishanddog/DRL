@@ -11,13 +11,28 @@ from mrta_baselines.hga import (
     initialize_hga_solution,
     manage_population,
     mutate_optional_y,
+    mutate_legal_pattern,
     normalized_route_edge_distance,
     route_based_crossover,
     AdaptedHGAConfig,
 )
-from mrta_reference.geometry import robot_is_eligible
-from mrta_reference.model import ParentWeld, Route, ScientificConfig, SplitKind, SplitPattern
+from mrta_baselines.wag_vns import transition_legal_pattern
+from mrta_reference.geometry import (
+    build_legal_pattern_catalog,
+    pattern_catalog_hash,
+    robot_is_eligible,
+)
+from mrta_reference.model import (
+    FORMAL_SCOPE_V2,
+    MoveType,
+    ParentWeld,
+    Route,
+    ScientificConfig,
+    SplitKind,
+    SplitPattern,
+)
 from mrta_reference.solution import block_map, canonicalize
+from mrta_search.neighborhood import make_raw_candidate
 
 
 def _parents():
@@ -55,6 +70,54 @@ def _assert_valid(solution, config):
         for route in solution.routes
         for item in route.block_ids
     )
+
+
+def test_v2_three_method_pattern_access_uses_one_catalog_hash():
+    config = ScientificConfig()
+    parents = (
+        ParentWeld("upper", (1.0, 8.0), (5.0, 8.0)),
+        ParentWeld("lower", (6.0, 4.0), (10.0, 4.0)),
+        ParentWeld("handover", (2.0, 5.0), (3.0, 7.0)),
+    )
+    catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+    expected_hash = pattern_catalog_hash(parents, config, FORMAL_SCOPE_V2)
+    assert expected_hash == pattern_catalog_hash(
+        tuple(reversed(parents)), config, FORMAL_SCOPE_V2
+    )
+    initial = initialize_hga_region_seed(
+        parents, config, scope=FORMAL_SCOPE_V2
+    )
+    hga_candidate, hga_kind = mutate_legal_pattern(
+        initial,
+        config,
+        random.Random(7),
+        FORMAL_SCOPE_V2,
+        family_ordinal=1,
+    )
+    wag_candidate, wag_kind = transition_legal_pattern(
+        initial,
+        config,
+        random.Random(7),
+        FORMAL_SCOPE_V2,
+        family_ordinal=1,
+    )
+    alns = make_raw_candidate(
+        initial,
+        config,
+        MoveType.SPLIT_ACTIVATE,
+        seed=7,
+        ordinal=1,
+        enable_x_split=True,
+        scope=FORMAL_SCOPE_V2,
+    )
+    assert hga_kind is wag_kind is SplitKind.X_SPLIT
+    assert wag_candidate is not None
+    assert alns.candidate is not None
+    assert alns.candidate.split_pattern is not None
+    assert alns.candidate.split_pattern.kind is SplitKind.X_SPLIT
+    for solution in (hga_candidate, wag_candidate):
+        for pattern in solution.patterns:
+            assert pattern in catalog[pattern.parent_id]
 
 
 def test_hga_population_initialization_is_fixed_seed_deterministic_and_eligible():

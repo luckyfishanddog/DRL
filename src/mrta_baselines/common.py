@@ -17,6 +17,7 @@ from mrta_reference.model import (
     ScheduleResult,
     ScheduleStatus,
     ScientificConfig,
+    SplitKind,
 )
 from mrta_reference.scheduler import FormalReferenceEvaluator
 from mrta_reference.solution import official_metrics
@@ -88,6 +89,22 @@ class BaselineAccounting:
     swap_calls: int = 0
     lns_calls: int = 0
     optional_y_toggle_attempts: int = 0
+    pattern_transition_proposals: int = 0
+    legal_x_pattern_count: int = 0
+    x_pattern_proposals: int = 0
+    x_pattern_constructed: int = 0
+    x_pattern_direction_evaluated: int = 0
+    x_pattern_reference_evaluated: int = 0
+    x_pattern_certified: int = 0
+    x_pattern_accepted: int = 0
+    x_pattern_global_best_updates: int = 0
+    y_pattern_proposals: int = 0
+    y_pattern_constructed: int = 0
+    y_pattern_direction_evaluated: int = 0
+    y_pattern_reference_evaluated: int = 0
+    y_pattern_certified: int = 0
+    y_pattern_accepted: int = 0
+    y_pattern_global_best_updates: int = 0
 
 
 @dataclass(frozen=True)
@@ -276,12 +293,26 @@ class CommonBaselineEvaluator:
             self.first_certified = candidate.completed_at
         if self.best is None or candidate.metrics.compare(self.best.metrics) < 0:  # type: ignore[arg-type]
             self.best = candidate
+            has_x = any(
+                pattern.kind is SplitKind.X_SPLIT
+                for pattern in candidate.solution.patterns
+            )
+            has_y = any(
+                pattern.kind is SplitKind.Y_SPLIT
+                for pattern in candidate.solution.patterns
+            )
+            self.accounting.x_pattern_global_best_updates += int(has_x)
+            self.accounting.y_pattern_global_best_updates += int(has_y)
             self.best_events.append(
                 BaselineBestEvent(candidate.completed_at, candidate.metrics.cmax, candidate.source)
             )
 
     def evaluate(self, solution: CanonicalSolution, *, source: str) -> EvaluatedCandidate:
         self.accounting.candidate_count += 1
+        has_x = any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
+        has_y = any(pattern.kind is SplitKind.Y_SPLIT for pattern in solution.patterns)
+        self.accounting.x_pattern_constructed += int(has_x)
+        self.accounting.y_pattern_constructed += int(has_y)
         direction_started = time.perf_counter()
         direction: ConstrainedDirectionResult
         try:
@@ -304,6 +335,8 @@ class CommonBaselineEvaluator:
             return result
         self.accounting.direction_time += time.perf_counter() - direction_started
         self.accounting.direction_dp_calls += direction.route_dp_calls
+        self.accounting.x_pattern_direction_evaluated += int(has_x)
+        self.accounting.y_pattern_direction_evaluated += int(has_y)
         if direction.status is not DirectionStatus.FEASIBLE:
             self.accounting.direction_infeasible += 1
             return EvaluatedCandidate(
@@ -335,6 +368,8 @@ class CommonBaselineEvaluator:
             )
         self.accounting.scheduler_time += time.perf_counter() - scheduler_started
         self.accounting.reference_calls += 1
+        self.accounting.x_pattern_reference_evaluated += int(has_x)
+        self.accounting.y_pattern_reference_evaluated += int(has_y)
         if schedule.baseline_deadlock:
             self.accounting.baseline_deadlock += 1
             if schedule.status is ScheduleStatus.FEASIBLE:
@@ -409,6 +444,10 @@ class CommonBaselineEvaluator:
             return result
 
         metrics = official_metrics(solution, schedule, self.config)
+        self.accounting.x_pattern_certified += int(has_x)
+        self.accounting.y_pattern_certified += int(has_y)
+        self.accounting.x_pattern_accepted += int(has_x)
+        self.accounting.y_pattern_accepted += int(has_y)
         result = EvaluatedCandidate(
             BaselineStatus.COMPLETED,
             solution,

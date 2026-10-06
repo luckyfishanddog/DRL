@@ -9,6 +9,7 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
         ACTIVE_FORMAL_SCOPE,
         FORMAL_SCOPE_V1,
         FORMAL_SCOPE_V1_1,
+        FORMAL_SCOPE_V2,
         FormalScope,
         ScientificConfig,
         RunScientificIdentity,
@@ -17,6 +18,7 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
     scope = FORMAL_SCOPE_V1
     assert scope.scope_hash == "8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9"
     assert FORMAL_SCOPE_V1_1.scope_hash == "5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc"
+    assert FORMAL_SCOPE_V2.scope_hash == "16f6110a7384d585fa539777b059e0a297da4fa394a3b4b545ebe967ece54599"
     assert scope.scope_hash == FormalScope().scope_hash
     assert scope.scope_hash == hashlib.sha256(scope.canonical_json.encode()).hexdigest()
     for change in (
@@ -51,6 +53,17 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
         assert getattr(FORMAL_SCOPE_V1_1, field) == getattr(FORMAL_SCOPE_V1, field)
     FORMAL_SCOPE_V1.validate_implemented()
     FORMAL_SCOPE_V1_1.validate_implemented()
+    FORMAL_SCOPE_V2.validate_implemented()
+    for field in (
+        "x_split_rule_id",
+        "x_split_assignment_policy_id",
+        "x_split_processing_policy_id",
+        "x_split_shared_point_policy_id",
+        "combined_xy_split_policy_id",
+    ):
+        assert getattr(FORMAL_SCOPE_V1, field) is None
+        assert getattr(FORMAL_SCOPE_V1_1, field) is None
+        assert getattr(FORMAL_SCOPE_V2, field) is not None
     first = RunScientificIdentity.from_scope(
         scope, ScientificConfig(),
         SourceProvenance("luckyfishanddog/DRL", "commit-a", "tree-a", False, True),
@@ -63,6 +76,41 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
     assert first.scientific_config_hash != second.scientific_config_hash
     assert first.repository_id == "luckyfishanddog/DRL"
     assert first.source_tree_hash == "tree-a" and first.commit_verified
+
+
+def test_v2_shared_catalog_is_deterministic_finite_and_mandatory_y_closed():
+    from mrta_reference.geometry import (
+        build_legal_pattern_catalog,
+        pattern_catalog_hash,
+    )
+    from mrta_reference.model import (
+        FORMAL_SCOPE_V2,
+        ParentWeld,
+        ScientificConfig,
+        SplitKind,
+    )
+
+    config = ScientificConfig()
+    parents = (
+        ParentWeld("short", (1.0, 8.0), (2.0, 8.0)),
+        ParentWeld("vertical", (4.0, 8.0), (4.0, 9.0)),
+        ParentWeld("mandatory", (3.0, 2.0), (3.5, 10.0)),
+    )
+    first = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+    second = build_legal_pattern_catalog(tuple(reversed(parents)), config, FORMAL_SCOPE_V2)
+    assert first == second
+    assert pattern_catalog_hash(parents, config, FORMAL_SCOPE_V2) == pattern_catalog_hash(
+        tuple(reversed(parents)), config, FORMAL_SCOPE_V2
+    )
+    short_x = [item for item in first["short"] if item.kind is SplitKind.X_SPLIT]
+    assert short_x
+    assert {item.point_id for item in short_x} <= {
+        "BX_LOWER", "BX_CENTER", "BX_UPPER", "MIDPOINT"
+    }
+    assert not any(item.kind is SplitKind.X_SPLIT for item in first["vertical"])
+    assert first["mandatory"]
+    assert all(item.kind is SplitKind.Y_SPLIT for item in first["mandatory"])
+    assert all(item.mandatory for item in first["mandatory"])
 
 
 def _git(cwd, *args):

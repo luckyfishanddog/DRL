@@ -5,10 +5,21 @@ from pathlib import Path
 
 import pytest
 
-from mrta_data.phase3_split import ROLE_ID_TEST, ROLE_TRAIN, ROLE_VALIDATION
+from mrta_data.phase3_split import (
+    ROLE_ID_TEST,
+    ROLE_ID_TEST_SEALED,
+    ROLE_TRAIN,
+    ROLE_VALIDATION,
+    ROLE_V2_DEVELOPMENT,
+    ROLE_V2_TRAIN,
+    ROLE_V2_VALIDATION,
+    assert_v2_solver_access_allowed,
+    validate_v2_role_overlay,
+)
 from mrta_search.stats import SearchStats
 from scripts import run_phase3_validation as validation
 from scripts import run_phase3x_xsplit_gate as phase3x
+from scripts import run_phase3y_v2_core as phase3y
 
 
 def _manifests():
@@ -67,6 +78,40 @@ def test_validation_set_and_protocol_hashes_are_deterministic():
     assert protocol["validation_protocol_hash"] == validation._hash_payload(
         protocol, "validation_protocol_hash"
     )
+
+
+def test_v2_role_overlay_and_validation_set_are_frozen_before_smoke():
+    roles = phase3y._read_json(phase3y.V2_ROLES_PATH)
+    selection = phase3y._read_json(phase3y.V2_VALIDATION_PATH)
+    _, split = _manifests()
+    validate_v2_role_overlay(roles)
+    phase3y.validate_v2_roles(roles)
+    phase3y.validate_v2_validation_set(selection, split)
+    assert roles["v2_data_roles_hash"] == phase3y._payload_hash(
+        roles, "v2_data_roles_hash"
+    )
+    assert selection["v2_validation_set_hash"] == phase3y._payload_hash(
+        selection, "v2_validation_set_hash"
+    )
+    assert roles["counts"] == {
+        ROLE_V2_DEVELOPMENT: 38,
+        ROLE_V2_VALIDATION: 12,
+        ROLE_V2_TRAIN: 31,
+        ROLE_ID_TEST_SEALED: 15,
+    }
+    paths = {
+        row["new_v2_role"]: row["relative_path"]
+        for row in roles["workbooks"]
+    }
+    assert_v2_solver_access_allowed(
+        roles, (paths[ROLE_V2_DEVELOPMENT],),
+        allowed_roles=(ROLE_V2_DEVELOPMENT,),
+    )
+    for role in (ROLE_V2_VALIDATION, ROLE_V2_TRAIN, ROLE_ID_TEST_SEALED):
+        with pytest.raises(PermissionError, match="V2 solver access forbidden"):
+            assert_v2_solver_access_allowed(
+                roles, (paths[role],), allowed_roles=(ROLE_V2_DEVELOPMENT,)
+            )
 
 
 def test_repeated_prepare_accepts_json_tuple_list_roundtrip():

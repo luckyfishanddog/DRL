@@ -4,7 +4,11 @@ from dataclasses import dataclass
 import math
 from collections.abc import Callable
 
-from .geometry import finite_x_split_validator
+from .geometry import (
+    build_legal_pattern_catalog,
+    finite_x_split_validator,
+    pattern_in_catalog,
+)
 
 from .model import (
     CanonicalSolution,
@@ -169,8 +173,10 @@ def certify_schedule(
 ) -> CertificationReport:
     """Independently reconstruct geometry and timing; scheduler helpers are not called."""
     errors: list[str] = []
+    formal_catalog = None
     if scope is not None:
         scope.validate_implemented()
+        formal_catalog = build_legal_pattern_catalog(solution.parents, config, scope)
         if (schedule.scope_id, schedule.scope_hash, schedule.reference_policy_id) != (
             scope.scope_id, scope.scope_hash, scope.reference_scheduler_policy_id
         ):
@@ -211,6 +217,13 @@ def certify_schedule(
         if parent is None:
             errors.append(f"{pattern.parent_id}: unknown parent")
             continue
+        if formal_catalog is not None and not pattern_in_catalog(
+            parent, pattern, formal_catalog, config
+        ):
+            errors.append(
+                f"{scope.scope_id}: pattern is absent from legal catalog: "
+                f"{pattern.pattern_id}"
+            )
         if pattern.kind is SplitKind.WHOLE:
             blocks[f"{parent.parent_id}::whole"] = (
                 parent.parent_id, parent.start, parent.end, parent.length
@@ -269,11 +282,9 @@ def certify_schedule(
                     or max(parent.start[1], parent.end[1]) <= config.by[1] + config.numeric_epsilon
                 ):
                     errors.append(f"{parent.parent_id}: X split cannot replace mandatory Y handover")
-                if x_split_validator is None and scope is not None:
-                    x_split_validator = finite_x_split_validator(solution.parents, config)
-                if x_split_validator is None:
+                if scope is None and x_split_validator is None:
                     raise ScientificAmbiguityError("retained X_SPLIT requires an explicit formal XSplitValidator")
-                if not x_split_validator(parent, pattern, config):
+                if scope is None and x_split_validator is not None and not x_split_validator(parent, pattern, config):
                     errors.append(
                         f"{pattern.pattern_id}: rejected by explicit XSplitValidator"
                     )

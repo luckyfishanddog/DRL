@@ -1,0 +1,688 @@
+{
+  "counts": {
+    "ID_TEST_SEALED": 15,
+    "V2_MODEL_DEVELOPMENT_CONSUMED": 38,
+    "V2_TRAIN_POOL": 31,
+    "V2_VALIDATION": 12
+  },
+  "dataset_manifest_hash": "3a12fc59708fcd6adc20bb19ba44ba8ece585f8e0a81a93304694960f18f2a31",
+  "overlay_policy": "Phase3 DEVELOPMENT_CONSUMED and VALIDATION -> V2 model-development-consumed; original ID_TEST -> sealed; 12 geometry-selected old TRAIN_POOL workbooks -> V2 validation; remaining old TRAIN_POOL -> V2 train pool",
+  "roles_manifest_id": "PPO_V2_DATA_ROLES_V1",
+  "source_phase3_split_hash": "5b5e3a6d43b943c5bad03a9ecbadaefa74c6158b33036da6e0fc236e03af1c5a",
+  "v2_data_roles_hash": "7a80372eb072b10da3d8044eb8bb330a29ede93fe16c806b1aa0d58bee968a5a",
+  "v2_validation_set_hash": "2989d8fe15330883a617504d4cc51a6a6cfc547aa9c9813853b6df8fcb2245fe",
+  "workbooks": [
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/DEV_ONLY/seed_000101.xlsx",
+      "workbook_sha256": "def77df48c1de5ed1caae52fd9ebf67e6f0747059a079467aab6f4191bd70502"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/DEV_ONLY/seed_000202.xlsx",
+      "workbook_sha256": "a774ca16ba8458b37834ee193ad3a327fce99eb6386298b0b48a89d677bddbe0"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/DEV_ONLY/seed_000303.xlsx",
+      "workbook_sha256": "388f40ae874db4c8b83e108725c1c551f51574e2ca263c08b1b6ad1dd472b0c4"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/DEV_ONLY/seed_000404.xlsx",
+      "workbook_sha256": "07415adf30952c55bca843207735b185a9243b5aa86d7dec01c6d9c1daaec906"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/DEV_ONLY/seed_000505.xlsx",
+      "workbook_sha256": "facbec0e8bdf7391b26ff9382a1331f75d7cabbba66d7572666f41f2e437581b"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/ID_TEST/seed_0263067416.xlsx",
+      "workbook_sha256": "353b5fb20b73a10a3715a67548674a1d3bd7c10e8326617a452b44628e6ff373"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/ID_TEST/seed_0357172400.xlsx",
+      "workbook_sha256": "7c0dcef0ea8242500c140ac6eba36f1611830139d52d4a6708b1febd58d2e254"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/ID_TEST/seed_0394443053.xlsx",
+      "workbook_sha256": "e5d5c830db1a2cd128bfac93189e261f17902732ef19c8f93cab1d4f965e9394"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/ID_TEST/seed_0401115467.xlsx",
+      "workbook_sha256": "3ff97c9bb37dd6325b3ea55d1dd3245ac718405db5471a5ce482e297d949a0f8"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/ID_TEST/seed_0469626998.xlsx",
+      "workbook_sha256": "c1ee691dfdc19af82e64422013a104c641d0efc350869979c1ec8948879a4e9b"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/ID_TEST/seed_0533728435.xlsx",
+      "workbook_sha256": "888f2bd730a2d41d4fa4f31fd7a4ab0ebacb1bcacd736781618615202ad1f0a1"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/ID_TEST/seed_0539338415.xlsx",
+      "workbook_sha256": "3d07df9dd98b7c37e288b7505c95b3b5ad3f82c1e582cba06277333120a641a2"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/ID_TEST/seed_1050940519.xlsx",
+      "workbook_sha256": "5e25c6755af5562c0df2f7addb510059ee53c39d618f36c1bd858b9c409b5a71"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/ID_TEST/seed_1142967162.xlsx",
+      "workbook_sha256": "06868ebf72631fd05799a3733b55f44be264e2504572a7c8880db1121f966f77"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/ID_TEST/seed_1336405095.xlsx",
+      "workbook_sha256": "f5955b94a8757b0fc3492346df439571fa6bc9cb500791774839af995c23c03e"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/ID_TEST/seed_1398320817.xlsx",
+      "workbook_sha256": "f9c4d4316dc402a00ef8a6fb36c8e026c6a2b4fc7657b62a9a52a784d17aaf9a"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/ID_TEST/seed_1411252158.xlsx",
+      "workbook_sha256": "e4c8d6887fd706bbbcb1d56f1afc07a45256666989857d4b3fc5fbe1a51e8ae7"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/ID_TEST/seed_1411387107.xlsx",
+      "workbook_sha256": "a9bf08d039e9aba8d9ca25a5afe14e3fae6b3aafdaa8adec2f1e3dfac7341c01"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/ID_TEST/seed_1674663312.xlsx",
+      "workbook_sha256": "72c10545617fdef963d2beeaaac71ac8811ecc311eb3f1e4c2b4146e57046f2c"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/ID_TEST/seed_1821446561.xlsx",
+      "workbook_sha256": "98279d5744f4849e30ab00a34a3fb3ad30be8380fef9ce2e54cebde6a481a70c"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/ID_TEST/seed_1846918101.xlsx",
+      "workbook_sha256": "69a3d63450cdcd5a9accaf2a6301c27ce19b6a9987eb848d9b8cf471f66c7199"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/ID_TEST/seed_1869050708.xlsx",
+      "workbook_sha256": "7855abd3ec75a3cb5bc8f3f77921a5fa99a74572140ffc019011783509c35549"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/ID_TEST/seed_2013829876.xlsx",
+      "workbook_sha256": "c4e038dca0fb875d4bfab50e72ae1648597a21ff6536831e6051cf87e3411b7a"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_0062056589.xlsx",
+      "workbook_sha256": "ca3dd8a74ab67ed898c9e6cf8d228dc2b9f38892f5c425dba91ee7792023d2f8"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_0071493183.xlsx",
+      "workbook_sha256": "87544a1bb8f46fa2389c91fd1e1d47742cb57ce3c183f9572e95fbb73b4a5b14"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_0088690758.xlsx",
+      "workbook_sha256": "27dd5b45e2a8b9f6d7b2fb8166531061a9956d55b7f78b5a6f1e091bd9d00e98"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/PPO_TRAIN/seed_0150777682.xlsx",
+      "workbook_sha256": "b9e7975d7a7ab3b32d2e871ba454799a229f17075a866c16d0907d09d58010f8"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_0155539492.xlsx",
+      "workbook_sha256": "ecfacfe11edfa75e8006086833a6ea62dd6ca276a3187a04d4f13e773e58ed38"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_0180141104.xlsx",
+      "workbook_sha256": "6429ad6234d5d32ca34df5de7d752623e9fa93683e81489ee37dcc277192a3f7"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0194123089.xlsx",
+      "workbook_sha256": "3af6427c77910ff09804b70225d3889a66b3774c9e62201f166cfa0122fbe70e"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0211781140.xlsx",
+      "workbook_sha256": "c1c16c16a1cbf351a372360fb05333480f211af5d2fb85fec22361ac1bee8992"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_0224399224.xlsx",
+      "workbook_sha256": "a3bd683f51da96f5d53da1b468785d549cad08ed66f4424e57be6daebdba5f01"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_0259933401.xlsx",
+      "workbook_sha256": "5e1335dd6f6c9d5bcf99d4f66307baf04c885f303b1d1237a0cb54dac8d23079"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/PPO_TRAIN/seed_0334554054.xlsx",
+      "workbook_sha256": "a2f3411f9dee73e4a34de871ef85cf9dbedf54f96a92ea4c432b5b1d299b5c2e"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_0377964238.xlsx",
+      "workbook_sha256": "e315b74f6833566cc11ddcccd4cbd77233660ad596d90baa4bbe420208dce8bc"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/PPO_TRAIN/seed_0414671407.xlsx",
+      "workbook_sha256": "ea20312b900c7e8699b5b6dad1b971dfe4b9e2abb9e84cedcb6103fe50098a26"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0442383381.xlsx",
+      "workbook_sha256": "476f76fe64a1a04cd7dcc59361f58228af22837e93237d5a326c50e82a7645c7"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/PPO_TRAIN/seed_0450139711.xlsx",
+      "workbook_sha256": "d1ed5def1fefe015157b05a18a2337e398d8861d999aee5ad72781892e41fa09"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/PPO_TRAIN/seed_0455745885.xlsx",
+      "workbook_sha256": "dc427c342063efe13fc0a0ddef2b20f12e5651c87b06a5310083a2a9d415e73b"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0457685429.xlsx",
+      "workbook_sha256": "135542cf705ce08ba6a9a76812eaa4531ba8969aeb03dc1f97a0ddbade39d553"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_0463639632.xlsx",
+      "workbook_sha256": "ef9a601f29d894b4b9323bc6f3db96873bc109e9bd919279a0d9b830268911c0"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_0514719396.xlsx",
+      "workbook_sha256": "e94476dba4e6b13fc75dc76911912da9f6d74d1bd959fbb16a35c994beb3f176"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_0523177928.xlsx",
+      "workbook_sha256": "f92c8e9595b57ea271c2586989731390f570fec6c0c82c4ba359bd40a190aa74"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0566744530.xlsx",
+      "workbook_sha256": "f8f0b4935eafe919426ec32583093f5d9ff82679ed2a0788dbccaee69ad8f19b"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_0600641460.xlsx",
+      "workbook_sha256": "7ab4eed09e5985cb98a6ff7550606af0354626f624191522805ffe50cf12c4e8"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0676566458.xlsx",
+      "workbook_sha256": "da0be7f334a6e23cad65ea957b16bfe90e8b918e838ab8db86765b34126d4b81"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_0703048389.xlsx",
+      "workbook_sha256": "d4b83ab4265ec1d4abf9fffc2d1c5b7f29d71f2f288f6500f83f4a7081ae2cf5"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_0750298421.xlsx",
+      "workbook_sha256": "11c1d4a8d25bc4fafbee89eef7087ad6ed904935c3c650266fe3beffe7f5a365"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0760656368.xlsx",
+      "workbook_sha256": "9ae545f33e50e3180420b5a64b5325a76860c4ace7674284c872f8b224deee1f"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_0765477955.xlsx",
+      "workbook_sha256": "6f1f143fd5c914e9844b6b68072c7f70bb553534844dd1c641b515242f1a7538"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0767803876.xlsx",
+      "workbook_sha256": "f6f9d7155231ba8ce64f0f519aab3ca4b5701627583944036f98c03dfe5ce488"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_0778528190.xlsx",
+      "workbook_sha256": "a4546bcee81bbaed7ce62d8bc06d2d55c9a189aaf7e4ebb881edf37bf9f06c89"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_0817833068.xlsx",
+      "workbook_sha256": "a4bfce1e818bfe0a4de19c81a3acd542ac06045dcf96b1610521e080e9c7a09d"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_0834257622.xlsx",
+      "workbook_sha256": "8336901677a436282927db9241f5d801e85b83ddacaf2a5434ec3bfd730941d1"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_0900775608.xlsx",
+      "workbook_sha256": "6ccb3d168dad4581ded11e7f5f4bbff2cd41808322e8735f28dc9973df4f1fa6"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_1054426823.xlsx",
+      "workbook_sha256": "c95ba17b8de6e82e8390567698539346077d66ad1e77f2ef02193876b8e49b57"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1062621171.xlsx",
+      "workbook_sha256": "86b5ac03ffe2ef860bbac4f18dd91edb371e82507c6a03575677d4ecf9eea559"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_1064648049.xlsx",
+      "workbook_sha256": "70563525004977148f8947b4941a896e8855bdec2e765fe1097a79b5ff7d7c21"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1098469608.xlsx",
+      "workbook_sha256": "8dc18a4140a727fe75ba221eb7233854a958b1e260c667478c145fa5ee00c3e2"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_1118337379.xlsx",
+      "workbook_sha256": "617a53e1b5e91d7bd3d5235496cae044f895578317247d1c75daf377f3a51421"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_1123873019.xlsx",
+      "workbook_sha256": "af8ed4660f31a1759863c78be485b9d19a88d2513d1d249dd75d62e98f824e2e"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/PPO_TRAIN/seed_1126479801.xlsx",
+      "workbook_sha256": "6fd3ab754f6b5f4c6e1b24e7a377ce33721d9bb4fb85ea7c412e0551f652fe4f"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_1137713392.xlsx",
+      "workbook_sha256": "8d6d2d3aeddbe569a4a2914fcaa57ddaed016b4c8dab3ee5bd93ff5de350fbe6"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_1303898625.xlsx",
+      "workbook_sha256": "565b93c81fd15721313e6ec2572cebb1ad3f0561577b6adce3df8b2ebda25402"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_1419626827.xlsx",
+      "workbook_sha256": "39ec4580c9be07192457be59844dc91142eabbdf27bad822ad5d502c35b8d197"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1631571109.xlsx",
+      "workbook_sha256": "e195a0f7e7f7a2d77517d83285c13b80964659eea520e5b3e10a7ac82c49c638"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1636194744.xlsx",
+      "workbook_sha256": "3d0807a62364cf7b9103d2ad6df26bea72d0b763faa41ad88b77aeec345cc79d"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_1702002874.xlsx",
+      "workbook_sha256": "0b75ca662e9fb7623aaec071ff69bb84415ae4a7d0bc09932147d048ab879eae"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/PPO_TRAIN/seed_1727996722.xlsx",
+      "workbook_sha256": "b14e7400ed1956e6b9225db685c9c5f523c9a16434f2ca1ca8d59595ea08b3ff"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1742672780.xlsx",
+      "workbook_sha256": "d50fbf80449aa4cf7994cd21212b5bf609517f19622209eb2be408216a85cef6"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1745884954.xlsx",
+      "workbook_sha256": "56347df97c0f0ece4a12f2bb6b88e6d418c0b29a32522572752192b8a7554375"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_1779073227.xlsx",
+      "workbook_sha256": "aa7d2d307ca389008502b0974e1561da479c6512f3b57c3a49e0bf8bd6171c39"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1783157644.xlsx",
+      "workbook_sha256": "396acbe9235a8f5014d105a1c5720e670e9c11de621869cacddd5caa82dd0962"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_1826907252.xlsx",
+      "workbook_sha256": "c779b0845c234418cefbe207f37bd2748e780080e8a4a12d5c81aa7a05f5b204"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1861847868.xlsx",
+      "workbook_sha256": "0a01f02b56622a1f6c1932b4957069b1f3dee9d6a01122046f039cca71a19a40"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_1867256633.xlsx",
+      "workbook_sha256": "ea1a9c79f1bd6cd24c74ce237b41d29fcc7e34e44ccfb9bc157b4c8414e921fe"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_1871665270.xlsx",
+      "workbook_sha256": "3b0d4d4b082330c5410b11c9b1b03c8efc118411f0bd717499bd1ef1f4060d64"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1872211770.xlsx",
+      "workbook_sha256": "75f65ee94246dd5b51a70f18901ee3592698570715b6fade0755946113dcaf2e"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/PPO_TRAIN/seed_1914517550.xlsx",
+      "workbook_sha256": "61657b6c333075d1d21080b14df977cfbb511d6b55478b2b191a35947fd0adf0"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_1916546866.xlsx",
+      "workbook_sha256": "ec40218d73cb92a391b85e008c4f92b4a2e6a6656690aea732cb533761284650"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/PPO_TRAIN/seed_2086015184.xlsx",
+      "workbook_sha256": "1fdccb8ff232c6a1258edf65ea50e598c4bc8cb2d4d86950ab66bf5076e8fcce"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/PPO_TRAIN/seed_2091884649.xlsx",
+      "workbook_sha256": "97208c071e8177fb61c1accbe0840422ada8259bb430683a0c82ae3ca9cc990f"
+    },
+    {
+      "new_v2_role": "V2_VALIDATION",
+      "old_role": "TRAIN_POOL",
+      "reason": "solver-independent V2 geometry selection before V2 performance smoke",
+      "relative_path": "data/PPO_TRAIN/seed_2095476608.xlsx",
+      "workbook_sha256": "4beb1b9cac89186031e8821f89016f7910f0dde73f3212de7cf3e99b5e141e7c"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/VALIDATION/seed_0006664118.xlsx",
+      "workbook_sha256": "4dbb7b43e107aa33d0889eb0ad935b82137aa82753fb856155b53c015a2710f4"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/VALIDATION/seed_0151520473.xlsx",
+      "workbook_sha256": "409518cf5b3e8c71c0823f6949074835b77da5a0e2ec2b95895dd8442471407a"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/VALIDATION/seed_0471570702.xlsx",
+      "workbook_sha256": "fc58a991fafe1db66b456c3f59be032a8abd70f16570f16287a46cd8cdd3f950"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/VALIDATION/seed_0967455456.xlsx",
+      "workbook_sha256": "5ec01bee3212d4531b2d08017f75725b69a92b2b9764d32d0a0659f6321971df"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/VALIDATION/seed_1653613181.xlsx",
+      "workbook_sha256": "160c35533c2cf53948e5ec72d03ff9f7adb9922a1edcf1ca806572f67f7dee46"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/VALIDATION/seed_1910136750.xlsx",
+      "workbook_sha256": "536316b6dae279ebb355eb68af1fcac99a7467b0fdc78401a53e484194f95cac"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/VALIDATION/seed_1924011179.xlsx",
+      "workbook_sha256": "43be1c540f0fb05ac8a9c7b2cd1230a6b6e7a9a5104fe57485391b1a177bcaa6"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "data/VALIDATION/seed_1960958179.xlsx",
+      "workbook_sha256": "8cf44ee1c2246a811906f06b968beb372d2b04e9a2963223b431896a822c8b29"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/VALIDATION/seed_1964074713.xlsx",
+      "workbook_sha256": "3b673ca527f8f7a2d0b0670dec45596af27eec066fefa5b90ef6cc74cb782b0b"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "DEVELOPMENT_CONSUMED",
+      "reason": "already development-consumed before V2",
+      "relative_path": "data/VALIDATION/seed_1964628001.xlsx",
+      "workbook_sha256": "d0041ca0f00ed43dfca4d2bda48b26dc31d537ee6365286a01453823a08e90e1"
+    },
+    {
+      "new_v2_role": "ID_TEST_SEALED",
+      "old_role": "ID_TEST",
+      "reason": "original ID_TEST remains sealed and solver-inaccessible",
+      "relative_path": "data/VALIDATION/seed_2024817788.xlsx",
+      "workbook_sha256": "830384b75540e3f3169bb106e04d38db8c7f9b21ffe1b680e2525f1ac2298520"
+    },
+    {
+      "new_v2_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+      "old_role": "VALIDATION",
+      "reason": "old Phase3 validation influenced V2 model decisions",
+      "relative_path": "data/VALIDATION/seed_2145450783.xlsx",
+      "workbook_sha256": "f88a25b8f023b48a1128a9504605ab230ba8358758570813e2e71e03c0b15420"
+    },
+    {
+      "new_v2_role": "V2_TRAIN_POOL",
+      "old_role": "TRAIN_POOL",
+      "reason": "remaining old TRAIN_POOL; no training performed in Phase3-Y",
+      "relative_path": "outputs/v9_frozen_dataset_round_20260808/dev_only_dgseed_900001.xlsx",
+      "workbook_sha256": "2d533761996f24125447cca5065781b463e8b066220f24dc4128d7f4b16af4ba"
+    }
+  ]
+}

@@ -1756,24 +1756,60 @@ def reference_schedule_formal(
     has_x = any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
     if has_x and scope.optional_x_split_policy == "EXCLUDED":
         result = _infeasible(f"{scope.scope_id}: optional X_SPLIT is EXCLUDED")
-    else:
-        x_validator = (
-            finite_x_split_validator(solution.parents, config)
-            if has_x
-            else None
+        return replace(
+            result,
+            reference_policy_id=scope.reference_scheduler_policy_id,
+            scope_id=scope.scope_id,
+            scope_hash=scope.scope_hash,
+            state_budget=scope.deadlock_state_budget or 0,
+            rollout_budget=scope.deadlock_rollout_budget or 0,
         )
-        def dispatch(templates, cfg, *, directions, profile):
-            return reference_schedule_from_templates_formal(
-                templates, cfg, scope=scope, directions=directions, profile=profile
-            )
-        result = _reference_schedule_with(
-            solution,
+    try:
+        normalized = canonicalize(
+            solution.parents,
+            solution.patterns,
+            solution.routes,
             config,
-            dispatch,
-            orientations=orientations,
-            x_split_validator=x_validator,
-            profile=profile,
+            revision=solution.revision,
+            scope=scope,
         )
+    except (ArithmeticError, ValueError) as error:
+        result = _infeasible(f"{scope.scope_id}: formal solution validation failed: {error}")
+        return replace(
+            result,
+            reference_policy_id=scope.reference_scheduler_policy_id,
+            scope_id=scope.scope_id,
+            scope_hash=scope.scope_hash,
+            state_budget=scope.deadlock_state_budget or 0,
+            rollout_budget=scope.deadlock_rollout_budget or 0,
+        )
+    if normalized.canonical_hash != solution.canonical_hash:
+        result = _infeasible(f"{scope.scope_id}: solution is not canonical")
+        return replace(
+            result,
+            reference_policy_id=scope.reference_scheduler_policy_id,
+            scope_id=scope.scope_id,
+            scope_hash=scope.scope_hash,
+            state_budget=scope.deadlock_state_budget or 0,
+            rollout_budget=scope.deadlock_rollout_budget or 0,
+        )
+    x_validator = (
+        finite_x_split_validator(solution.parents, config)
+        if has_x
+        else None
+    )
+    def dispatch(templates, cfg, *, directions, profile):
+        return reference_schedule_from_templates_formal(
+            templates, cfg, scope=scope, directions=directions, profile=profile
+        )
+    result = _reference_schedule_with(
+        solution,
+        config,
+        dispatch,
+        orientations=orientations,
+        x_split_validator=x_validator,
+        profile=profile,
+    )
     return replace(
         result,
         reference_policy_id=scope.reference_scheduler_policy_id,
