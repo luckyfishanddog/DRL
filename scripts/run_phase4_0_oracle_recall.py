@@ -605,7 +605,7 @@ def expanded_identity(value):
     return zlib.decompress(bytes(value)).decode('utf-8') if isinstance(value,(bytes,memoryview)) else value
 
 
-def expanded_stored_blob(db,state_id,packet_column,value):
+def expanded_stored_blob(db,state_id,packet_column,value,packet_cache=None):
     if value is None:
         return None
     if isinstance(value,str) and value.isdecimal():
@@ -614,26 +614,33 @@ def expanded_stored_blob(db,state_id,packet_column,value):
         return bytes(value)
     if packet_column not in ('attempt_trace','candidate_payloads','oracle_diagnostics'):
         raise ValueError('Unsupported shared packet column')
-    packet=db.execute('SELECT '+packet_column+' FROM states WHERE state_id=?',(state_id,)).fetchone()[0]
-    encoded=json.loads(zlib.decompress(packet))[value]
+    key=(state_id,packet_column)
+    if packet_cache is not None and key in packet_cache:
+        entries=packet_cache[key]
+    else:
+        packet=db.execute('SELECT '+packet_column+' FROM states WHERE state_id=?',(state_id,)).fetchone()[0]
+        entries=json.loads(zlib.decompress(packet))
+        if packet_cache is not None:
+            packet_cache[key]=entries
+    encoded=entries[value]
     return zlib.compress(dumps(encoded).encode('utf-8'),6)
 
 
-def read_attempt_detail(db,state_id,ordinal,parents=None):
+def read_attempt_detail(db,state_id,ordinal,parents=None,*,packet_cache=None):
     value=db.execute('SELECT details FROM attempts WHERE state_id=? AND ordinal=?',(state_id,ordinal)).fetchone()[0]
-    return unpack(expanded_stored_blob(db,state_id,'attempt_trace',value),parents)
+    return unpack(expanded_stored_blob(db,state_id,'attempt_trace',value,packet_cache),parents)
 
 
-def read_candidate_payload(db,state_id,candidate_id,parents=None):
-    value=db.execute('SELECT payload FROM candidates WHERE state_id=? AND candidate_id IN (?,?)',
+def read_candidate_payload(db,state_id,candidate_id,parents=None,*,packet_cache=None):
+    value=db.execute("SELECT payload FROM candidates WHERE protocol_hash=(SELECT value FROM metadata WHERE key='protocol_hash') AND state_id=? AND candidate_id IN (?,?)",
                      (state_id,stored_identity(candidate_id),expanded_identity(candidate_id))).fetchone()[0]
-    return unpack(expanded_stored_blob(db,state_id,'candidate_payloads',value),parents)
+    return unpack(expanded_stored_blob(db,state_id,'candidate_payloads',value,packet_cache),parents)
 
 
-def read_candidate_diagnostic(db,state_id,candidate_id):
-    value=db.execute('SELECT diagnostics FROM candidates WHERE state_id=? AND candidate_id IN (?,?)',
+def read_candidate_diagnostic(db,state_id,candidate_id,*,packet_cache=None):
+    value=db.execute("SELECT diagnostics FROM candidates WHERE protocol_hash=(SELECT value FROM metadata WHERE key='protocol_hash') AND state_id=? AND candidate_id IN (?,?)",
                      (state_id,stored_identity(candidate_id),expanded_identity(candidate_id))).fetchone()[0]
-    blob=expanded_stored_blob(db,state_id,'oracle_diagnostics',value)
+    blob=expanded_stored_blob(db,state_id,'oracle_diagnostics',value,packet_cache)
     return None if blob is None else json.loads(zlib.decompress(blob))
 
 

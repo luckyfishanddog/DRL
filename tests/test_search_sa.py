@@ -641,3 +641,152 @@ def test_phase4_storage_compaction_preserves_every_logical_row(monkeypatch):
     with pytest.raises(sqlite3.IntegrityError):
         db.execute('INSERT INTO candidates SELECT * FROM candidates LIMIT 1')
     db.close()
+
+def test_phase4b_balanced_prefixes_and_duplicate_promotion():
+    from collections import Counter
+    from scripts import analyze_phase4_0b_pool_scaling as b
+    attempts=[]
+    ai=li=0
+    for atomic,lns in ((48,16),(48,16),(96,32)):
+        for _ in range(atomic):
+            attempts.append(dict(ordinal=len(attempts),source='ATOMIC',status='VALID',canonical_hash=f'a{ai}'))
+            ai+=1
+        for _ in range(lns):
+            # LNS #16 duplicated atomic #90 in the full original chunk. At
+            # M80, atomic #90 is absent, so the frozen LNS payload is valid.
+            canonical='a90' if li==16 else f'l{li}'
+            attempts.append(dict(ordinal=len(attempts),source='LNS_REPAIRED',status='DUPLICATE' if li==16 else 'VALID',canonical_hash=canonical))
+            li+=1
+    attempts[0].update(status='IDENTITY',canonical_hash=None)
+    attempts[1].update(status='CONSTRUCTION_REJECTED',canonical_hash=None)
+    labels={a['canonical_hash']:{'status':'FEASIBLE_CERTIFIED','Cmax':80} for a in attempts if a['canonical_hash'] is not None}
+    previous=set()
+    for m in b.SIZES:
+        chosen=b.select_attempt_prefix(attempts,m)
+        assert Counter(a['source'] for a in chosen)=={'ATOMIC':3*m//4,'LNS_REPAIRED':m//4}
+        result=b.build_prefix(chosen,labels)
+        assert previous<=set(result['representatives'])
+        previous=set(result['representatives'])
+        assert sum(result['counts'].values())==m
+        if m in (64,128,256):
+            original=b.build_prefix(attempts[:m],labels)
+            assert result['counts']==original['counts']
+            assert set(result['representatives'])==set(original['representatives'])
+    prefix80=b.build_prefix(b.select_attempt_prefix(attempts,80),labels)
+    assert prefix80['promoted_duplicates']==1
+    assert prefix80['representatives']['a90']['source']=='LNS_REPAIRED'
+    assert prefix80['counts']['IDENTITY']==1
+    assert prefix80['counts']['CONSTRUCTION_REJECTED']==1
+    assert len(b.select_attempt_prefix(attempts,80))==80  # never refill
+
+
+def test_phase4b_materiality_nulls_and_literal_signed_recall(tmp_path,monkeypatch):
+    from scripts import analyze_phase4_0b_pool_scaling as b
+    assert not b.in_materiality(None,0)
+    assert not b.in_materiality(0,0) and b.in_materiality(1e-12,0)
+    for threshold in (.001,.005,.01):
+        assert b.in_materiality(threshold,threshold)
+        assert not b.in_materiality(threshold-1e-12,threshold)
+    null=b.generation_metrics(100,None,None)
+    assert null['C_star'] is None and null['normalized_generation_regret'] is None
+    assert null['generation_recall'] is None and not null['opportunity']
+    missing=b.generation_metrics(100,None,90)
+    assert missing['normalized_generation_regret'] is None
+    assert missing['selection_regret_with_incumbent_fallback']==pytest.approx(.1)
+    assert missing['generation_recall']==0 and missing['zero_capture']
+    no_gain=b.generation_metrics(100,100,100)
+    assert no_gain['generation_recall'] is None
+    signed=b.screening_metrics(100,90,110)
+    assert signed['recall']==-1 and signed['capture_recall']==0
+    assert signed['normalized_regret']==.2 and signed['incumbent_fallback_regret']==.1
+    selected_null=b.screening_metrics(100,90,None)
+    assert selected_null['recall'] is None and selected_null['normalized_regret'] is None
+    assert selected_null['zero_capture'] and selected_null['capture_recall']==0
+    assert b.quantile([0,10],.9)==9
+    # The historical writer must keep its original whitelist; new approved
+    # analysis outputs belong to the analysis writer, not that legacy API.
+    import json
+    monkeypatch.setattr(b,'OUTPUT',tmp_path/'analysis.json')
+    monkeypatch.setattr(b,'REPORT',tmp_path/'analysis.md')
+    monkeypatch.setattr(b,'report_text',lambda result:'# 已完成分析\n')
+    monkeypatch.setattr(b.audit,'write',lambda *args:pytest.fail('Historical writer must not be used'))
+    b.write_outputs({'recommended_pool_size':192,'中文':'无损'})
+    assert json.loads(b.OUTPUT.read_text(encoding='utf-8'))['recommended_pool_size']==192
+    assert b.REPORT.read_text(encoding='utf-8')=='# 已完成分析\n'
+
+
+def test_phase4b_minimum_global_pool_selector_exact_boundaries():
+    from copy import deepcopy
+    from scripts import analyze_phase4_0b_pool_scaling as b
+    states=[]
+    for i in range(10):
+        row={'selection_regret_with_incumbent_fallback':.001 if i<8 else .005,
+             'oracle_improvement_ratio':.005,
+             'generation_recall':.8 if i<8 else .1 if i==8 else 0,
+             'zero_capture':i==9}
+        states.append({'prefixes':{'64':row}})
+    passed=b.selection_criteria(states,64)
+    assert passed['satisfies'] and all(passed['conditions'].values())
+    variants=[]
+    worse=deepcopy(states);worse[9]['prefixes']['64']['selection_regret_with_incumbent_fallback']+=1e-8;variants.append(worse)
+    worse=deepcopy(states);worse[0]['prefixes']['64']['generation_recall']=.8-1e-8;variants.append(worse)
+    worse=deepcopy(states);worse[8]['prefixes']['64']['zero_capture']=True;variants.append(worse)
+    for variant in variants:
+        assert not b.selection_criteria(variant,64)['satisfies']
+    criteria={str(m):{'satisfies':False} for m in b.SIZES}
+    assert b.choose_pool(criteria) is None
+    criteria['80']=passed
+    assert b.choose_pool(criteria)==80
+    criteria['64']=passed
+    assert b.choose_pool(criteria)==64
+
+
+def test_phase4b_replay_calls_real_policy_with_stored_directions():
+    from types import SimpleNamespace
+    from scripts import analyze_phase4_0b_pool_scaling as b
+    from mrta_search.lns import atomic_complete_candidate
+    from mrta_search.pipeline import select_c2_by_family,select_c4_by_family
+    current=_base();dirs=((),(),(0,0),(0,0))
+    pool=[atomic_complete_candidate(current,dirs,c,FAST) for c in _family_candidates()]
+    calls=[]
+    def direction(canonical):
+        calls.append(canonical)
+        return SimpleNamespace(total_empty_travel=10.0)
+    labels={current.canonical_hash:{'status':'FEASIBLE_CERTIFIED','Cmax':80}}
+    actual=b.replay_screening(pool,labels,direction,17,3,100)
+    ranked=sorted(pool,key=lambda c:c.cheap_score)
+    expected2=select_c2_by_family(ranked,8,seed=17,iteration=3)
+    expected3=[DirectionEvaluatedCandidate(c,ranked.index(c),SimpleNamespace(total_empty_travel=10.0)) for c in expected2]
+    expected4=select_c4_by_family(expected3,2,seed=17,iteration=3)
+    assert actual['C2_ids']==[b.audit.identity(c) for c in expected2]
+    assert actual['C4_ids']==[b.audit.identity(c.screened) for c in expected4]
+    assert len(calls)==8 and len(actual['C4_ids'])==2
+
+
+def test_phase4b_existing_artifact_prefixes_and_screening_without_solver(monkeypatch):
+    import sqlite3
+    from scripts import analyze_phase4_0b_pool_scaling as b
+    a=b.audit
+    def forbidden(*args,**kwargs):
+        raise AssertionError('Re-analysis must not run a solver or generator')
+    for name in ('generate_candidate_pool','optimize_directions_with_initial_feasibility','evaluate_oracle_candidate','FormalReferenceEvaluator','replay'):
+        monkeypatch.setattr(a,name,forbidden)
+    data=a.read(a.CONTEXTS);original=a.read(a.RESULT)
+    row=data['contexts'][0]
+    db=sqlite3.connect('file:'+a.LABELS.as_posix()+'?mode=ro',uri=True);db.row_factory=sqlite3.Row
+    meta,context,labels,attempts,prefixes,repaired,cache=b.load_state(db,row,data)
+    old=next(s for s in original['states'] if s['state_context_id']==row['state_context_id'])
+    for m in (64,128,256):
+        assert prefixes[str(m)]['C_star']==old['C_star'][str(m)]
+        assert prefixes[str(m)]['valid_unique']==old['unique_counts'][str(m)]
+    pool=[a.read_candidate_payload(db,meta['state_context_id'],v['candidate_id'],context['solution'].parents,packet_cache=cache) for v in prefixes['64']['representatives'].values()]
+    def direction(canonical):
+        return a.decode(a.read_candidate_diagnostic(db,meta['state_context_id'],labels[canonical]['candidate_id'],packet_cache=cache)['direction'])
+    result=b.replay_screening(pool,labels,direction,meta['seed'],meta['iteration'],meta['C_s'])
+    assert result['C2_ids']==meta['C2'] and result['C4_ids']==meta['C4']
+    # Cached and uncached readers expand precisely the same existing record.
+    cid=next(iter(labels.values()))['candidate_id']
+    assert a.read_candidate_payload(db,meta['state_context_id'],cid,context['solution'].parents,packet_cache=cache)==a.read_candidate_payload(db,meta['state_context_id'],cid,context['solution'].parents)
+    with pytest.raises(sqlite3.OperationalError,match='readonly'):
+        db.execute('DELETE FROM candidates')
+    db.close()
