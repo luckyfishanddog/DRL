@@ -1,0 +1,5044 @@
+{
+  "phase": "Phase4-1A",
+  "offline_recommended_pool": 192,
+  "cases": [
+    {
+      "mechanism_id": "I2",
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "relative_path": "data/PPO_TRAIN/seed_1064648049.xlsx",
+      "sheet_name": "g20_w026",
+      "tier": "SMALL",
+      "N": 26,
+      "raw_file_sha256": "70563525004977148f8947b4941a896e8855bdec2e765fe1097a79b5ff7d7c21",
+      "instance_geometry_hash": "fcc882f9f55903f4826c10c23400ca0813deb717b88a34d63b9e2ee608093bc1"
+    },
+    {
+      "mechanism_id": "I3",
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "relative_path": "data/DEV_ONLY/seed_000505.xlsx",
+      "sheet_name": "g15_w026",
+      "tier": "SMALL",
+      "N": 26,
+      "raw_file_sha256": "facbec0e8bdf7391b26ff9382a1331f75d7cabbba66d7572666f41f2e437581b",
+      "instance_geometry_hash": "8bbc8632a8b943d2dd511e3c5b146fc0563efefd2242f48d14af7b8f5ea1cccb"
+    },
+    {
+      "mechanism_id": "I5",
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "relative_path": "data/PPO_TRAIN/seed_0900775608.xlsx",
+      "sheet_name": "g30_w055",
+      "tier": "MEDIUM",
+      "N": 55,
+      "raw_file_sha256": "6ccb3d168dad4581ded11e7f5f4bbff2cd41808322e8735f28dc9973df4f1fa6",
+      "instance_geometry_hash": "aaa64e169c6165173acc82388ef2e4ab432b2bcd502d0b566b2203e16e5301b5"
+    },
+    {
+      "mechanism_id": "I6",
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "relative_path": "data/PPO_TRAIN/seed_1419626827.xlsx",
+      "sheet_name": "g29_w055",
+      "tier": "MEDIUM",
+      "N": 55,
+      "raw_file_sha256": "39ec4580c9be07192457be59844dc91142eabbdf27bad822ad5d502c35b8d197",
+      "instance_geometry_hash": "d3110ed6d4d6fbf03909edfe760dca94487b0d670a671e3d0ca4b34fb32b615a"
+    },
+    {
+      "mechanism_id": "I9",
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "relative_path": "data/PPO_TRAIN/seed_0194123089.xlsx",
+      "sheet_name": "g43_w085",
+      "tier": "LARGE",
+      "N": 85,
+      "raw_file_sha256": "3af6427c77910ff09804b70225d3889a66b3774c9e62201f166cfa0122fbe70e",
+      "instance_geometry_hash": "f399a20e4a588849d1822dc7317e7ac96f63fa2d35940d82e91bbf5e2f4754dc"
+    },
+    {
+      "mechanism_id": "I12",
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "relative_path": "data/PPO_TRAIN/seed_0211781140.xlsx",
+      "sheet_name": "g32_w085",
+      "tier": "LARGE",
+      "N": 85,
+      "raw_file_sha256": "c1c16c16a1cbf351a372360fb05333480f211af5d2fb85fec22361ac1bee8992",
+      "instance_geometry_hash": "0395e11300f687af90bdaced161afe6cd6adb5a21d41a1368a2fbcb8851bbb79"
+    }
+  ],
+  "seeds": [
+    20261111,
+    20261112,
+    20261113
+  ],
+  "configs": {
+    "64": {
+      "m": 64,
+      "kdp": 8,
+      "kref": 2,
+      "insertion_limit": 8,
+      "construction_budget": 5,
+      "kinit_ref": 5,
+      "feasibility_bootstrap_budget": 1,
+      "m_atomic": null,
+      "m_lns": 16,
+      "kref_total": 4,
+      "destroy_rho": 0.15,
+      "destroy_q_min": 2,
+      "destroy_q_max": 8,
+      "repair_insertion_limit": 8,
+      "repair_evaluation_cap": 4096,
+      "adaptive_reaction": 0.2,
+      "adaptive_segment_length": 20,
+      "reward_global_best": 8.0,
+      "reward_accepted_improvement": 4.0,
+      "reward_accepted_non_improvement": 1.0,
+      "reward_rejected": 0.0,
+      "reward_evaluation_failed": 0.0,
+      "direction_refinement_budget": 4,
+      "t0": 0.05,
+      "cooling_rate": 0.995,
+      "tmin": 1e-06,
+      "max_iterations": 100000,
+      "time_limit": 60.0,
+      "checkpoints": [
+        5.0,
+        30.0,
+        60.0
+      ],
+      "enable_two_opt_star": false
+    },
+    "128": {
+      "m": 128,
+      "kdp": 8,
+      "kref": 2,
+      "insertion_limit": 8,
+      "construction_budget": 5,
+      "kinit_ref": 5,
+      "feasibility_bootstrap_budget": 1,
+      "m_atomic": null,
+      "m_lns": 32,
+      "kref_total": 4,
+      "destroy_rho": 0.15,
+      "destroy_q_min": 2,
+      "destroy_q_max": 8,
+      "repair_insertion_limit": 8,
+      "repair_evaluation_cap": 4096,
+      "adaptive_reaction": 0.2,
+      "adaptive_segment_length": 20,
+      "reward_global_best": 8.0,
+      "reward_accepted_improvement": 4.0,
+      "reward_accepted_non_improvement": 1.0,
+      "reward_rejected": 0.0,
+      "reward_evaluation_failed": 0.0,
+      "direction_refinement_budget": 4,
+      "t0": 0.05,
+      "cooling_rate": 0.995,
+      "tmin": 1e-06,
+      "max_iterations": 100000,
+      "time_limit": 60.0,
+      "checkpoints": [
+        5.0,
+        30.0,
+        60.0
+      ],
+      "enable_two_opt_star": false
+    },
+    "160": {
+      "m": 160,
+      "kdp": 8,
+      "kref": 2,
+      "insertion_limit": 8,
+      "construction_budget": 5,
+      "kinit_ref": 5,
+      "feasibility_bootstrap_budget": 1,
+      "m_atomic": null,
+      "m_lns": 40,
+      "kref_total": 4,
+      "destroy_rho": 0.15,
+      "destroy_q_min": 2,
+      "destroy_q_max": 8,
+      "repair_insertion_limit": 8,
+      "repair_evaluation_cap": 4096,
+      "adaptive_reaction": 0.2,
+      "adaptive_segment_length": 20,
+      "reward_global_best": 8.0,
+      "reward_accepted_improvement": 4.0,
+      "reward_accepted_non_improvement": 1.0,
+      "reward_rejected": 0.0,
+      "reward_evaluation_failed": 0.0,
+      "direction_refinement_budget": 4,
+      "t0": 0.05,
+      "cooling_rate": 0.995,
+      "tmin": 1e-06,
+      "max_iterations": 100000,
+      "time_limit": 60.0,
+      "checkpoints": [
+        5.0,
+        30.0,
+        60.0
+      ],
+      "enable_two_opt_star": false
+    },
+    "192": {
+      "m": 192,
+      "kdp": 8,
+      "kref": 2,
+      "insertion_limit": 8,
+      "construction_budget": 5,
+      "kinit_ref": 5,
+      "feasibility_bootstrap_budget": 1,
+      "m_atomic": null,
+      "m_lns": 48,
+      "kref_total": 4,
+      "destroy_rho": 0.15,
+      "destroy_q_min": 2,
+      "destroy_q_max": 8,
+      "repair_insertion_limit": 8,
+      "repair_evaluation_cap": 4096,
+      "adaptive_reaction": 0.2,
+      "adaptive_segment_length": 20,
+      "reward_global_best": 8.0,
+      "reward_accepted_improvement": 4.0,
+      "reward_accepted_non_improvement": 1.0,
+      "reward_rejected": 0.0,
+      "reward_evaluation_failed": 0.0,
+      "direction_refinement_budget": 4,
+      "t0": 0.05,
+      "cooling_rate": 0.995,
+      "tmin": 1e-06,
+      "max_iterations": 100000,
+      "time_limit": 60.0,
+      "checkpoints": [
+        5.0,
+        30.0,
+        60.0
+      ],
+      "enable_two_opt_star": false
+    }
+  },
+  "execution": "3 seed processes on separate physical cores; one logical CPU per core; sequential rotated M order within each seed",
+  "affinity_masks": [
+    1,
+    4,
+    16
+  ],
+  "runs": [
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 70,
+      "raw_candidate_attempts": 4480,
+      "valid_unique_candidates": 2486,
+      "candidate_generation_seconds": 41.1295617999931,
+      "lns_seconds": 24.452334400044492,
+      "raw_generation_counter_seconds": 4.085474100025749,
+      "cheap_screen_seconds": 11.342403799986641,
+      "lns_repair_seconds": 24.2751019999414,
+      "direction_dp_seconds": 0.2287503000261495,
+      "reference_scheduler_seconds": 17.35948520000602,
+      "reference_calls": 276,
+      "search_reference_calls": 272,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.9196100999979535,
+      "accepted_moves": 52,
+      "global_best_updates": 1,
+      "deadlock_count": 46,
+      "numeric_failure": 0,
+      "actual_runtime": 60.593031299998984,
+      "overshoot": 0.5930312999989837,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.484375,
+      "iterations_per_second": 1.1552483593934535,
+      "unique_candidates_per_second": 41.027820306458935,
+      "reference_calls_per_second": 4.5549792456084734,
+      "candidate_generation_time_fraction": 0.6787836970287668,
+      "best_events": [
+        [
+          0.9220458999989205,
+          1639.154648084687
+        ],
+        [
+          3.5595615999991423,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 41,
+      "raw_candidate_attempts": 5248,
+      "valid_unique_candidates": 2693,
+      "candidate_generation_seconds": 47.12669160000223,
+      "lns_seconds": 28.799429800252256,
+      "raw_generation_counter_seconds": 4.732314599947131,
+      "cheap_screen_seconds": 12.278439699985029,
+      "lns_repair_seconds": 28.57957180008816,
+      "direction_dp_seconds": 0.13320439996459754,
+      "reference_scheduler_seconds": 12.65238750001663,
+      "reference_calls": 140,
+      "search_reference_calls": 136,
+      "init_reference_calls": 4,
+      "initialization_seconds": 1.01176359999954,
+      "accepted_moves": 24,
+      "global_best_updates": 1,
+      "deadlock_count": 55,
+      "numeric_failure": 0,
+      "actual_runtime": 60.64936849999867,
+      "overshoot": 0.6493684999986726,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.5,
+      "iterations_per_second": 0.6760169316519907,
+      "unique_candidates_per_second": 44.40277065704417,
+      "reference_calls_per_second": 2.3083504983238705,
+      "candidate_generation_time_fraction": 0.7770351574230038,
+      "best_events": [
+        [
+          1.0137781999983417,
+          1639.154648084687
+        ],
+        [
+          24.147373699997843,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 26,
+      "raw_candidate_attempts": 4160,
+      "valid_unique_candidates": 2250,
+      "candidate_generation_seconds": 52.45415090000097,
+      "lns_seconds": 37.34166839992031,
+      "raw_generation_counter_seconds": 3.768332899948291,
+      "cheap_screen_seconds": 10.102532899993093,
+      "lns_repair_seconds": 37.148090200040315,
+      "direction_dp_seconds": 0.09395869998479611,
+      "reference_scheduler_seconds": 10.53463359998932,
+      "reference_calls": 84,
+      "search_reference_calls": 80,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.9955719999998109,
+      "accepted_moves": 12,
+      "global_best_updates": 1,
+      "deadlock_count": 41,
+      "numeric_failure": 0,
+      "actual_runtime": 63.4943749999984,
+      "overshoot": 3.4943749999983993,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.6875,
+      "iterations_per_second": 0.40948509218337303,
+      "unique_candidates_per_second": 35.4362099004842,
+      "reference_calls_per_second": 1.3229518362847437,
+      "candidate_generation_time_fraction": 0.8261228006418252,
+      "best_events": [
+        [
+          0.9969326999998884,
+          1639.154648084687
+        ],
+        [
+          15.239460799999506,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1639.154648084687,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1639.154648084687,
+      "iterations_completed": 27,
+      "raw_candidate_attempts": 4320,
+      "valid_unique_candidates": 2327,
+      "candidate_generation_seconds": 51.62295929999527,
+      "lns_seconds": 36.618498499898124,
+      "raw_generation_counter_seconds": 3.906530700089206,
+      "cheap_screen_seconds": 9.98955009999554,
+      "lns_repair_seconds": 36.44870589998027,
+      "direction_dp_seconds": 0.08893520001947763,
+      "reference_scheduler_seconds": 8.665680300000531,
+      "reference_calls": 68,
+      "search_reference_calls": 64,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.9345202000004065,
+      "accepted_moves": 4,
+      "global_best_updates": 0,
+      "deadlock_count": 53,
+      "numeric_failure": 0,
+      "actual_runtime": 60.56068579999919,
+      "overshoot": 0.5606857999991917,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.4375,
+      "iterations_per_second": 0.4458337887580586,
+      "unique_candidates_per_second": 38.424267645926015,
+      "reference_calls_per_second": 1.1228406531684438,
+      "candidate_generation_time_fraction": 0.8524170196896278,
+      "best_events": [
+        [
+          0.9359035000015865,
+          1639.154648084687
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1621.10693518536,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1621.10693518536,
+      "iterations_completed": 32,
+      "raw_candidate_attempts": 4096,
+      "valid_unique_candidates": 2275,
+      "candidate_generation_seconds": 49.512157900015154,
+      "lns_seconds": 34.355535399896326,
+      "raw_generation_counter_seconds": 3.6822083999795723,
+      "cheap_screen_seconds": 10.246303400021134,
+      "lns_repair_seconds": 34.1928566000679,
+      "direction_dp_seconds": 0.1129849000244576,
+      "reference_scheduler_seconds": 10.996837399994547,
+      "reference_calls": 106,
+      "search_reference_calls": 102,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.8701344000000972,
+      "accepted_moves": 13,
+      "global_best_updates": 2,
+      "deadlock_count": 45,
+      "numeric_failure": 0,
+      "actual_runtime": 61.163613599997916,
+      "overshoot": 1.163613599997916,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.0625,
+      "iterations_per_second": 0.5231868772384156,
+      "unique_candidates_per_second": 37.19531705366861,
+      "reference_calls_per_second": 1.7330565308522519,
+      "candidate_generation_time_fraction": 0.8095034774076337,
+      "best_events": [
+        [
+          0.8714841000000888,
+          1639.154648084687
+        ],
+        [
+          27.22254939999766,
+          1626.6342275081704
+        ],
+        [
+          51.20674719999806,
+          1621.10693518536
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 28,
+      "raw_candidate_attempts": 5376,
+      "valid_unique_candidates": 2674,
+      "candidate_generation_seconds": 50.41418479999993,
+      "lns_seconds": 32.19326870008808,
+      "raw_generation_counter_seconds": 4.710098599989578,
+      "cheap_screen_seconds": 12.116439200002787,
+      "lns_repair_seconds": 31.96296019996953,
+      "direction_dp_seconds": 0.09411760000148206,
+      "reference_scheduler_seconds": 9.119922000012593,
+      "reference_calls": 94,
+      "search_reference_calls": 90,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.8971195999984047,
+      "accepted_moves": 17,
+      "global_best_updates": 1,
+      "deadlock_count": 45,
+      "numeric_failure": 0,
+      "actual_runtime": 60.068272000000434,
+      "overshoot": 0.06827200000043376,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.53125,
+      "iterations_per_second": 0.46613626574774447,
+      "unique_candidates_per_second": 44.5160133789096,
+      "reference_calls_per_second": 1.564886035010285,
+      "candidate_generation_time_fraction": 0.8392814229781667,
+      "best_events": [
+        [
+          0.8984735000012734,
+          1639.154648084687
+        ],
+        [
+          17.33126550000088,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 22,
+      "raw_candidate_attempts": 4224,
+      "valid_unique_candidates": 2082,
+      "candidate_generation_seconds": 52.94447320000472,
+      "lns_seconds": 38.32997550001528,
+      "raw_generation_counter_seconds": 3.7385634999482136,
+      "cheap_screen_seconds": 9.777909899992665,
+      "lns_repair_seconds": 38.15545220001877,
+      "direction_dp_seconds": 0.07535170001210645,
+      "reference_scheduler_seconds": 7.30684260000271,
+      "reference_calls": 82,
+      "search_reference_calls": 78,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.8845846000003803,
+      "accepted_moves": 16,
+      "global_best_updates": 2,
+      "deadlock_count": 36,
+      "numeric_failure": 0,
+      "actual_runtime": 60.74598730000071,
+      "overshoot": 0.7459873000007065,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.75,
+      "iterations_per_second": 0.3621638395858247,
+      "unique_candidates_per_second": 34.273868818985775,
+      "reference_calls_per_second": 1.3498834020926194,
+      "candidate_generation_time_fraction": 0.871571531771023,
+      "best_events": [
+        [
+          0.8860597000020789,
+          1639.154648084687
+        ],
+        [
+          14.215432900000451,
+          1599.535344188462
+        ],
+        [
+          19.96053530000063,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 26,
+      "raw_candidate_attempts": 4160,
+      "valid_unique_candidates": 2155,
+      "candidate_generation_seconds": 52.868744899999,
+      "lns_seconds": 38.167330799980846,
+      "raw_generation_counter_seconds": 3.8021624999710184,
+      "cheap_screen_seconds": 9.803389500000776,
+      "lns_repair_seconds": 38.002869499967346,
+      "direction_dp_seconds": 0.08797789998789085,
+      "reference_scheduler_seconds": 9.328223499993328,
+      "reference_calls": 90,
+      "search_reference_calls": 86,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.9200165000002016,
+      "accepted_moves": 11,
+      "global_best_updates": 1,
+      "deadlock_count": 38,
+      "numeric_failure": 0,
+      "actual_runtime": 62.75901359999989,
+      "overshoot": 2.7590135999998893,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.453125,
+      "iterations_per_second": 0.4142831206002264,
+      "unique_candidates_per_second": 34.337697111287994,
+      "reference_calls_per_second": 1.4340569559238605,
+      "candidate_generation_time_fraction": 0.8424087930534188,
+      "best_events": [
+        [
+          0.9215534000031766,
+          1639.154648084687
+        ],
+        [
+          32.567116300000635,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 76,
+      "raw_candidate_attempts": 4864,
+      "valid_unique_candidates": 2707,
+      "candidate_generation_seconds": 38.210071999998036,
+      "lns_seconds": 20.369958800110908,
+      "raw_generation_counter_seconds": 4.306165899943153,
+      "cheap_screen_seconds": 12.159848300008889,
+      "lns_repair_seconds": 20.188518200051476,
+      "direction_dp_seconds": 0.2429552000030526,
+      "reference_scheduler_seconds": 20.05548559998715,
+      "reference_calls": 296,
+      "search_reference_calls": 292,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.8517776000007871,
+      "accepted_moves": 55,
+      "global_best_updates": 6,
+      "deadlock_count": 58,
+      "numeric_failure": 0,
+      "actual_runtime": 60.399851399997715,
+      "overshoot": 0.3998513999977149,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.90625,
+      "iterations_per_second": 1.2582812414005853,
+      "unique_candidates_per_second": 44.817991058834004,
+      "reference_calls_per_second": 4.900674308612806,
+      "candidate_generation_time_fraction": 0.6326186425021483,
+      "best_events": [
+        [
+          0.8532871999996132,
+          1639.154648084687
+        ],
+        [
+          2.163498799996887,
+          1628.781734457422
+        ],
+        [
+          3.3936977999983355,
+          1620.6978224172196
+        ],
+        [
+          5.360491399998864,
+          1597.3949350029632
+        ],
+        [
+          6.139081099998293,
+          1597.3949350029632
+        ],
+        [
+          27.384328899999673,
+          1597.3949350029632
+        ],
+        [
+          37.294241699997656,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 70,
+      "raw_candidate_attempts": 4480,
+      "valid_unique_candidates": 2431,
+      "candidate_generation_seconds": 36.98164760000145,
+      "lns_seconds": 20.18182000001252,
+      "raw_generation_counter_seconds": 4.105502100017475,
+      "cheap_screen_seconds": 11.439884699993854,
+      "lns_repair_seconds": 19.99724140005128,
+      "direction_dp_seconds": 0.2275157999320072,
+      "reference_scheduler_seconds": 21.6013328000372,
+      "reference_calls": 276,
+      "search_reference_calls": 272,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.8548014000007242,
+      "accepted_moves": 57,
+      "global_best_updates": 1,
+      "deadlock_count": 53,
+      "numeric_failure": 0,
+      "actual_runtime": 60.61903130000064,
+      "overshoot": 0.6190313000006427,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.65625,
+      "iterations_per_second": 1.1547528638914304,
+      "unique_candidates_per_second": 40.10291731600096,
+      "reference_calls_per_second": 4.553025577629068,
+      "candidate_generation_time_fraction": 0.6100666211075045,
+      "best_events": [
+        [
+          0.8563667999987956,
+          1639.154648084687
+        ],
+        [
+          2.356334699998115,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1597.3949350029632,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1597.3949350029632,
+      "iterations_completed": 22,
+      "raw_candidate_attempts": 4224,
+      "valid_unique_candidates": 2166,
+      "candidate_generation_seconds": 53.252087000004394,
+      "lns_seconds": 38.503322700125864,
+      "raw_generation_counter_seconds": 3.811389299997245,
+      "cheap_screen_seconds": 9.839041299994278,
+      "lns_repair_seconds": 38.337747799982026,
+      "direction_dp_seconds": 0.07373070002358872,
+      "reference_scheduler_seconds": 7.745874799999001,
+      "reference_calls": 76,
+      "search_reference_calls": 72,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.8729240000029677,
+      "accepted_moves": 9,
+      "global_best_updates": 1,
+      "deadlock_count": 32,
+      "numeric_failure": 0,
+      "actual_runtime": 61.469184999998106,
+      "overshoot": 1.469184999998106,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.15625,
+      "iterations_per_second": 0.35790290696062876,
+      "unique_candidates_per_second": 35.23716802166918,
+      "reference_calls_per_second": 1.2363918604094448,
+      "candidate_generation_time_fraction": 0.86632166995554,
+      "best_events": [
+        [
+          0.8746629999986908,
+          1639.154648084687
+        ],
+        [
+          37.866416000000754,
+          1597.3949350029632
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1064648049::g20_w026",
+      "case": "I2",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1606.0590949525963,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1606.0590949525963,
+      "iterations_completed": 28,
+      "raw_candidate_attempts": 3584,
+      "valid_unique_candidates": 1857,
+      "candidate_generation_seconds": 46.018930700000055,
+      "lns_seconds": 32.731050799990044,
+      "raw_generation_counter_seconds": 3.27620269997351,
+      "cheap_screen_seconds": 8.91027110000141,
+      "lns_repair_seconds": 32.57008290001613,
+      "direction_dp_seconds": 0.09988709999379353,
+      "reference_scheduler_seconds": 14.880323800000042,
+      "reference_calls": 100,
+      "search_reference_calls": 96,
+      "init_reference_calls": 4,
+      "initialization_seconds": 0.8563353999998071,
+      "accepted_moves": 19,
+      "global_best_updates": 4,
+      "deadlock_count": 37,
+      "numeric_failure": 0,
+      "actual_runtime": 61.564704899999924,
+      "overshoot": 1.5647048999999242,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.828125,
+      "iterations_per_second": 0.45480604585826634,
+      "unique_candidates_per_second": 30.163386684242877,
+      "reference_calls_per_second": 1.6243073066366656,
+      "candidate_generation_time_fraction": 0.7474888537961645,
+      "best_events": [
+        [
+          0.8578453999980411,
+          1639.154648084687
+        ],
+        [
+          3.07636349999666,
+          1628.781734457422
+        ],
+        [
+          4.993059099997481,
+          1620.6978224172196
+        ],
+        [
+          12.247612399998616,
+          1616.2356674516273
+        ],
+        [
+          43.38864139999714,
+          1606.0590949525963
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 15,
+      "raw_candidate_attempts": 2400,
+      "valid_unique_candidates": 1463,
+      "candidate_generation_seconds": 55.70797439999296,
+      "lns_seconds": 46.00567290002073,
+      "raw_generation_counter_seconds": 2.181832199996279,
+      "cheap_screen_seconds": 6.627010200001678,
+      "lns_repair_seconds": 45.89344309998705,
+      "direction_dp_seconds": 0.06579929999497836,
+      "reference_scheduler_seconds": 5.888604600007966,
+      "reference_calls": 49,
+      "search_reference_calls": 44,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0366036000013992,
+      "accepted_moves": 7,
+      "global_best_updates": 3,
+      "deadlock_count": 27,
+      "numeric_failure": 0,
+      "actual_runtime": 61.98878809999951,
+      "overshoot": 1.9887880999995105,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.546875,
+      "iterations_per_second": 0.24197924269469817,
+      "unique_candidates_per_second": 23.60104213748956,
+      "reference_calls_per_second": 0.7904655261360141,
+      "candidate_generation_time_fraction": 0.898678230491062,
+      "best_events": [
+        [
+          1.0383640999971249,
+          2118.4033350744635
+        ],
+        [
+          4.948695099999895,
+          1832.1458302850112
+        ],
+        [
+          8.860998399999517,
+          1790.2315587982225
+        ],
+        [
+          13.069634399998904,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 18,
+      "raw_candidate_attempts": 2304,
+      "valid_unique_candidates": 1459,
+      "candidate_generation_seconds": 53.04224519998752,
+      "lns_seconds": 43.490363799981424,
+      "raw_generation_counter_seconds": 2.0375421000135248,
+      "cheap_screen_seconds": 6.623043499996129,
+      "lns_repair_seconds": 43.38397109998914,
+      "direction_dp_seconds": 0.07311519998620497,
+      "reference_scheduler_seconds": 8.303730000010546,
+      "reference_calls": 59,
+      "search_reference_calls": 54,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0037013000001025,
+      "accepted_moves": 7,
+      "global_best_updates": 3,
+      "deadlock_count": 32,
+      "numeric_failure": 0,
+      "actual_runtime": 61.821795899999415,
+      "overshoot": 1.8217958999994153,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.75,
+      "iterations_per_second": 0.2911594485077094,
+      "unique_candidates_per_second": 23.600090854041557,
+      "reference_calls_per_second": 0.9543559701086031,
+      "candidate_generation_time_fraction": 0.857986158891059,
+      "best_events": [
+        [
+          1.00530549999894,
+          2118.4033350744635
+        ],
+        [
+          10.138174899999285,
+          1832.1458302850112
+        ],
+        [
+          13.019324500000948,
+          1790.2315587982225
+        ],
+        [
+          23.10952299999917,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 13,
+      "raw_candidate_attempts": 2496,
+      "valid_unique_candidates": 1490,
+      "candidate_generation_seconds": 58.55357359999107,
+      "lns_seconds": 48.48111210001662,
+      "raw_generation_counter_seconds": 2.200504999993427,
+      "cheap_screen_seconds": 6.789256799995201,
+      "lns_repair_seconds": 48.355711500054895,
+      "direction_dp_seconds": 0.05517850000251201,
+      "reference_scheduler_seconds": 5.737991599995439,
+      "reference_calls": 47,
+      "search_reference_calls": 42,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0330710999987787,
+      "accepted_moves": 8,
+      "global_best_updates": 3,
+      "deadlock_count": 22,
+      "numeric_failure": 0,
+      "actual_runtime": 64.70606690000204,
+      "overshoot": 4.7060669000020425,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 62.46875,
+      "iterations_per_second": 0.2009085178997271,
+      "unique_candidates_per_second": 23.027207051584107,
+      "reference_calls_per_second": 0.726361564714398,
+      "candidate_generation_time_fraction": 0.9049162838235996,
+      "best_events": [
+        [
+          1.0346797999991395,
+          2118.4033350744635
+        ],
+        [
+          5.502335699999094,
+          1832.1458302850112
+        ],
+        [
+          9.405580200000259,
+          1790.2315587982225
+        ],
+        [
+          23.572400500001095,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 13,
+      "raw_candidate_attempts": 2496,
+      "valid_unique_candidates": 1484,
+      "candidate_generation_seconds": 55.198200600003474,
+      "lns_seconds": 45.530559100014216,
+      "raw_generation_counter_seconds": 2.2132901000004495,
+      "cheap_screen_seconds": 6.567930000004708,
+      "lns_repair_seconds": 45.4173935000108,
+      "direction_dp_seconds": 0.06031630000870791,
+      "reference_scheduler_seconds": 6.326984600000287,
+      "reference_calls": 47,
+      "search_reference_calls": 42,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0413507999983267,
+      "accepted_moves": 7,
+      "global_best_updates": 3,
+      "deadlock_count": 22,
+      "numeric_failure": 0,
+      "actual_runtime": 61.948871900000086,
+      "overshoot": 1.9488719000000856,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.546875,
+      "iterations_per_second": 0.20985047186952863,
+      "unique_candidates_per_second": 23.95523848110619,
+      "reference_calls_per_second": 0.7586901675282958,
+      "candidate_generation_time_fraction": 0.891028341712279,
+      "best_events": [
+        [
+          1.0429810999994515,
+          2118.4033350744635
+        ],
+        [
+          5.7127600999992865,
+          1832.1458302850112
+        ],
+        [
+          10.152904599999601,
+          1790.2315587982225
+        ],
+        [
+          14.985844700000598,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 15,
+      "raw_candidate_attempts": 2400,
+      "valid_unique_candidates": 1496,
+      "candidate_generation_seconds": 52.98459939999884,
+      "lns_seconds": 43.2645718000349,
+      "raw_generation_counter_seconds": 2.0948398999826168,
+      "cheap_screen_seconds": 6.714741199986747,
+      "lns_repair_seconds": 43.14564660000906,
+      "direction_dp_seconds": 0.07165059996987111,
+      "reference_scheduler_seconds": 7.228754800002207,
+      "reference_calls": 53,
+      "search_reference_calls": 48,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0656190000008792,
+      "accepted_moves": 7,
+      "global_best_updates": 3,
+      "deadlock_count": 27,
+      "numeric_failure": 0,
+      "actual_runtime": 60.68487699999969,
+      "overshoot": 0.6848769999996875,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.375,
+      "iterations_per_second": 0.2471785515854317,
+      "unique_candidates_per_second": 24.65194087812039,
+      "reference_calls_per_second": 0.8733642156018586,
+      "candidate_generation_time_fraction": 0.8731104357350697,
+      "best_events": [
+        [
+          1.0672771999998076,
+          2118.4033350744635
+        ],
+        [
+          11.906185200001346,
+          1832.1458302850112
+        ],
+        [
+          15.304296999998769,
+          1790.2315587982225
+        ],
+        [
+          27.638926499999798,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 33,
+      "raw_candidate_attempts": 2112,
+      "valid_unique_candidates": 1435,
+      "candidate_generation_seconds": 48.49967389999438,
+      "lns_seconds": 39.52404240001488,
+      "raw_generation_counter_seconds": 1.9560361999792804,
+      "cheap_screen_seconds": 6.1633648999959405,
+      "lns_repair_seconds": 39.42168399997536,
+      "direction_dp_seconds": 0.12925930002165842,
+      "reference_scheduler_seconds": 11.720517800022208,
+      "reference_calls": 105,
+      "search_reference_calls": 100,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0218313000004855,
+      "accepted_moves": 14,
+      "global_best_updates": 4,
+      "deadlock_count": 54,
+      "numeric_failure": 0,
+      "actual_runtime": 61.03825499999948,
+      "overshoot": 1.0382549999994808,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.703125,
+      "iterations_per_second": 0.5406445515193755,
+      "unique_candidates_per_second": 23.509846406978905,
+      "reference_calls_per_second": 1.7202326639252858,
+      "candidate_generation_time_fraction": 0.7945783164999523,
+      "best_events": [
+        [
+          1.0234080999980506,
+          2118.4033350744635
+        ],
+        [
+          2.7968518000016047,
+          1827.0269751697597
+        ],
+        [
+          4.035496100001183,
+          1808.5670555412685
+        ],
+        [
+          5.555137499999546,
+          1790.2315587982225
+        ],
+        [
+          8.99262390000149,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1775.0121441120416,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1775.0121441120416,
+      "iterations_completed": 37,
+      "raw_candidate_attempts": 2368,
+      "valid_unique_candidates": 1485,
+      "candidate_generation_seconds": 42.41940799999793,
+      "lns_seconds": 31.92146399999183,
+      "raw_generation_counter_seconds": 2.1586055000043416,
+      "cheap_screen_seconds": 7.36348430002181,
+      "lns_repair_seconds": 31.80384550000599,
+      "direction_dp_seconds": 0.15042170000015176,
+      "reference_scheduler_seconds": 16.48384790000273,
+      "reference_calls": 137,
+      "search_reference_calls": 132,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0420615000002726,
+      "accepted_moves": 28,
+      "global_best_updates": 9,
+      "deadlock_count": 36,
+      "numeric_failure": 0,
+      "actual_runtime": 60.244381099997554,
+      "overshoot": 0.24438109999755397,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.625,
+      "iterations_per_second": 0.6141651607074357,
+      "unique_candidates_per_second": 24.64960172028492,
+      "reference_calls_per_second": 2.274071000457262,
+      "candidate_generation_time_fraction": 0.7041222305792706,
+      "best_events": [
+        [
+          1.043674499996996,
+          2118.4033350744635
+        ],
+        [
+          6.623206299998856,
+          1832.1458302850112
+        ],
+        [
+          11.977312999999413,
+          1808.6249345792135
+        ],
+        [
+          13.261171899997862,
+          1808.6249345792135
+        ],
+        [
+          14.868932699999277,
+          1790.1064160606952
+        ],
+        [
+          16.784582299998874,
+          1790.1064160606952
+        ],
+        [
+          18.62845069999821,
+          1783.4712378230029
+        ],
+        [
+          29.308017299998028,
+          1776.3578364687155
+        ],
+        [
+          31.69551059999867,
+          1775.0121441120416
+        ],
+        [
+          33.16000649999842,
+          1775.0121441120416
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 13,
+      "raw_candidate_attempts": 2496,
+      "valid_unique_candidates": 1530,
+      "candidate_generation_seconds": 55.52213089999714,
+      "lns_seconds": 45.427101399985986,
+      "raw_generation_counter_seconds": 2.2449774999695364,
+      "cheap_screen_seconds": 6.883382099997107,
+      "lns_repair_seconds": 45.31283150006857,
+      "direction_dp_seconds": 0.055156900016299915,
+      "reference_scheduler_seconds": 6.5990471000041,
+      "reference_calls": 47,
+      "search_reference_calls": 42,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0871933000016725,
+      "accepted_moves": 6,
+      "global_best_updates": 3,
+      "deadlock_count": 24,
+      "numeric_failure": 0,
+      "actual_runtime": 62.58207609999954,
+      "overshoot": 2.58207609999954,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.53125,
+      "iterations_per_second": 0.20772720897317906,
+      "unique_candidates_per_second": 24.44789459453569,
+      "reference_calls_per_second": 0.7510137555184166,
+      "candidate_generation_time_fraction": 0.8871890221615314,
+      "best_events": [
+        [
+          1.0893840999997337,
+          2118.4033350744635
+        ],
+        [
+          13.657900099999097,
+          1832.1458302850112
+        ],
+        [
+          18.102183299997705,
+          1790.2315587982225
+        ],
+        [
+          33.39696389999881,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 19,
+      "raw_candidate_attempts": 2432,
+      "valid_unique_candidates": 1558,
+      "candidate_generation_seconds": 55.803288699989935,
+      "lns_seconds": 45.66069770005561,
+      "raw_generation_counter_seconds": 2.1756610999982513,
+      "cheap_screen_seconds": 7.004918800001178,
+      "lns_repair_seconds": 45.539187499991385,
+      "direction_dp_seconds": 0.08179499999096151,
+      "reference_scheduler_seconds": 6.699272500005463,
+      "reference_calls": 65,
+      "search_reference_calls": 60,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.0055320999999822,
+      "accepted_moves": 11,
+      "global_best_updates": 3,
+      "deadlock_count": 31,
+      "numeric_failure": 0,
+      "actual_runtime": 63.07593310000084,
+      "overshoot": 3.0759331000008387,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.59375,
+      "iterations_per_second": 0.30122423983609287,
+      "unique_candidates_per_second": 24.700387666559614,
+      "reference_calls_per_second": 1.0305039783866334,
+      "candidate_generation_time_fraction": 0.8847001694214999,
+      "best_events": [
+        [
+          1.007895999999164,
+          2118.4033350744635
+        ],
+        [
+          4.275405199998204,
+          1832.1458302850112
+        ],
+        [
+          7.087819699998363,
+          1790.2315587982225
+        ],
+        [
+          19.78750559999753,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 1777.283347138153,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1777.283347138153,
+      "iterations_completed": 24,
+      "raw_candidate_attempts": 3072,
+      "valid_unique_candidates": 1842,
+      "candidate_generation_seconds": 52.730425199999445,
+      "lns_seconds": 39.67645790001916,
+      "raw_generation_counter_seconds": 2.82895619995179,
+      "cheap_screen_seconds": 9.031121499996516,
+      "lns_repair_seconds": 39.530311500042444,
+      "direction_dp_seconds": 0.09436530002130894,
+      "reference_scheduler_seconds": 8.186354599998594,
+      "reference_calls": 97,
+      "search_reference_calls": 92,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.011497600000439,
+      "accepted_moves": 18,
+      "global_best_updates": 4,
+      "deadlock_count": 22,
+      "numeric_failure": 0,
+      "actual_runtime": 61.84243630000128,
+      "overshoot": 1.8424363000012818,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.203125,
+      "iterations_per_second": 0.3880830289992877,
+      "unique_candidates_per_second": 29.785372475695333,
+      "reference_calls_per_second": 1.5685022422054544,
+      "candidate_generation_time_fraction": 0.8526576305015064,
+      "best_events": [
+        [
+          1.0133863000010024,
+          2118.4033350744635
+        ],
+        [
+          5.448730600000999,
+          1981.3423712087256
+        ],
+        [
+          9.309319699998014,
+          1778.960869896409
+        ],
+        [
+          22.378770200000872,
+          1777.283347138153
+        ],
+        [
+          25.227163200001087,
+          1777.283347138153
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 32,
+      "raw_candidate_attempts": 2048,
+      "valid_unique_candidates": 1439,
+      "candidate_generation_seconds": 48.25955340000655,
+      "lns_seconds": 39.20248700000957,
+      "raw_generation_counter_seconds": 1.9636948999504966,
+      "cheap_screen_seconds": 6.202955699998711,
+      "lns_repair_seconds": 39.107886100064206,
+      "direction_dp_seconds": 0.12886139999318402,
+      "reference_scheduler_seconds": 12.130199200018978,
+      "reference_calls": 103,
+      "search_reference_calls": 98,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.53251249999812,
+      "accepted_moves": 13,
+      "global_best_updates": 3,
+      "deadlock_count": 52,
+      "numeric_failure": 0,
+      "actual_runtime": 61.20944189999864,
+      "overshoot": 1.2094418999986374,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.28125,
+      "iterations_per_second": 0.5227951604636459,
+      "unique_candidates_per_second": 23.50944487209958,
+      "reference_calls_per_second": 1.6827469227423604,
+      "candidate_generation_time_fraction": 0.7884331551143848,
+      "best_events": [
+        [
+          1.5385395000012068,
+          2118.4033350744635
+        ],
+        [
+          7.564918100000796,
+          1832.1458302850112
+        ],
+        [
+          9.325362999999925,
+          1790.2315587982225
+        ],
+        [
+          16.98542599999928,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/DEV_ONLY/seed_000505::g15_w026",
+      "case": "I3",
+      "tier": "SMALL",
+      "N": 26,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 1790.2315587982225,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 1790.2315587982225,
+      "iterations_completed": 16,
+      "raw_candidate_attempts": 2560,
+      "valid_unique_candidates": 1586,
+      "candidate_generation_seconds": 57.04374269999971,
+      "lns_seconds": 46.62120369997865,
+      "raw_generation_counter_seconds": 2.314159999965341,
+      "cheap_screen_seconds": 7.151503200006118,
+      "lns_repair_seconds": 46.49871050002548,
+      "direction_dp_seconds": 0.06552340000052936,
+      "reference_scheduler_seconds": 6.203845699990779,
+      "reference_calls": 55,
+      "search_reference_calls": 50,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.2193446999990556,
+      "accepted_moves": 9,
+      "global_best_updates": 3,
+      "deadlock_count": 27,
+      "numeric_failure": 0,
+      "actual_runtime": 63.73061850000158,
+      "overshoot": 3.730618500001583,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.734375,
+      "iterations_per_second": 0.25105671930674267,
+      "unique_candidates_per_second": 24.88599730128087,
+      "reference_calls_per_second": 0.863007472616928,
+      "candidate_generation_time_fraction": 0.8950759312024925,
+      "best_events": [
+        [
+          1.2217453000012028,
+          2118.4033350744635
+        ],
+        [
+          4.933849199998804,
+          1832.1458302850112
+        ],
+        [
+          8.15819669999837,
+          1790.2315587982225
+        ],
+        [
+          23.558693999999377,
+          1790.2315587982225
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 4096.880102155959,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4040.4272550097658,
+      "iterations_completed": 10,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1143,
+      "candidate_generation_seconds": 51.80015729999286,
+      "lns_seconds": 40.00631650000287,
+      "raw_generation_counter_seconds": 2.9417399000303703,
+      "cheap_screen_seconds": 7.896054099997855,
+      "lns_repair_seconds": 39.88448779994724,
+      "direction_dp_seconds": 0.05755770001997007,
+      "reference_scheduler_seconds": 9.114638999992167,
+      "reference_calls": 33,
+      "search_reference_calls": 28,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.938289599998825,
+      "accepted_moves": 4,
+      "global_best_updates": 3,
+      "deadlock_count": 23,
+      "numeric_failure": 0,
+      "actual_runtime": 61.28247419999752,
+      "overshoot": 1.282474199997523,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.140625,
+      "iterations_per_second": 0.16317879019317408,
+      "unique_candidates_per_second": 18.6513357190798,
+      "reference_calls_per_second": 0.5384900076374745,
+      "candidate_generation_time_fraction": 0.845268700002895,
+      "best_events": [
+        [
+          1.9399360999996134,
+          4305.53700823084
+        ],
+        [
+          37.890681299999414,
+          4096.880102155959
+        ],
+        [
+          42.62360759999865,
+          4096.880102155959
+        ],
+        [
+          61.25986389999889,
+          4040.4272550097658
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 4065.9770721131986,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4065.9770721131986,
+      "iterations_completed": 12,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1146,
+      "candidate_generation_seconds": 50.84052059999158,
+      "lns_seconds": 39.01365809997151,
+      "raw_generation_counter_seconds": 2.8726102000036917,
+      "cheap_screen_seconds": 7.9717211999995925,
+      "lns_repair_seconds": 38.86033330000282,
+      "direction_dp_seconds": 0.07100209999771323,
+      "reference_scheduler_seconds": 10.809275099993101,
+      "reference_calls": 47,
+      "search_reference_calls": 42,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.8407149000013305,
+      "accepted_moves": 8,
+      "global_best_updates": 4,
+      "deadlock_count": 26,
+      "numeric_failure": 0,
+      "actual_runtime": 62.318884499996784,
+      "overshoot": 2.318884499996784,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.703125,
+      "iterations_per_second": 0.19255800382628188,
+      "unique_candidates_per_second": 18.38928936540992,
+      "reference_calls_per_second": 0.7541855149862707,
+      "candidate_generation_time_fraction": 0.8158124300186118,
+      "best_events": [
+        [
+          1.8425002999974822,
+          4305.53700823084
+        ],
+        [
+          6.90231969999877,
+          4270.184806967212
+        ],
+        [
+          18.53403949999847,
+          4096.880102155959
+        ],
+        [
+          23.215628599999036,
+          4096.880102155959
+        ],
+        [
+          48.79755209999712,
+          4065.9770721131986
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 4102.1521843007995,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4102.1521843007995,
+      "iterations_completed": 24,
+      "raw_candidate_attempts": 1536,
+      "valid_unique_candidates": 979,
+      "candidate_generation_seconds": 43.30652770000597,
+      "lns_seconds": 33.70123430003514,
+      "raw_generation_counter_seconds": 2.297828200047661,
+      "cheap_screen_seconds": 6.512197599997307,
+      "lns_repair_seconds": 33.60421899998619,
+      "direction_dp_seconds": 0.12790839999433956,
+      "reference_scheduler_seconds": 16.730676599996514,
+      "reference_calls": 57,
+      "search_reference_calls": 52,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.9086669999996957,
+      "accepted_moves": 2,
+      "global_best_updates": 2,
+      "deadlock_count": 52,
+      "numeric_failure": 0,
+      "actual_runtime": 60.37674060000063,
+      "overshoot": 0.37674060000063037,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.59375,
+      "iterations_per_second": 0.3975040679820956,
+      "unique_candidates_per_second": 16.214853439769648,
+      "reference_calls_per_second": 0.944072161457477,
+      "candidate_generation_time_fraction": 0.7172717054554866,
+      "best_events": [
+        [
+          1.9109289000007266,
+          4305.53700823084
+        ],
+        [
+          58.07096100000126,
+          4102.1521843007995
+        ],
+        [
+          60.355362700000114,
+          4102.1521843007995
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 4089.0691105986143,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4089.0691105986143,
+      "iterations_completed": 24,
+      "raw_candidate_attempts": 1536,
+      "valid_unique_candidates": 1012,
+      "candidate_generation_seconds": 41.22829299998921,
+      "lns_seconds": 30.97127559996079,
+      "raw_generation_counter_seconds": 2.3709448000117845,
+      "cheap_screen_seconds": 6.980809000004228,
+      "lns_repair_seconds": 30.862335900026665,
+      "direction_dp_seconds": 0.13663570001153857,
+      "reference_scheduler_seconds": 20.07476160000806,
+      "reference_calls": 85,
+      "search_reference_calls": 80,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.9391010999970604,
+      "accepted_moves": 16,
+      "global_best_updates": 3,
+      "deadlock_count": 49,
+      "numeric_failure": 0,
+      "actual_runtime": 62.40505639999901,
+      "overshoot": 2.4050563999990118,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.375,
+      "iterations_per_second": 0.384584220967075,
+      "unique_candidates_per_second": 16.21663465077833,
+      "reference_calls_per_second": 1.3620691159250573,
+      "candidate_generation_time_fraction": 0.6606562893834651,
+      "best_events": [
+        [
+          1.9408105000002251,
+          4305.53700823084
+        ],
+        [
+          18.276614499998686,
+          4120.50196528045
+        ],
+        [
+          20.36900919999971,
+          4120.50196528045
+        ],
+        [
+          43.31541389999984,
+          4089.0691105986143
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 3949.3651245849524,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 3933.724788362176,
+      "iterations_completed": 10,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1101,
+      "candidate_generation_seconds": 49.866233500004455,
+      "lns_seconds": 38.21294090000447,
+      "raw_generation_counter_seconds": 2.822151300013502,
+      "cheap_screen_seconds": 7.868122299994866,
+      "lns_repair_seconds": 38.07551450000756,
+      "direction_dp_seconds": 0.06375570000091102,
+      "reference_scheduler_seconds": 9.930469299990364,
+      "reference_calls": 43,
+      "search_reference_calls": 38,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.967031300002418,
+      "accepted_moves": 8,
+      "global_best_updates": 5,
+      "deadlock_count": 23,
+      "numeric_failure": 0,
+      "actual_runtime": 60.45934760000091,
+      "overshoot": 0.45934760000091046,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.109375,
+      "iterations_per_second": 0.16540039542206125,
+      "unique_candidates_per_second": 18.210583535968944,
+      "reference_calls_per_second": 0.7112217003148633,
+      "candidate_generation_time_fraction": 0.8247894739109574,
+      "best_events": [
+        [
+          1.9686174999987998,
+          4305.53700823084
+        ],
+        [
+          7.887002700001176,
+          4270.184806967212
+        ],
+        [
+          20.410303299999214,
+          4096.880102155959
+        ],
+        [
+          25.676938199998403,
+          4096.880102155959
+        ],
+        [
+          49.07695709999825,
+          3949.3651245849524
+        ],
+        [
+          60.42780489999859,
+          3933.724788362176
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 4305.53700823084,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4305.53700823084,
+      "iterations_completed": 15,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1166,
+      "candidate_generation_seconds": 52.8822495999957,
+      "lns_seconds": 41.3282068000226,
+      "raw_generation_counter_seconds": 2.8981719999865163,
+      "cheap_screen_seconds": 7.705017800002679,
+      "lns_repair_seconds": 41.21390739997878,
+      "direction_dp_seconds": 0.08424069997636252,
+      "reference_scheduler_seconds": 10.578305099996214,
+      "reference_calls": 35,
+      "search_reference_calls": 30,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.843413500002498,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 34,
+      "numeric_failure": 0,
+      "actual_runtime": 63.65682890000244,
+      "overshoot": 3.656828900002438,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.953125,
+      "iterations_per_second": 0.23563850507795914,
+      "unique_candidates_per_second": 18.316966461393356,
+      "reference_calls_per_second": 0.549823178515238,
+      "candidate_generation_time_fraction": 0.830739616060166,
+      "best_events": [
+        [
+          1.8452266999993299,
+          4305.53700823084
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 3934.112165963209,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 3934.112165963209,
+      "iterations_completed": 15,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1139,
+      "candidate_generation_seconds": 49.11584029999722,
+      "lns_seconds": 37.31881380003688,
+      "raw_generation_counter_seconds": 2.8437936999871454,
+      "cheap_screen_seconds": 7.982687199993961,
+      "lns_repair_seconds": 37.19206580004902,
+      "direction_dp_seconds": 0.08657270000185235,
+      "reference_scheduler_seconds": 12.560101799987024,
+      "reference_calls": 51,
+      "search_reference_calls": 46,
+      "init_reference_calls": 5,
+      "initialization_seconds": 2.031067500000063,
+      "accepted_moves": 8,
+      "global_best_updates": 5,
+      "deadlock_count": 31,
+      "numeric_failure": 0,
+      "actual_runtime": 62.33426889999828,
+      "overshoot": 2.3342688999982784,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.96875,
+      "iterations_per_second": 0.24063809947084203,
+      "unique_candidates_per_second": 18.27245301981927,
+      "reference_calls_per_second": 0.8181695382008629,
+      "candidate_generation_time_fraction": 0.7879428309136481,
+      "best_events": [
+        [
+          2.032941199999186,
+          4305.53700823084
+        ],
+        [
+          28.74475320000056,
+          4096.880102155959
+        ],
+        [
+          32.29956829999719,
+          4096.880102155959
+        ],
+        [
+          45.32176400000026,
+          4040.4272550097658
+        ],
+        [
+          48.633408800000325,
+          4026.382390052937
+        ],
+        [
+          54.92507099999784,
+          3934.112165963209
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 4305.53700823084,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4305.53700823084,
+      "iterations_completed": 26,
+      "raw_candidate_attempts": 1664,
+      "valid_unique_candidates": 1096,
+      "candidate_generation_seconds": 45.27387240000098,
+      "lns_seconds": 34.480735900117,
+      "raw_generation_counter_seconds": 2.491955000015878,
+      "cheap_screen_seconds": 7.429273500001727,
+      "lns_repair_seconds": 34.38021579999622,
+      "direction_dp_seconds": 0.13896710002154578,
+      "reference_scheduler_seconds": 16.978521199995157,
+      "reference_calls": 57,
+      "search_reference_calls": 52,
+      "init_reference_calls": 5,
+      "initialization_seconds": 2.3100692000007257,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 56,
+      "numeric_failure": 0,
+      "actual_runtime": 62.540194000001065,
+      "overshoot": 2.5401940000010654,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.703125,
+      "iterations_per_second": 0.4157326406758437,
+      "unique_candidates_per_second": 17.52472977618172,
+      "reference_calls_per_second": 0.911413866097042,
+      "candidate_generation_time_fraction": 0.7239164048643695,
+      "best_events": [
+        [
+          2.3117216999999073,
+          4305.53700823084
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 4305.53700823084,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4305.53700823084,
+      "iterations_completed": 12,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1142,
+      "candidate_generation_seconds": 53.481407399998716,
+      "lns_seconds": 42.137439199992514,
+      "raw_generation_counter_seconds": 2.801321300008567,
+      "cheap_screen_seconds": 7.616951899995911,
+      "lns_repair_seconds": 42.02271999999721,
+      "direction_dp_seconds": 0.06476749998910236,
+      "reference_scheduler_seconds": 9.091827700005524,
+      "reference_calls": 29,
+      "search_reference_calls": 24,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.8178870000010647,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 28,
+      "numeric_failure": 0,
+      "actual_runtime": 62.736421400000836,
+      "overshoot": 2.736421400000836,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.0625,
+      "iterations_per_second": 0.19127645046071817,
+      "unique_candidates_per_second": 18.20314220217835,
+      "reference_calls_per_second": 0.46225142194673563,
+      "candidate_generation_time_fraction": 0.8524778144262785,
+      "best_events": [
+        [
+          1.8197443000026396,
+          4305.53700823084
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 4026.382390052937,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4026.382390052937,
+      "iterations_completed": 12,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1141,
+      "candidate_generation_seconds": 50.32097210000211,
+      "lns_seconds": 38.48108199998023,
+      "raw_generation_counter_seconds": 2.9288575999707973,
+      "cheap_screen_seconds": 7.921907099997043,
+      "lns_repair_seconds": 38.356983700039564,
+      "direction_dp_seconds": 0.0693210000063118,
+      "reference_scheduler_seconds": 10.63019489999715,
+      "reference_calls": 39,
+      "search_reference_calls": 34,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.9417890000004263,
+      "accepted_moves": 5,
+      "global_best_updates": 4,
+      "deadlock_count": 26,
+      "numeric_failure": 0,
+      "actual_runtime": 61.40481240000008,
+      "overshoot": 1.4048124000000826,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.328125,
+      "iterations_per_second": 0.19542442246757818,
+      "unique_candidates_per_second": 18.581605502958894,
+      "reference_calls_per_second": 0.6351293730196291,
+      "candidate_generation_time_fraction": 0.8194955758875023,
+      "best_events": [
+        [
+          1.9434331000011298,
+          4305.53700823084
+        ],
+        [
+          33.331770799999504,
+          4096.880102155959
+        ],
+        [
+          37.23930610000025,
+          4096.880102155959
+        ],
+        [
+          53.29470840000067,
+          4040.4272550097658
+        ],
+        [
+          57.377027599999565,
+          4026.382390052937
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 4096.880102155959,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4096.880102155959,
+      "iterations_completed": 14,
+      "raw_candidate_attempts": 1792,
+      "valid_unique_candidates": 1109,
+      "candidate_generation_seconds": 49.61365240000305,
+      "lns_seconds": 38.03671219995522,
+      "raw_generation_counter_seconds": 2.696715199977916,
+      "cheap_screen_seconds": 7.832380399991962,
+      "lns_repair_seconds": 37.899853099981556,
+      "direction_dp_seconds": 0.10549570002694963,
+      "reference_scheduler_seconds": 13.128919199996744,
+      "reference_calls": 53,
+      "search_reference_calls": 48,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.882754099999147,
+      "accepted_moves": 10,
+      "global_best_updates": 3,
+      "deadlock_count": 31,
+      "numeric_failure": 0,
+      "actual_runtime": 63.481195399999706,
+      "overshoot": 3.481195399999706,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.4375,
+      "iterations_per_second": 0.22053774998698378,
+      "unique_candidates_per_second": 17.469740338254645,
+      "reference_calls_per_second": 0.83489291066501,
+      "candidate_generation_time_fraction": 0.781548804923785,
+      "best_events": [
+        [
+          1.8843673000010313,
+          4305.53700823084
+        ],
+        [
+          5.936056099999405,
+          4270.184806967212
+        ],
+        [
+          15.258937899998273,
+          4096.880102155959
+        ],
+        [
+          19.063991399998486,
+          4096.880102155959
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0900775608::g30_w055",
+      "case": "I5",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 4305.53700823084,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4305.53700823084,
+      "iterations_completed": 10,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1119,
+      "candidate_generation_seconds": 54.05239760001132,
+      "lns_seconds": 42.76222899996719,
+      "raw_generation_counter_seconds": 2.8200491999778023,
+      "cheap_screen_seconds": 7.578717399996094,
+      "lns_repair_seconds": 42.64664120002999,
+      "direction_dp_seconds": 0.054301000003761146,
+      "reference_scheduler_seconds": 7.728153899999597,
+      "reference_calls": 25,
+      "search_reference_calls": 20,
+      "init_reference_calls": 5,
+      "initialization_seconds": 1.8117390000006708,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 24,
+      "numeric_failure": 0,
+      "actual_runtime": 61.928212700000586,
+      "overshoot": 1.9282127000005858,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.25,
+      "iterations_per_second": 0.1614772906242764,
+      "unique_candidates_per_second": 18.06930882085653,
+      "reference_calls_per_second": 0.403693226560691,
+      "candidate_generation_time_fraction": 0.8728234716195968,
+      "best_events": [
+        [
+          1.8133959000006143,
+          4305.53700823084
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 5694.199487271489,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5694.199487271489,
+      "iterations_completed": 23,
+      "raw_candidate_attempts": 1472,
+      "valid_unique_candidates": 891,
+      "candidate_generation_seconds": 23.43742230000862,
+      "lns_seconds": 14.688430900037929,
+      "raw_generation_counter_seconds": 2.067689099974814,
+      "cheap_screen_seconds": 5.9002211000006355,
+      "lns_repair_seconds": 14.59422570003153,
+      "direction_dp_seconds": 0.13239060003616032,
+      "reference_scheduler_seconds": 38.10914249999041,
+      "reference_calls": 83,
+      "search_reference_calls": 76,
+      "init_reference_calls": 7,
+      "initialization_seconds": 4.061374100001558,
+      "accepted_moves": 14,
+      "global_best_updates": 5,
+      "deadlock_count": 38,
+      "numeric_failure": 0,
+      "actual_runtime": 62.63197410000066,
+      "overshoot": 2.6319741000006616,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.078125,
+      "iterations_per_second": 0.36722457387782953,
+      "unique_candidates_per_second": 14.225960666310701,
+      "reference_calls_per_second": 1.3252017231243414,
+      "candidate_generation_time_fraction": 0.3742085833441481,
+      "best_events": [
+        [
+          4.063057200000912,
+          7174.129171206783
+        ],
+        [
+          7.837908299999981,
+          7151.88991566066
+        ],
+        [
+          10.313274500000261,
+          7124.997589690948
+        ],
+        [
+          13.603513300000486,
+          6002.304700816076
+        ],
+        [
+          17.216828000000532,
+          5716.4387428176115
+        ],
+        [
+          20.062161099998775,
+          5694.199487271489
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 4807.888179918283,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4807.888179918283,
+      "iterations_completed": 15,
+      "raw_candidate_attempts": 2880,
+      "valid_unique_candidates": 1676,
+      "candidate_generation_seconds": 42.75053319999279,
+      "lns_seconds": 25.62522579994402,
+      "raw_generation_counter_seconds": 4.077032600042003,
+      "cheap_screen_seconds": 11.436600600012753,
+      "lns_repair_seconds": 25.38938540001618,
+      "direction_dp_seconds": 0.09961339997607865,
+      "reference_scheduler_seconds": 17.617647600000055,
+      "reference_calls": 51,
+      "search_reference_calls": 44,
+      "init_reference_calls": 7,
+      "initialization_seconds": 4.044226300000446,
+      "accepted_moves": 7,
+      "global_best_updates": 5,
+      "deadlock_count": 29,
+      "numeric_failure": 0,
+      "actual_runtime": 60.9656232999987,
+      "overshoot": 0.9656232999986969,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.375,
+      "iterations_per_second": 0.24604029595807184,
+      "unique_candidates_per_second": 27.49090240171523,
+      "reference_calls_per_second": 0.8365370062574443,
+      "candidate_generation_time_fraction": 0.7012235893927734,
+      "best_events": [
+        [
+          4.045935099999042,
+          7174.129171206783
+        ],
+        [
+          7.525472199999058,
+          7078.846527888956
+        ],
+        [
+          15.147789399998146,
+          6831.4860133055245
+        ],
+        [
+          18.15665579999768,
+          6809.246757759402
+        ],
+        [
+          21.351674800000183,
+          6239.438285938819
+        ],
+        [
+          24.70273769999767,
+          4807.888179918283
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 6091.971392176302,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5507.652040860191,
+      "iterations_completed": 23,
+      "raw_candidate_attempts": 2944,
+      "valid_unique_candidates": 1683,
+      "candidate_generation_seconds": 39.577416200008884,
+      "lns_seconds": 22.969762500018987,
+      "raw_generation_counter_seconds": 4.210635099909268,
+      "cheap_screen_seconds": 10.993075399994268,
+      "lns_repair_seconds": 22.77097000001595,
+      "direction_dp_seconds": 0.12730539996846346,
+      "reference_scheduler_seconds": 20.115627400009544,
+      "reference_calls": 89,
+      "search_reference_calls": 82,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.778625300001295,
+      "accepted_moves": 17,
+      "global_best_updates": 10,
+      "deadlock_count": 34,
+      "numeric_failure": 0,
+      "actual_runtime": 60.88537129999895,
+      "overshoot": 0.8853712999989511,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.125,
+      "iterations_per_second": 0.3777590496520532,
+      "unique_candidates_per_second": 27.642107850626328,
+      "reference_calls_per_second": 1.4617632790883799,
+      "candidate_generation_time_fraction": 0.6500316144086579,
+      "best_events": [
+        [
+          3.7802706000002217,
+          7174.129171206783
+        ],
+        [
+          6.1281486000007135,
+          7151.88991566066
+        ],
+        [
+          15.515605299999152,
+          6970.91097091815
+        ],
+        [
+          17.722028600001067,
+          6948.671715372027
+        ],
+        [
+          19.949272499998187,
+          6928.8696846949
+        ],
+        [
+          25.9959388999996,
+          6606.028557470769
+        ],
+        [
+          35.49372930000027,
+          6407.771279079785
+        ],
+        [
+          37.98177379999834,
+          6385.532023533662
+        ],
+        [
+          49.40376119999928,
+          6356.87392036422
+        ],
+        [
+          55.90375470000072,
+          6091.971392176302
+        ],
+        [
+          60.866985399999976,
+          5507.652040860191
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 4978.683937159665,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4978.683937159665,
+      "iterations_completed": 22,
+      "raw_candidate_attempts": 2816,
+      "valid_unique_candidates": 1631,
+      "candidate_generation_seconds": 41.30904940002074,
+      "lns_seconds": 25.252478800044628,
+      "raw_generation_counter_seconds": 3.910934300009103,
+      "cheap_screen_seconds": 10.68063470000925,
+      "lns_repair_seconds": 25.059626100020978,
+      "direction_dp_seconds": 0.12963849999505328,
+      "reference_scheduler_seconds": 19.800048399985826,
+      "reference_calls": 77,
+      "search_reference_calls": 70,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.8389217000003555,
+      "accepted_moves": 13,
+      "global_best_updates": 6,
+      "deadlock_count": 37,
+      "numeric_failure": 0,
+      "actual_runtime": 62.098766799997975,
+      "overshoot": 2.098766799997975,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.25,
+      "iterations_per_second": 0.35427434607285496,
+      "unique_candidates_per_second": 26.26461174749211,
+      "reference_calls_per_second": 1.2399602112549923,
+      "candidate_generation_time_fraction": 0.6652152937765278,
+      "best_events": [
+        [
+          3.840523299997585,
+          7174.129171206783
+        ],
+        [
+          8.686800499999663,
+          7151.88991566066
+        ],
+        [
+          13.16063849999773,
+          7129.233310321841
+        ],
+        [
+          15.807616399997642,
+          5271.210686175537
+        ],
+        [
+          18.225635200000397,
+          5109.6100134691505
+        ],
+        [
+          44.57942109999931,
+          4978.683937159665
+        ],
+        [
+          52.98869279999781,
+          4978.683937159665
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 5675.721263404344,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5675.721263404344,
+      "iterations_completed": 31,
+      "raw_candidate_attempts": 1984,
+      "valid_unique_candidates": 1229,
+      "candidate_generation_seconds": 28.851948000003176,
+      "lns_seconds": 17.0798874999673,
+      "raw_generation_counter_seconds": 2.8489629999749013,
+      "cheap_screen_seconds": 7.8323879999807104,
+      "lns_repair_seconds": 16.946042500025214,
+      "direction_dp_seconds": 0.17621309999958612,
+      "reference_scheduler_seconds": 31.218347100002575,
+      "reference_calls": 111,
+      "search_reference_calls": 104,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.9343212000021595,
+      "accepted_moves": 20,
+      "global_best_updates": 11,
+      "deadlock_count": 47,
+      "numeric_failure": 0,
+      "actual_runtime": 61.48748609999893,
+      "overshoot": 1.4874860999989323,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.140625,
+      "iterations_per_second": 0.504167627695557,
+      "unique_candidates_per_second": 19.987806917349666,
+      "reference_calls_per_second": 1.805245376587317,
+      "candidate_generation_time_fraction": 0.46923284443732816,
+      "best_events": [
+        [
+          3.935942199997953,
+          7174.129171206783
+        ],
+        [
+          5.3530465999974695,
+          7168.923935478642
+        ],
+        [
+          15.643371899997874,
+          6970.150768973896
+        ],
+        [
+          18.719060600000375,
+          6945.011975536271
+        ],
+        [
+          22.607166800000414,
+          6642.274500866185
+        ],
+        [
+          24.17239569999947,
+          6620.035245320062
+        ],
+        [
+          25.773322199998802,
+          6471.246089144678
+        ],
+        [
+          29.333207499999844,
+          6277.392087418803
+        ],
+        [
+          32.163814299998194,
+          6163.976530944047
+        ],
+        [
+          36.204657399997814,
+          5952.259724983411
+        ],
+        [
+          37.94446799999787,
+          5930.020469437288
+        ],
+        [
+          45.23925799999779,
+          5675.721263404344
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 5818.133823276741,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5818.133823276741,
+      "iterations_completed": 19,
+      "raw_candidate_attempts": 3040,
+      "valid_unique_candidates": 1726,
+      "candidate_generation_seconds": 42.16006390000621,
+      "lns_seconds": 24.713617700046598,
+      "raw_generation_counter_seconds": 4.205036199986353,
+      "cheap_screen_seconds": 11.506448400003137,
+      "lns_repair_seconds": 24.45569710001655,
+      "direction_dp_seconds": 0.12364180000440683,
+      "reference_scheduler_seconds": 17.694262400011212,
+      "reference_calls": 65,
+      "search_reference_calls": 58,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.7012230000000272,
+      "accepted_moves": 9,
+      "global_best_updates": 6,
+      "deadlock_count": 34,
+      "numeric_failure": 0,
+      "actual_runtime": 60.62514490000103,
+      "overshoot": 0.6251449000010325,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.96875,
+      "iterations_per_second": 0.3134013127942178,
+      "unique_candidates_per_second": 28.470035046464204,
+      "reference_calls_per_second": 1.0721623858749556,
+      "candidate_generation_time_fraction": 0.6954220723026344,
+      "best_events": [
+        [
+          3.702830099999119,
+          7174.129171206783
+        ],
+        [
+          6.42792449999979,
+          7151.88991566066
+        ],
+        [
+          11.672008900000947,
+          6621.889787867565
+        ],
+        [
+          19.54995340000096,
+          6599.650532321442
+        ],
+        [
+          22.55431850000241,
+          6472.678604159674
+        ],
+        [
+          35.03849600000103,
+          6438.988499418632
+        ],
+        [
+          41.78396269999939,
+          5818.133823276741
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 5154.783486092983,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5154.783486092983,
+      "iterations_completed": 17,
+      "raw_candidate_attempts": 2720,
+      "valid_unique_candidates": 1586,
+      "candidate_generation_seconds": 39.14172509999844,
+      "lns_seconds": 23.71973650000291,
+      "raw_generation_counter_seconds": 3.757045299949823,
+      "cheap_screen_seconds": 10.233867400002055,
+      "lns_repair_seconds": 23.53032710005573,
+      "direction_dp_seconds": 0.09972480000578798,
+      "reference_scheduler_seconds": 21.239077600013843,
+      "reference_calls": 59,
+      "search_reference_calls": 52,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.8960237999999663,
+      "accepted_moves": 9,
+      "global_best_updates": 6,
+      "deadlock_count": 31,
+      "numeric_failure": 0,
+      "actual_runtime": 61.06976070000019,
+      "overshoot": 1.069760700000188,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.140625,
+      "iterations_per_second": 0.27837017543774245,
+      "unique_candidates_per_second": 25.970299896721148,
+      "reference_calls_per_second": 0.9661082559309884,
+      "candidate_generation_time_fraction": 0.6409346401777912,
+      "best_events": [
+        [
+          3.897638000002189,
+          7174.129171206783
+        ],
+        [
+          9.677043700001377,
+          7151.88991566066
+        ],
+        [
+          14.740900700002385,
+          7141.415734503314
+        ],
+        [
+          20.221802200001548,
+          6953.632637269678
+        ],
+        [
+          22.568827099999908,
+          6931.393381723555
+        ],
+        [
+          25.387622300000658,
+          6343.9411105130475
+        ],
+        [
+          32.960163400002784,
+          5154.783486092983
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 6089.895767412125,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 6089.895767412125,
+      "iterations_completed": 23,
+      "raw_candidate_attempts": 2944,
+      "valid_unique_candidates": 1663,
+      "candidate_generation_seconds": 39.59215409999524,
+      "lns_seconds": 23.367270699989604,
+      "raw_generation_counter_seconds": 4.051305600023625,
+      "cheap_screen_seconds": 10.757795600009558,
+      "lns_repair_seconds": 23.178324100044847,
+      "direction_dp_seconds": 0.12835580000682967,
+      "reference_scheduler_seconds": 20.839534900009312,
+      "reference_calls": 83,
+      "search_reference_calls": 76,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.8033303000011074,
+      "accepted_moves": 14,
+      "global_best_updates": 10,
+      "deadlock_count": 37,
+      "numeric_failure": 0,
+      "actual_runtime": 61.458786399998644,
+      "overshoot": 1.458786399998644,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.390625,
+      "iterations_per_second": 0.3742345293040233,
+      "unique_candidates_per_second": 27.058783575330033,
+      "reference_calls_per_second": 1.3504985187927796,
+      "candidate_generation_time_fraction": 0.6442065719019163,
+      "best_events": [
+        [
+          3.8049356999981683,
+          7174.129171206783
+        ],
+        [
+          6.087100599997939,
+          7078.846527888956
+        ],
+        [
+          12.355002199998125,
+          6831.4860133055245
+        ],
+        [
+          14.674524199999723,
+          6809.246757759402
+        ],
+        [
+          16.974456699997972,
+          6749.43184862468
+        ],
+        [
+          22.41663609999887,
+          6606.028557470769
+        ],
+        [
+          26.616201099997852,
+          6567.558158279933
+        ],
+        [
+          31.387125999997807,
+          6279.065588869559
+        ],
+        [
+          33.65695109999797,
+          6256.826333323436
+        ],
+        [
+          36.21247779999976,
+          6223.968569437404
+        ],
+        [
+          41.15910029999941,
+          6089.895767412125
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 5818.133823276741,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5818.133823276741,
+      "iterations_completed": 17,
+      "raw_candidate_attempts": 3264,
+      "valid_unique_candidates": 1829,
+      "candidate_generation_seconds": 44.86876260000645,
+      "lns_seconds": 26.396476000052644,
+      "raw_generation_counter_seconds": 4.473018899985618,
+      "cheap_screen_seconds": 12.213046899989422,
+      "lns_repair_seconds": 26.116817799964338,
+      "direction_dp_seconds": 0.11005349998231395,
+      "reference_scheduler_seconds": 16.124403700003313,
+      "reference_calls": 59,
+      "search_reference_calls": 52,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.913696899999195,
+      "accepted_moves": 8,
+      "global_best_updates": 6,
+      "deadlock_count": 31,
+      "numeric_failure": 0,
+      "actual_runtime": 61.67420560000028,
+      "overshoot": 1.6742056000002776,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.25,
+      "iterations_per_second": 0.2756419776244337,
+      "unique_candidates_per_second": 29.655833945593486,
+      "reference_calls_per_second": 0.956639804696564,
+      "candidate_generation_time_fraction": 0.7275126150957062,
+      "best_events": [
+        [
+          3.915459199997713,
+          7174.129171206783
+        ],
+        [
+          7.044159599998238,
+          7151.88991566066
+        ],
+        [
+          13.001548899999761,
+          6621.889787867565
+        ],
+        [
+          21.625195199998416,
+          6599.650532321442
+        ],
+        [
+          24.865289999997913,
+          6472.678604159674
+        ],
+        [
+          38.621593399999256,
+          6438.988499418632
+        ],
+        [
+          46.45370049999838,
+          5818.133823276741
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 4680.666679152735,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 4636.321483270359,
+      "iterations_completed": 16,
+      "raw_candidate_attempts": 3072,
+      "valid_unique_candidates": 1799,
+      "candidate_generation_seconds": 44.76294920000146,
+      "lns_seconds": 26.71847380005056,
+      "raw_generation_counter_seconds": 4.323820599987812,
+      "cheap_screen_seconds": 12.039462699998694,
+      "lns_repair_seconds": 26.493590200010658,
+      "direction_dp_seconds": 0.09907569998540566,
+      "reference_scheduler_seconds": 15.844858299991756,
+      "reference_calls": 61,
+      "search_reference_calls": 54,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.959910999998101,
+      "accepted_moves": 11,
+      "global_best_updates": 9,
+      "deadlock_count": 27,
+      "numeric_failure": 0,
+      "actual_runtime": 61.446076000000176,
+      "overshoot": 1.4460760000001756,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.265625,
+      "iterations_per_second": 0.2603909157681599,
+      "unique_candidates_per_second": 29.277703591682485,
+      "reference_calls_per_second": 0.9927403663661097,
+      "candidate_generation_time_fraction": 0.7284915834170002,
+      "best_events": [
+        [
+          3.9622668999982125,
+          7174.129171206783
+        ],
+        [
+          10.831951299998764,
+          7151.88991566066
+        ],
+        [
+          16.45211779999954,
+          7119.9785827158985
+        ],
+        [
+          23.48110799999995,
+          6831.4860133055245
+        ],
+        [
+          26.399416299998848,
+          6809.246757759402
+        ],
+        [
+          29.740472800000134,
+          6232.284519780604
+        ],
+        [
+          32.95989109999937,
+          4822.711447815045
+        ],
+        [
+          44.608180499999435,
+          4702.905934698857
+        ],
+        [
+          57.46891569999934,
+          4680.666679152735
+        ],
+        [
+          61.42454739999812,
+          4636.321483270359
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 6256.826333323436,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 6256.826333323436,
+      "iterations_completed": 18,
+      "raw_candidate_attempts": 2880,
+      "valid_unique_candidates": 1540,
+      "candidate_generation_seconds": 38.12710240000524,
+      "lns_seconds": 22.406809499985684,
+      "raw_generation_counter_seconds": 4.006619199997658,
+      "cheap_screen_seconds": 10.361721899993427,
+      "lns_repair_seconds": 22.213612799994735,
+      "direction_dp_seconds": 0.0977967000217177,
+      "reference_scheduler_seconds": 21.332121700001153,
+      "reference_calls": 67,
+      "search_reference_calls": 60,
+      "init_reference_calls": 7,
+      "initialization_seconds": 3.8266686999995727,
+      "accepted_moves": 11,
+      "global_best_updates": 8,
+      "deadlock_count": 30,
+      "numeric_failure": 0,
+      "actual_runtime": 60.30069939999885,
+      "overshoot": 0.3006993999988481,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.015625,
+      "iterations_per_second": 0.298504000436193,
+      "unique_candidates_per_second": 25.53867559287429,
+      "reference_calls_per_second": 1.1110982238458296,
+      "candidate_generation_time_fraction": 0.6322829217467745,
+      "best_events": [
+        [
+          3.8288137999988976,
+          7174.129171206783
+        ],
+        [
+          6.775097300000198,
+          7078.846527888956
+        ],
+        [
+          14.126238200002263,
+          6831.4860133055245
+        ],
+        [
+          16.85574110000016,
+          6809.246757759402
+        ],
+        [
+          19.56930360000115,
+          6749.43184862468
+        ],
+        [
+          25.707025100000465,
+          6606.028557470769
+        ],
+        [
+          31.790962999999465,
+          6567.558158279933
+        ],
+        [
+          37.59033930000078,
+          6279.065588869559
+        ],
+        [
+          40.39570509999976,
+          6256.826333323436
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_1419626827::g29_w055",
+      "case": "I6",
+      "tier": "MEDIUM",
+      "N": 55,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 6433.677751938751,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 6433.677751938751,
+      "iterations_completed": 28,
+      "raw_candidate_attempts": 1792,
+      "valid_unique_candidates": 1084,
+      "candidate_generation_seconds": 29.871426000012434,
+      "lns_seconds": 19.253640600036306,
+      "raw_generation_counter_seconds": 2.5541764999397856,
+      "cheap_screen_seconds": 7.113068900001963,
+      "lns_repair_seconds": 19.12450760005231,
+      "direction_dp_seconds": 0.15570220001973212,
+      "reference_scheduler_seconds": 29.71032559999003,
+      "reference_calls": 97,
+      "search_reference_calls": 90,
+      "init_reference_calls": 7,
+      "initialization_seconds": 4.088469199999963,
+      "accepted_moves": 17,
+      "global_best_updates": 7,
+      "deadlock_count": 45,
+      "numeric_failure": 0,
+      "actual_runtime": 60.72389889999977,
+      "overshoot": 0.7238988999997673,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.59375,
+      "iterations_per_second": 0.4611034618529758,
+      "unique_candidates_per_second": 17.851291166022346,
+      "reference_calls_per_second": 1.5973941357049517,
+      "candidate_generation_time_fraction": 0.49192206925324006,
+      "best_events": [
+        [
+          4.0909107999978005,
+          7174.129171206783
+        ],
+        [
+          5.612881400000333,
+          7151.88991566066
+        ],
+        [
+          12.469367399997282,
+          6970.91097091815
+        ],
+        [
+          13.911931899998308,
+          6948.671715372027
+        ],
+        [
+          15.265176299999439,
+          6928.8696846949
+        ],
+        [
+          18.85916189999989,
+          6606.028557470769
+        ],
+        [
+          32.67790989999776,
+          6455.9170074848735
+        ],
+        [
+          34.14214979999815,
+          6433.677751938751
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 7612.662891972904,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7612.662891972904,
+      "iterations_completed": 11,
+      "raw_candidate_attempts": 1408,
+      "valid_unique_candidates": 832,
+      "candidate_generation_seconds": 30.79985090000264,
+      "lns_seconds": 19.522138100008306,
+      "raw_generation_counter_seconds": 2.7036583999833965,
+      "cheap_screen_seconds": 7.539966300002561,
+      "lns_repair_seconds": 19.38380160001907,
+      "direction_dp_seconds": 0.09453799999027979,
+      "reference_scheduler_seconds": 30.77785099999528,
+      "reference_calls": 38,
+      "search_reference_calls": 30,
+      "init_reference_calls": 8,
+      "initialization_seconds": 6.1139729999995325,
+      "accepted_moves": 4,
+      "global_best_updates": 4,
+      "deadlock_count": 25,
+      "numeric_failure": 0,
+      "actual_runtime": 62.3815016999979,
+      "overshoot": 2.381501699997898,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.171875,
+      "iterations_per_second": 0.17633432508407168,
+      "unique_candidates_per_second": 13.337287133631603,
+      "reference_calls_per_second": 0.6091549411995204,
+      "candidate_generation_time_fraction": 0.4937337201038185,
+      "best_events": [
+        [
+          6.11572139999771,
+          9810.207603702162
+        ],
+        [
+          10.269833799997286,
+          7687.11352572669
+        ],
+        [
+          17.647746699996787,
+          7670.842188023751
+        ],
+        [
+          28.619817899998452,
+          7631.210915989386
+        ],
+        [
+          40.409593999997014,
+          7612.662891972904
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 7320.910352315082,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7320.910352315082,
+      "iterations_completed": 14,
+      "raw_candidate_attempts": 896,
+      "valid_unique_candidates": 581,
+      "candidate_generation_seconds": 21.80378140000539,
+      "lns_seconds": 13.861573500031227,
+      "raw_generation_counter_seconds": 1.8056265000268468,
+      "cheap_screen_seconds": 5.315084399993793,
+      "lns_repair_seconds": 13.771324800000002,
+      "direction_dp_seconds": 0.13562149999052053,
+      "reference_scheduler_seconds": 40.15797719999682,
+      "reference_calls": 54,
+      "search_reference_calls": 46,
+      "init_reference_calls": 8,
+      "initialization_seconds": 6.078590599998279,
+      "accepted_moves": 8,
+      "global_best_updates": 5,
+      "deadlock_count": 24,
+      "numeric_failure": 0,
+      "actual_runtime": 63.57419989999835,
+      "overshoot": 3.574199899998348,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.390625,
+      "iterations_per_second": 0.22021511905807506,
+      "unique_candidates_per_second": 9.138927440910114,
+      "reference_calls_per_second": 0.8494011735097181,
+      "candidate_generation_time_fraction": 0.34296587977988785,
+      "best_events": [
+        [
+          6.0803210999984,
+          9810.207603702162
+        ],
+        [
+          14.846630000000005,
+          8948.669874269146
+        ],
+        [
+          20.231358799999725,
+          8359.270943303914
+        ],
+        [
+          26.70319810000001,
+          8321.633137301224
+        ],
+        [
+          40.04488219999985,
+          7438.4632505577465
+        ],
+        [
+          42.52250709999862,
+          7320.910352315082
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 7224.285789983662,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7224.285789983662,
+      "iterations_completed": 10,
+      "raw_candidate_attempts": 1600,
+      "valid_unique_candidates": 897,
+      "candidate_generation_seconds": 33.10327210000469,
+      "lns_seconds": 21.206978100035485,
+      "raw_generation_counter_seconds": 2.990949700011697,
+      "cheap_screen_seconds": 7.883392699990509,
+      "lns_repair_seconds": 21.071101500001532,
+      "direction_dp_seconds": 0.08063540000875946,
+      "reference_scheduler_seconds": 27.687237500002084,
+      "reference_calls": 38,
+      "search_reference_calls": 30,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.25175599999784,
+      "accepted_moves": 5,
+      "global_best_updates": 4,
+      "deadlock_count": 22,
+      "numeric_failure": 0,
+      "actual_runtime": 61.68710949999877,
+      "overshoot": 1.687109499998769,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.34375,
+      "iterations_per_second": 0.16210842234389666,
+      "unique_candidates_per_second": 14.54112548424753,
+      "reference_calls_per_second": 0.6160120049068073,
+      "candidate_generation_time_fraction": 0.5366319214552491,
+      "best_events": [
+        [
+          5.253505299999233,
+          9810.207603702162
+        ],
+        [
+          9.531914099999995,
+          9692.654705459498
+        ],
+        [
+          17.78266430000076,
+          7424.379961666902
+        ],
+        [
+          33.598091699997894,
+          7263.3226384786885
+        ],
+        [
+          54.11751770000046,
+          7224.285789983662
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 7611.871979163444,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7611.871979163444,
+      "iterations_completed": 9,
+      "raw_candidate_attempts": 1440,
+      "valid_unique_candidates": 836,
+      "candidate_generation_seconds": 31.905282200004876,
+      "lns_seconds": 20.28675339997426,
+      "raw_generation_counter_seconds": 2.7592865000151505,
+      "cheap_screen_seconds": 7.781099499999982,
+      "lns_repair_seconds": 20.14715609997802,
+      "direction_dp_seconds": 0.10629149999658694,
+      "reference_scheduler_seconds": 27.822250200006238,
+      "reference_calls": 34,
+      "search_reference_calls": 26,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.577913400000398,
+      "accepted_moves": 4,
+      "global_best_updates": 4,
+      "deadlock_count": 21,
+      "numeric_failure": 0,
+      "actual_runtime": 60.564785999999,
+      "overshoot": 0.5647859999990033,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.96875,
+      "iterations_per_second": 0.14860120202521887,
+      "unique_candidates_per_second": 13.803400543675886,
+      "reference_calls_per_second": 0.561382318761938,
+      "candidate_generation_time_fraction": 0.5267959206527272,
+      "best_events": [
+        [
+          5.580103600001166,
+          9810.207603702162
+        ],
+        [
+          9.600772300000244,
+          7687.11352572669
+        ],
+        [
+          17.886770799999795,
+          7670.842188023751
+        ],
+        [
+          31.31841809999969,
+          7631.210915989386
+        ],
+        [
+          45.010606600000756,
+          7611.871979163444
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 6630.805604678049,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 6630.805604678049,
+      "iterations_completed": 13,
+      "raw_candidate_attempts": 1664,
+      "valid_unique_candidates": 1004,
+      "candidate_generation_seconds": 38.04563740001322,
+      "lns_seconds": 23.55512760008787,
+      "raw_generation_counter_seconds": 3.3132739999964542,
+      "cheap_screen_seconds": 9.76868060000561,
+      "lns_repair_seconds": 23.376507299995865,
+      "direction_dp_seconds": 0.11654029997225734,
+      "reference_scheduler_seconds": 23.76727429998573,
+      "reference_calls": 46,
+      "search_reference_calls": 38,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.707770299999538,
+      "accepted_moves": 6,
+      "global_best_updates": 5,
+      "deadlock_count": 27,
+      "numeric_failure": 0,
+      "actual_runtime": 62.86681859999953,
+      "overshoot": 2.866818599999533,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.15625,
+      "iterations_per_second": 0.20678635072524723,
+      "unique_candidates_per_second": 15.970268932934479,
+      "reference_calls_per_second": 0.7317055487201056,
+      "candidate_generation_time_fraction": 0.6051783476126705,
+      "best_events": [
+        [
+          5.711608100002195,
+          9810.207603702162
+        ],
+        [
+          9.597534100001212,
+          9737.428203058025
+        ],
+        [
+          12.797896600000968,
+          8668.8695524345
+        ],
+        [
+          16.148222499999974,
+          8541.524643234343
+        ],
+        [
+          19.432271600002423,
+          8502.487794739318
+        ],
+        [
+          30.617336200000864,
+          6630.805604678049
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 7263.3226384786885,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7224.285789983662,
+      "iterations_completed": 9,
+      "raw_candidate_attempts": 1728,
+      "valid_unique_candidates": 961,
+      "candidate_generation_seconds": 36.17627359999824,
+      "lns_seconds": 23.046224599991547,
+      "raw_generation_counter_seconds": 3.4378023000317626,
+      "cheap_screen_seconds": 8.585100500004046,
+      "lns_repair_seconds": 22.894502700000885,
+      "direction_dp_seconds": 0.07449520001682686,
+      "reference_scheduler_seconds": 24.89187159998619,
+      "reference_calls": 34,
+      "search_reference_calls": 26,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.716720100001112,
+      "accepted_moves": 4,
+      "global_best_updates": 4,
+      "deadlock_count": 21,
+      "numeric_failure": 0,
+      "actual_runtime": 61.78982099999848,
+      "overshoot": 1.7898209999984829,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.8125,
+      "iterations_per_second": 0.1456550586220378,
+      "unique_candidates_per_second": 15.552723481753144,
+      "reference_calls_per_second": 0.5502524436832539,
+      "candidate_generation_time_fraction": 0.5854730279927357,
+      "best_events": [
+        [
+          5.718458100000134,
+          9810.207603702162
+        ],
+        [
+          10.381050099997083,
+          9692.654705459498
+        ],
+        [
+          19.179853799996636,
+          7424.379961666902
+        ],
+        [
+          38.19731150000007,
+          7263.3226384786885
+        ],
+        [
+          61.75213769999755,
+          7224.285789983662
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 7611.871979163444,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7611.871979163444,
+      "iterations_completed": 8,
+      "raw_candidate_attempts": 1536,
+      "valid_unique_candidates": 893,
+      "candidate_generation_seconds": 34.286564300000464,
+      "lns_seconds": 21.6068242000365,
+      "raw_generation_counter_seconds": 3.0219513000483857,
+      "cheap_screen_seconds": 8.455387100002554,
+      "lns_repair_seconds": 21.454823999905784,
+      "direction_dp_seconds": 0.07078979999641888,
+      "reference_scheduler_seconds": 25.69933490001131,
+      "reference_calls": 32,
+      "search_reference_calls": 24,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.372610500002338,
+      "accepted_moves": 4,
+      "global_best_updates": 4,
+      "deadlock_count": 19,
+      "numeric_failure": 0,
+      "actual_runtime": 60.85967190000156,
+      "overshoot": 0.8596719000015582,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.53125,
+      "iterations_per_second": 0.1314499363904687,
+      "unique_candidates_per_second": 14.673099149586069,
+      "reference_calls_per_second": 0.5257997455618748,
+      "candidate_generation_time_fraction": 0.563370837035347,
+      "best_events": [
+        [
+          5.374395000002551,
+          9810.207603702162
+        ],
+        [
+          10.080216800000926,
+          7687.11352572669
+        ],
+        [
+          19.440645000002405,
+          7670.842188023751
+        ],
+        [
+          34.05270060000112,
+          7631.210915989386
+        ],
+        [
+          48.69857430000047,
+          7611.871979163444
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 6630.805604678049,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 6630.805604678049,
+      "iterations_completed": 11,
+      "raw_candidate_attempts": 1760,
+      "valid_unique_candidates": 1050,
+      "candidate_generation_seconds": 38.61467400000038,
+      "lns_seconds": 23.579139199937345,
+      "raw_generation_counter_seconds": 3.471658100006607,
+      "cheap_screen_seconds": 10.036656099993706,
+      "lns_repair_seconds": 23.39849539997158,
+      "direction_dp_seconds": 0.10408520000783028,
+      "reference_scheduler_seconds": 20.92676960001336,
+      "reference_calls": 42,
+      "search_reference_calls": 34,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.838882200001535,
+      "accepted_moves": 6,
+      "global_best_updates": 5,
+      "deadlock_count": 23,
+      "numeric_failure": 0,
+      "actual_runtime": 60.575371999999334,
+      "overshoot": 0.5753719999993336,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.09375,
+      "iterations_per_second": 0.18159195126362776,
+      "unique_candidates_per_second": 17.333777166073556,
+      "reference_calls_per_second": 0.6933510866429423,
+      "candidate_generation_time_fraction": 0.6374649090062675,
+      "best_events": [
+        [
+          5.840956399999413,
+          9810.207603702162
+        ],
+        [
+          10.110224399999424,
+          9737.428203058025
+        ],
+        [
+          14.002008499999647,
+          8668.8695524345
+        ],
+        [
+          17.955325499999162,
+          8541.524643234343
+        ],
+        [
+          22.249486500000785,
+          8502.487794739318
+        ],
+        [
+          34.23853919999965,
+          6630.805604678049
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 7656.840507901354,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7656.840507901354,
+      "iterations_completed": 17,
+      "raw_candidate_attempts": 1088,
+      "valid_unique_candidates": 608,
+      "candidate_generation_seconds": 22.98097589999452,
+      "lns_seconds": 14.168216599995503,
+      "raw_generation_counter_seconds": 2.1253839999808406,
+      "cheap_screen_seconds": 5.821377999996912,
+      "lns_repair_seconds": 14.04630410003665,
+      "direction_dp_seconds": 0.14605050001773634,
+      "reference_scheduler_seconds": 37.217707999989216,
+      "reference_calls": 60,
+      "search_reference_calls": 52,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.840389699998923,
+      "accepted_moves": 8,
+      "global_best_updates": 5,
+      "deadlock_count": 32,
+      "numeric_failure": 0,
+      "actual_runtime": 61.509299099998316,
+      "overshoot": 1.5092990999983158,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 59.40625,
+      "iterations_per_second": 0.2763809740761696,
+      "unique_candidates_per_second": 9.884684249312421,
+      "reference_calls_per_second": 0.9754622614453047,
+      "candidate_generation_time_fraction": 0.373617912027145,
+      "best_events": [
+        [
+          5.842256500000076,
+          9810.207603702162
+        ],
+        [
+          7.7310144000002765,
+          9692.654705459498
+        ],
+        [
+          9.855591399998957,
+          9653.617856964473
+        ],
+        [
+          14.922639299998991,
+          7749.931211712822
+        ],
+        [
+          17.921261499999673,
+          7656.840507901354
+        ],
+        [
+          31.1381865000003,
+          7656.840507901354
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 8393.289456189288,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 8393.289456189288,
+      "iterations_completed": 14,
+      "raw_candidate_attempts": 896,
+      "valid_unique_candidates": 561,
+      "candidate_generation_seconds": 21.741515299985622,
+      "lns_seconds": 13.762369899981422,
+      "raw_generation_counter_seconds": 1.7302664000235382,
+      "cheap_screen_seconds": 5.432488100002956,
+      "lns_repair_seconds": 13.65955580001173,
+      "direction_dp_seconds": 0.12973829999828013,
+      "reference_scheduler_seconds": 39.30170630000066,
+      "reference_calls": 54,
+      "search_reference_calls": 46,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.345820700000331,
+      "accepted_moves": 8,
+      "global_best_updates": 6,
+      "deadlock_count": 24,
+      "numeric_failure": 0,
+      "actual_runtime": 62.56538619999992,
+      "overshoot": 2.565386199999921,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.71875,
+      "iterations_per_second": 0.22376590076894654,
+      "unique_candidates_per_second": 8.966619309384216,
+      "reference_calls_per_second": 0.8630970458230796,
+      "candidate_generation_time_fraction": 0.347500696798794,
+      "best_events": [
+        [
+          5.347590900000796,
+          9810.207603702162
+        ],
+        [
+          7.035284099998535,
+          8774.939506777777
+        ],
+        [
+          10.03256440000041,
+          8657.386608535113
+        ],
+        [
+          12.473208399998839,
+          8619.091649837479
+        ],
+        [
+          14.950271699999576,
+          8513.907196477445
+        ],
+        [
+          21.7888157999987,
+          8426.686970665665
+        ],
+        [
+          51.7469314000009,
+          8393.289456189288
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 5945.261354850438,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5945.261354850438,
+      "iterations_completed": 10,
+      "raw_candidate_attempts": 1920,
+      "valid_unique_candidates": 1094,
+      "candidate_generation_seconds": 41.15479150000829,
+      "lns_seconds": 25.70536199997514,
+      "raw_generation_counter_seconds": 3.7328037000770564,
+      "cheap_screen_seconds": 10.252720300009969,
+      "lns_repair_seconds": 25.493190999954095,
+      "direction_dp_seconds": 0.09153580000929651,
+      "reference_scheduler_seconds": 20.253157699986332,
+      "reference_calls": 38,
+      "search_reference_calls": 30,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.512072999998054,
+      "accepted_moves": 5,
+      "global_best_updates": 5,
+      "deadlock_count": 20,
+      "numeric_failure": 0,
+      "actual_runtime": 62.36435639999763,
+      "overshoot": 2.3643563999976323,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.359375,
+      "iterations_per_second": 0.160348002885834,
+      "unique_candidates_per_second": 17.542071515710237,
+      "reference_calls_per_second": 0.6093224109661691,
+      "candidate_generation_time_fraction": 0.6599088626209225,
+      "best_events": [
+        [
+          5.513840199997503,
+          9810.207603702162
+        ],
+        [
+          10.259106299999985,
+          9737.428203058025
+        ],
+        [
+          18.672257999998692,
+          7428.200132828394
+        ],
+        [
+          24.25663319999876,
+          7314.205865868657
+        ],
+        [
+          31.11267719999887,
+          6074.641664490964
+        ],
+        [
+          42.98096959999748,
+          5945.261354850438
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0194123089::g43_w085",
+      "case": "I9",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 7743.687087327125,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 7743.687087327125,
+      "iterations_completed": 14,
+      "raw_candidate_attempts": 1792,
+      "valid_unique_candidates": 1017,
+      "candidate_generation_seconds": 38.42623749998893,
+      "lns_seconds": 24.355332600061956,
+      "raw_generation_counter_seconds": 3.3466483999218326,
+      "cheap_screen_seconds": 9.390017499998066,
+      "lns_repair_seconds": 24.160647300031997,
+      "direction_dp_seconds": 0.13267669998458587,
+      "reference_scheduler_seconds": 22.070281400017848,
+      "reference_calls": 46,
+      "search_reference_calls": 38,
+      "init_reference_calls": 8,
+      "initialization_seconds": 5.2402048999974795,
+      "accepted_moves": 5,
+      "global_best_updates": 4,
+      "deadlock_count": 29,
+      "numeric_failure": 0,
+      "actual_runtime": 61.40910149999763,
+      "overshoot": 1.4091014999976323,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 60.3125,
+      "iterations_per_second": 0.22797923529300523,
+      "unique_candidates_per_second": 16.561063020927595,
+      "reference_calls_per_second": 0.7490746302484457,
+      "candidate_generation_time_fraction": 0.6257417314596341,
+      "best_events": [
+        [
+          5.241963799999212,
+          9810.207603702162
+        ],
+        [
+          8.795575899999676,
+          7974.294668932931
+        ],
+        [
+          13.57967689999714,
+          7935.257820437904
+        ],
+        [
+          17.091881999996986,
+          7866.024473388524
+        ],
+        [
+          43.45049929999732,
+          7743.687087327125
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 6,
+      "raw_candidate_attempts": 960,
+      "valid_unique_candidates": 632,
+      "candidate_generation_seconds": 57.81941359999473,
+      "lns_seconds": 49.474166700030764,
+      "raw_generation_counter_seconds": 1.7514979999759817,
+      "cheap_screen_seconds": 5.746347600001172,
+      "lns_repair_seconds": 49.375422800054366,
+      "direction_dp_seconds": 0.05927080001856666,
+      "reference_scheduler_seconds": 8.517199599995365,
+      "reference_calls": 17,
+      "search_reference_calls": 12,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.3930990000008023,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 16,
+      "numeric_failure": 0,
+      "actual_runtime": 66.58862980000049,
+      "overshoot": 6.58862980000049,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 65.390625,
+      "iterations_per_second": 0.09010547323200749,
+      "unique_candidates_per_second": 9.491109847104788,
+      "reference_calls_per_second": 0.2552988408240212,
+      "candidate_generation_time_fraction": 0.8683076040707824,
+      "best_events": [
+        [
+          3.395214500000293,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 7,
+      "raw_candidate_attempts": 896,
+      "valid_unique_candidates": 620,
+      "candidate_generation_seconds": 55.172985100001824,
+      "lns_seconds": 46.92876790005539,
+      "raw_generation_counter_seconds": 1.6890544000198133,
+      "cheap_screen_seconds": 5.673981499996444,
+      "lns_repair_seconds": 46.83890119996431,
+      "direction_dp_seconds": 0.06769899998107576,
+      "reference_scheduler_seconds": 11.640708099999756,
+      "reference_calls": 19,
+      "search_reference_calls": 14,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.535339900001418,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 18,
+      "numeric_failure": 0,
+      "actual_runtime": 67.07979049999994,
+      "overshoot": 7.079790499999945,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 64.71875,
+      "iterations_per_second": 0.1043533372394776,
+      "unique_candidates_per_second": 9.242724155496587,
+      "reference_calls_per_second": 0.28324477250715346,
+      "candidate_generation_time_fraction": 0.8224978743784519,
+      "best_events": [
+        [
+          3.5371687000006204,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 5,
+      "raw_candidate_attempts": 960,
+      "valid_unique_candidates": 619,
+      "candidate_generation_seconds": 56.41674769999736,
+      "lns_seconds": 48.12459639998269,
+      "raw_generation_counter_seconds": 1.748124599984294,
+      "cheap_screen_seconds": 5.7217633000000205,
+      "lns_repair_seconds": 48.02838230000998,
+      "direction_dp_seconds": 0.04771259998597088,
+      "reference_scheduler_seconds": 7.918324700007361,
+      "reference_calls": 15,
+      "search_reference_calls": 10,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.3029664999994566,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 14,
+      "numeric_failure": 0,
+      "actual_runtime": 64.5717482,
+      "overshoot": 4.571748200000002,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 63.21875,
+      "iterations_per_second": 0.0774332450240212,
+      "unique_candidates_per_second": 9.586235733973824,
+      "reference_calls_per_second": 0.2322997350720636,
+      "candidate_generation_time_fraction": 0.873706369622456,
+      "best_events": [
+        [
+          3.3047879000005196,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 5,
+      "raw_candidate_attempts": 960,
+      "valid_unique_candidates": 646,
+      "candidate_generation_seconds": 56.16286349999791,
+      "lns_seconds": 47.86575229999653,
+      "raw_generation_counter_seconds": 1.7213738000755257,
+      "cheap_screen_seconds": 5.700558999997156,
+      "lns_repair_seconds": 47.77496489994519,
+      "direction_dp_seconds": 0.0500830999808386,
+      "reference_scheduler_seconds": 7.833119300001272,
+      "reference_calls": 15,
+      "search_reference_calls": 10,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.372496299998602,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 14,
+      "numeric_failure": 0,
+      "actual_runtime": 64.25518419999935,
+      "overshoot": 4.2551841999993485,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 63.40625,
+      "iterations_per_second": 0.07781473296282373,
+      "unique_candidates_per_second": 10.053663498796826,
+      "reference_calls_per_second": 0.2334441988884712,
+      "candidate_generation_time_fraction": 0.8740596451359715,
+      "best_events": [
+        [
+          3.3743179999983113,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 5331.614365159387,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5331.614365159387,
+      "iterations_completed": 13,
+      "raw_candidate_attempts": 832,
+      "valid_unique_candidates": 604,
+      "candidate_generation_seconds": 45.258640899992315,
+      "lns_seconds": 37.272587300009036,
+      "raw_generation_counter_seconds": 1.5661666999694717,
+      "cheap_screen_seconds": 5.531015700002172,
+      "lns_repair_seconds": 37.18016150001131,
+      "direction_dp_seconds": 0.1271718999814766,
+      "reference_scheduler_seconds": 17.215275600006862,
+      "reference_calls": 33,
+      "search_reference_calls": 28,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.353365799997846,
+      "accepted_moves": 1,
+      "global_best_updates": 1,
+      "deadlock_count": 29,
+      "numeric_failure": 0,
+      "actual_runtime": 63.00337360000049,
+      "overshoot": 3.0033736000004865,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 61.34375,
+      "iterations_per_second": 0.20633815710465225,
+      "unique_candidates_per_second": 9.586788222400767,
+      "reference_calls_per_second": 0.5237814757271941,
+      "candidate_generation_time_fraction": 0.7183526581819734,
+      "best_events": [
+        [
+          3.3559381999984907,
+          5427.661043593272
+        ],
+        [
+          38.76901970000108,
+          5331.614365159387
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 6,
+      "raw_candidate_attempts": 960,
+      "valid_unique_candidates": 657,
+      "candidate_generation_seconds": 58.227255399997375,
+      "lns_seconds": 49.48485470009473,
+      "raw_generation_counter_seconds": 1.7832336000392388,
+      "cheap_screen_seconds": 6.027330999997503,
+      "lns_repair_seconds": 49.386089499988884,
+      "direction_dp_seconds": 0.05770259999189875,
+      "reference_scheduler_seconds": 9.959512699988409,
+      "reference_calls": 17,
+      "search_reference_calls": 12,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.3379238999987138,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 16,
+      "numeric_failure": 0,
+      "actual_runtime": 68.44105879999915,
+      "overshoot": 8.441058799999155,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 66.046875,
+      "iterations_per_second": 0.08766667414560912,
+      "unique_candidates_per_second": 9.5995008189442,
+      "reference_calls_per_second": 0.24838891007922587,
+      "candidate_generation_time_fraction": 0.8507649709241215,
+      "best_events": [
+        [
+          3.3397480999992695,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 5331.614365159387,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5331.614365159387,
+      "iterations_completed": 12,
+      "raw_candidate_attempts": 768,
+      "valid_unique_candidates": 554,
+      "candidate_generation_seconds": 46.59707499999422,
+      "lns_seconds": 39.38041140000496,
+      "raw_generation_counter_seconds": 1.4345639000130177,
+      "cheap_screen_seconds": 4.992859399997542,
+      "lns_repair_seconds": 39.28961159998289,
+      "direction_dp_seconds": 0.11735299998326809,
+      "reference_scheduler_seconds": 17.610777300018526,
+      "reference_calls": 31,
+      "search_reference_calls": 26,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.442126499998267,
+      "accepted_moves": 1,
+      "global_best_updates": 1,
+      "deadlock_count": 27,
+      "numeric_failure": 0,
+      "actual_runtime": 64.72800740000093,
+      "overshoot": 4.728007400000934,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 64.171875,
+      "iterations_per_second": 0.18539115418528745,
+      "unique_candidates_per_second": 8.55889161822077,
+      "reference_calls_per_second": 0.47892714831199257,
+      "candidate_generation_time_fraction": 0.7198904596589443,
+      "best_events": [
+        [
+          3.44429239999954,
+          5427.661043593272
+        ],
+        [
+          43.23902449999878,
+          5331.614365159387
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5331.614365159387,
+      "iterations_completed": 7,
+      "raw_candidate_attempts": 896,
+      "valid_unique_candidates": 612,
+      "candidate_generation_seconds": 53.74148810000406,
+      "lns_seconds": 45.89579139997295,
+      "raw_generation_counter_seconds": 1.6295003999912296,
+      "cheap_screen_seconds": 5.406688600000052,
+      "lns_repair_seconds": 45.804257599993434,
+      "direction_dp_seconds": 0.06676680000600754,
+      "reference_scheduler_seconds": 10.794017099993653,
+      "reference_calls": 21,
+      "search_reference_calls": 16,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.3417832999984967,
+      "accepted_moves": 1,
+      "global_best_updates": 1,
+      "deadlock_count": 17,
+      "numeric_failure": 0,
+      "actual_runtime": 64.98036059999868,
+      "overshoot": 4.980360599998676,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 63.671875,
+      "iterations_per_second": 0.10772485617754701,
+      "unique_candidates_per_second": 9.418230282951253,
+      "reference_calls_per_second": 0.32317456853264104,
+      "candidate_generation_time_fraction": 0.827042010905756,
+      "best_events": [
+        [
+          3.344140699999116,
+          5427.661043593272
+        ],
+        [
+          64.92001229999732,
+          5331.614365159387
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 192,
+      "M_atomic": 144,
+      "M_lns": 48,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 5,
+      "raw_candidate_attempts": 960,
+      "valid_unique_candidates": 657,
+      "candidate_generation_seconds": 57.80566610000096,
+      "lns_seconds": 49.20252110001093,
+      "raw_generation_counter_seconds": 1.7790375999793469,
+      "cheap_screen_seconds": 5.911361599999509,
+      "lns_repair_seconds": 49.10751120000714,
+      "direction_dp_seconds": 0.052892399984557414,
+      "reference_scheduler_seconds": 8.218098199999076,
+      "reference_calls": 15,
+      "search_reference_calls": 10,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.356359599998541,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 14,
+      "numeric_failure": 0,
+      "actual_runtime": 66.27611809999871,
+      "overshoot": 6.276118099998712,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 64.546875,
+      "iterations_per_second": 0.07544195621801358,
+      "unique_candidates_per_second": 9.913073047046984,
+      "reference_calls_per_second": 0.22632586865404072,
+      "candidate_generation_time_fraction": 0.8721945062138768,
+      "best_events": [
+        [
+          3.3582891000005475,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 128,
+      "M_atomic": 96,
+      "M_lns": 32,
+      "seed": 20261112,
+      "cpu_affinity_mask": 4,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 7,
+      "raw_candidate_attempts": 896,
+      "valid_unique_candidates": 601,
+      "candidate_generation_seconds": 54.34365070000058,
+      "lns_seconds": 46.412816200016096,
+      "raw_generation_counter_seconds": 1.6296501000215358,
+      "cheap_screen_seconds": 5.489673399995809,
+      "lns_repair_seconds": 46.31697769997845,
+      "direction_dp_seconds": 0.06888170000456739,
+      "reference_scheduler_seconds": 12.55879919999279,
+      "reference_calls": 19,
+      "search_reference_calls": 14,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.403024600000208,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 18,
+      "numeric_failure": 0,
+      "actual_runtime": 67.18090980000125,
+      "overshoot": 7.1809098000012455,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 66.046875,
+      "iterations_per_second": 0.10419626677934436,
+      "unique_candidates_per_second": 8.945993762055137,
+      "reference_calls_per_second": 0.28281843840107757,
+      "candidate_generation_time_fraction": 0.808915075157252,
+      "best_events": [
+        [
+          3.404922500001703,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 160,
+      "M_atomic": 120,
+      "M_lns": 40,
+      "seed": 20261113,
+      "cpu_affinity_mask": 16,
+      "Cmax_at_60": 5427.661043593272,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5427.661043593272,
+      "iterations_completed": 6,
+      "raw_candidate_attempts": 960,
+      "valid_unique_candidates": 640,
+      "candidate_generation_seconds": 57.10893849999411,
+      "lns_seconds": 48.75795049998851,
+      "raw_generation_counter_seconds": 1.7280028000132006,
+      "cheap_screen_seconds": 5.7666688000026625,
+      "lns_repair_seconds": 48.66060659998766,
+      "direction_dp_seconds": 0.05673519998890697,
+      "reference_scheduler_seconds": 8.98583680000229,
+      "reference_calls": 17,
+      "search_reference_calls": 12,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.271765500001493,
+      "accepted_moves": 0,
+      "global_best_updates": 0,
+      "deadlock_count": 16,
+      "numeric_failure": 0,
+      "actual_runtime": 66.33564429999751,
+      "overshoot": 6.3356442999975116,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 64.78125,
+      "iterations_per_second": 0.09044911017771218,
+      "unique_candidates_per_second": 9.647905085622632,
+      "reference_calls_per_second": 0.25627247883685117,
+      "candidate_generation_time_fraction": 0.8609087784196927,
+      "best_events": [
+        [
+          3.2735799999973096,
+          5427.661043593272
+        ]
+      ]
+    },
+    {
+      "instance_id": "data/PPO_TRAIN/seed_0211781140::g32_w085",
+      "case": "I12",
+      "tier": "LARGE",
+      "N": 85,
+      "M": 64,
+      "M_atomic": 48,
+      "M_lns": 16,
+      "seed": 20261111,
+      "cpu_affinity_mask": 1,
+      "Cmax_at_60": 5331.614365159387,
+      "checkpoint_certified": true,
+      "final_certified": true,
+      "final_cmax": 5294.577328122349,
+      "iterations_completed": 12,
+      "raw_candidate_attempts": 768,
+      "valid_unique_candidates": 574,
+      "candidate_generation_seconds": 44.02971549999347,
+      "lns_seconds": 36.69480280006246,
+      "raw_generation_counter_seconds": 1.4494050999928731,
+      "cheap_screen_seconds": 5.088766600005329,
+      "lns_repair_seconds": 36.61863409998841,
+      "direction_dp_seconds": 0.11321610000231885,
+      "reference_scheduler_seconds": 15.812647299990203,
+      "reference_calls": 35,
+      "search_reference_calls": 30,
+      "init_reference_calls": 5,
+      "initialization_seconds": 3.3077260999998543,
+      "accepted_moves": 3,
+      "global_best_updates": 3,
+      "deadlock_count": 25,
+      "numeric_failure": 0,
+      "actual_runtime": 60.68852359999801,
+      "overshoot": 0.6885235999980068,
+      "termination": "TIME_LIMIT",
+      "cpu_seconds": 58.875,
+      "iterations_per_second": 0.1977309594659573,
+      "unique_candidates_per_second": 9.458130894454959,
+      "reference_calls_per_second": 0.5767152984423755,
+      "candidate_generation_time_fraction": 0.7255031575689035,
+      "best_events": [
+        [
+          3.3095913999968616,
+          5427.661043593272
+        ],
+        [
+          47.2358682999984,
+          5331.614365159387
+        ],
+        [
+          54.973981600000116,
+          5331.614365159387
+        ],
+        [
+          60.635499699998036,
+          5294.577328122349
+        ]
+      ]
+    }
+  ],
+  "M_prod": 192,
+  "pool_comparison": {
+    "64": {
+      "median_ratio": 1.0,
+      "tier_median_ratio": {
+        "SMALL": 1.0,
+        "MEDIUM": 1.097991038892932,
+        "LARGE": 1.0299375419586405
+      },
+      "certified_checkpoints": 18,
+      "median_iteration_retention_vs_M64": 1.0,
+      "conditions": {
+        "all_18_checkpoints_certified": true,
+        "overall_within1pct": true,
+        "all_tiers_within2pct": false,
+        "iteration_retention_at_least40pct": true
+      },
+      "satisfies": false,
+      "medians": {
+        "iterations_completed": 25.0,
+        "candidate_generation_time_fraction": 0.669719993206116,
+        "reference_calls": 84.0,
+        "reference_calls_per_second": 1.3436354195246993,
+        "candidate_generation_seconds": 41.17892739999115,
+        "lns_seconds": 27.71180500000264,
+        "direction_dp_seconds": 0.13612860000102955,
+        "reference_scheduler_seconds": 18.83313145000284,
+        "valid_unique_candidates": 1048.0,
+        "unique_candidates_per_second": 16.870682213480023,
+        "actual_runtime": 61.348463999998785,
+        "overshoot": 1.3484639999987849,
+        "initialization_seconds": 2.80889765000029
+      },
+      "tier_medians": {
+        "SMALL": {
+          "iterations_completed": 53.5,
+          "candidate_generation_time_fraction": 0.6914529638040188,
+          "reference_calls": 206.5,
+          "Cmax_at_60": 1686.2035395575024
+        },
+        "MEDIUM": {
+          "iterations_completed": 25.0,
+          "candidate_generation_time_fraction": 0.5762891793183526,
+          "reference_calls": 84.0,
+          "Cmax_at_60": 4990.629135817592
+        },
+        "LARGE": {
+          "iterations_completed": 13.5,
+          "candidate_generation_time_fraction": 0.5459852851045592,
+          "reference_calls": 44.5,
+          "Cmax_at_60": 6326.2623587372345
+        }
+      }
+    },
+    "128": {
+      "median_ratio": 1.0180145584162132,
+      "tier_median_ratio": {
+        "SMALL": 1.000639771123157,
+        "MEDIUM": 1.048323124664634,
+        "LARGE": 1.0180145584162132
+      },
+      "certified_checkpoints": 18,
+      "median_iteration_retention_vs_M64": 0.66,
+      "conditions": {
+        "all_18_checkpoints_certified": true,
+        "overall_within1pct": false,
+        "all_tiers_within2pct": false,
+        "iteration_retention_at_least40pct": true
+      },
+      "satisfies": false,
+      "medians": {
+        "iterations_completed": 16.5,
+        "candidate_generation_time_fraction": 0.7847458179187166,
+        "reference_calls": 56.0,
+        "reference_calls_per_second": 0.8946244403868066,
+        "candidate_generation_seconds": 49.313999100006185,
+        "lns_seconds": 35.8371745999666,
+        "direction_dp_seconds": 0.09721254999203666,
+        "reference_scheduler_seconds": 12.606244650001827,
+        "valid_unique_candidates": 1312.5,
+        "unique_candidates_per_second": 20.95852865771746,
+        "actual_runtime": 62.21651784999813,
+        "overshoot": 2.2165178499981266,
+        "initialization_seconds": 2.6864253999992798
+      },
+      "tier_medians": {
+        "SMALL": {
+          "iterations_completed": 26.0,
+          "candidate_generation_time_fraction": 0.83108055395457,
+          "reference_calls": 98.5,
+          "Cmax_at_60": 1699.1951411617565
+        },
+        "MEDIUM": {
+          "iterations_completed": 18.5,
+          "candidate_generation_time_fraction": 0.7233820493501564,
+          "reference_calls": 65.0,
+          "Cmax_at_60": 4642.110472695253
+        },
+        "LARGE": {
+          "iterations_completed": 9.0,
+          "candidate_generation_time_fraction": 0.717328403308443,
+          "reference_calls": 29.5,
+          "Cmax_at_60": 6029.233324135661
+        }
+      }
+    },
+    "160": {
+      "median_ratio": 1.0180145584162132,
+      "tier_median_ratio": {
+        "SMALL": 1.0,
+        "MEDIUM": 1.0395533933636834,
+        "LARGE": 1.0180145584162132
+      },
+      "certified_checkpoints": 18,
+      "median_iteration_retention_vs_M64": 0.54,
+      "conditions": {
+        "all_18_checkpoints_certified": true,
+        "overall_within1pct": false,
+        "all_tiers_within2pct": false,
+        "iteration_retention_at_least40pct": true
+      },
+      "satisfies": false,
+      "medians": {
+        "iterations_completed": 13.5,
+        "candidate_generation_time_fraction": 0.8342657968476219,
+        "reference_calls": 48.0,
+        "reference_calls_per_second": 0.7723255205611423,
+        "candidate_generation_seconds": 52.03855509999812,
+        "lns_seconds": 38.32420639998054,
+        "direction_dp_seconds": 0.07614299998931529,
+        "reference_scheduler_seconds": 10.247073149988864,
+        "valid_unique_candidates": 1304.5,
+        "unique_candidates_per_second": 21.091323820224225,
+        "actual_runtime": 61.83794879999914,
+        "overshoot": 1.8379487999991397,
+        "initialization_seconds": 2.6067772500009596
+      },
+      "tier_medians": {
+        "SMALL": {
+          "iterations_completed": 21.0,
+          "candidate_generation_time_fraction": 0.8627637277123488,
+          "reference_calls": 61.5,
+          "Cmax_at_60": 1714.6931034414547
+        },
+        "MEDIUM": {
+          "iterations_completed": 14.5,
+          "candidate_generation_time_fraction": 0.7556172511606232,
+          "reference_calls": 53.0,
+          "Cmax_at_60": 4730.160247161912
+        },
+        "LARGE": {
+          "iterations_completed": 7.5,
+          "candidate_generation_time_fraction": 0.7441149399651945,
+          "reference_calls": 25.5,
+          "Cmax_at_60": 6029.233324135661
+        }
+      }
+    },
+    "192": {
+      "median_ratio": 1.0,
+      "tier_median_ratio": {
+        "SMALL": 1.0,
+        "MEDIUM": 1.0,
+        "LARGE": 1.011709058292563
+      },
+      "certified_checkpoints": 18,
+      "median_iteration_retention_vs_M64": 0.46,
+      "conditions": {
+        "all_18_checkpoints_certified": true,
+        "overall_within1pct": true,
+        "all_tiers_within2pct": true,
+        "iteration_retention_at_least40pct": true
+      },
+      "satisfies": true,
+      "medians": {
+        "iterations_completed": 11.5,
+        "candidate_generation_time_fraction": 0.8557951849792176,
+        "reference_calls": 45.0,
+        "reference_calls_per_second": 0.7187916325146306,
+        "candidate_generation_seconds": 52.37231524999879,
+        "lns_seconds": 38.41664910007057,
+        "direction_dp_seconds": 0.06727274999866495,
+        "reference_scheduler_seconds": 8.666368599995621,
+        "valid_unique_candidates": 1313.5,
+        "unique_candidates_per_second": 20.839271385331955,
+        "actual_runtime": 61.73201329999938,
+        "overshoot": 1.7320132999993803,
+        "initialization_seconds": 2.6349989000009373
+      },
+      "tier_medians": {
+        "SMALL": {
+          "iterations_completed": 17.5,
+          "candidate_generation_time_fraction": 0.8793802769662772,
+          "reference_calls": 61.5,
+          "Cmax_at_60": 1693.8132469005927
+        },
+        "MEDIUM": {
+          "iterations_completed": 12.5,
+          "candidate_generation_time_fraction": 0.7766405286639788,
+          "reference_calls": 47.0,
+          "Cmax_at_60": 4493.1018436917875
+        },
+        "LARGE": {
+          "iterations_completed": 6.5,
+          "candidate_generation_time_fraction": 0.7660516844173997,
+          "reference_calls": 23.5,
+          "Cmax_at_60": 5686.461199221854
+        }
+      }
+    }
+  },
+  "mlp_split_counts": {
+    "MLP_TRAIN": 17,
+    "MLP_DEV": 6,
+    "ORACLE_DEV_CONSUMED": 8
+  },
+  "feature_validation": {
+    "passed": true,
+    "states": 72,
+    "counts": {
+      "candidates": 10701,
+      "FEASIBLE_CERTIFIED": 5540,
+      "DEADLOCK": 4871,
+      "DIRECTION_INFEASIBLE": 290
+    },
+    "C2_feature_count": 87,
+    "C4_feature_count": 130,
+    "C2_feature_names": [
+      "source_atomic",
+      "source_lns_repaired",
+      "move_intra_relocate",
+      "move_inter_relocate",
+      "move_swap",
+      "move_two_opt",
+      "move_split_activate",
+      "move_split_deactivate",
+      "move_split_point_switch",
+      "family_structural",
+      "family_target_whole",
+      "family_target_y",
+      "family_target_x",
+      "destroy_random_removal",
+      "destroy_critical_load_removal",
+      "repair_greedy_repair",
+      "repair_regret_2_repair",
+      "current_cmax",
+      "projected_process_before",
+      "projected_process_after",
+      "projected_process_delta",
+      "travel_proxy_before",
+      "travel_proxy_after",
+      "travel_delta",
+      "split_count_delta",
+      "load_spread_delta",
+      "before_r0_process_load",
+      "before_r0_block_count",
+      "before_r1_process_load",
+      "before_r1_block_count",
+      "before_r2_process_load",
+      "before_r2_block_count",
+      "before_r3_process_load",
+      "before_r3_block_count",
+      "before_max_robot_load",
+      "before_load_range",
+      "before_load_std",
+      "before_whole_count",
+      "before_x_split_count",
+      "before_y_split_count",
+      "after_r0_process_load",
+      "after_r0_block_count",
+      "after_r1_process_load",
+      "after_r1_block_count",
+      "after_r2_process_load",
+      "after_r2_block_count",
+      "after_r3_process_load",
+      "after_r3_block_count",
+      "after_max_robot_load",
+      "after_load_range",
+      "after_load_std",
+      "after_whole_count",
+      "after_x_split_count",
+      "after_y_split_count",
+      "affected_r0",
+      "affected_r1",
+      "affected_r2",
+      "affected_r3",
+      "affected_robot_count",
+      "affected_upper_rail",
+      "affected_lower_rail",
+      "affected_same_rail",
+      "affected_parent_count",
+      "remove_position_count",
+      "remove_position_min",
+      "remove_position_max",
+      "remove_position_mean",
+      "remove_position_std",
+      "insert_position_count",
+      "insert_position_min",
+      "insert_position_max",
+      "insert_position_mean",
+      "insert_position_std",
+      "parent_length_min",
+      "parent_length_max",
+      "parent_length_mean",
+      "parent_length_std",
+      "affected_length_min",
+      "affected_length_max",
+      "affected_length_mean",
+      "affected_length_std",
+      "affected_x_span",
+      "affected_y_span",
+      "affected_mid_x",
+      "affected_mid_y",
+      "affected_upper_fraction",
+      "affected_left_fraction"
+    ],
+    "C4_feature_names": [
+      "source_atomic",
+      "source_lns_repaired",
+      "move_intra_relocate",
+      "move_inter_relocate",
+      "move_swap",
+      "move_two_opt",
+      "move_split_activate",
+      "move_split_deactivate",
+      "move_split_point_switch",
+      "family_structural",
+      "family_target_whole",
+      "family_target_y",
+      "family_target_x",
+      "destroy_random_removal",
+      "destroy_critical_load_removal",
+      "repair_greedy_repair",
+      "repair_regret_2_repair",
+      "current_cmax",
+      "projected_process_before",
+      "projected_process_after",
+      "projected_process_delta",
+      "travel_proxy_before",
+      "travel_proxy_after",
+      "travel_delta",
+      "split_count_delta",
+      "load_spread_delta",
+      "before_r0_process_load",
+      "before_r0_block_count",
+      "before_r1_process_load",
+      "before_r1_block_count",
+      "before_r2_process_load",
+      "before_r2_block_count",
+      "before_r3_process_load",
+      "before_r3_block_count",
+      "before_max_robot_load",
+      "before_load_range",
+      "before_load_std",
+      "before_whole_count",
+      "before_x_split_count",
+      "before_y_split_count",
+      "after_r0_process_load",
+      "after_r0_block_count",
+      "after_r1_process_load",
+      "after_r1_block_count",
+      "after_r2_process_load",
+      "after_r2_block_count",
+      "after_r3_process_load",
+      "after_r3_block_count",
+      "after_max_robot_load",
+      "after_load_range",
+      "after_load_std",
+      "after_whole_count",
+      "after_x_split_count",
+      "after_y_split_count",
+      "affected_r0",
+      "affected_r1",
+      "affected_r2",
+      "affected_r3",
+      "affected_robot_count",
+      "affected_upper_rail",
+      "affected_lower_rail",
+      "affected_same_rail",
+      "affected_parent_count",
+      "remove_position_count",
+      "remove_position_min",
+      "remove_position_max",
+      "remove_position_mean",
+      "remove_position_std",
+      "insert_position_count",
+      "insert_position_min",
+      "insert_position_max",
+      "insert_position_mean",
+      "insert_position_std",
+      "parent_length_min",
+      "parent_length_max",
+      "parent_length_mean",
+      "parent_length_std",
+      "affected_length_min",
+      "affected_length_max",
+      "affected_length_mean",
+      "affected_length_std",
+      "affected_x_span",
+      "affected_y_span",
+      "affected_mid_x",
+      "affected_mid_y",
+      "affected_upper_fraction",
+      "affected_left_fraction",
+      "direction_feasible",
+      "direction_cost_available",
+      "direction_dp_travel",
+      "direction_dp_travel_delta",
+      "direction_r0_route_available",
+      "direction_r0_reverse_count",
+      "direction_r0_alternations",
+      "direction_r0_first_orientation",
+      "direction_r0_last_orientation",
+      "direction_r0_first_x",
+      "direction_r0_first_y",
+      "direction_r0_last_x",
+      "direction_r0_last_y",
+      "direction_r1_route_available",
+      "direction_r1_reverse_count",
+      "direction_r1_alternations",
+      "direction_r1_first_orientation",
+      "direction_r1_last_orientation",
+      "direction_r1_first_x",
+      "direction_r1_first_y",
+      "direction_r1_last_x",
+      "direction_r1_last_y",
+      "direction_r2_route_available",
+      "direction_r2_reverse_count",
+      "direction_r2_alternations",
+      "direction_r2_first_orientation",
+      "direction_r2_last_orientation",
+      "direction_r2_first_x",
+      "direction_r2_first_y",
+      "direction_r2_last_x",
+      "direction_r2_last_y",
+      "direction_r3_route_available",
+      "direction_r3_reverse_count",
+      "direction_r3_alternations",
+      "direction_r3_first_orientation",
+      "direction_r3_last_orientation",
+      "direction_r3_first_x",
+      "direction_r3_first_y",
+      "direction_r3_last_x",
+      "direction_r3_last_y",
+      "direction_shared_blocks",
+      "direction_flips",
+      "c3_cheap_rank"
+    ],
+    "historical_inputs_unchanged": true,
+    "new_reference_calls": 0,
+    "new_direction_optimizations": 0,
+    "purpose": "consumed ORACLE_DEV pipeline regression only; true frozen M256 cheap ranks; no feature selection or fitting"
+  },
+  "regression": {
+    "passed": 365,
+    "interpreter": "D:\\pybullet_test\\.venv\\Scripts\\python.exe",
+    "command": "pytest -q -p no:cacheprovider"
+  },
+  "passed": true
+}

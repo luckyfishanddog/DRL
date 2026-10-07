@@ -1,0 +1,148 @@
+{
+  "MLP_TRAIN": [
+    "data/DEV_ONLY/seed_000101.xlsx",
+    "data/DEV_ONLY/seed_000404.xlsx",
+    "data/ID_TEST/seed_0357172400.xlsx",
+    "data/ID_TEST/seed_0394443053.xlsx",
+    "data/ID_TEST/seed_0539338415.xlsx",
+    "data/ID_TEST/seed_1050940519.xlsx",
+    "data/ID_TEST/seed_1846918101.xlsx",
+    "data/PPO_TRAIN/seed_0155539492.xlsx",
+    "data/PPO_TRAIN/seed_0377964238.xlsx",
+    "data/PPO_TRAIN/seed_0514719396.xlsx",
+    "data/PPO_TRAIN/seed_0765477955.xlsx",
+    "data/PPO_TRAIN/seed_1098469608.xlsx",
+    "data/PPO_TRAIN/seed_1631571109.xlsx",
+    "data/PPO_TRAIN/seed_1742672780.xlsx",
+    "data/PPO_TRAIN/seed_1783157644.xlsx",
+    "data/PPO_TRAIN/seed_1861847868.xlsx",
+    "data/VALIDATION/seed_1910136750.xlsx"
+  ],
+  "MLP_DEV": [
+    "data/DEV_ONLY/seed_000303.xlsx",
+    "data/ID_TEST/seed_1142967162.xlsx",
+    "data/PPO_TRAIN/seed_0834257622.xlsx",
+    "data/PPO_TRAIN/seed_1745884954.xlsx",
+    "data/PPO_TRAIN/seed_1872211770.xlsx",
+    "data/VALIDATION/seed_0151520473.xlsx"
+  ],
+  "ORACLE_DEV_CONSUMED": [
+    "data/PPO_TRAIN/seed_0180141104.xlsx",
+    "data/PPO_TRAIN/seed_0703048389.xlsx",
+    "data/PPO_TRAIN/seed_1062621171.xlsx",
+    "data/PPO_TRAIN/seed_1636194744.xlsx",
+    "data/PPO_TRAIN/seed_1914517550.xlsx",
+    "data/VALIDATION/seed_1653613181.xlsx",
+    "data/VALIDATION/seed_1960958179.xlsx",
+    "outputs/v9_frozen_dataset_round_20260808/dev_only_dgseed_900001.xlsx"
+  ],
+  "workbook_identity": {
+    "data/DEV_ONLY/seed_000101.xlsx": {
+      "raw_file_sha256": "def77df48c1de5ed1caae52fd9ebf67e6f0747059a079467aab6f4191bd70502"
+    },
+    "data/DEV_ONLY/seed_000303.xlsx": {
+      "raw_file_sha256": "388f40ae874db4c8b83e108725c1c551f51574e2ca263c08b1b6ad1dd472b0c4"
+    },
+    "data/DEV_ONLY/seed_000404.xlsx": {
+      "raw_file_sha256": "07415adf30952c55bca843207735b185a9243b5aa86d7dec01c6d9c1daaec906"
+    },
+    "data/ID_TEST/seed_0357172400.xlsx": {
+      "raw_file_sha256": "7c0dcef0ea8242500c140ac6eba36f1611830139d52d4a6708b1febd58d2e254"
+    },
+    "data/ID_TEST/seed_0394443053.xlsx": {
+      "raw_file_sha256": "e5d5c830db1a2cd128bfac93189e261f17902732ef19c8f93cab1d4f965e9394"
+    },
+    "data/ID_TEST/seed_0539338415.xlsx": {
+      "raw_file_sha256": "3d07df9dd98b7c37e288b7505c95b3b5ad3f82c1e582cba06277333120a641a2"
+    },
+    "data/ID_TEST/seed_1050940519.xlsx": {
+      "raw_file_sha256": "5e25c6755af5562c0df2f7addb510059ee53c39d618f36c1bd858b9c409b5a71"
+    },
+    "data/ID_TEST/seed_1142967162.xlsx": {
+      "raw_file_sha256": "06868ebf72631fd05799a3733b55f44be264e2504572a7c8880db1121f966f77"
+    },
+    "data/ID_TEST/seed_1846918101.xlsx": {
+      "raw_file_sha256": "69a3d63450cdcd5a9accaf2a6301c27ce19b6a9987eb848d9b8cf471f66c7199"
+    },
+    "data/PPO_TRAIN/seed_0155539492.xlsx": {
+      "raw_file_sha256": "ecfacfe11edfa75e8006086833a6ea62dd6ca276a3187a04d4f13e773e58ed38"
+    },
+    "data/PPO_TRAIN/seed_0180141104.xlsx": {
+      "raw_file_sha256": "6429ad6234d5d32ca34df5de7d752623e9fa93683e81489ee37dcc277192a3f7"
+    },
+    "data/PPO_TRAIN/seed_0377964238.xlsx": {
+      "raw_file_sha256": "e315b74f6833566cc11ddcccd4cbd77233660ad596d90baa4bbe420208dce8bc"
+    },
+    "data/PPO_TRAIN/seed_0514719396.xlsx": {
+      "raw_file_sha256": "e94476dba4e6b13fc75dc76911912da9f6d74d1bd959fbb16a35c994beb3f176"
+    },
+    "data/PPO_TRAIN/seed_0703048389.xlsx": {
+      "raw_file_sha256": "d4b83ab4265ec1d4abf9fffc2d1c5b7f29d71f2f288f6500f83f4a7081ae2cf5"
+    },
+    "data/PPO_TRAIN/seed_0765477955.xlsx": {
+      "raw_file_sha256": "6f1f143fd5c914e9844b6b68072c7f70bb553534844dd1c641b515242f1a7538"
+    },
+    "data/PPO_TRAIN/seed_0834257622.xlsx": {
+      "raw_file_sha256": "8336901677a436282927db9241f5d801e85b83ddacaf2a5434ec3bfd730941d1"
+    },
+    "data/PPO_TRAIN/seed_1062621171.xlsx": {
+      "raw_file_sha256": "86b5ac03ffe2ef860bbac4f18dd91edb371e82507c6a03575677d4ecf9eea559"
+    },
+    "data/PPO_TRAIN/seed_1098469608.xlsx": {
+      "raw_file_sha256": "8dc18a4140a727fe75ba221eb7233854a958b1e260c667478c145fa5ee00c3e2"
+    },
+    "data/PPO_TRAIN/seed_1631571109.xlsx": {
+      "raw_file_sha256": "e195a0f7e7f7a2d77517d83285c13b80964659eea520e5b3e10a7ac82c49c638"
+    },
+    "data/PPO_TRAIN/seed_1636194744.xlsx": {
+      "raw_file_sha256": "3d0807a62364cf7b9103d2ad6df26bea72d0b763faa41ad88b77aeec345cc79d"
+    },
+    "data/PPO_TRAIN/seed_1742672780.xlsx": {
+      "raw_file_sha256": "d50fbf80449aa4cf7994cd21212b5bf609517f19622209eb2be408216a85cef6"
+    },
+    "data/PPO_TRAIN/seed_1745884954.xlsx": {
+      "raw_file_sha256": "56347df97c0f0ece4a12f2bb6b88e6d418c0b29a32522572752192b8a7554375"
+    },
+    "data/PPO_TRAIN/seed_1783157644.xlsx": {
+      "raw_file_sha256": "396acbe9235a8f5014d105a1c5720e670e9c11de621869cacddd5caa82dd0962"
+    },
+    "data/PPO_TRAIN/seed_1861847868.xlsx": {
+      "raw_file_sha256": "0a01f02b56622a1f6c1932b4957069b1f3dee9d6a01122046f039cca71a19a40"
+    },
+    "data/PPO_TRAIN/seed_1872211770.xlsx": {
+      "raw_file_sha256": "75f65ee94246dd5b51a70f18901ee3592698570715b6fade0755946113dcaf2e"
+    },
+    "data/PPO_TRAIN/seed_1914517550.xlsx": {
+      "raw_file_sha256": "61657b6c333075d1d21080b14df977cfbb511d6b55478b2b191a35947fd0adf0"
+    },
+    "data/VALIDATION/seed_0151520473.xlsx": {
+      "raw_file_sha256": "409518cf5b3e8c71c0823f6949074835b77da5a0e2ec2b95895dd8442471407a"
+    },
+    "data/VALIDATION/seed_1653613181.xlsx": {
+      "raw_file_sha256": "160c35533c2cf53948e5ec72d03ff9f7adb9922a1edcf1ca806572f67f7dee46"
+    },
+    "data/VALIDATION/seed_1910136750.xlsx": {
+      "raw_file_sha256": "536316b6dae279ebb355eb68af1fcac99a7467b0fdc78401a53e484194f95cac"
+    },
+    "data/VALIDATION/seed_1960958179.xlsx": {
+      "raw_file_sha256": "8cf44ee1c2246a811906f06b968beb372d2b04e9a2963223b431896a822c8b29"
+    },
+    "outputs/v9_frozen_dataset_round_20260808/dev_only_dgseed_900001.xlsx": {
+      "raw_file_sha256": "2d533761996f24125447cca5065781b463e8b066220f24dc4128d7f4b16af4ba"
+    }
+  },
+  "selection": "farthest-first on standardized existing static workbook descriptors; path lexical tie-break; no solver outcomes",
+  "descriptor_fields": [
+    "main_range_instance_count",
+    "n_min",
+    "n_median",
+    "n_max",
+    "median_total_weld_length_m",
+    "median_bbox_coverage",
+    "median_x_coverage",
+    "median_y_coverage",
+    "median_cross_y6_count",
+    "median_upper_lower_imbalance",
+    "median_left_right_imbalance"
+  ]
+}

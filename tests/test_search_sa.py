@@ -790,3 +790,173 @@ def test_phase4b_existing_artifact_prefixes_and_screening_without_solver(monkeyp
     with pytest.raises(sqlite3.OperationalError,match='readonly'):
         db.execute('DELETE FROM candidates')
     db.close()
+
+def test_phase4_1a_configs_only_change_attempt_budgets():
+    from dataclasses import asdict
+    from scripts import run_phase4_1a_production_pool as smoke
+    historical=asdict(smoke.audit.SEARCH)
+    for m in smoke.SIZES:
+        cfg=asdict(smoke.config_for(m))
+        assert cfg.pop('m')==m
+        assert cfg.pop('m_lns')==m//4
+        assert m-m//4==3*m//4
+        assert cfg=={k:v for k,v in historical.items() if k not in ('m','m_lns')}
+        assert (cfg['kdp'],cfg['kref'],cfg['kref_total'])==(8,2,4)
+    with pytest.raises(ValueError): smoke.config_for(256)
+
+
+def test_phase4_1a_checkpoint_excludes_overshoot_and_initialization_late():
+    from types import SimpleNamespace
+    from scripts.run_phase4_1a_production_pool import checkpoint_cmax
+    stats=SearchStats(scope_id="V2_TEST",seed=0)
+    stats.record_best(4.0,100.0)
+    stats.record_best(60.0,90.0)
+    stats.record_best(60.001,70.0)
+    result=SimpleNamespace(stats=stats,anytime=stats.anytime((60.0,)))
+    assert checkpoint_cmax(result)==90.0
+    stats.best_events=[(60.001,100.0)]
+    result.anytime=stats.anytime((60.0,))
+    assert checkpoint_cmax(result) is None
+
+
+def _phase4_1a_synthetic_runs():
+    from scripts.run_phase4_1a_production_pool import SIZES,TIERS
+    rows=[]
+    for index in range(18):
+        for m in SIZES:
+            row={'instance_id':str(index//3),'seed':index%3,'tier':TIERS[index//6],
+                 'M':m,'checkpoint_certified':True,'Cmax_at_60':100.0,
+                 'iterations_completed':100 if m==64 else 40}
+            for name in ('candidate_generation_time_fraction','reference_calls','reference_calls_per_second',
+                'candidate_generation_seconds','lns_seconds','direction_dp_seconds','reference_scheduler_seconds',
+                'valid_unique_candidates','unique_candidates_per_second','actual_runtime','overshoot','initialization_seconds'):
+                row[name]=1.0
+            rows.append(row)
+    return rows
+
+
+def test_phase4_1a_selects_smallest_pool_and_respects_boundaries():
+    from scripts.run_phase4_1a_production_pool import compare_and_choose
+    rows=_phase4_1a_synthetic_runs()
+    assert compare_and_choose(rows)[0]==64
+    # 64 violates the overall threshold; 128 sits on the inclusive limits.
+    for r in rows:
+        if r['M']==64: r['Cmax_at_60']=102.0
+        if r['M']==128: r['Cmax_at_60']=101.0
+    chosen,summary=compare_and_choose(rows)
+    assert chosen==128 and summary['128']['median_iteration_retention_vs_M64']==.4
+    for r in rows:
+        if r['M']==128: r['iterations_completed']=39
+    assert compare_and_choose(rows)[0]==160
+    # A tier median above 2% rejects an otherwise good overall median.
+    for r in rows:
+        if r['M']==160 and r['tier']=='LARGE': r['Cmax_at_60']=102.01
+    assert compare_and_choose(rows)[0]==192
+    next(r for r in rows if r['M']==192)['checkpoint_certified']=False
+    chosen,summary=compare_and_choose(rows)
+    assert chosen==64 and not any(s['satisfies'] for s in summary.values())
+    with pytest.raises(ValueError): compare_and_choose(rows+[rows[0]])
+
+
+def test_phase4_1a_workbook_split_is_geometry_only_and_isolated(monkeypatch):
+    from scripts import run_phase4_1a_production_pool as smoke
+    def forbidden(*args,**kwargs): raise AssertionError('Solver/label access during split')
+    monkeypatch.setattr(smoke.audit,'load_parents',forbidden)
+    monkeypatch.setattr(smoke.audit,'read_candidate_payload',forbidden)
+    split=smoke.compute_mlp_split()
+    assert split==smoke.compute_mlp_split()
+    train,dev,consumed=(set(split[k]) for k in ('MLP_TRAIN','MLP_DEV','ORACLE_DEV_CONSUMED'))
+    assert (len(train),len(dev),len(consumed))==(17,6,8)
+    assert not (train&dev or train&consumed or dev&consumed)
+    assert not {case['relative_path'] for case in smoke.development_cases()} & (train|dev|consumed)
+    old=smoke.audit.read(smoke.audit.SPLIT)['workbooks']
+    assert train|dev=={w['relative_path'] for w in old if w['ranker_role']=='RANKER_TRAIN'}
+    assert consumed=={w['relative_path'] for w in old if w['ranker_role']=='RANKER_DEV'}
+
+
+def test_ranker_features_are_pure_stage_available_and_geometrically_correct(monkeypatch):
+    import copy
+    from dataclasses import replace
+    from mrta_ranker.features import extract_c2_features,extract_c4_features
+    from mrta_search.lns import atomic_complete_candidate
+    import mrta_search.direction as direction_module
+    import mrta_reference.scheduler as scheduler_module
+    def forbidden(*args,**kwargs): raise AssertionError('Feature extraction invoked expensive evaluator')
+    monkeypatch.setattr(scheduler_module,'reference_schedule',forbidden)
+    monkeypatch.setattr(direction_module,'optimize_directions_with_initial_feasibility',forbidden)
+    current=_base();directions=((),(),(0,0),(0,0))
+    candidate=atomic_complete_candidate(current,directions,_family_candidates()[0],FAST)
+    candidate=replace(candidate,projected_process_makespan=6.0,local_directed_travel_delta=0.0)
+    direction=ConstrainedDirectionResult(DirectionStatus.FEASIBLE,directions,5.0)
+    before=copy.deepcopy((current,directions,candidate,direction));rng=random.getstate()
+    args=(current,directions,100.0,candidate,FAST)
+    c2=extract_c2_features(*args)
+    c4=extract_c4_features(*args,direction=direction,cheap_rank=2)
+    assert c2==extract_c2_features(*args)
+    assert c4==extract_c4_features(*args,direction=direction,cheap_rank=2)
+    assert before==(current,directions,candidate,direction) and rng==random.getstate()
+    assert not any(word in key for key in c2 for word in ('direction','reference','wait','deadlock','certif','schedule','c3','c4'))
+    assert not any(word in key for key in c4 for word in ('reference','wait','deadlock','certif','schedule'))
+    assert c2.items()<=c4.items()
+    assert c2['before_max_robot_load']==6.0 and c2['travel_proxy_before']==5.0
+    assert c4['direction_dp_travel']==5.0 and c4['direction_flips']==0.0
+    assert c4['direction_r2_first_x']==1.0 and c4['direction_r2_last_x']==5.0
+    unavailable=ConstrainedDirectionResult(DirectionStatus.NO_LEGAL_FIRST_ORIENTATION,((),(),(),()),None)
+    masked=extract_c4_features(*args,direction=unavailable,cheap_rank=2)
+    assert tuple(masked)==tuple(c4)
+    assert masked['direction_cost_available']==0.0 and masked['direction_r2_route_available']==0.0
+    import math
+    assert all(math.isfinite(value) for row in (c2,c4,masked) for value in row.values())
+    with pytest.raises(ValueError): extract_c2_features(current,directions,0.0,candidate,FAST)
+
+
+def test_ranker_targets_exclude_numeric_and_leave_deadlock_regression_missing():
+    from mrta_ranker.features import make_training_targets
+    assert make_training_targets('NUMERIC_FAILURE',100.0,None) is None
+    assert make_training_targets('DEADLOCK',100.0,None)=={'y_feasible':0,'y_improvement':None}
+    assert make_training_targets('DIRECTION_INFEASIBLE',100.0,None)=={'y_feasible':0,'y_improvement':None}
+    assert make_training_targets('FEASIBLE_CERTIFIED',100.0,90.0)=={'y_feasible':1,'y_improvement':.1}
+    assert make_training_targets('FEASIBLE_CERTIFIED',100.0,110.0)=={'y_feasible':1,'y_improvement':-.1}
+    with pytest.raises(ValueError): make_training_targets('FEASIBLE_CERTIFIED',100.0,None)
+    with pytest.raises(ValueError): make_training_targets('FEASIBLE_CERTIFIED',0.0,10.0)
+    with pytest.raises(ValueError): make_training_targets('typo',100.0,None)
+
+
+def test_phase4_1a_timing_wrapper_preserves_values_rng_and_restores(monkeypatch):
+    from scripts import run_phase4_1a_production_pool as smoke
+    marker=object()
+    def destroy(): return marker
+    def repair(value): return value
+    def generate(): return smoke.pipeline.repair_partial_state(smoke.pipeline.destroy_parents())
+    for name,fn in (('destroy_parents',destroy),('repair_partial_state',repair),('generate_candidate_pool',generate)):
+        monkeypatch.setattr(smoke.pipeline,name,fn)
+    ticks=iter(range(6))
+    monkeypatch.setattr(smoke.time,'perf_counter',lambda:next(ticks))
+    rng=random.getstate()
+    with smoke.generation_timers() as totals:
+        assert smoke.pipeline.generate_candidate_pool() is marker
+    assert totals=={'candidate_generation_seconds':5.0,'lns_seconds':2.0}
+    assert random.getstate()==rng
+    assert smoke.pipeline.generate_candidate_pool is generate
+    assert smoke.pipeline.destroy_parents is destroy
+    assert smoke.pipeline.repair_partial_state is repair
+
+
+def test_v2_production_pool_keeps_historical_explicit_configs(monkeypatch):
+    from dataclasses import asdict
+    from mrta_search import pipeline
+    calls=[];marker=object()
+    def capture(parents,config,search_config,**kwargs):
+        calls.append(search_config)
+        return marker
+    monkeypatch.setattr(pipeline,'run_bounded_sa_oi',capture)
+    assert pipeline.run_sa_oi_alns_v2(()) is marker
+    production=calls[-1]
+    assert production.m==pipeline.SA_OI_ALNS_V2_PRODUCTION_POOL_SIZE==192
+    assert production.m_lns==48 and production.m_atomic is None
+    assert (production.kdp,production.kref,production.kref_total)==(8,2,4)
+    historical=SearchConfig()
+    assert historical.m==64 and historical.m_lns==16
+    assert {k:v for k,v in asdict(production).items() if k not in ('m','m_lns')}=={k:v for k,v in asdict(historical).items() if k not in ('m','m_lns')}
+    pipeline.run_sa_oi_alns_v2((),search_config=historical)
+    assert calls[-1] is historical

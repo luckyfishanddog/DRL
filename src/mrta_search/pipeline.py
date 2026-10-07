@@ -69,6 +69,8 @@ from .stats import ACTIVE_MOVE_TYPES, SearchStats
 
 REFERENCE_POLICY_ID = DEVELOPMENT_NO_REPAIR_V1
 SA_OI_ALNS_V2_METHOD_ID = "SA_OI_ALNS_V2"
+# Phase4-1A native 60s development smoke; generic SearchConfig keeps historical M64.
+SA_OI_ALNS_V2_PRODUCTION_POOL_SIZE = 192
 PATTERN_TRANSITION_BALANCED_FAMILY_V1 = "PATTERN_TRANSITION_BALANCED_FAMILY_V1"
 V2_C2_PATTERN_FAMILY_STRATIFIED_V1 = "V2_C2_PATTERN_FAMILY_STRATIFIED_V1"
 V2_C4_FAMILY_EXPLORE_EXPLOIT_V1 = "V2_C4_FAMILY_EXPLORE_EXPLOIT_V1"
@@ -1059,7 +1061,7 @@ def run_bounded_sa_oi(
 def run_sa_oi_alns_v2(
     parents: Sequence[ParentWeld],
     config: ScientificConfig = ScientificConfig(),
-    search_config: SearchConfig = SearchConfig(),
+    search_config: SearchConfig | None = None,
     *,
     seed: int = 0,
     source_provenance: SourceProvenance | None = None,
@@ -1068,6 +1070,13 @@ def run_sa_oi_alns_v2(
     formal_result: bool = False,
     observer=None,
 ) -> SearchResult:
+    # Explicit historical configs are honored unchanged. Only this V2 default
+    # adopts the measured production pool; expensive evaluation budgets stay fixed.
+    if search_config is None:
+        search_config = replace(
+            SearchConfig(), m=SA_OI_ALNS_V2_PRODUCTION_POOL_SIZE,
+            m_lns=SA_OI_ALNS_V2_PRODUCTION_POOL_SIZE // 4,
+        )
     return run_bounded_sa_oi(
         parents,
         config,
