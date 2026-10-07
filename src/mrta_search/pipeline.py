@@ -372,27 +372,14 @@ def _y_patterns(solution: CanonicalSolution):
 ReferenceEvaluator = Callable[..., ScheduleResult]
 
 
-def evaluate_iteration(
-    current: CanonicalSolution,
-    current_directions: DirectionVectors,
-    config: ScientificConfig,
-    search_config: SearchConfig,
-    stats: SearchStats,
-    *,
-    seed: int,
-    reference_evaluator: ReferenceEvaluator | None = None,
-    current_schedule: ScheduleResult | None = None,
-    adaptive_state: AdaptiveOperatorState | None = None,
-    scope: FormalScope | None = None,
-    enable_x_split: bool = False,
-    family_access_policy: bool | None = None,
-) -> IterationResult:
-    family_access = scope == FORMAL_SCOPE_V2 if family_access_policy is None else family_access_policy
-    if family_access and scope != FORMAL_SCOPE_V2:
-        raise ValueError("decision-family access policies require FORMAL_SCOPE_V2")
-    reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
-    attempts_before = stats.raw_attempts
-    atomic_budget = (
+def generate_candidate_pool(
+    current, current_directions, config, search_config, stats, *, seed,
+    current_schedule=None, adaptive_state=None, scope=None, enable_x_split=False,
+    atomic_budget=None, lns_budget=None, atomic_offset=0, lns_offset=0,
+    lns_rng=None, seen_solutions=None, observer=None,
+):
+    """Shared production generator; explicit cursors continue a shadow attempt stream."""
+    atomic_budget = atomic_budget if atomic_budget is not None else (
         search_config.m
         if current_schedule is None
         else (
@@ -405,6 +392,7 @@ def evaluate_iteration(
         current,
         config,
         m=atomic_budget,
+        start_attempt=atomic_offset,
         seed=seed,
         stats=stats,
         moves=(
@@ -436,6 +424,7 @@ def evaluate_iteration(
         raw,
         config,
         stats,
+        observer=observer,
         enable_x_split=enable_x_split,
         scope=scope,
     )
@@ -446,7 +435,7 @@ def evaluate_iteration(
         bool(_y_patterns(item.solution)) for item in screened
     )
     complete: list[CompleteSearchCandidate] = []
-    seen_solutions: set[str] = {current.canonical_hash}
+    seen_solutions = {current.canonical_hash} if seen_solutions is None else seen_solutions
     for item in screened:
         stats.decision_family_funnel[decision_family(item)]["constructed"] += 1
         candidate = atomic_complete_candidate(current, current_directions, item, config)
@@ -458,20 +447,22 @@ def evaluate_iteration(
         stats.decision_family_funnel[decision_family(candidate)]["cheap_valid"] += 1
         stats.valid_by_family[CandidateSourceKind.ATOMIC.value] += 1
 
-    if current_schedule is not None and search_config.m_lns:
+    lns_budget = search_config.m_lns if lns_budget is None else lns_budget
+    if current_schedule is not None and lns_budget:
         if adaptive_state is None:
             adaptive_state = AdaptiveOperatorState(
                 search_config.adaptive_reaction,
                 search_config.adaptive_segment_length,
             )
-        lns_rng = random.Random(seed + 7_919_119 * (current.revision + 1))
+        if lns_rng is None:
+            lns_rng = random.Random(seed + 7_919_119 * (current.revision + 1))
         q = destroy_size(
             len(current.parents),
             rho=search_config.destroy_rho,
             q_min=search_config.destroy_q_min,
             q_max=search_config.destroy_q_max,
         )
-        for ordinal in range(search_config.m_lns):
+        for ordinal in range(lns_offset, lns_offset + lns_budget):
             stats.decision_family_funnel["STRUCTURAL"]["generated"] += 1
             stats.raw_attempts += 1
             stats.attempted_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
@@ -499,6 +490,12 @@ def evaluate_iteration(
             stats.repair_time += time.perf_counter() - repair_started
             stats.candidate_generation_time += repair_started - generation_started
             stats.repair_insertion_evaluations += repaired.insertion_evaluations
+            if observer is not None:
+                candidate_for_trace = repaired.candidate
+                status = ("CONSTRUCTION_REJECTED" if candidate_for_trace is None else
+                          "IDENTITY" if candidate_for_trace.solution.canonical_hash == current.canonical_hash else
+                          "DUPLICATE" if candidate_for_trace.solution.canonical_hash in seen_solutions else "VALID")
+                observer("lns_attempt", (ordinal, pair, partial, repaired, status))
             if repaired.candidate is None:
                 stats.rejection_reasons[
                     f"LNS:{repaired.rejection_reason or 'REPAIR_FAILED'}"
@@ -518,11 +515,43 @@ def evaluate_iteration(
             stats.cheap_feasible += 1
             stats.valid_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
 
+    return tuple(screened), tuple(complete), lns_rng
+
+
+def evaluate_iteration(
+    current: CanonicalSolution,
+    current_directions: DirectionVectors,
+    config: ScientificConfig,
+    search_config: SearchConfig,
+    stats: SearchStats,
+    *,
+    seed: int,
+    reference_evaluator: ReferenceEvaluator | None = None,
+    current_schedule: ScheduleResult | None = None,
+    adaptive_state: AdaptiveOperatorState | None = None,
+    scope: FormalScope | None = None,
+    enable_x_split: bool = False,
+    family_access_policy: bool | None = None,
+    observer=None,
+) -> IterationResult:
+    family_access = scope == FORMAL_SCOPE_V2 if family_access_policy is None else family_access_policy
+    if family_access and scope != FORMAL_SCOPE_V2:
+        raise ValueError("decision-family access policies require FORMAL_SCOPE_V2")
+    reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
+    attempts_before = stats.raw_attempts
+    screened, complete, _ = generate_candidate_pool(
+        current, current_directions, config, search_config, stats, seed=seed,
+        current_schedule=current_schedule, adaptive_state=adaptive_state,
+        scope=scope, enable_x_split=enable_x_split, observer=observer,
+    )
+
     cheap_ranked = tuple(sorted(complete, key=lambda item: item.cheap_score))
     c2 = (
         select_c2_by_family(cheap_ranked, search_config.kdp, seed=stats.seed, iteration=stats.iterations)
         if family_access else cheap_ranked[: search_config.kdp]
     )
+    if observer is not None:
+        observer("selection", (tuple(complete), tuple(c2)))
     stats.kdp_count += len(c2)
     stats.per_iteration_kdp.append(len(c2))
 
@@ -658,6 +687,8 @@ def evaluate_iteration(
         c4.append(evaluated)
     stats.per_iteration_nref.append(stats.nref - calls_before)
     stats.per_iteration_attempts.append(stats.raw_attempts - attempts_before)
+    if observer is not None:
+        observer("iteration_evaluation", (tuple(c3), tuple(c4), _proposal(c4)))
     return IterationResult(
         tuple(screened), tuple(complete), tuple(c3), tuple(c4), _proposal(c4)
     )
@@ -678,6 +709,7 @@ def run_bounded_sa_oi(
     initialization_override: InitializationResult | None = None,
     enable_x_split: bool = False,
     family_access_policy: bool | None = None,
+    observer=None,
 ) -> SearchResult:
     started = time.perf_counter()
     if enable_x_split and (
@@ -803,6 +835,21 @@ def run_bounded_sa_oi(
             stats.operator_pair_global_bests[label] += 1
         adaptive.record(pair, reward)
 
+    def observe_boundary():
+        if observer is not None:
+            observer("boundary", {
+                "solution": current_solution, "directions": current_directions,
+                "schedule": current_schedule, "metrics": current_metrics,
+                "iteration": stats.iterations, "elapsed": time.perf_counter() - started,
+                "adaptive": adaptive, "rng_state": rng.getstate(),
+                "temperature": temperature(search_config, stats.nref),
+                "nref": stats.nref,
+                "operator_pair_uses": dict(stats.operator_pair_uses),
+                "operator_pair_rewards": dict(stats.operator_pair_rewards),
+                "operator_pair_global_bests": dict(stats.operator_pair_global_bests),
+            })
+
+    observe_boundary()
     termination_reason = "ITERATION_LIMIT"
     for iteration in range(search_config.max_iterations):
         if (
@@ -827,6 +874,7 @@ def run_bounded_sa_oi(
             scope=scope,
             enable_x_split=enable_x_split,
             family_access_policy=family_access_policy,
+            observer=observer,
         )
         stats.iterations += 1
         proposal = result.proposal
@@ -843,6 +891,7 @@ def run_bounded_sa_oi(
         if proposal is None or proposal.metrics is None:
             stats.proposal_trajectory.append((iteration, None, False, None))
             stats.per_iteration_nref[-1] = stats.nref - iteration_calls_before
+            observe_boundary()
             continue
         remaining_refinement = min(
             search_config.direction_refinement_budget,
@@ -890,6 +939,8 @@ def run_bounded_sa_oi(
                     False,
                 )
         stats.per_iteration_nref[-1] = stats.nref - iteration_calls_before
+        if observer is not None:
+            observer("post_c4", proposal)
         current_before = current_metrics
         accepted, _, _ = sa_accept(
             current_metrics.cmax,
@@ -908,6 +959,7 @@ def run_bounded_sa_oi(
                 )
             )
             record_lns_observation(proposal, search_config.reward_rejected)
+            observe_boundary()
             continue
         stats.proposal_trajectory.append(
             (
@@ -962,6 +1014,7 @@ def run_bounded_sa_oi(
         else:
             reward = search_config.reward_accepted_non_improvement
         record_lns_observation(proposal, reward, global_best=global_best)
+        observe_boundary()
 
     cert_started = time.perf_counter()
     final_certification = certify_schedule(best_solution, best_schedule, config, scope=scope)
@@ -1013,6 +1066,7 @@ def run_sa_oi_alns_v2(
     source_commit: str | None = None,
     allow_unverified_source: bool = False,
     formal_result: bool = False,
+    observer=None,
 ) -> SearchResult:
     return run_bounded_sa_oi(
         parents,
@@ -1025,6 +1079,7 @@ def run_sa_oi_alns_v2(
         allow_unverified_source=allow_unverified_source,
         formal_result=formal_result,
         enable_x_split=True,
+        observer=observer,
     )
 
 

@@ -24,7 +24,11 @@ from scripts import run_phase3z_v2_validation as phase3z
 
 
 def test_z_frozen_metadata_configs_and_new_seeds():
-    roles, selected, yr = phase3z.frozen_metadata()
+    roles, selected, yr = _z_historical_metadata()
+    # Phase4 adds observation/continuation APIs. The old execution guard must
+    # still reject running the frozen Phase3 protocol against this newer source.
+    with pytest.raises(ValueError, match="protected source/history changed"):
+        phase3z.frozen_metadata()
     assert len(selected["instances"]) == 12
     assert phase3z.SEEDS == (20261011, 20261012, 20261013, 20261014, 20261015)
     assert not set(phase3z.SEEDS) & {20261005, 20261006, 20261007}
@@ -51,7 +55,7 @@ def test_z_rejects_other_roles_before_workbook_loader(role):
 @pytest.mark.parametrize("folder", ("ID_TEST", "PPO_TRAIN"))
 def test_z_role_not_folder_authorizes_validation(monkeypatch, folder):
     from types import SimpleNamespace
-    roles, selection, _ = phase3z.frozen_metadata()
+    roles, selection, _ = _z_historical_metadata()
     entry = next(r for r in selection["instances"] if folder in r["relative_path"])
     calls = []
     def fake_loader(*args, **kwargs):
@@ -80,9 +84,16 @@ def test_z_deterministic_interleaved_order():
     assert order == phase3z.run_order(entries)
 
 
+def _z_historical_metadata():
+    # Read archived metadata for analysis tests; never authorize a new solver.
+    return tuple(phase3z.read_json(p) for p in
+                 (phase3z.ROLES_PATH, phase3z.VALIDATION_PATH, phase3z.YR_PATH))
+
+
 def _z_protocol():
-    # Metadata fixture only, not a formal protocol and never used for a solver.
-    return phase3z.build_protocol(require_verified=False)
+    # Frozen historical protocol, read-only: resume/aggregation unit fixtures
+    # must not rebuild an old scientific registration using Phase4 source.
+    return phase3z.read_json(phase3z.PROTOCOL_PATH)
 
 
 @pytest.mark.parametrize("field", ("phase3z_protocol_hash", "scope_hash", "v2_validation_set_hash",
@@ -264,7 +275,12 @@ def test_yr_runner_rejects_sealed_roles_before_workbook_load(monkeypatch, role):
 def test_yr_protocol_preserves_all_frozen_science_data_and_hga():
     protocol = phase3y._read_json(phase3y.YR_PROTOCOL_PATH)
     old = phase3y._read_json(phase3y.PROTOCOL_PATH)
-    phase3y.verify_yr_frozen(protocol)
+    import hashlib
+    changed = [path for path, expected in protocol["protected_file_sha256"].items()
+               if hashlib.sha256((phase3y.ROOT / path).read_bytes()).hexdigest() != expected]
+    assert set(changed) == {"src/mrta_search/neighborhood.py"}
+    with pytest.raises(ValueError, match="protected file changed"):
+        phase3y.verify_yr_frozen(protocol)
     assert protocol["source_phase3y_protocol_hash"] == old["phase3y_protocol_hash"]
     for field in ("scope_hash", "catalog_hashes", "methods", "instances", "seeds",
                   "checkpoints_seconds", "time_limit_seconds", "access_gate",

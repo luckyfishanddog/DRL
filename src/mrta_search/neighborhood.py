@@ -503,6 +503,7 @@ def generate_raw_attempts(
     moves: tuple[MoveType, ...] = ACTIVE_MOVE_TYPES,
     enable_x_split: bool = False,
     scope: FormalScope | None = None,
+    start_attempt: int = 0,
 ) -> tuple[RawAttempt, ...]:
     started = time.perf_counter()
     mask = applicable_move_mask(
@@ -516,11 +517,13 @@ def generate_raw_attempts(
     for move in applicable:
         stats.applicable_by_move[move.value] += 1
     order = balanced_move_attempt_order(
-        m, seed + solution.revision, applicable
+        m + start_attempt, seed + solution.revision, applicable
     )
     ordinals = {move: 0 for move in moves}
+    for move in order[:start_attempt]:
+        ordinals[move] += 1
     attempts = []
-    for move in order:
+    for move in order[start_attempt:]:
         stats.raw_attempts += 1
         stats.attempted_by_move[move.value] += 1
         attempt = make_raw_candidate(
@@ -668,6 +671,7 @@ def screen_raw_attempts(
     *,
     enable_x_split: bool = False,
     scope: FormalScope | None = None,
+    observer=None,
 ) -> tuple[ScreenedCandidate, ...]:
     started = time.perf_counter()
     seen_keys: set[CandidateKey] = set()
@@ -679,20 +683,27 @@ def screen_raw_attempts(
     x_validator = (
         finite_x_split_validator(current.parents, config) if enable_x_split else None
     )
+    def emit(attempt, status, reason=None, solution=None):
+        if observer is not None:
+            observer("atomic_attempt", (attempt, status, reason, solution))
+
     for attempt in attempts:
         candidate = attempt.candidate
         if candidate is None:
+            emit(attempt, "RAW_REJECTED", attempt.rejection_reason)
             continue
         move_name = attempt.move_type.value
         if candidate.key in seen_keys:
             stats.duplicates += 1
             stats.duplicate_by_move[move_name] += 1
             stats.rejection_reasons["DUPLICATE_CANDIDATE_KEY"] += 1
+            emit(attempt, "DUPLICATE", "DUPLICATE_CANDIDATE_KEY")
             continue
         seen_keys.add(candidate.key)
         obvious_error = _obvious_move_error(current, candidate)
         if obvious_error is not None:
             stats.rejection_reasons[f"CHEAP_INVALID:{obvious_error}"] += 1
+            emit(attempt, "CONSTRUCTION_REJECTED", obvious_error)
             continue
         if (
             candidate.split_pattern is not None
@@ -700,6 +711,7 @@ def screen_raw_attempts(
             and not enable_x_split
         ):
             stats.rejection_reasons["X_SPLIT_FORBIDDEN"] += 1
+            emit(attempt, "CONSTRUCTION_REJECTED", "X_SPLIT_FORBIDDEN")
             continue
         if candidate.key.move_type is MoveType.SPLIT_DEACTIVATE:
             pattern = next(
@@ -709,6 +721,7 @@ def screen_raw_attempts(
             )
             if pattern.mandatory:
                 stats.rejection_reasons["MANDATORY_Y_CANNOT_DEACTIVATE"] += 1
+                emit(attempt, "CONSTRUCTION_REJECTED", "MANDATORY_Y_CANNOT_DEACTIVATE")
                 continue
         try:
             provisional = apply_candidate(
@@ -727,16 +740,19 @@ def screen_raw_attempts(
                 raise ValueError("robot eligibility failure")
         except (ValueError, IndexError, KeyError) as error:
             stats.rejection_reasons[f"CHEAP_INVALID:{error}"] += 1
+            emit(attempt, "CONSTRUCTION_REJECTED", str(error))
             continue
         if provisional.canonical_hash == current.canonical_hash:
             stats.duplicates += 1
             stats.duplicate_by_move[move_name] += 1
             stats.rejection_reasons["IDENTITY_MOVE"] += 1
+            emit(attempt, "IDENTITY", "IDENTITY_MOVE", provisional)
             continue
         if provisional.canonical_hash in seen_solutions:
             stats.duplicates += 1
             stats.duplicate_by_move[move_name] += 1
             stats.rejection_reasons["DUPLICATE_CANONICAL_SOLUTION"] += 1
+            emit(attempt, "DUPLICATE", "DUPLICATE_CANONICAL_SOLUTION", provisional)
             continue
         seen_solutions.add(provisional.canonical_hash)
         provisional_blocks = block_map(provisional, config, scope=scope)
@@ -759,6 +775,7 @@ def screen_raw_attempts(
                 split_delta,
             )
         )
+        emit(attempt, "VALID", solution=provisional)
         stats.cheap_feasible += 1
         stats.cheap_valid_by_move[move_name] += 1
     stats.cheap_screen_time += time.perf_counter() - started

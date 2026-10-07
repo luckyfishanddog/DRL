@@ -96,7 +96,8 @@ def test_stable_weld_ids_and_geometry_hash_ignore_absolute_root(tmp_path):
     left.mkdir()
     right.mkdir()
     _write_family(left / "family.xlsx")
-    _write_family(right / "family.xlsx")
+    # Compare identical workbook bytes under different absolute roots.
+    (right / "family.xlsx").write_bytes((left / "family.xlsx").read_bytes())
     a = load_ppo_platform_instance(left / "family.xlsx", "g01_w003", ppo_root=left)
     b = load_ppo_platform_instance(right / "family.xlsx", "g01_w003", ppo_root=right)
     assert [row.weld_id for row in a.rows] == ["w0", "w1", "w2"]

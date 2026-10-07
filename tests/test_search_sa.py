@@ -416,3 +416,228 @@ def test_q1_q5_nontrivial_initial_gap_and_backbone_quality(case_name: str) -> No
         )
     assert search.final_certification is not None
     assert search.final_certification.certified
+
+# Phase4-0 observation/replay is tested in this existing search test module.
+def test_phase4_observer_and_prefix_replay_leave_search_unchanged(monkeypatch):
+    from copy import deepcopy
+    from dataclasses import replace
+    from scripts import run_phase4_0_oracle_recall as audit
+    from mrta_search import pipeline
+    from mrta_search.neighborhood import generate_raw_attempts
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    parents=_base().parents
+    cfg=replace(audit.SEARCH,max_iterations=3,time_limit=None)
+    captures=[]
+    original=pipeline.evaluate_iteration
+    def observed_evaluation(*args,**kwargs):
+        result=original(*args,**kwargs)
+        captures.append((result.complete_candidates,result.c3_candidates,result.c4_candidates))
+        return result
+    monkeypatch.setattr(pipeline,'evaluate_iteration',observed_evaluation)
+    a=pipeline.run_sa_oi_alns_v2(parents,audit.CONFIG,cfg,seed=19,source_provenance=_development_provenance())
+    off=captures[:];captures.clear()
+    cap=audit.Capture(keep_all=True)
+    b=pipeline.run_sa_oi_alns_v2(parents,audit.CONFIG,cfg,seed=19,source_provenance=_development_provenance(),observer=cap)
+    assert captures==off
+    assert a.best_solution==b.best_solution and a.best_directions==b.best_directions
+    assert a.best_metrics==b.best_metrics
+    assert a.stats.proposal_trajectory==b.stats.proposal_trajectory
+    assert a.stats.operator_sequence==b.stats.operator_sequence
+    before=deepcopy(b.stats)
+    for context in cap.all[:-1]:
+        saved=deepcopy(context)
+        candidates,trace,chunks,c2,c3,c4=audit.replay(context,seed=19)
+        assert len(trace)==256 and trace[:64]==context['attempts']
+        assert chunks[0][0]==64 and chunks[1][0]==128 and chunks[2][0]==256
+        assert len(c2)<=8 and len(c4)<=2
+        assert len(candidates)<256  # rejected/duplicate attempts consume budget
+        assert context==saved
+        assert audit.unpack(audit.pack(context,parents),parents)==context
+        generation_seed=19+context['iteration']*65537
+        actual_atomic=generate_raw_attempts(context['solution'],audit.CONFIG,m=192,seed=generation_seed,
+            stats=SearchStats(FORMAL_SCOPE_V2.scope_id,19),enable_x_split=True,scope=FORMAL_SCOPE_V2)
+        assert actual_atomic==tuple(v[0] for event,v in trace if event=='atomic_attempt')
+        lns=[]
+        pipeline.generate_candidate_pool(context['solution'],context['directions'],audit.CONFIG,audit.SEARCH,
+            SearchStats(FORMAL_SCOPE_V2.scope_id,19),seed=generation_seed,current_schedule=context['schedule'],
+            adaptive_state=deepcopy(context['adaptive']),scope=FORMAL_SCOPE_V2,enable_x_split=True,
+            atomic_budget=0,lns_budget=64,observer=lambda event,value:lns.append((event,value)))
+        assert [v[:4] for event,v in lns]==[v[:4] for event,v in trace if event=='lns_attempt']
+    assert b.stats==before
+
+
+def test_phase4_recall_nulls_epsilon_and_nested_minima():
+    from scripts.run_phase4_0_oracle_recall import recall_metrics
+    def c(key,prefix,cmax,status='FEASIBLE_CERTIFIED'):
+        return dict(candidate_id=key,first_prefix=prefix,Cmax=cmax,status=status)
+    rows=[c('a',64,90),c('b',128,80),c('c',256,60),c('dead',64,None,'DEADLOCK')]
+    m=recall_metrics(100,rows,['a'],['a'])
+    assert m['C_star']=={'64':90,'128':80,'256':60,'C2':90,'C4':90}
+    assert m['generation_recall64']==.25 and m['generation_recall128']==.5
+    assert m['c2_recall']==1 and m['c4_recall']==1
+    m=recall_metrics(100,[c('dead',64,None,'DEADLOCK'),c('b',128,80)],[],[])
+    assert m['C_star']['64'] is None and m['no_feasible']['64']
+    assert m['zero_capture64'] and m['generation_recall64']==0
+    assert m['c2_recall'] is None and m['c4_recall'] is None
+    m=recall_metrics(100,[c('a',64,100-5e-8)],['a'],[])
+    assert not m['opportunity'] and m['generation_recall64'] is None
+    m=recall_metrics(100,[c('a',64,90)],[],[])
+    assert m['c2_recall']==0 and m['c4_recall']==0 and m['zero_captureC4']
+
+
+@pytest.mark.parametrize('status',('DEADLOCK','INFEASIBLE','NUMERIC_FAILURE','DIRECTION_INFEASIBLE','FEASIBLE','CERTIFIER_MISMATCH'))
+def test_phase4_label_semantics(monkeypatch,status):
+    from types import SimpleNamespace
+    from scripts import run_phase4_0_oracle_recall as audit
+    from mrta_reference.model import OfficialMetrics
+    solution=_base()
+    candidate=SimpleNamespace(solution=solution)
+    direction=SimpleNamespace(total_empty_travel=None if status=='DIRECTION_INFEASIBLE' else 1.0,directions=((),(),(0,0),(0,0)))
+    monkeypatch.setattr(audit,'canonicalize',lambda *a,**kw:solution)
+    monkeypatch.setattr(audit,'optimize_directions_with_initial_feasibility',lambda *a:direction)
+    monkeypatch.setattr(audit,'encode',lambda value,*a:repr(value))
+    monkeypatch.setattr(audit,'identity',lambda c:'id')
+    monkeypatch.setattr(audit,'certify_schedule',lambda *a,**kw:SimpleNamespace(certified=status!='CERTIFIER_MISMATCH'))
+    calls=[]
+    def evaluator(*args,**kwargs):
+        calls.append(1)
+        schedule_status=ScheduleStatus.FEASIBLE if status in ('FEASIBLE','CERTIFIER_MISMATCH') else ScheduleStatus(status)
+        return ScheduleResult(schedule_status,cmax=90.0 if schedule_status is ScheduleStatus.FEASIBLE else None)
+    label=audit.evaluate_oracle_candidate(candidate,100,evaluator)
+    if status=='FEASIBLE':
+        assert label[:4]==('FEASIBLE_CERTIFIED',90.0,10.0,1)
+    elif status=='CERTIFIER_MISMATCH':
+        assert label[0]=='NUMERIC_FAILURE' and label[1:3]==(None,None) and label[8]==1
+    else:
+        assert label[0]==status and label[1:3]==(None,None)
+    assert len(calls)==(0 if status=='DIRECTION_INFEASIBLE' else 1)
+
+
+@pytest.mark.parametrize('role',('RANKER_TRAIN','V2_VALIDATION','ID_TEST_SEALED','V2_MODEL_DEVELOPMENT_CONSUMED'))
+def test_phase4_isolation_fails_before_excel(monkeypatch,role):
+    from scripts import run_phase4_0_oracle_recall as audit
+    calls=[]
+    original=audit.read
+    parent_role='V2_TRAIN_POOL' if role=='RANKER_TRAIN' else role
+    def read(path):
+        if path==audit.ROLES:
+            return {'workbooks':[{'relative_path':'blocked.xlsx','new_v2_role':parent_role}]}
+        if path==audit.SPLIT:
+            return {'workbooks':[{'relative_path':'blocked.xlsx','ranker_role':role}]}
+        return original(path)
+    monkeypatch.setattr(audit,'read',read)
+    monkeypatch.setattr(audit,'load_ppo_platform_instance',lambda *a,**kw:calls.append(1))
+    with pytest.raises(ValueError):
+        audit.load_parents({'relative_path':'blocked.xlsx'})
+    assert not calls
+
+
+def test_phase4_mechanical_bottleneck_priority():
+    from scripts.run_phase4_0_oracle_recall import decisions,recall_metrics
+    def rows(c64,c128,c256,c2,c4):
+        result=[]
+        for tier in ('SMALL','MEDIUM','LARGE'):
+            for _ in range(6):
+                candidates=[dict(candidate_id=k,first_prefix=p,Cmax=v,status='FEASIBLE_CERTIFIED') for k,p,v in [('base',64,c64),('two',64,c2),('four',64,c4),('b',128,c128),('c',256,c256)]]
+                result.append({'tier':tier,**recall_metrics(100,candidates,['two','four'],['four'])})
+        return result
+    assert decisions(rows(99,80,80,100,100),True)['PRIMARY_BOTTLENECK']=='CANDIDATE_GENERATION'
+    assert decisions(rows(80,80,80,90,95),True)['PHASE4_1_MLP_AUTHORIZED']=='YES'
+    assert decisions(rows(80,80,80,80,80),True)['PRIMARY_BOTTLENECK']=='NO_MATERIAL_POOL_OR_RANKING_GAP'
+    assert decisions(rows(100,100,100,100,100),True)['PRIMARY_BOTTLENECK']=='INSUFFICIENT_EVIDENCE'
+    assert decisions(rows(80,80,80,90,95),False)['PHASE4_1_MLP_AUTHORIZED']=='NO'
+
+
+def test_phase4_offline_worker_preserves_label_and_diagnostics():
+    from scripts import run_phase4_0_oracle_recall as audit
+    from mrta_search.lns import atomic_complete_candidate
+    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.neighborhood import generate_raw_attempts, screen_raw_attempts
+    current=_base()
+    directions=((),(),(0,0),(0,0))
+    stats=SearchStats(FORMAL_SCOPE_V2.scope_id,19)
+    raw=generate_raw_attempts(current,audit.CONFIG,m=48,seed=19,stats=stats,enable_x_split=True,scope=FORMAL_SCOPE_V2)
+    screened=screen_raw_attempts(current,directions,raw,audit.CONFIG,stats,enable_x_split=True,scope=FORMAL_SCOPE_V2)
+    candidate=atomic_complete_candidate(current,directions,screened[0],audit.CONFIG)
+    expected=audit.evaluate_oracle_candidate(candidate,1000,FormalReferenceEvaluator(FORMAL_SCOPE_V2))
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=1) as executor:
+        actual=executor.submit(audit.oracle_worker,(audit.pack(candidate,current.parents),current.parents,1000,())).result(timeout=30)
+    assert actual[:4]==expected[:4]
+    assert actual[8]==expected[8]
+    assert bytes(actual[-1])==bytes(expected[-1])
+
+
+@pytest.mark.parametrize('column',('protocol_hash','scope_hash','source_hash'))
+def test_phase4_resume_rejects_mixed_scientific_identity(monkeypatch,column):
+    import sqlite3
+    from scripts import run_phase4_0_oracle_recall as audit
+    connection=sqlite3.connect(':memory:')
+    monkeypatch.setattr(audit.sqlite3,'connect',lambda *args,**kwargs:connection)
+    protocol={'protocol_hash':'protocol','scope_hash':audit.FORMAL_SCOPE_V2.scope_hash,
+              'source':{'source_tree_hash':'source'}}
+    db=audit.database(protocol)
+    db.execute('INSERT INTO states VALUES (?,?,?)',('state','{}','PASS'))
+    db.execute('INSERT INTO candidates(protocol_hash,state_id,candidate_id,scope_hash,source_hash,canonical_hash,family,first_prefix,production_reference_evaluated,payload) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        ('protocol','state','candidate',protocol['scope_hash'],'source','canonical','STRUCTURAL',64,0,b'payload'))
+    db.execute('UPDATE candidates SET '+column+'=?',('wrong',))
+    db.commit()
+    with pytest.raises(ValueError,match='different protocol/scope/source identity'):
+        audit.database(protocol)
+    db.close()
+
+
+def test_phase4_split_uses_only_whole_training_workbooks():
+    from collections import Counter
+    from scripts import run_phase4_0_oracle_recall as audit
+    split=audit.read(audit.SPLIT)
+    paths={row['relative_path'] for row in split['workbooks']}
+    assert len(paths)==31
+    assert Counter(row['ranker_role'] for row in split['workbooks'])=={'RANKER_TRAIN':23,'RANKER_DEV':8}
+    roles={row['relative_path']:row['new_v2_role'] for row in audit.read(audit.ROLES)['workbooks']}
+    assert all(roles[path]=='V2_TRAIN_POOL' for path in paths)
+    counts=Counter(row['relative_path'] for row in split['audit_instances'])
+    assert max(counts.values())<=2
+    assigned={row['relative_path']:row['ranker_role'] for row in split['workbooks']}
+    assert all(assigned[row['relative_path']]=='RANKER_DEV' for row in split['audit_instances'])
+    assert Counter(row['tier'] for row in split['audit_instances'])=={'SMALL':4,'MEDIUM':4,'LARGE':4}
+
+
+def test_phase4_storage_compaction_preserves_every_logical_row(monkeypatch):
+    import sqlite3
+    from scripts import run_phase4_0_oracle_recall as audit
+    connection=sqlite3.connect(':memory:')
+    monkeypatch.setattr(audit.sqlite3,'connect',lambda *args,**kwargs:connection)
+    protocol={'protocol_hash':'protocol','scope_hash':audit.FORMAL_SCOPE_V2.scope_hash,
+              'source':{'source_tree_hash':'source'}}
+    db=audit.database(protocol)
+    expected={}
+    for state in ('first','second'):
+        db.execute('INSERT INTO states VALUES (?,?,?)',(state,'{}','PASS'))
+        db.execute('INSERT INTO candidates(protocol_hash,state_id,candidate_id,scope_hash,source_hash,canonical_hash,family,first_prefix,production_reference_evaluated,payload,status,Cmax,delta_Cmax) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ('protocol',state,'完整候选身份:long identity'*20,protocol['scope_hash'],'source','canonical','STRUCTURAL',64,0,audit.pack({'candidate':'payload'}),'FEASIBLE_CERTIFIED',90,10))
+        for ordinal in range(4):
+            detail=('atomic_attempt',{'ordinal':ordinal,'shared':'a repeated trace value'*20})
+            expected[state,ordinal]=detail
+            db.execute('INSERT INTO attempts VALUES (?,?,?,?,?,?,?)',(state,ordinal,'ATOMIC','VALID','STRUCTURAL','完整候选身份:long identity'*20,audit.pack(detail)))
+    import zlib
+    diagnostic={'certified':True,'note':'完整诊断','shared':'repeated data'*20}
+    db.execute('UPDATE candidates SET diagnostics=?',(zlib.compress(audit.dumps(diagnostic).encode('utf-8')),))
+    db.commit()
+    candidate_id='完整候选身份:long identity'*20
+    assert audit.read_candidate_payload(db,'first',candidate_id)=={'candidate':'payload'}
+    assert audit.read_candidate_diagnostic(db,'first',candidate_id)==diagnostic
+    assert audit.compact_connection(db)
+    assert audit.compact_connection(db)  # repeated compaction is lossless too
+    assert audit.read_candidate_payload(db,'first',candidate_id)=={'candidate':'payload'}
+    assert audit.read_candidate_diagnostic(db,'first',candidate_id)==diagnostic
+    for key,value in expected.items():
+        assert audit.read_attempt_detail(db,*key)==value
+    identity=db.execute('SELECT candidate_id FROM candidates LIMIT 1').fetchone()[0]
+    assert isinstance(identity,bytes)
+    assert audit.expanded_identity(identity)=='完整候选身份:long identity'*20
+    assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute('INSERT INTO candidates SELECT * FROM candidates LIMIT 1')
+    db.close()
