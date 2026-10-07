@@ -164,7 +164,7 @@ NEXT_PHASE is Phase 3-Z — V2 Common-Model Validation, using the already-frozen
 
 ## Files and execution
 
-The three approved new files are the [YR protocol](../data/manifests/PHASE3YR_V2_ACCESS_PROTOCOL_V1.json), [YR artifact](../data/development/phase3yr_v2_access_closure_v1.json), and this handoff. The existing runner and test files were reused. [FORMAL_SCOPE_V2](FORMAL_SCOPE_V2.md) was updated only for closure/activation history; README reflects the active V2 state.
+The three approved new files are the YR protocol（对应过程文件已清理，结论保留在本报告）, YR artifact（对应过程文件已清理，结论保留在本报告）, and this handoff. The existing runner and test files were reused. [FORMAL_SCOPE_V2](FORMAL_SCOPE_V2.md) was updated only for closure/activation history; README reflects the active V2 state.
 
 Working directory: `D:\pybullet_test\MRTA_GA\DRL`. Required interpreter: `D:\pybullet_test\.venv\Scripts\python.exe`.
 

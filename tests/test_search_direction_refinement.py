@@ -211,7 +211,7 @@ def test_formal_q1_q6_regression(name, expected, monkeypatch):
     from pathlib import Path
     from mrta_reference.scope import FORMAL_SCOPE_V1_1
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
-    from profile_scheduler import quality_fixture
+    from test_scheduler_equivalence import quality_fixture
     parents, seed, iterations = quality_fixture(name)
     result = run_bounded_sa_oi(parents, FAST, SearchConfig(max_iterations=iterations),
                                seed=seed, scope=FORMAL_SCOPE_V1_1, source_provenance=_development_provenance("test"),

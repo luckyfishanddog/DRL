@@ -535,6 +535,7 @@ def evaluate_iteration(
     enable_x_split: bool = False,
     family_access_policy: bool | None = None,
     observer=None,
+    ranker=None,
 ) -> IterationResult:
     family_access = scope == FORMAL_SCOPE_V2 if family_access_policy is None else family_access_policy
     if family_access and scope != FORMAL_SCOPE_V2:
@@ -548,10 +549,16 @@ def evaluate_iteration(
     )
 
     cheap_ranked = tuple(sorted(complete, key=lambda item: item.cheap_score))
-    c2 = (
-        select_c2_by_family(cheap_ranked, search_config.kdp, seed=stats.seed, iteration=stats.iterations)
-        if family_access else cheap_ranked[: search_config.kdp]
-    )
+    if ranker is not None:
+        if not family_access or current_schedule is None or current_schedule.cmax is None:
+            raise ValueError("Learned ranking requires a certified V2 current state")
+        c2 = ranker.select_c2(current,current_directions,current_schedule.cmax,cheap_ranked,config,
+                             seed=stats.seed,iteration=stats.iterations,k=search_config.kdp)
+    else:
+        c2 = (
+            select_c2_by_family(cheap_ranked, search_config.kdp, seed=stats.seed, iteration=stats.iterations)
+            if family_access else cheap_ranked[: search_config.kdp]
+        )
     if observer is not None:
         observer("selection", (tuple(complete), tuple(c2)))
     stats.kdp_count += len(c2)
@@ -582,10 +589,14 @@ def evaluate_iteration(
         if _y_patterns(candidate.solution):
             stats.y_pattern_candidates_c3 += 1
     feasible_c3 = [item for item in c3 if item.direction.total_empty_travel is not None]
-    shortlist = (
-        select_c4_by_family(feasible_c3, search_config.kref, seed=stats.seed, iteration=stats.iterations)
-        if family_access else rerank_c3(feasible_c3, search_config.kref)
-    )
+    if ranker is not None:
+        shortlist = ranker.select_c4(current,current_directions,current_schedule.cmax,feasible_c3,config,
+                                     seed=stats.seed,iteration=stats.iterations,k=search_config.kref)
+    else:
+        shortlist = (
+            select_c4_by_family(feasible_c3, search_config.kref, seed=stats.seed, iteration=stats.iterations)
+            if family_access else rerank_c3(feasible_c3, search_config.kref)
+        )
 
     cache: dict[tuple[object, ...], ReferenceEvaluatedCandidate] = {}
     c4 = []
@@ -712,6 +723,7 @@ def run_bounded_sa_oi(
     enable_x_split: bool = False,
     family_access_policy: bool | None = None,
     observer=None,
+    ranker=None,
 ) -> SearchResult:
     started = time.perf_counter()
     if enable_x_split and (
@@ -877,6 +889,7 @@ def run_bounded_sa_oi(
             enable_x_split=enable_x_split,
             family_access_policy=family_access_policy,
             observer=observer,
+            ranker=ranker,
         )
         stats.iterations += 1
         proposal = result.proposal
@@ -1069,6 +1082,7 @@ def run_sa_oi_alns_v2(
     allow_unverified_source: bool = False,
     formal_result: bool = False,
     observer=None,
+    ranker=None,
 ) -> SearchResult:
     # Explicit historical configs are honored unchanged. Only this V2 default
     # adopts the measured production pool; expensive evaluation budgets stay fixed.
@@ -1089,6 +1103,7 @@ def run_sa_oi_alns_v2(
         formal_result=formal_result,
         enable_x_split=True,
         observer=observer,
+        ranker=ranker,
     )
 
 
@@ -1144,4 +1159,19 @@ def micro_gap_decomposition(
         search_gap,
         scheduler_gap,
         total_gap,
+    )
+
+
+def phase3_alns_config(budget: float, *, policy: str = "V2") -> SearchConfig:
+    """Phase-3 comparison config: wall clock is primary; iterations are safety only."""
+    if policy not in ("V2", "V3_NO_TWO_OPT_STAR", "V3_TWO_OPT_STAR"):
+        raise ValueError(f"unsupported ALNS policy: {policy}")
+    v3 = policy != "V2"
+    return SearchConfig(
+        construction_budget=5 if v3 else 4,
+        kinit_ref=5 if v3 else 2,
+        time_limit=budget,
+        max_iterations=100000,
+        checkpoints=(5.0, 30.0, 60.0),
+        enable_two_opt_star=policy == "V3_TWO_OPT_STAR",
     )

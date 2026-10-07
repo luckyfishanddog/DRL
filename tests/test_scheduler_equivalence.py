@@ -30,7 +30,7 @@ FAST = ScientificConfig(weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
 @pytest.mark.parametrize("level", (1, 2))
 def test_zr_dispatch_observer_preserves_feasible_recovered_deadlock(monkeypatch, index, level):
     from dataclasses import asdict
-    from scripts.run_phase3zr_runtime_audit import ReferenceTrace
+    from test_baseline_common import ReferenceTrace
     from mrta_reference.scope import FORMAL_SCOPE_V2
     from mrta_reference.scheduler import FormalReferenceEvaluator
     templates = _oracle_cases()[index]
@@ -686,7 +686,7 @@ def test_v1_1_profile_on_off_has_identical_scientific_result():
 def test_plateau_detector_uses_per_candidate_status_cmax_and_certification(monkeypatch):
     from pathlib import Path
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
-    from profile_scheduler import detect_local_plateaus
+    from test_scheduler_equivalence import detect_local_plateaus
     budgets = (16, 32, 64, 128, 256)
     entry = {"replays": {
         str(budget): {
@@ -866,7 +866,7 @@ def test_fixed_budget_search_trajectory_is_identical() -> None:
 def test_method_independent_sampler_is_deterministic_canonical_and_search_free(
     monkeypatch,
 ) -> None:
-    import profile_scheduler as profiler
+    profiler=sys.modules[__name__]
 
     def forbidden(*args, **kwargs):
         raise AssertionError("a search heuristic was called by the direct sampler")
@@ -902,7 +902,7 @@ def test_method_independent_sampler_is_deterministic_canonical_and_search_free(
 
 
 def test_method_independent_pattern_sampling_selects_kind_before_y_candidate() -> None:
-    import profile_scheduler as profiler
+    profiler=sys.modules[__name__]
 
     parent = ParentWeld("optional-many-y", (1.0, 5.8), (9.0, 10.0))
 
@@ -927,7 +927,7 @@ def test_method_independent_pattern_sampling_selects_kind_before_y_candidate() -
 
 
 def test_method_independent_identity_dedup_and_json_round_trip_are_stable() -> None:
-    import profile_scheduler as profiler
+    profiler=sys.modules[__name__]
 
     parents = profiler.development_family("load_skew", 20)
     solution, directions, metadata = profiler.sample_method_independent_solution(
@@ -964,13 +964,13 @@ def test_method_independent_identity_dedup_and_json_round_trip_are_stable() -> N
     ),
 )
 def test_method_independent_corpus_accepts_only_baseline_deadlock(status, expected) -> None:
-    import profile_scheduler as profiler
+    profiler=sys.modules[__name__]
 
     assert profiler._baseline_status_is_collectible(status) is expected
 
 
 def test_final_budget_selector_uses_smallest_90_percent_budget_and_runtime_gate() -> None:
-    import profile_scheduler as profiler
+    profiler=sys.modules[__name__]
 
     selection = profiler.select_final_deadlock_budget(
         {32: 89, 64: 90, 128: 100},
@@ -993,3 +993,320 @@ def test_final_budget_selector_uses_smallest_90_percent_budget_and_runtime_gate(
         {32: 89, 64: 90, 128: 100},
         {32: 8.1, 64: 8.1, 128: 8.1},
     ) is None
+
+
+# Pure fixtures retained from the retired profiling driver.
+import hashlib,json,sys
+from dataclasses import asdict
+from mrta_reference.model import CanonicalSolution
+from mrta_reference.geometry import blocks_for_pattern,whole_eligible_rails
+from mrta_search.direction import optimize_directions_with_initial_feasibility
+from mrta_search.initialization import _construct,_patterns
+METHOD_INDEPENDENT_SAMPLER_POLICY_ID="METHOD_INDEPENDENT_DIRECT_SAMPLER_V1"
+def _solution_from_payload(payload: dict[str, object]) -> CanonicalSolution:
+    parents = tuple(ParentWeld(row[0], tuple(row[1]), tuple(row[2])) for row in payload["parents"])
+    patterns = tuple(
+        SplitPattern(row[0], SplitKind(row[1]), row[2], row[3], row[4])
+        for row in payload["patterns"]
+    )
+    routes = tuple(Route(row[0], tuple(row[1])) for row in payload["routes"])
+    solution = CanonicalSolution(parents, patterns, routes)
+    if solution.canonical_payload() != payload:
+        raise RuntimeError("corpus solution did not round-trip canonically")
+    return solution
+
+def detect_local_plateaus(
+    entries: list[dict[str, object]],
+    budgets: tuple[int, ...],
+    *,
+    tolerance: float = 1.0e-9,
+) -> list[int]:
+    candidates = []
+    available = set(budgets)
+    for budget in budgets:
+        if 2 * budget not in available or 4 * budget not in available:
+            continue
+        stable = True
+        for entry in entries:
+            rows = [entry["replays"][str(value)] for value in (budget, 2 * budget, 4 * budget)]
+            if len({row["status"] for row in rows}) != 1:
+                stable = False
+                break
+            if rows[0]["status"] == ScheduleStatus.FEASIBLE.value:
+                if not all(row["certified"] for row in rows):
+                    stable = False
+                    break
+                if max(row["Cmax"] for row in rows) - min(row["Cmax"] for row in rows) > tolerance:
+                    stable = False
+                    break
+        if stable:
+            candidates.append(budget)
+    return candidates
+
+def _rail_x(local: int, total: int) -> float:
+    left_count = (total + 1) // 2
+    right_count = total // 2
+    if local % 2 == 0:
+        return 0.7 + 8.0 * (local // 2) / max(1, left_count - 1)
+    return 19.2 - 8.0 * (local // 2) / max(1, right_count - 1)
+
+def development_family(name: str, count: int) -> tuple[ParentWeld, ...]:
+    parents = []
+    per_rail = (count + 1) // 2
+    left_count = (per_rail + 1) // 2
+    right_count = per_rail // 2
+    upper_seen = 0
+    lower_seen = 0
+    for index in range(count):
+        rail_index = index // 2
+        upper = index % 2 == 0
+        if rail_index % 2 == 0:
+            local = rail_index // 2
+            x = 0.7 + 8.0 * local / max(1, left_count - 1)
+        else:
+            local = rail_index // 2
+            x = 19.2 - 8.0 * local / max(1, right_count - 1)
+        if name == "load_skew":
+            upper = index % 4 != 3
+            local = upper_seen if upper else lower_seen
+            total = count - count // 4 if upper else count // 4
+            x = _rail_x(local, total)
+            upper_seen += int(upper)
+            lower_seen += int(not upper)
+            start = (x, 9.0 if upper else 3.0)
+            end = (x, 10.0 if upper else 2.0)
+        elif name == "spatial_cluster":
+            x = 0.7 + (x - 0.7) * 0.25 if rail_index % 2 == 0 else 19.2 - (19.2 - x) * 0.25
+            start = (x, 9.0 if upper else 3.0)
+            end = (x, 9.25 if upper else 2.75)
+        elif name == "handover_heavy":
+            local = index // 4
+            groups = (count + 3) // 4
+            offset = 7.0 * local / max(1, groups - 1)
+            x = {
+                0: 0.7 + offset,
+                1: 19.2 - offset,
+                2: 1.3 + offset,
+                3: 18.6 - offset,
+            }[index % 4]
+            start, end = (x, 5.8), (x, 6.2)
+        elif name == "interference_stress":
+            start = (x, 6.3 if upper else 5.0)
+            end = (x, 7.0 if upper else 5.7)
+        else:
+            raise ValueError(f"unknown development family: {name}")
+        parents.append(ParentWeld(f"{name}-{index:03d}", start, end))
+    return tuple(parents)
+
+def _direct_sampling_seed(
+    master_seed: int, family: str, size: int, sample_ordinal: int
+) -> int:
+    payload = json.dumps(
+        {
+            "family": family,
+            "master_seed": master_seed,
+            "policy": METHOD_INDEPENDENT_SAMPLER_POLICY_ID,
+            "sample_ordinal": sample_ordinal,
+            "size": size,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:8], "big")
+
+def _sample_formal_pattern(
+    parent: ParentWeld, config: ScientificConfig, rng: random.Random
+) -> SplitPattern:
+    """Sample pattern kind first so Y candidate multiplicity cannot bias the kind."""
+    y_patterns = tuple(
+        pattern
+        for pattern in generate_y_split_patterns(parent, config)
+        if all(
+            any(robot_is_eligible(block, robot, config) for robot in range(4))
+            for block in blocks_for_pattern(parent, pattern, config)
+        )
+    )
+    whole_eligible = bool(whole_eligible_rails(parent.start, parent.end, config))
+    if not whole_eligible:
+        if not y_patterns:
+            raise ValueError(f"{parent.parent_id}: mandatory Y has no legal candidate")
+        return rng.choice(y_patterns)
+    if not y_patterns or rng.randrange(2) == 0:
+        return SplitPattern(parent.parent_id, SplitKind.WHOLE)
+    return rng.choice(y_patterns)
+
+def sample_method_independent_solution(
+    parents: tuple[ParentWeld, ...],
+    config: ScientificConfig,
+    *,
+    master_seed: int,
+    family: str,
+    size: int,
+    sample_ordinal: int,
+) -> tuple[CanonicalSolution, tuple[tuple[int, ...], ...], dict[str, object]]:
+    """Directly sample the formal structural domain without a search heuristic."""
+    sampling_seed = _direct_sampling_seed(master_seed, family, size, sample_ordinal)
+    rng = random.Random(sampling_seed)
+    ordered_parents = tuple(sorted(parents, key=lambda parent: parent.parent_id))
+    for structural_draw in range(1, 4097):
+        patterns = tuple(
+            _sample_formal_pattern(parent, config, rng) for parent in ordered_parents
+        )
+        blocks = sorted(
+            (
+                block
+                for parent, pattern in zip(ordered_parents, patterns)
+                for block in blocks_for_pattern(parent, pattern, config)
+            ),
+            key=lambda block: block.block_id,
+        )
+        assigned = [[] for _ in range(4)]
+        for block in blocks:
+            eligible = tuple(
+                robot for robot in range(4) if robot_is_eligible(block, robot, config)
+            )
+            if not eligible:
+                raise ValueError(f"{block.block_id}: no formally eligible robot")
+            assigned[rng.choice(eligible)].append(block.block_id)
+        for block_ids in assigned:
+            block_ids.sort()
+            rng.shuffle(block_ids)
+        routes = tuple(Route(robot, tuple(assigned[robot])) for robot in range(4))
+        try:
+            solution = canonicalize(ordered_parents, patterns, routes, config)
+        except ValueError:
+            # Mandatory-Y children that become adjacent on one robot are not a
+            # canonical formal solution. Rejection sampling preserves the
+            # direct uniform draws while returning only structural-domain rows.
+            continue
+        directions = tuple(
+            tuple(rng.randrange(2) for _ in route.block_ids)
+            for route in solution.routes
+        )
+        metadata = {
+            "sampler_policy_id": METHOD_INDEPENDENT_SAMPLER_POLICY_ID,
+            "master_seed": master_seed,
+            "stratum": {"family": family, "N": size},
+            "sample_ordinal": sample_ordinal,
+            "sampling_seed": sampling_seed,
+            "structural_draws": structural_draw,
+        }
+        return solution, directions, metadata
+    raise RuntimeError("direct sampler exceeded 4096 deterministic structural draws")
+
+def _direct_state_exact_key(
+    solution: CanonicalSolution,
+    directions: tuple[tuple[int, ...], ...],
+    config: ScientificConfig,
+) -> str:
+    return json.dumps(
+        {
+            "canonical_solution_hash": solution.canonical_hash,
+            "directions": directions,
+            "scientific_config_hash": config.scientific_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+def _direct_corpus_entry(
+    solution: CanonicalSolution,
+    directions: tuple[tuple[int, ...], ...],
+    config: ScientificConfig,
+    metadata: dict[str, object],
+    baseline,
+) -> dict[str, object]:
+    exact_key = _direct_state_exact_key(solution, directions, config)
+    return {
+        "identity": hashlib.sha256(exact_key.encode("utf-8")).hexdigest(),
+        "canonical_solution_hash": solution.canonical_hash,
+        "canonical_solution": solution.canonical_payload(),
+        "directions": [list(row) for row in directions],
+        "scientific_config_hash": config.scientific_hash,
+        "scientific_config": json.loads(json.dumps(asdict(config), allow_nan=False)),
+        **metadata,
+        "baseline": {
+            "status": baseline.status.value,
+            "source": baseline.source,
+            "diagnostics": list(baseline.diagnostics),
+            "wait_for_graph": [
+                [robot, list(blockers)] for robot, blockers in baseline.wait_for_graph
+            ],
+            "canonical_schedule_hash": hashlib.sha256(
+                baseline.canonical_json().encode("utf-8")
+            ).hexdigest(),
+        },
+    }
+
+def _baseline_status_is_collectible(status: ScheduleStatus) -> bool:
+    return status is ScheduleStatus.DEADLOCK
+
+def select_final_deadlock_budget(
+    recovery_counts: dict[int, int], n100_p95: dict[int, float | None]
+) -> int | None:
+    """Apply the predeclared 90%-of-B128 coverage and eight-second gate."""
+    r128 = recovery_counts[128]
+    for budget in (32, 64, 128):
+        coverage = 1.0 if r128 == 0 else recovery_counts[budget] / r128
+        p95 = n100_p95.get(budget)
+        if coverage >= 0.90 and p95 is not None and p95 <= 8.0:
+            return budget
+    return None
+
+def quality_fixture(name: str) -> tuple[tuple[ParentWeld, ...], int, int]:
+    cases = {
+        "Q1_assignment_trap": (
+            (
+                ParentWeld("p0", (11.14, 10.0), (12.54, 10.0)),
+                ParentWeld("p1", (1.73, 10.0), (3.44, 10.0)),
+                ParentWeld("p2", (3.70, 10.0), (4.88, 10.0)),
+            ),
+            7,
+            1,
+        ),
+        "Q2_route_order_trap": (
+            (
+                ParentWeld("p0", (7.133, 8.048), (10.143, 11.5)),
+                ParentWeld("p1", (10.03, 8.264), (10.365, 8.484)),
+                ParentWeld("p2", (13.385, 9.169), (12.862, 9.463)),
+                ParentWeld("p3", (12.928, 8.209), (13.724, 8.133)),
+            ),
+            43,
+            8,
+        ),
+        "Q3_direction_trap": (
+            (
+                ParentWeld("u", (1.26, 6.33), (5.33, 6.21)),
+                ParentWeld("l", (6.26, 5.68), (1.99, 5.79)),
+            ),
+            3,
+            20,
+        ),
+        "Q4_optional_y_split_trap": (
+            (ParentWeld("optional", (0.0, 6.0), (4.0, 6.0)),),
+            0,
+            10,
+        ),
+        "Q5_interference_wait_trap": (
+            (
+                ParentWeld("u", (1.26, 6.33), (5.33, 6.21)),
+                ParentWeld("l", (6.26, 5.68), (1.99, 5.79)),
+                ParentWeld("d", (2.31, 10.0), (2.59, 10.0)),
+            ),
+            37,
+            12,
+        ),
+        "Q6_lns_basin_trap": (
+            (
+                ParentWeld("p0", (1.6988031761970745, 8.06251909281191), (2.507267666737879, 8.024513064718768)),
+                ParentWeld("p1", (10.876415580121574, 3.0587891677034196), (11.955019966147066, 3.7709109070254483)),
+                ParentWeld("p2", (16.84513432535822, 8.602342619881437), (15.951444969122434, 9.165047149162183)),
+                ParentWeld("p3", (6.854207738122211, 1.5241986081119485), (5.40597202291001, 2.096412420693884)),
+            ),
+            1,
+            4,
+        ),
+    }
+    return cases[name]
