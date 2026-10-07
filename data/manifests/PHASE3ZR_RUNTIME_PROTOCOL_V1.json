@@ -1,0 +1,141 @@
+{
+  "allowed_role": "V2_MODEL_DEVELOPMENT_CONSUMED",
+  "created_at": "2026-10-06T23:55:36.236471+08:00",
+  "execution": "sequential; native initialization in clock; no injection, retries, timeout or changed policy",
+  "forensic_policy": "Z11 only after Stage A/B root cause and HGA audit; separate ZR storage; never replace history",
+  "future_outcome_policy": "EXECUTION_FAILURE for exception; NUMERIC_FAILURE for numeric; otherwise certified or no certified incumbent; preserve old termination_reason",
+  "hga_classes": {
+    "INTERMITTENT_NO_CERTIFIED": "32..37/40",
+    "ROBUST_95": ">=38/40",
+    "SYSTEMIC_NO_CERTIFIED": "<32/40"
+  },
+  "hga_count": 40,
+  "hga_seeds": [
+    20261021,
+    20261022,
+    20261023,
+    20261024,
+    20261025
+  ],
+  "historical_artifact_read_only": true,
+  "historical_execution": "FAIL_179_OF_180_CERTIFIED",
+  "historical_run_count": 180,
+  "level_1": "coarse reference/preparation/baseline/recovery/packaging timing; candidate serialization outside native clock",
+  "level_2": "existing counters plus per-rollout timing; diagnostic only, excluded from thresholds",
+  "methods": {
+    "ADAPTED_HGA_V2": {
+      "config": {
+        "alpha": 20,
+        "initialization_reference_limit": 20,
+        "lambda_size": 10,
+        "max_iterations": 200000,
+        "mu": 20,
+        "pattern_mutation_probability": 0.15,
+        "vnd_candidate_cap": 256,
+        "vnd_max_passes": 2
+      },
+      "method_config_hash": "a1748ac615fd93270dbeb75361c14a32ca3018cca805c33361cb90309d903847"
+    },
+    "ADAPTED_WAG_VNS_V2": {
+      "config": {
+        "factorial_mode": "COMMON_MODEL_BOUNDED",
+        "factorial_window": 5,
+        "imax": 500,
+        "max_factorial_calls": 30720,
+        "max_route_combinations_per_wag": 3,
+        "max_wag_variants": 10,
+        "max_windows": 8,
+        "n": 10,
+        "p": 0.5
+      },
+      "method_config_hash": "469c79808f2cb6c2e9d6af0c5252555ea803e0c9f500f9e8652162d071e17f67"
+    },
+    "SA_OI_ALNS_V2": {
+      "config": {
+        "adaptive_reaction": 0.2,
+        "adaptive_segment_length": 20,
+        "checkpoints": [
+          5.0,
+          30.0,
+          60.0
+        ],
+        "construction_budget": 5,
+        "cooling_rate": 0.995,
+        "destroy_q_max": 8,
+        "destroy_q_min": 2,
+        "destroy_rho": 0.15,
+        "direction_refinement_budget": 4,
+        "enable_two_opt_star": false,
+        "feasibility_bootstrap_budget": 1,
+        "insertion_limit": 8,
+        "kdp": 8,
+        "kinit_ref": 5,
+        "kref": 2,
+        "kref_total": 4,
+        "m": 64,
+        "m_atomic": null,
+        "m_lns": 16,
+        "max_iterations": 100000,
+        "repair_evaluation_cap": 4096,
+        "repair_insertion_limit": 8,
+        "reward_accepted_improvement": 4.0,
+        "reward_accepted_non_improvement": 1.0,
+        "reward_evaluation_failed": 0.0,
+        "reward_global_best": 8.0,
+        "reward_rejected": 0.0,
+        "t0": 0.05,
+        "time_limit": 60.0,
+        "tmin": 1e-06
+      },
+      "method_config_hash": "53a83e8b45d91732116a64ade3bfb0bd701988c2804e2b4827339fce7130f9db"
+    }
+  },
+  "protocol_hash": "00379447601705e48de54775f72979dc0f187bbb9c522595e217931c18b5a262",
+  "protocol_id": "PHASE3ZR_RUNTIME_PROTOCOL_V1",
+  "provenance_before_instrumentation": {
+    "commit_verified": true,
+    "repository_id": "luckyfishanddog/DRL",
+    "source_commit": "43a004c2b40382110b642fa009b7a30ff124470b",
+    "source_tree_hash": "533372e63cef39a1ee967b8cae8afa9dac3b1a259da08f6199d6fc0943f332a7",
+    "worktree_dirty": true
+  },
+  "regression_before": "314 passed in 61.05s",
+  "remote_main_verification": "network unavailable; supplied 94ea6c1 not verified",
+  "requested_budget": 60.0,
+  "runtime_set_hash": "e6dd978e799520ffab2ca110c74915878d336bda4467d63a5ea552d75e3f1a2e",
+  "runtime_thresholds": {
+    "max": 60.0,
+    "p95": 8.0,
+    "p99": 30.0,
+    "run_max": 120.0
+  },
+  "scientific_config": {
+    "delta_x": 0.2,
+    "delta_y": 0.2,
+    "empty_speed": 0.2,
+    "interference_dx": 0.5,
+    "interference_dy": 0.5,
+    "min_child_length": 0.2,
+    "numeric_epsilon": 1e-10,
+    "t_post": 30.0,
+    "t_pre": 20.0,
+    "weld_speed": 0.0108,
+    "workspace_x": [
+      0.0,
+      20.0
+    ],
+    "workspace_y": [
+      0.0,
+      12.0
+    ]
+  },
+  "scope_hash": "16f6110a7384d585fa539777b059e0a297da4fa394a3b4b545ebe967ece54599",
+  "scope_id": "FORMAL_SCOPE_V2",
+  "slow_set_policy": "top20 unique geometry/solution/directions; add5 FEASIBLE,5 recovered FEASIBLE,5 remaining DEADLOCK if available",
+  "stage_a_count": 72,
+  "stage_a_seeds": [
+    20261021,
+    20261022
+  ],
+  "workbook_storage": "D:\\pybullet_test\\MRTA_GA\\ppo"
+}

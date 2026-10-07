@@ -26,6 +26,36 @@ from mrta_search import SearchConfig, run_bounded_sa_oi
 FAST = ScientificConfig(weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
 
 
+@pytest.mark.parametrize("index", (0, 2, 3))
+@pytest.mark.parametrize("level", (1, 2))
+def test_zr_dispatch_observer_preserves_feasible_recovered_deadlock(monkeypatch, index, level):
+    from dataclasses import asdict
+    from scripts.run_phase3zr_runtime_audit import ReferenceTrace
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.scheduler import FormalReferenceEvaluator
+    templates = _oracle_cases()[index]
+    original = scheduler_module.reference_schedule_from_templates_formal(templates, FAST, scope=FORMAL_SCOPE_V2)
+    # Route the observer entry through the existing operation fixtures; scheduling
+    # and recovery themselves remain real, including complete B32 rollouts.
+    monkeypatch.setattr(scheduler_module, "reference_schedule_formal", lambda solution, config, **kw:
+        scheduler_module.reference_schedule_from_templates_formal(templates, config, scope=kw["scope"], profile=kw.get("profile")))
+    with ReferenceTrace("FIXTURE", level) as trace:
+        actual = FormalReferenceEvaluator(FORMAL_SCOPE_V2)(None, FAST)
+    assert asdict(actual) == asdict(original)
+    row = trace.rows[0]
+    assert row["schedule_status"] == original.status.value
+    assert row["recovery_rollouts"] == original.recovery_rollouts
+    assert row["rollout_budget"] == 32
+    assert row["baseline_deadlock"] == (index != 0)
+    assert (row["recovery_time"] > 0) == (index != 0)
+    assert sum(row[k] for k in ("preparation_time", "baseline_dispatch_time", "recovery_time", "packaging_time")) == pytest.approx(row["scheduler_duration"], abs=1e-8)
+    if level == 2 and index != 0:
+        assert len(row["rollouts"]) == row["rollouts_attempted"] == row["rollouts_completed"] == original.recovery_rollouts
+        assert all(r["duration"] > 0 for r in row["rollouts"])
+        if original.feasible:
+            assert row["selected_rollout_index"] is not None
+
+
 def _assert_schedule_equivalent(slow: ScheduleResult, optimized: ScheduleResult, config=FAST) -> None:
     assert slow.status is optimized.status
     assert slow.directions == optimized.directions
