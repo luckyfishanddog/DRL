@@ -239,3 +239,69 @@ def test_smoke_runner_requires_explicit_source_label_without_stale_commit() -> N
     assert "e4de209d872d46687af4974d030b32904192b906" not in source
     assert '"--source-commit-label"' in source
     assert "required=True" in source
+
+
+
+def _small30_runner(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/"scripts"))
+    import run_ppo_smoke
+    return run_ppo_smoke
+
+
+def test_small30_static_selection_uses_actual_n_and_distinct_workbooks(monkeypatch):
+    runner=_small30_runner(monkeypatch)
+    candidates=[dict(N=n,x_patterns=x,y_patterns=y,relative_path=f"{book}.xlsx",sheet_name="name_does_not_define_N")
+                for n,x,y,book in ((35,50,10,"rich"),(35,35,10,"normal"),(35,20,0,"sparse"),
+                                   (35,49,50,"rich"),(26,1000,1000,"boundary26"),(39,1001,1001,"farther39"))]
+    first=runner._small30_choose(candidates)
+    second=runner._small30_choose(list(reversed(candidates)))
+    assert first==second
+    assert [e['N'] for e in first]==[35,35,35]
+    assert len({e['relative_path'] for e in first})==3
+    assert [e['relative_path'] for e in first]==['rich.xlsx','normal.xlsx','sparse.xlsx']
+
+
+def test_small30_checkpoint_never_uses_overshoot_even_for_equal_cmax(monkeypatch):
+    from types import SimpleNamespace
+    runner=_small30_runner(monkeypatch)
+    before=(59.,'before','schedule',SimpleNamespace(cmax=100.))
+    after=(61.,'overshoot','schedule',SimpleNamespace(cmax=100.))
+    assert runner._small30_pick_snapshot([before,after],100.) is before
+    assert runner._small30_pick_snapshot([after],100.) is None
+
+
+def test_small30_real_initial_certification_and_counter_hook_restoration(monkeypatch):
+    from mrta_reference.model import ParentWeld
+    from mrta_search.stats import SearchStats
+    runner=_small30_runner(monkeypatch)
+    parents=(ParentWeld('only',(1.,10.),(2.,10.)),)
+    monkeypatch.setattr(runner,'_range_parents',lambda *a:parents)
+    normal_config=runner._range_search_config
+    monkeypatch.setattr(runner,'_range_search_config',lambda:normal_config(iterations=0))
+    monkeypatch.setattr(runner,'_RANGE_CORE_MASK',1,raising=False)
+    original=SearchStats.record_reference
+    entry=dict(selection_ordinal=1,instance_id='unit::sheet',relative_path='unit.xlsx',sheet_name='sheet')
+    row=runner._small30_worker((entry,20261081,'D','.',0))
+    assert SearchStats.record_reference is original
+    assert row['certified_at60'] and row['final_certified']
+    assert row['first_certified_initial']['status']=='FEASIBLE'
+    assert row['cmax_at60']==row['chosen_initial']['cmax']
+    assert row['counters_at60']['iterations']==0
+    assert row['counters_at60']['global_best_updates']==0
+    loads=row['at60']['process_loads']
+    assert len(loads)==4 and max(loads)-min(loads)==pytest.approx(row['at60']['process_imbalance'])
+    with pytest.raises(RuntimeError):
+        with runner._Small30Telemetry():
+            raise RuntimeError('ensure observation is restored on failure')
+    assert SearchStats.record_reference is original
+
+
+def test_small30_report_append_preserves_historical_results(monkeypatch,tmp_path):
+    runner=_small30_runner(monkeypatch)
+    report=tmp_path/'existing.md'
+    prefix='# Historical N26/55/85\n\n24 original records remain unchanged.\n'
+    report.write_text(prefix+'\n\n## SMALL_30_39复核\nold draft',encoding='utf-8')
+    data=dict(inspected_development_workbooks=0,eligible_sheet_count=0,eligible_workbook_count=0,
+              candidates=[],selection_rule='unit',entries=[],runs=[],i3_diagnostics=[])
+    runner._small30_write(report,data)
+    assert report.read_text(encoding='utf-8').split('\n\n## SMALL_30_39复核',1)[0]==prefix

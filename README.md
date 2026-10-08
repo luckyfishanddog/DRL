@@ -41,3 +41,11 @@ Scientific modules remain independent of PyTorch. Optional training dependencies
 Current sensitivity entry point (same environment): `python -B scripts/run_ppo_smoke.py --yx-range catalog`, then `--yx-range run --workers 4`. All static statistics and 24 A/D raw run records stay in the single report; resume skips recorded runs. Production remains heuristic.
 
 Current A/D sensitivity completed: **24/24 certified at 60 s**, numeric failure / certifier mismatch **0**; final full regression **299 passed**. D vs A paired Cmax median change: SMALL +13.40%, MEDIUM −6.20%, LARGE −4.46%; ALL mean Cmax rises 1.59%, so no overall superiority claim. M192 and heuristic ranking remain unchanged. Only A/D are retained per the latest instruction.
+
+## SMALL_30_39 application-scale recheck
+
+Three static-selected instances from distinct consumed-development workbooks have actual **N=35**. All **18/18 native 60-second A/D runs certified**, with numeric/certifier errors **0**; full pytest **303 passed**. This chapter remains separate from historical N26 SMALL and N55/N85 results.
+
+Nine pairs: **4 improved / 3 tied / 2 worse**; paired relative median **0%**, mean **−3.66%**; mean Cmax 2540.199→2464.717 s. S1 (X-rich) changes **+55.17%, +6.77%, −7.63%**; S2 improves all three; S3 stays at initialization Cmax. The deterioration persists for one geometry, not for all N35 instances. S1 has similar initialization but weaker C4 certification/search gains. Targeted I3 replay identifies serial fallback using only R0/R2; the better A initial solution was rebuilt and certified in D.
+
+Next: retain 0.5 as the task model, investigate I3 initialization robustness and S1 C2/C4/reference selection at fixed M192 before broader learning. No MLP/GAT training or parameter changes were made. Complete per-run initialization, four-robot loads, outer-cut usage and failure diagnostics are appended to [the existing range report](docs/YX_SPLIT_RANGE_05_CHANGE.md).
