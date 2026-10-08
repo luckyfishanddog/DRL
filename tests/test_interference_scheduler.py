@@ -198,6 +198,8 @@ def test_v2_x_processing_shared_point_and_no_x_differential_compatibility() -> N
 
 
 def test_phase3x_controlled_fixtures_f1_to_f8() -> None:
+    # Historical Phase3-X fixtures use their original 0.2 numeric domain.
+    CONFIG = ScientificConfig(delta_x=.20, delta_y=.20)
     def whole_and_x(length: float):
         parent = ParentWeld(f"p{length}", (0.0, 8.0), (length, 8.0))
         whole = canonicalize(

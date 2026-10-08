@@ -249,13 +249,17 @@ def certify_schedule(
                 candidate_t = []
                 dy = parent.end[1] - parent.start[1]
                 if dy != 0.0:
+                    # Independent reconstruction: retain legacy inner lines and
+                    # add outer lines without trusting the generator or flag.
+                    inner = min(0.20, config.delta_y)
+                    y_lines = [(6.0-inner, "BY_LOWER"), (6.0, "BY_CENTER"),
+                               (6.0+inner, "BY_UPPER")]
+                    if config.delta_y > 0.20:
+                        y_lines.extend(((config.by[0], "BY_OUTER_LOWER"),
+                                        (config.by[1], "BY_OUTER_UPPER")))
                     candidate_t.extend(
                         ((y - parent.start[1]) / dy, point_id)
-                        for y, point_id in (
-                            (config.by[0], "BY_LOWER"),
-                            (6.0, "BY_CENTER"),
-                            (config.by[1], "BY_UPPER"),
-                        )
+                        for y, point_id in y_lines
                     )
                 midpoint = parent.point(0.5)
                 if config.by[0] - config.numeric_epsilon <= midpoint[1] <= config.by[1] + config.numeric_epsilon:

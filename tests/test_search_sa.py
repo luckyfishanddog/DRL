@@ -22,7 +22,8 @@ from mrta_search.stats import SearchStats
 from mrta_search.pipeline import phase3_alns_config
 
 
-FAST = ScientificConfig(weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
+# Historical Q1-Q5 quality fixtures retain their original 0.2 feasible domain.
+FAST = ScientificConfig(delta_x=.20, delta_y=.20, weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
 
 
 def _base():

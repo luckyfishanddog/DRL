@@ -222,7 +222,10 @@ def test_scientific_defaults_and_whole_eligibility() -> None:
     assert CONFIG.empty_speed == 0.20
     assert CONFIG.t_pre == 20.0
     assert CONFIG.t_post == 30.0
-    assert CONFIG.by == (5.8, 6.2)
+    assert CONFIG.by == (5.5, 6.5)
+    assert CONFIG.delta_x == CONFIG.delta_y == 0.5
+    assert CONFIG.min_child_length == 0.2
+    assert CONFIG.interference_dx == CONFIG.interference_dy == 0.5
     assert whole_eligible_rails((0, 6.0), (2, 6.1), CONFIG) == frozenset((Rail.UPPER, Rail.LOWER))
     assert whole_eligible_rails((0, 7.0), (2, 8.0), CONFIG) == frozenset((Rail.UPPER,))
     assert whole_eligible_rails((0, 4.0), (2, 5.0), CONFIG) == frozenset((Rail.LOWER,))
@@ -243,8 +246,8 @@ def test_scientific_config_serialization_and_hash_are_value_only_and_stable() ->
 def test_y_candidates_are_only_boundaries_center_midpoint_and_deterministically_deduplicated() -> None:
     parent = ParentWeld("cross", (1.0, 5.0), (1.0, 7.0))
     candidates = generate_y_split_patterns(parent, CONFIG)
-    assert [candidate.point_id for candidate in candidates] == ["BY_LOWER", "BY_CENTER", "BY_UPPER"]
-    assert [candidate.t for candidate in candidates] == pytest.approx([0.4, 0.5, 0.6])
+    assert [candidate.point_id for candidate in candidates] == ["BY_OUTER_LOWER", "BY_LOWER", "BY_CENTER", "BY_UPPER", "BY_OUTER_UPPER"]
+    assert [candidate.t for candidate in candidates] == pytest.approx([0.25, 0.4, 0.5, 0.6, 0.75])
     assert all(candidate.mandatory for candidate in candidates)
     assert candidates == generate_y_split_patterns(parent, CONFIG)
     # The geometric midpoint duplicates BY_CENTER here and is deterministically removed.
@@ -321,8 +324,8 @@ def test_finite_x_candidates_are_deterministic_geometry_only_and_deduplicated() 
     first = generate_x_split_patterns(parent, 3.0, CONFIG, rail=Rail.UPPER)
     second = generate_x_split_patterns(parent, 3.0, CONFIG, rail=Rail.UPPER)
     assert first == second
-    assert [item.point_id for item in first] == ["BX_LOWER", "BX_CENTER", "BX_UPPER"]
-    assert [item.t for item in first] == pytest.approx([0.45, 0.5, 0.55])
+    assert [item.point_id for item in first] == ["BX_OUTER_LOWER", "BX_LOWER", "BX_CENTER", "BX_UPPER", "BX_OUTER_UPPER"]
+    assert [item.t for item in first] == pytest.approx([0.375, 0.45, 0.5, 0.55, 0.625])
     assert all(item.rail is Rail.UPPER for item in first)
     assert all(parent.point(item.t)[0] != 10.0 for item in first if item.t is not None)
 
@@ -366,7 +369,7 @@ def test_weighted_median_is_leftmost_deterministic_and_clipped() -> None:
         ParentWeld("c", (9.0, 4.0), (11.0, 4.0)),
     )
     up, low = frozen_handover_centers(parents, CONFIG)
-    assert up == 0.2  # equal weights: the leftmost weighted median wins
+    assert up == 0.5  # leftmost weighted median clipped to the new window
     assert low == 10.0
     assert (up, low) == frozen_handover_centers(tuple(reversed(parents)), CONFIG)
     assert frozen_handover_centers((ParentWeld("only-up", (2, 8), (3, 8)),), CONFIG)[1] == 10.0
@@ -419,3 +422,157 @@ def test_direction_dp_exact_ties_reversed_geometry_and_zero_transition() -> None
     assert result.empty_travel_time == pytest.approx(0.0)
     assert result.empty_travel_time == pytest.approx(expected_cost)
     assert result.orientations == expected_vector == (0, 0)
+
+
+@pytest.mark.parametrize('axis', ('Y','X'))
+def test_range_05_retains_all_legacy_cut_geometry_and_ids(axis):
+    old=ScientificConfig(delta_x=.2,delta_y=.2)
+    parent=ParentWeld('p',(1.,5.),(1.,7.)) if axis=='Y' else ParentWeld('p',(1.,8.),(5.,8.))
+    generate=(lambda cfg:generate_y_split_patterns(parent,cfg)) if axis=='Y' else (lambda cfg:generate_x_split_patterns(parent,3.,cfg,rail=Rail.UPPER))
+    earlier=generate(old);current=generate(CONFIG)
+    for p in earlier:
+        assert any(p.point_id==q.point_id and p.t==pytest.approx(q.t) for q in current)
+    assert len(current)==5
+    assert len({p.point_id for p in current})==len(current)
+    assert len({round(p.t,10) for p in current})==len(current)
+
+
+def test_y_whole_eligibility_and_mandatory_change_with_task_coverage():
+    from mrta_reference.geometry import build_legal_pattern_catalog,robot_is_eligible
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    old=ScientificConfig(delta_x=.2,delta_y=.2)
+    overlap=ParentWeld('overlap',(1.,5.6),(2.,6.4))
+    crossing=ParentWeld('crossing',(4.,5.4),(5.,6.6))
+    assert not whole_eligible_rails(overlap.start,overlap.end,old)
+    assert whole_eligible_rails(overlap.start,overlap.end,CONFIG)==frozenset((Rail.UPPER,Rail.LOWER))
+    assert all(p.mandatory for p in generate_y_split_patterns(overlap,old))
+    assert not any(p.mandatory for p in generate_y_split_patterns(overlap,CONFIG))
+    catalog=build_legal_pattern_catalog((overlap,crossing),CONFIG,FORMAL_SCOPE_V2)
+    assert any(p.kind is SplitKind.WHOLE for p in catalog['overlap'])
+    assert all(p.kind is SplitKind.Y_SPLIT and p.mandatory for p in catalog['crossing'])
+    for parent in (overlap,crossing):
+        for pattern in generate_y_split_patterns(parent,CONFIG):
+            lower,upper=blocks_for_pattern(parent,pattern,CONFIG)
+            assert robot_is_eligible(lower,2,CONFIG) and robot_is_eligible(upper,0,CONFIG)
+
+
+@pytest.mark.parametrize('length,allowed', ((.398,False),(.4,True)))
+def test_y_exact_euclidean_child_minimum(length,allowed):
+    parent=ParentWeld('p',(1.,6.-length/2),(1.,6.+length/2))
+    patterns=generate_y_split_patterns(parent,CONFIG)
+    assert bool(patterns)==allowed
+    if allowed:
+        assert len(patterns)==1
+        assert [b.length for b in blocks_for_pattern(parent,patterns[0],CONFIG)]==pytest.approx([.2,.2])
+
+
+def test_oblique_cut_uses_euclidean_length_not_axis_projection():
+    y=ParentWeld('y',(1.,5.45),(2.,5.55))
+    cut=next(p for p in generate_y_split_patterns(y,CONFIG) if p.point_id=='BY_OUTER_LOWER')
+    assert min(b.length for b in blocks_for_pattern(y,cut,CONFIG))>.5
+    x=ParentWeld('x',(2.,7.),(2.1,8.))
+    patterns=generate_x_split_patterns(x,2.05,CONFIG,rail=Rail.UPPER)
+    assert patterns and min(b.length for b in blocks_for_pattern(x,patterns[0],CONFIG))>.5
+
+
+def test_x_endpoints_vertical_and_short_children_filtered_at_05():
+    assert not generate_x_split_patterns(ParentWeld('v',(3.,7.),(3.,9.)),3.,CONFIG,rail=Rail.UPPER)
+    parent=ParentWeld('p',(2.5,8.),(3.5,8.))
+    points=[parent.point(p.t)[0] for p in generate_x_split_patterns(parent,3.,CONFIG,rail=Rail.UPPER)]
+    assert points==pytest.approx([2.8,3.,3.2])
+    for length,allowed in ((.398,False),(.4,True)):
+        short=ParentWeld('short',(3.-length/2,8.),(3.+length/2,8.))
+        cuts=generate_x_split_patterns(short,3.,CONFIG,rail=Rail.UPPER)
+        assert bool(cuts)==allowed
+
+
+def test_y_expansion_changes_rail_specific_weighted_centers():
+    parents=(ParentWeld('u',(2.,8.),(4.,8.)),ParentWeld('l',(14.,2.),(16.,2.)),
+             ParentWeld('shared',(7.,5.6),(13.,6.4)))
+    old=ScientificConfig(delta_x=.2,delta_y=.2)
+    assert frozen_handover_centers(parents,old)==(3.,15.)
+    assert frozen_handover_centers(parents,CONFIG)==(10.,10.)
+    assert frozen_handover_centers(tuple(reversed(parents)),CONFIG)==(10.,10.)
+
+
+@pytest.mark.parametrize('rail,robots,y', ((Rail.UPPER,(0,1),8.),(Rail.LOWER,(2,3),2.)))
+def test_outer_x_canonical_catalog_and_fixed_robot_pair(rail,robots,y):
+    from mrta_reference.solution import canonicalize
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    parent=ParentWeld('p',(1.,y),(5.,y))
+    catalog=build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)
+    pattern=next(p for p in catalog['p'] if p.point_id=='BX_OUTER_LOWER')
+    solution=canonicalize((parent,),(pattern,),{robots[0]:('p::0',),robots[1]:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    assert solution.patterns==(pattern,)
+    with pytest.raises(ValueError,match='spatial children'):
+        canonicalize((parent,),(pattern,),{robots[1]:('p::0',),robots[0]:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    with pytest.raises(ValueError,match='absent from legal catalog'):
+        canonicalize((parent,),(pattern,),{robots[0]:('p::0',),robots[1]:('p::1',)},ScientificConfig(delta_x=.2,delta_y=.2),scope=FORMAL_SCOPE_V2)
+
+
+@pytest.mark.parametrize('point_id', ('BY_OUTER_LOWER','BY_LOWER','BY_CENTER','BY_UPPER','BY_OUTER_UPPER'))
+def test_new_y_cut_is_canonical_and_independently_certified(point_id):
+    from mrta_reference.solution import canonicalize
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.model import ScheduleStatus
+    parent=ParentWeld('p',(2.,4.),(2.,8.))
+    pattern=next(p for p in generate_y_split_patterns(parent,CONFIG) if p.point_id==point_id)
+    sol=canonicalize((parent,),(pattern,),{2:('p::0',),0:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(1,),2:(0,)})
+    assert schedule.status is ScheduleStatus.FEASIBLE
+    assert certify_schedule(sol,schedule,CONFIG,scope=FORMAL_SCOPE_V2).certified
+    forged=replace(schedule,operations=())
+    assert not certify_schedule(sol,forged,CONFIG,scope=FORMAL_SCOPE_V2).certified
+
+
+def test_outer_x_shared_point_has_no_continuous_interference_exception():
+    from mrta_reference.solution import canonicalize
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.model import OperationKind,ScheduleStatus
+    parent=ParentWeld('p',(1.,8.),(5.,8.))
+    pattern=next(p for p in generate_x_split_patterns(parent,3.,CONFIG,rail=Rail.UPPER) if p.point_id=='BX_OUTER_LOWER')
+    sol=canonicalize((parent,),(pattern,),{0:('p::0',),1:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(0,),1:(1,)})
+    assert schedule.status is ScheduleStatus.FEASIBLE
+    assert certify_schedule(sol,schedule,CONFIG,scope=FORMAL_SCOPE_V2).certified
+    # Forge both children reaching the common cut simultaneously.
+    offsets={}
+    for robot in (0,1):
+        offsets[robot]=min(o.start_time for o in schedule.operations if o.robot_id==robot and o.kind is OperationKind.SETUP)
+    left,right=blocks_for_pattern(parent,pattern,CONFIG)
+    delay={0:(right.length-left.length)/CONFIG.weld_speed,1:0.}
+    operations=tuple(replace(o,start_time=o.start_time-offsets[o.robot_id]+delay[o.robot_id],end_time=o.end_time-offsets[o.robot_id]+delay[o.robot_id])
+                     for o in schedule.operations if o.kind is not OperationKind.WAIT)
+    forged=replace(schedule,operations=operations)
+    report=certify_schedule(sol,forged,CONFIG,scope=FORMAL_SCOPE_V2)
+    assert not report.certified
+    assert any('interference:' in error or 'order violation' in error for error in report.errors)
+
+
+def test_three_solvers_really_consume_same_expanded_catalog():
+    import mrta_reference.geometry as geometry
+    import mrta_search.neighborhood as alns
+    import mrta_baselines.hga as hga
+    import mrta_baselines.wag_vns as wag
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    assert alns.build_legal_pattern_catalog is hga.build_legal_pattern_catalog is wag.build_legal_pattern_catalog is geometry.build_legal_pattern_catalog
+    parent=ParentWeld('p',(1.,8.),(5.,8.))
+    catalog=geometry.build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)
+    assert {'BX_OUTER_LOWER','BX_OUTER_UPPER'}<={p.point_id for p in catalog['p']}
+    # Existing three-method access test executes all three production consumers.
+    from test_hga_baseline import test_v2_three_method_pattern_access_uses_one_catalog_hash
+    test_v2_three_method_pattern_access_uses_one_catalog_hash()
+
+
+
+def test_new_outer_x_does_not_replace_existing_midpoint_identity():
+    parent=ParentWeld('p',(1.,8.),(4.,8.))
+    old=generate_x_split_patterns(parent,3.,ScientificConfig(delta_x=.2,delta_y=.2),rail=Rail.UPPER)
+    new=generate_x_split_patterns(parent,3.,CONFIG,rail=Rail.UPPER)
+    assert next(p for p in old if p.t==.5).point_id=='MIDPOINT'
+    assert next(p for p in new if p.t==.5).point_id=='MIDPOINT'

@@ -2,9 +2,13 @@
 
 FORMAL_SCOPE_V2 active: WHOLE / Y_SPLIT / X_SPLIT.
 
+Current split windows: **delta_x=delta_y=0.50 m**, child minimum **0.20 m**, interference_dx/dy **0.50 m**. Old ±0.2 cuts and legal MIDPOINT remain; new ±0.5 cuts use distinct OUTER identities. By=[5.5,6.5] is a task-layer rail coverage assumption; no URDF/IK reachability claim. Current development sensitivity: [Y/X range change](docs/YX_SPLIT_RANGE_05_CHANGE.md).
+
+The Phase3-Z and Phase4-0/0B/1A/1B/1C evidence below is **historical delta_x=delta_y=0.20**, including M192 pool validation and all MLP labels/checkpoints. It does not establish performance in the expanded domain. Historical ranker tools explicitly retain 0.20; do not use those labels for formal 0.50 training.
+
 - Production ALNS: M192 (144 atomic + 48 LNS), Kdp8 / Kref2 / Kref_total4; heuristic C2/C4.
 - Candidate generation material loss: closed relative to the audited finite pool; M192 passed native 60-second development selection.
-- Current phase: Phase4-1C completed; Top-K aligned material/pairwise objectives evaluated. Offline gate **FAIL**; native MLP smoke **SKIPPED / 0 runs**. Production stays heuristic.
+- Historical Phase4-1C completed; Top-K aligned material/pairwise objectives evaluated. Offline gate **FAIL**; native MLP smoke **SKIPPED / 0 runs**. Production stays heuristic.
 - Phase4-1C best: **V2 / NEW-MLP-C2**. ALL C2 Top8 capture 0% → 47.10%; C4 Top2 median capture stays 0%. C4 zero capture 79.31% → 62.07%. LARGE C2/C4 median capture stays 0%; its zero capture improves 75% → 66.67%, while cross-workbook ranking failure persists.
 - Pairwise V3 C2 capture is 14.26%, below V2 47.10%. C4 hard training uses 3,097 existing candidates; V2 BOTH helps MEDIUM Top2 capture (0% → 66.74%) but does not improve ALL median capture. No loss/architecture search followed the failure.
 - Historical Phase4-1B remains **FAIL**. Its checkpoints, scaler, result JSON and report remain unchanged; 0 native MLP smoke runs.
@@ -30,6 +34,10 @@ The Phase4-1C workflow uses the existing `scripts/train_mlp_ranker.py`: `audit` 
 
 Models: V1 `models/mlp_c2.pt` / `models/mlp_c4.pt` remain failure evidence. V2 classification checkpoints are `models/mlp_c2_material_v2.pt` / `models/mlp_c4_material_v2.pt`; V3 pairwise checkpoints are `models/mlp_c2_rank_v2.pt` / `models/mlp_c4_rank_v2.pt`. All reuse `models/mlp_scalers.npz`. `LearnedRanker(variant, model_version="material_v2")` selects V2; `model_version="rank_v2"` selects V3; legacy `"v1"` remains the optional interface default. None is recommended for production after the failed gate.
 
-Verification: `pytest -q -p no:cacheprovider` passed 281 tests. Existing-state native API replay matched 216 offline selections with 0 new direction/reference calls. Best V2 C2 feature extraction/scaler/forward/ranking median was 97.76 ms/state in replay; its share of a real 60-second run is unmeasured.
+Historical Phase4-1C verification: `pytest -q -p no:cacheprovider` passed 281 tests. Existing-state native API replay matched 216 offline selections with 0 new direction/reference calls. Best V2 C2 feature extraction/scaler/forward/ranking median was 97.76 ms/state in replay; its share of a real 60-second run is unmeasured.
 
 Scientific modules remain independent of PyTorch. Optional training dependencies are in the `ranker` extra. Workbook paths are relative to `../ppo`; physical directory names do not define data roles.
+
+Current sensitivity entry point (same environment): `python -B scripts/run_ppo_smoke.py --yx-range catalog`, then `--yx-range run --workers 4`. All static statistics and 24 A/D raw run records stay in the single report; resume skips recorded runs. Production remains heuristic.
+
+Current A/D sensitivity completed: **24/24 certified at 60 s**, numeric failure / certifier mismatch **0**; final full regression **299 passed**. D vs A paired Cmax median change: SMALL +13.40%, MEDIUM −6.20%, LARGE −4.46%; ALL mean Cmax rises 1.59%, so no overall superiority claim. M192 and heuristic ranking remain unchanged. Only A/D are retained per the latest instruction.

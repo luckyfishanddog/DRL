@@ -69,8 +69,8 @@ class ScientificConfig:
     t_pre: float = 20.0
     t_post: float = 30.0
     min_child_length: float = 0.20
-    delta_x: float = 0.20
-    delta_y: float = 0.20
+    delta_x: float = 0.50
+    delta_y: float = 0.50
     interference_dx: float = 0.50
     interference_dy: float = 0.50
     numeric_epsilon: float = 1.0e-10

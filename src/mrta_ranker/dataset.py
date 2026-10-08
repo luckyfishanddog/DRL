@@ -29,7 +29,8 @@ RESULT=ROOT/'data/development/phase4_1b_mlp_results.json'
 STAGES=(('EARLY',5.0),('MID',30.0),('LATE',60.0))
 SEEDS=(20261121,20261122)
 TIERS=('SMALL','MEDIUM','LARGE')
-CONFIG=ScientificConfig()
+# Phase4-1A/B/C labels and checkpoints belong to the historical 0.2 domain.
+CONFIG=ScientificConfig(delta_x=0.20,delta_y=0.20)
 def dumps(value): return json.dumps(value,ensure_ascii=False,separators=(',',':'),allow_nan=False)
 def read(path): return json.loads(Path(path).read_text(encoding='utf-8'))
 def provenance(): return SourceProvenance(REPOSITORY_ID,'LOCAL_DRL_USER_AUTHORIZED',compute_source_tree_hash(ROOT),True,False)

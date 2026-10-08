@@ -18,7 +18,8 @@ from mrta_search.direction import refine_directions_bounded
 from mrta_search.stats import SearchStats
 
 
-FAST = ScientificConfig(weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
+# Q3 is the historical 0.2 direction-gap fixture, not the new coverage domain.
+FAST = ScientificConfig(delta_x=.20, delta_y=.20, weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
 Q3 = (
     ParentWeld("u", (1.26, 6.33), (5.33, 6.21)),
     ParentWeld("l", (6.26, 5.68), (1.99, 5.79)),

@@ -6,7 +6,7 @@
 
 `FORMAL_SCOPE_V2_HASH = 16f6110a7384d585fa539777b059e0a297da4fa394a3b4b545ebe967ece54599`
 
-This document freezes the machine-readable meaning of V2. The initial Phase 3-Y smoke failed its X-search-access gate and remains historical FAIL. On 2026-10-06, Phase 3-YR repaired generic decision-family access and passed the same 54-run gate, followed by full regression before and after activation. V2 is now active; the scientific definition and hash below are unchanged.
+This document freezes the machine-readable meaning of V2. The initial Phase 3-Y smoke failed its X-search-access gate and remains historical FAIL. On 2026-10-06, Phase 3-YR repaired generic decision-family access and passed the same 54-run gate, followed by full regression before and after activation. V2 is now active. Historical activation evidence used delta_x=delta_y=0.20 m. The current 2026-10-08 configuration expands both to 0.50 m as described below; the existing scope identifiers are retained and do not identify a numeric configuration by themselves.
 
 ## 1. Task and pattern domain
 
@@ -26,7 +26,7 @@ The complete parent collection is used once to compute the frozen weighted-media
 
 ## 3. Mandatory Y and whole eligibility
 
-The existing Y rule is unchanged: `BY_LOWER_CENTER_UPPER_LEGAL_MIDPOINT_T_DEDUP_V1`. A parent that cannot be legally assigned whole to one rail remains mandatory-Y and receives only its existing mandatory Y family. X cannot bypass mandatory Y.
+The existing rule identifier remains `BY_LOWER_CENTER_UPPER_LEGAL_MIDPOINT_T_DEDUP_V1`. Current delta_y=0.50 gives By=[5.5,6.5]. Finite Y lines are 5.5, 5.8, 6.0, 6.2, 6.5 plus legal MIDPOINT; old BY_LOWER/CENTER/UPPER identities retain 5.8/6.0/6.2 and added outer points use BY_OUTER_LOWER/UPPER. Actual segment intersections must be interior and deduplicated, with both Euclidean child lengths >=0.20 m. Upper rail whole eligibility is y>=5.5 for the entire segment; lower rail is y<=6.5. This expanded overlap is a task-layer coverage assumption, not a URDF/IK reachability validation. No physical kinematics system or URDF was changed. A parent that cannot be legally assigned whole to one rail remains mandatory-Y and receives only its existing mandatory Y family. X cannot bypass mandatory Y.
 
 For a whole-eligible parent, the catalog may include WHOLE, existing legal optional Y patterns, and the legal X family for each whole-eligible rail. Every child must satisfy the configured minimum length.
 
@@ -38,12 +38,13 @@ For a whole-eligible parent, the catalog may include WHOLE, existing legal optio
 
 For an eligible rail, X candidates are the segment parameters induced by:
 
-- `BX_LOWER`: `x_g - delta_x`
+- `BX_LOWER`: `x_g - min(0.20, delta_x)`
 - `BX_CENTER`: `x_g`
-- `BX_UPPER`: `x_g + delta_x`
+- `BX_UPPER`: `x_g + min(0.20, delta_x)`
+- `BX_OUTER_LOWER` / `BX_OUTER_UPPER`: `x_g - delta_x` / `x_g + delta_x` when delta_x>0.20
 - `MIDPOINT`: `t = 0.5`
 
-The frozen default `delta_x` is 0.20 m and minimum child length is 0.20 m. Invalid intersections, endpoints, duplicates, and candidates producing a child below the minimum are removed deterministically. Vertical or negligible-`dx` parents have no X pattern. There is no length threshold, WAIT/deadlock trigger, dynamic split point, dense grid, quarter point, or process-approved joint list.
+The current default `delta_x` is 0.50 m; minimum child length stays 0.20 m, independently of both split windows. Interference_dx/dy stay 0.50 m. Frozen rail centers still use their own WHOLE-eligible process-weighted midpoint median, clipped to [delta_x,20-delta_x]. Existing inner and MIDPOINT identities take priority over a coincident new outer X point. The expanded Y eligibility can change these centers. Invalid intersections, endpoints, duplicates, and candidates producing a child below the minimum are removed deterministically. Vertical or negligible-`dx` parents have no X pattern. There is no length threshold, WAIT/deadlock trigger, dynamic split point, dense grid, quarter point, or process-approved joint list.
 
 ## 5. X child assignment
 
@@ -125,3 +126,7 @@ The first Phase 3-Y common-domain smoke remains FAIL. Phase 3-YR used the same i
 `ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V2`
 
 `PHASE3Z_V2_VALIDATION_AUTHORIZED = YES`
+
+## Current numeric configuration and historical evidence
+
+Phase3-Z, Phase4-0/0B and Phase4-1A/B/C used the original delta_x=delta_y=0.20 domain. Their results, labels and MLP checkpoints retain that identity; do not reuse them as formal training data for the new 0.50 domain. Use `ScientificConfig(delta_x=0.20, delta_y=0.20)` to replay historical experiments. Current range sensitivity and full tests: [Y/X range change](YX_SPLIT_RANGE_05_CHANGE.md). No new scope/version/hash mechanism is introduced.

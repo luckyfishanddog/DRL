@@ -159,19 +159,31 @@ def robot_is_eligible(block: WeldingBlock, robot_id: int, config: ScientificConf
     return robot_rail(robot_id) in whole_eligible_rails(block.start, block.end, config)
 
 
+def split_axis_offsets(delta: float, prefix: str) -> tuple[tuple[float, str], ...]:
+    """Finite legacy +/-0.2 points plus the configured outer window.
+
+    Keep legacy identities when enlarging the window. Smaller explicit windows
+    retain their historical boundary semantics. Coincident points are deduped
+    by each generator, with the legacy sources preceding MIDPOINT.
+    """
+    inner = min(0.20, delta)
+    sources = [(-inner, prefix + "_LOWER"), (0.0, prefix + "_CENTER"),
+               (inner, prefix + "_UPPER")]
+    if delta > 0.20:
+        sources.extend(((-delta, prefix + "_OUTER_LOWER"),
+                        (delta, prefix + "_OUTER_UPPER")))
+    return tuple(sources)
+
+
 def generate_y_split_patterns(
     parent: ParentWeld, config: ScientificConfig
 ) -> tuple[SplitPattern, ...]:
-    """Return only the four scientifically specified Y candidates, deduplicated by t."""
+    """Return the finite Y line intersections and legal midpoint, deduplicated by t."""
     dy = parent.end[1] - parent.start[1]
     sources: list[tuple[float, str]] = []
     if dy != 0.0:
-        for y, point_id in (
-            (config.by[0], "BY_LOWER"),
-            (6.0, "BY_CENTER"),
-            (config.by[1], "BY_UPPER"),
-        ):
-            sources.append(((y - parent.start[1]) / dy, point_id))
+        for offset, point_id in split_axis_offsets(config.delta_y, "BY"):
+            sources.append(((6.0 + offset - parent.start[1]) / dy, point_id))
     midpoint = parent.point(0.5)
     if config.by[0] - config.numeric_epsilon <= midpoint[1] <= config.by[1] + config.numeric_epsilon:
         sources.append((0.5, "MIDPOINT"))
@@ -223,16 +235,13 @@ def generate_x_split_patterns(
     sources = (
         tuple(provider(parent, center, config))
         if provider is not None
-        else (
-            ((center - config.delta_x - parent.start[0]) / dx, "BX_LOWER"),
-            ((center - parent.start[0]) / dx, "BX_CENTER"),
-            ((center + config.delta_x - parent.start[0]) / dx, "BX_UPPER"),
-            (0.5, "MIDPOINT"),
-        )
+        else tuple(((center + offset - parent.start[0]) / dx, point_id)
+                   for offset, point_id in split_axis_offsets(config.delta_x, "BX"))
+             + ((0.5, "MIDPOINT"),)
     )
     candidates: list[SplitPattern] = []
     seen_t: list[float] = []
-    for t, point_id in sorted(sources, key=lambda item: (item[0], item[1])):
+    for t, point_id in sorted(sources, key=lambda item: (2 if "_OUTER_" in item[1] else 1 if item[1]=="MIDPOINT" else 0, item[0], item[1])):
         if not (0.0 < t < 1.0):
             continue
         if t * parent.length + config.numeric_epsilon < config.min_child_length:
@@ -245,7 +254,7 @@ def generate_x_split_patterns(
         validate_split_pattern(parent, pattern, config)
         candidates.append(pattern)
         seen_t.append(t)
-    return tuple(candidates)
+    return tuple(sorted(candidates, key=lambda p: (p.t, p.point_id)))
 
 
 def validate_split_pattern(
@@ -372,7 +381,7 @@ def x_split_geometry_metadata(
                 patterns_by_parent.setdefault(parent.parent_id, []).extend(patterns)
             for pattern in patterns:
                 assert pattern.point_id is not None
-                source_counts[pattern.point_id] += 1
+                source_counts[pattern.point_id] = source_counts.get(pattern.point_id, 0) + 1
     parent_by_id = {parent.parent_id: parent for parent in parents}
     splittable = [parent_by_id[parent_id] for parent_id in sorted(patterns_by_parent)]
     process_times = [config.process_time(parent.length) for parent in splittable]
