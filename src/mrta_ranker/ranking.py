@@ -32,17 +32,19 @@ def family_c4(items,key,family,*,k=2,seed=0,iteration=0):
 
 class LearnedRanker:
     """Models load outside search; feature/scaler/forward/selection time stays inside."""
-    def __init__(self,variant,root=None):
+    def __init__(self,variant,root=None,model_version="v1"):
         if variant not in ('MLP-C2','MLP-C4','MLP-BOTH'): raise ValueError('Unknown ranker variant')
         from .model import load_model
         import torch,numpy as np
         torch.set_num_threads(1)
+        if model_version not in ("v1","material_v2","rank_v2"): raise ValueError("Unknown model version")
         self.variant=variant;self.inference_seconds=0.0
+        suffix="" if model_version=="v1" else "_"+model_version
         root=Path(__file__).resolve().parents[2] if root is None else Path(root)
         self.scalers=np.load(root/'models/mlp_scalers.npz')
         self.models={}
         for stage in ('C2','C4'):
-            if variant in ('MLP-'+stage,'MLP-BOTH'): self.models[stage]=load_model(root/f'models/mlp_{stage.lower()}.pt')
+            if variant in ('MLP-'+stage,'MLP-BOTH'): self.models[stage]=load_model(root/f'models/mlp_{stage.lower()}{suffix}.pt')
     def scores(self,stage,features):
         from .model import predict_scores
         model,meta=self.models[stage]

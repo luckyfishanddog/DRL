@@ -201,3 +201,173 @@ def test_offline_heuristic_uses_exact_keys_and_no_label_inputs(tmp_path,monkeypa
     assert not module.qualifies_for_smoke(base,{'capture_median':.199,'zero_capture':.5})
     assert not module.qualifies_for_smoke(base,{'capture_median':.2,'zero_capture':.501})
     assert not module.qualifies_for_smoke(base,{'capture_median':None,'zero_capture':.5})
+
+
+
+def test_fixed_ranker_loss_decomposition_and_negative_product():
+    pytest.importorskip('torch')
+    import importlib.util
+    spec=importlib.util.spec_from_file_location('ranker_diagnostic_test',Path(__file__).resolve().parents[1]/'scripts/train_mlp_ranker.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    def row(i,cmax,family='STRUCTURAL',status='FEASIBLE_CERTIFIED'):
+        return {'state_id':'s','tier':'LARGE','stage':'MID','Cs':100.,'seed':3,'iteration':1,
+            'candidate_id':i,'family':family,'status':status,'C4_features':[1.],
+            'reference_cmax':cmax,'y_feasible':int(status=='FEASIBLE_CERTIFIED'),
+            'y_improvement':None if cmax is None else (100.-cmax)/100.}
+    best=row(0,90.);partial=row(1,95.,'TARGET_X');worse=row(2,120.);dead=row(3,None,status='DEADLOCK')
+    pool=[best,partial,worse,dead]
+    # C2 misses the best but captures half the available improvement.
+    loss=module.loss_decomposition(pool,[partial,worse,dead],[worse,dead])
+    assert loss['material'] and loss['C2_capture']==.5 and loss['C4_capture']==0
+    assert loss['oracle_C4_capture_given_C2']==.5 and loss['conditional_C4_capture']==0
+    assert loss['loss_location']=='C4_DROPPED_ALL'
+    none=module.loss_decomposition(pool,[worse,dead],[dead])
+    assert none['loss_location']=='NO_C2_CAPTURE' and none['conditional_C4_capture'] is None
+    retained=module.loss_decomposition(pool,[best,partial,worse],[partial])
+    assert retained['conditional_C4_capture']==.5
+    groups=module.decomposition_groups([loss,none,retained])['ALL']
+    assert (groups['material_states'],groups['no_C2_capture_states'],groups['C4_dropped_all_states'])==(3,1,1)
+    assert groups['conditional_C4_capture_median']==.25
+    # Zero opportunity does not create a recall denominator or attribution.
+    zero=module.loss_decomposition([worse],[worse],[worse])
+    assert not zero['material'] and zero['loss_location']=='NO_POOL_OPPORTUNITY'
+    for r,g,p in ((best,-.1,.9),(dead,-.2,.1)):
+        r.update(C4_gain=g,C4_p=p,C4_score=g*p)
+    negative=module.negative_product_diagnostics([best,dead],[dead],'C4')
+    assert negative['inversions']==1 and negative['inversion_exists']
+    dead.update(C4_gain=.2,C4_score=.02)
+    assert not module.negative_product_diagnostics([best,dead],[dead],'C4')['inversion_exists']
+
+
+@pytest.mark.parametrize('cmax,expected',[(995.01,0),(995.0,1),(994.99,1)])
+def test_material_target_half_percent_boundary(cmax,expected):
+    assert d.material_positive({'status':'FEASIBLE_CERTIFIED','Cs':1000.,'reference_cmax':cmax})==expected
+    assert d.material_positive({'status':'DEADLOCK','Cs':1000.,'reference_cmax':None})==0
+
+
+def test_pairwise_loss_moves_positive_above_negative():
+    torch=pytest.importorskip('torch')
+    from mrta_ranker.model import pairwise_loss,ranking_loss
+    scores=torch.nn.Parameter(torch.tensor([-1.,1.]))
+    opt=torch.optim.SGD([scores],lr=.5)
+    for _ in range(8):
+        opt.zero_grad();loss=pairwise_loss(scores[:1],scores[1:]);loss.backward();opt.step()
+    assert scores[0]>scores[1]
+    f=torch.zeros(2);m=torch.zeros(2);yf=torch.tensor([1.,0.]);ym=torch.tensor([1.,0.])
+    total,a,b,c=ranking_loss(f,m,yf,ym,torch.tensor(3.),scores[:1],scores[1:])
+    assert a==pytest.approx(.693147,rel=1e-5)
+    assert b==pytest.approx(2*.693147,rel=1e-5)
+    assert float(total.detach())==pytest.approx(float((a+b+c).detach()))
+
+
+def _rank_fixture_pool():
+    return [dict(state_id='state',candidate_id=i,family=('STRUCTURAL','TARGET_WHOLE','TARGET_Y','TARGET_X')[i%4],
+                 status='FEASIBLE_CERTIFIED',Cs=1000.,reference_cmax=990. if i==39 else 1000.,
+                 C2_score=float(i),C2_v1_score=float(i),C4_v1_score=float(i),
+                 C4_features=[1.],projected=float(i),dp_travel=1.,split_delta=0.,seed=0,iteration=0,tier='LARGE',stage='LATE')
+            for i in range(40)]
+
+
+def test_c4_hard_subset_keeps_top8_and_material_excludes_direction_infeasible():
+    pool=_rank_fixture_pool();pool[0].update(status='DIRECTION_INFEASIBLE',reference_cmax=None,C4_features=None)
+    subset=d.c4_hard_subset(pool,pool[:8],pool[8:16],pool[16:24],lambda r:r['candidate_id'])
+    ids={r['candidate_id'] for r in subset}
+    assert set(range(1,24))<=ids  # Feasible parts of all three actual Top8 lists.
+    assert set(range(24,32))<=ids and 39 in ids
+    assert 0 not in ids and all(r['status']!='DIRECTION_INFEASIBLE' for r in subset)
+
+
+def test_hard_pairs_are_state_local_bounded_and_state_equal():
+    first=_rank_fixture_pool();second=[dict(r,state_id='other',reference_cmax=980. if r['candidate_id']>36 else 1000.) for r in _rank_fixture_pool()]
+    rows=first+second
+    pairs=d.hard_ranking_pairs(rows,'C2',lambda r:r['candidate_id'])
+    from collections import Counter,defaultdict
+    counts=Counter(p for p,n,w in pairs);weights=defaultdict(float)
+    assert counts and max(counts.values())<=4
+    for p,n,w in pairs:
+        assert rows[p]['state_id']==rows[n]['state_id']
+        assert d.material_positive(rows[p]) and not d.material_positive(rows[n])
+        weights[rows[p]['state_id']]+=w
+    assert list(weights.values())==pytest.approx([.5,.5])
+    negatives={rows[n]['candidate_id'] for p,n,w in pairs if p==39}
+    assert 0 in negatives and 38 in negatives  # heuristic-best and V1-best negatives.
+
+
+def test_material_score_ignores_feasibility_and_signed_gain(tmp_path):
+    torch=pytest.importorskip('torch');import numpy as np
+    from mrta_ranker.model import CandidateMLP,predict_scores,save_model,load_model
+    model=CandidateMLP(2,objective='material')
+    with torch.no_grad():
+        for p in model.parameters(): p.zero_()
+        model.material.bias.fill_(-.05);model.feasibility.bias.fill_(9.)
+    a=predict_scores(model,[[0.,0.]],np.zeros(2),np.ones(2))
+    with torch.no_grad(): model.feasibility.bias.fill_(-9.)
+    b=predict_scores(model,[[0.,0.]],np.zeros(2),np.ones(2))
+    assert a[0]==b[0] and 0<=a[0]<=1
+    assert not hasattr(model,'improvement')
+    save_model(tmp_path/'material.pt',model,'C2',['a','b'],1,{})
+    loaded,meta=load_model(tmp_path/'material.pt')
+    assert meta['objective']=='material' and loaded.objective=='material'
+    assert predict_scores(loaded,[[0.,0.]],np.zeros(2),np.ones(2))[0]==a[0]
+
+
+def _training_module():
+    import importlib.util
+    path=Path(__file__).resolve().parents[1]/'scripts/train_mlp_ranker.py'
+    spec=importlib.util.spec_from_file_location('rank_topk_test',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module
+
+
+def test_c4_epoch_selection_uses_real_top8_and_strict_large_gate(monkeypatch):
+    pytest.importorskip('torch');m=_training_module();pool=_rank_fixture_pool()
+    original=m.c4_select;observed=[]
+    def select(top8,*args):
+        observed.append(len(top8));assert len(top8)<=8
+        return original(top8,*args)
+    monkeypatch.setattr(m,'c4_select',select)
+    for r in pool:r['C4_score']=float(r['candidate_id'])
+    m.evaluate_c4_top8(pool)
+    assert observed==[8,8]
+    base={'ALL':{'capture_median':0.,'zero_capture':.8},'LARGE':{'zero_capture':.5}}
+    new={'ALL':{'capture_median':.1,'zero_capture':.7},'LARGE':{'zero_capture':.5}}
+    assert m.rank_offline_gate(base,new)['passed']
+    new['LARGE']['zero_capture']=.5001
+    assert not m.rank_offline_gate(base,new)['passed']
+
+
+def test_actual_material_inference_never_invokes_scheduler(monkeypatch):
+    torch=pytest.importorskip('torch');import numpy as np
+    from test_search_sa import _base,_family_candidates,FAST
+    from mrta_ranker.ranking import LearnedRanker
+    from mrta_ranker.model import CandidateMLP
+    from mrta_ranker.features import extract_c2_features,extract_c4_features
+    from mrta_search.lns import atomic_complete_candidate
+    from mrta_search.pipeline import DirectionEvaluatedCandidate
+    from mrta_search.direction import ConstrainedDirectionResult,DirectionStatus
+    import mrta_reference.scheduler as scheduler
+    def forbidden(*a,**kw):raise AssertionError('Inference invoked scheduler')
+    monkeypatch.setattr(scheduler,'reference_schedule',forbidden)
+    monkeypatch.setattr(d,'FormalReferenceEvaluator',forbidden)
+    current=_base();directions=((),(),(0,0),(0,0))
+    candidates=[atomic_complete_candidate(current,directions,c,FAST) for c in _family_candidates()]
+    direct=ConstrainedDirectionResult(DirectionStatus.FEASIBLE,directions,1.)
+    directed=[DirectionEvaluatedCandidate(c,i,direct) for i,c in enumerate(candidates)]
+    names2=list(extract_c2_features(current,directions,100.,candidates[0],FAST))
+    names4=list(extract_c4_features(current,directions,100.,candidates[0],FAST,direction=direct,cheap_rank=0))
+    ranker=LearnedRanker.__new__(LearnedRanker);ranker.inference_seconds=0.
+    ranker.models={s:(CandidateMLP(len(names),objective='material'),{'feature_names':names}) for s,names in (('C2',names2),('C4',names4))}
+    ranker.scalers={s+suffix:(np.zeros(len(names)) if suffix=='_mean' else np.ones(len(names))) for s,names in (('C2',names2),('C4',names4)) for suffix in ('_mean','_std')}
+    selected=ranker.select_c2(current,directions,100.,candidates,FAST,seed=0,iteration=0)
+    assert len(selected)<=8
+    assert len(ranker.select_c4(current,directions,100.,directed,FAST,seed=0,iteration=0))<=2
+    assert ranker.inference_seconds>0
+
+
+def test_existing_candidate_dataset_workbooks_still_disjoint():
+    split=d.validate_split(d.read(d.SPLIT));db=d.connect(readonly=True)
+    groups={role:{r[0] for r in db.execute('SELECT DISTINCT workbook FROM instances WHERE split=?',(role,))} for role in ('MLP_TRAIN','MLP_DEV')}
+    assert groups['MLP_TRAIN']==set(split['MLP_TRAIN']) and groups['MLP_DEV']==set(split['MLP_DEV'])
+    assert not groups['MLP_TRAIN']&groups['MLP_DEV']
+    assert db.execute('SELECT count(*) FROM candidates').fetchone()[0]==14893
+    db.close()

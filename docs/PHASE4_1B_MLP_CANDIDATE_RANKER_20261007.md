@@ -8,7 +8,7 @@
 
 删除 53 个无当前依赖的旧过程文件：旧 Phase3/4 runner、profiling、候选 oracle SQLite、重复中间 JSON 和 handoff。通用 typed reader、accepted-state capture、存储与数据准备移入正式 `mrta_ranker.dataset`，新流程不依赖历史 runner。删除明细及字节数保存在结果 JSON。没有创建 archive/backup，没有提交或上传 GitHub。
 
-保留科学 src/tests、FORMAL_SCOPE_V2、实验方案、正式数据角色与固定 MLP split，以及解释当前算法的 Phase4-0B、Phase4-1A 等最终报告；清理后的文档链接已修复。退役104项仅服务旧runner/protocol/历史机械判定的过程测试，科学scheduler/certifier/search测试保留；清理后261项，加9项当前dataset/ranker回归后270项通过。清理前已向用户说明DRL未被当前外层Git跟踪，用户明确授权仍直接删除；没有声称这些本地过程文件已存入当前Git历史。
+保留科学 src/tests、FORMAL_SCOPE_V2、实验方案、正式数据角色与固定 MLP split，以及解释当前算法的 Phase4-0B、Phase4-1A 等最终报告；清理后的文档链接已修复。退役104项仅服务旧runner/protocol/历史机械判定的过程测试，科学scheduler/certifier/search测试保留；清理后261项，加10项当前dataset/ranker及失败定位回归后271项通过。清理前已向用户说明DRL未被当前外层Git跟踪，用户明确授权仍直接删除；没有声称这些本地过程文件已存入当前Git历史。
 
 ## 训练数据与隔离
 
@@ -113,11 +113,119 @@ Direct regret只在selected feasible存在时有定义，各variant定义样本�
 
 尚未证明可推荐的在线MLP收益。保留两个模型用于消融复查，生产继续heuristic。固定逐candidate BCE+SmoothL1并不直接优化Top-K capture，training loss下降不等于ranking有效。当前结果不足以断言特征缺失或标签错误；先检查目标与Top-K指标、负gain/尺度及score分布，不直接跳到GAT。
 
-下一步：保持 M192 heuristic；优先检查 C4 Top2 排序目标、score校准与 LARGE 跨workbook泛化，暂不进入 GAT。
+下一步：保持 M192 heuristic；下一轮限定改进 LARGE 的 C2 跨workbook泛化和 C4 state-level Top2 排序目标，复用既有TRAIN/DEV，不进入GAT。
 
 没有修改M192、Kdp/Kref、科学scope、X/Y、scheduler/B32或算子；没有访问真正最终测试、训练GAT或重新划分workbook。
 
 
+## 固定模型失败定位（继续分析）
+
+仅复用已有TRAIN/DEV标签与两个已选checkpoint；没有新增trajectory、reference调用、训练epoch或文件，没有改变score、family policy或生产配置。DEV四组结果逐项与原消融核对一致。TRAIN结果只作拟合程度的描述，未用于选模型。
+C4条件capture以C2已捕获改善为分母，只在C2捕获到改善的material states上计算。Oracle C4只作事后上界：用已知标签重排相同Top8并保留相同family policy，不能用于实际搜索。
+
+| split | variant | tier | material | C2有改善 | C4有改善 | 未进C2 | C4丢光 | 条件C4 capture | oracle C4/full-pool capture |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| MLP_TRAIN | BASELINE | ALL | 79 | 46 | 23 | 33 | 23 | 0.62% | 9.05% |
+| MLP_TRAIN | BASELINE | SMALL | 29 | 12 | 5 | 17 | 7 | 0.00% | 0.00% |
+| MLP_TRAIN | BASELINE | MEDIUM | 29 | 21 | 11 | 8 | 10 | 1.24% | 21.25% |
+| MLP_TRAIN | BASELINE | LARGE | 21 | 13 | 7 | 8 | 6 | 3.07% | 8.93% |
+| MLP_TRAIN | MLP-C2 | ALL | 79 | 53 | 33 | 26 | 20 | 96.35% | 47.40% |
+| MLP_TRAIN | MLP-C2 | SMALL | 29 | 16 | 7 | 13 | 9 | 0.00% | 1.78% |
+| MLP_TRAIN | MLP-C2 | MEDIUM | 29 | 19 | 11 | 10 | 8 | 100.00% | 41.96% |
+| MLP_TRAIN | MLP-C2 | LARGE | 21 | 18 | 15 | 3 | 3 | 100.00% | 92.24% |
+| MLP_TRAIN | MLP-C4 | ALL | 79 | 46 | 34 | 33 | 12 | 100.00% | 9.05% |
+| MLP_TRAIN | MLP-C4 | SMALL | 29 | 12 | 8 | 17 | 4 | 100.00% | 0.00% |
+| MLP_TRAIN | MLP-C4 | MEDIUM | 29 | 21 | 17 | 8 | 4 | 100.00% | 21.25% |
+| MLP_TRAIN | MLP-C4 | LARGE | 21 | 13 | 9 | 8 | 4 | 77.29% | 8.93% |
+| MLP_TRAIN | MLP-BOTH | ALL | 79 | 53 | 36 | 26 | 17 | 69.93% | 47.40% |
+| MLP_TRAIN | MLP-BOTH | SMALL | 29 | 16 | 8 | 13 | 8 | 0.78% | 1.78% |
+| MLP_TRAIN | MLP-BOTH | MEDIUM | 29 | 19 | 17 | 10 | 2 | 100.00% | 41.96% |
+| MLP_TRAIN | MLP-BOTH | LARGE | 21 | 18 | 11 | 3 | 7 | 68.96% | 92.24% |
+| MLP_DEV | BASELINE | ALL | 29 | 11 | 6 | 18 | 5 | 27.03% | 0.00% |
+| MLP_DEV | BASELINE | SMALL | 11 | 8 | 3 | 3 | 5 | 0.00% | 73.64% |
+| MLP_DEV | BASELINE | MEDIUM | 6 | 0 | 0 | 6 | 0 | — | 0.00% |
+| MLP_DEV | BASELINE | LARGE | 12 | 3 | 3 | 9 | 0 | 100.00% | 0.00% |
+| MLP_DEV | MLP-C2 | ALL | 29 | 15 | 9 | 14 | 6 | 100.00% | 30.89% |
+| MLP_DEV | MLP-C2 | SMALL | 11 | 9 | 8 | 2 | 1 | 100.00% | 46.12% |
+| MLP_DEV | MLP-C2 | MEDIUM | 6 | 4 | 0 | 2 | 4 | 0.00% | 66.74% |
+| MLP_DEV | MLP-C2 | LARGE | 12 | 2 | 1 | 10 | 1 | 50.00% | 0.00% |
+| MLP_DEV | MLP-C4 | ALL | 29 | 11 | 8 | 18 | 3 | 100.00% | 0.00% |
+| MLP_DEV | MLP-C4 | SMALL | 11 | 8 | 5 | 3 | 3 | 87.60% | 73.64% |
+| MLP_DEV | MLP-C4 | MEDIUM | 6 | 0 | 0 | 6 | 0 | — | 0.00% |
+| MLP_DEV | MLP-C4 | LARGE | 12 | 3 | 3 | 9 | 0 | 100.00% | 0.00% |
+| MLP_DEV | MLP-BOTH | ALL | 29 | 15 | 9 | 14 | 6 | 21.72% | 30.89% |
+| MLP_DEV | MLP-BOTH | SMALL | 11 | 9 | 8 | 2 | 1 | 66.26% | 46.12% |
+| MLP_DEV | MLP-BOTH | MEDIUM | 6 | 4 | 0 | 2 | 4 | 0.00% | 66.74% |
+| MLP_DEV | MLP-BOTH | LARGE | 12 | 2 | 1 | 10 | 1 | 50.00% | 0.00% |
+
+LARGE逐workbook复核（MLP-C2；物理路径只标识来源，角色按固定split）：
+
+| split | workbook | material | Top8 capture median | Top8有改善 | Top2有改善 |
+|---|---|---:|---:|---:|---:|
+| MLP_TRAIN | data/ID_TEST/seed_0357172400.xlsx | 4 | 91.58% | 3 | 3 |
+| MLP_TRAIN | data/ID_TEST/seed_1846918101.xlsx | 6 | 92.19% | 6 | 5 |
+| MLP_TRAIN | data/PPO_TRAIN/seed_0514719396.xlsx | 1 | 0.00% | 0 | 0 |
+| MLP_TRAIN | data/PPO_TRAIN/seed_0765477955.xlsx | 6 | 86.95% | 5 | 3 |
+| MLP_TRAIN | data/PPO_TRAIN/seed_1783157644.xlsx | 4 | 96.42% | 4 | 4 |
+| MLP_DEV | data/PPO_TRAIN/seed_0834257622.xlsx | 6 | 0.00% | 0 | 0 |
+| MLP_DEV | data/VALIDATION/seed_0151520473.xlsx | 6 | 0.00% | 2 | 1 |
+
+固定head误差（candidate级描述，不代替state equal weight capture）：
+
+| split | head | tier | 真改善候选 | 其中预测负gain | 真改善候选gain平均偏差 | 真改善候选p中位数 | 不可行候选p中位数 |
+|---|---|---|---:|---:|---:|---:|---:|
+| MLP_TRAIN | C2 | ALL | 1048 | 54.20% | -0.03144092454214661 | 73.89% | 25.93% |
+| MLP_TRAIN | C2 | SMALL | 252 | 55.56% | -0.05573583228062943 | 65.52% | 44.98% |
+| MLP_TRAIN | C2 | MEDIUM | 336 | 63.10% | -0.03535457605855549 | 78.30% | 8.75% |
+| MLP_TRAIN | C2 | LARGE | 460 | 46.96% | -0.015272873108209519 | 75.91% | 30.56% |
+| MLP_TRAIN | C4 | ALL | 1048 | 37.31% | -0.01085845813278267 | 74.79% | 16.19% |
+| MLP_TRAIN | C4 | SMALL | 252 | 55.56% | -0.04657047983370057 | 63.36% | 25.09% |
+| MLP_TRAIN | C4 | MEDIUM | 336 | 37.50% | -0.002195046889154963 | 87.42% | 7.36% |
+| MLP_TRAIN | C4 | LARGE | 460 | 27.17% | 0.0023774620645486337 | 78.97% | 27.68% |
+| MLP_DEV | C2 | ALL | 360 | 53.06% | -0.0588962384144084 | 58.73% | 38.39% |
+| MLP_DEV | C2 | SMALL | 182 | 46.15% | -0.04870390965791075 | 91.83% | 88.79% |
+| MLP_DEV | C2 | MEDIUM | 52 | 76.92% | -0.10409736570603721 | 57.77% | 40.91% |
+| MLP_DEV | C2 | LARGE | 126 | 53.17% | -0.05496405757724868 | 3.93% | 14.53% |
+| MLP_DEV | C4 | ALL | 360 | 40.28% | -0.048722903332821164 | 43.30% | 26.28% |
+| MLP_DEV | C4 | SMALL | 182 | 33.52% | -0.02958929358678085 | 63.93% | 49.00% |
+| MLP_DEV | C4 | MEDIUM | 52 | 25.00% | -0.030836201720537245 | 22.90% | 18.51% |
+| MLP_DEV | C4 | LARGE | 126 | 56.35% | -0.0837421529964569 | 21.35% | 34.27% |
+
+实际负gain乘积倒序：selected不可行候选的预测gain不高于池中真改善候选，且二者gain均负，但前者p×gain更高。该统计说明固定模型分数与所选集合的关系；heuristic阶段仅作对照，不能归因于该score。不是因果实验，也不是新score选择。
+
+| DEV variant | C2存在倒序的states | C4存在倒序的states | C4倒序pairs |
+|---|---:|---:|---:|
+| BASELINE | 19 | 0 | 0 |
+| MLP-C2 | 2 | 0 | 0 |
+| MLP-C4 | 19 | 0 | 0 |
+| MLP-BOTH | 2 | 0 | 0 |
+
+TRAIN标准化后|z|>5的特征比例（每state先平均、再取中位数）：
+
+| split | stage | ALL | SMALL | MEDIUM | LARGE |
+|---|---|---:|---:|---:|---:|
+| MLP_TRAIN | C2 | 0.02% | 0.02% | 0.04% | 0.09% |
+| MLP_TRAIN | C4 | 0.02% | 0.01% | 0.03% | 0.06% |
+| MLP_DEV | C2 | 0.07% | 0.25% | 0.02% | 0.11% |
+| MLP_DEV | C4 | 0.05% | 0.18% | 0.01% | 0.08% |
+
+分布尾部差异只说明观测特征的尺度/分布，不证明泛化失败由某个feature导致；候选相关性和workbook差异仍存在。所有事后分析均未用于追加选epoch、改分数或重复训练。
+
+进一步结论：LARGE既有C2跨workbook泛化差距，MEDIUM又有独立C4丢解。仅改善C4不能找回LARGE已被C2丢掉的候选。所检查的C4负gain乘积倒序为0个states，不能据理论性质直接断言它是本次失败主因。
+
+可用 `python -B scripts/train_mlp_ranker.py diagnose` 重复本节；`finish` 更新本报告。下一轮应限定为现有TRAIN上的state-level ranking目标与跨workbook泛化改进，DEV继续只用于模型选择，保持两层MLP、预算与family policy不变；当前没有依据进入GAT或native smoke。
+
+LARGE MLP-C2 Top8 capture median: TRAIN 92.24% vs DEV 0.00%; DEV 10/12 material states missed all improvement before C4. This is consistent with a cross-workbook generalization gap; TRAIN is in-sample and DEV has only two LARGE workbooks.
+
+MEDIUM DEV: MLP-C2 captured improvement in 4/6 material states, and C4 dropped all improvement in 4 of them. The same-policy oracle C4 ceiling is 66.74% capture vs the actual 0.00%.
+
+LARGE true-improving candidate predicted feasibility median: TRAIN 75.91% vs DEV 3.93%; DEV infeasible candidates median 14.53%. This is descriptive discrimination failure on this sample, not a standalone calibration metric or proven cause.
+
+MLP-BOTH C4 had 0 states with the defined selected infeasible negative-gain inversion. The theoretical p*negative_gain issue alone does not explain the observed C4 failure; no alternative score was selected or tested.
+
+Do not change M192, family access, Kdp/Kref, data split or architecture based on these diagnostics. The next bounded learning revision should address state-level ranking and cross-workbook generalization on existing TRAIN, with DEV used for selection; no GAT or native smoke is justified yet.
+
+
 ## 验证
 
-完整回归：270 passed in 34.00s。真实模型API重放36 states×4 variants=144次比较，mismatch=0，新增direction/reference调用=0。SQLite核验：quick_check OK; foreign_key_check empty; 14893 candidates after compaction。当前candidate总数=14893。
+完整回归：271 passed in 34.06s。真实模型API重放36 states×4 variants=144次比较，mismatch=0，新增direction/reference调用=0。SQLite核验：quick_check OK; foreign_key_check empty; 14893 candidates after compaction。当前candidate总数=14893。

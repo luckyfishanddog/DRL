@@ -177,6 +177,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None):
     st=result.stats
     record={'Cmax_at_60':checkpoint_cmax(result),'final_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
         'certified':bool(result.final_certification and result.final_certification.certified),'iterations':st.iterations,
+        'accepted_moves':sum(st.accepted_by_family.values()),'global_best_updates':len(st.best_improvement_cmax),
         'reference_calls':st.nref+st.init_reference_calls,'reference_seconds':st.reference_scheduler_time,
         'numeric_failure':st.n_numeric_failure+st.init_status_counts.get('NUMERIC_FAILURE',0),
         'actual_runtime':result.runtime,'overshoot':st.overshoot,**timings,
@@ -298,3 +299,45 @@ def bind_to_core(mask):
     kernel.SetProcessAffinityMask.argtypes=(wintypes.HANDLE,ctypes.c_size_t)
     if not kernel.SetProcessAffinityMask(kernel.GetCurrentProcess(),mask):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def material_positive(row):
+    """Existing reference labels only; numeric failures are excluded by the caller."""
+    return int(row['status']=='FEASIBLE_CERTIFIED' and
+               (row['Cs']-row['reference_cmax'])/row['Cs']>=0.005)
+
+
+def c4_hard_subset(pool,baseline_top8,new_top8,legacy_top8,heuristic_key):
+    """In-memory union for one TRAIN state; never evaluates new candidates."""
+    eligible=[r for r in pool if r['C4_features'] is not None and r['status']!='DIRECTION_INFEASIBLE']
+    ids={r['candidate_id'] for r in (*baseline_top8,*new_top8,*legacy_top8)}
+    ids.update(r['candidate_id'] for r in eligible if material_positive(r))
+    extra=[r for r in sorted(eligible,key=heuristic_key) if r['candidate_id'] not in ids][:8]
+    ids.update(r['candidate_id'] for r in extra)
+    return [r for r in eligible if r['candidate_id'] in ids]
+
+
+def hard_ranking_pairs(rows,stage,heuristic_key):
+    """Up to four negatives per positive, prioritizing heuristic and V1 tails.
+
+    Alternating both rankings preserves contributions from both failure sources.
+    Return row indices and state-equal weights; no cross-state comparisons.
+    """
+    from collections import defaultdict
+    states=defaultdict(list)
+    for i,r in enumerate(rows): states[r['state_id']].append(i)
+    by_state=[]
+    for indices in states.values():
+        positives=[i for i in indices if material_positive(rows[i])]
+        negatives=[i for i in indices if not material_positive(rows[i])]
+        a=sorted(negatives,key=lambda i:heuristic_key(rows[i]))
+        b=sorted(negatives,key=lambda i:(-rows[i][stage+'_v1_score'],heuristic_key(rows[i])))
+        chosen=[]
+        for j in range(len(negatives)):
+            for order in (a,b):
+                if order[j] not in chosen: chosen.append(order[j])
+                if len(chosen)==4: break
+            if len(chosen)==4: break
+        pairs=[(p,n) for p in positives for n in chosen]
+        if pairs: by_state.append(pairs)
+    return [(p,n,1/(len(by_state)*len(pairs))) for pairs in by_state for p,n in pairs]
