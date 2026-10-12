@@ -13,6 +13,7 @@ from mrta_ranker.ranking import family_c2,family_c4
 import numpy as np
 from mrta_ranker.model import CandidateMLP,fit_scaler,transform,predict_scores,multitask_loss,save_model,load_model
 import torch
+from torch import nn
 MODELS=ROOT/'models'
 REPORT=ROOT/'docs/PHASE4_1B_MLP_CANDIDATE_RANKER_20261007.md'
 VARIANTS=('BASELINE','MLP-C2','MLP-C4','MLP-BOTH')
@@ -929,11 +930,304 @@ def rank_finish():
     RANK_REPORT.write_text('\n'.join(lines),encoding='utf-8')
     print(f"Phase4-1C: {result['phase_status']}\nBest offline variant: {o} / NEW-{v}\nBaseline C4 capture: {pc(base['C4']['ALL']['capture_median'])}\nNew C4 capture: {pc(best['C4']['ALL']['capture_median'])}\nBaseline zero capture: {pc(base['C4']['ALL']['zero_capture'])}\nNew zero capture: {pc(best['C4']['ALL']['zero_capture'])}\nLARGE: {result['large_assessment']} (ranking failure persists)\nOffline gate: {'PASS' if result['offline_ranking_improved'] else 'FAIL'}\n60s smoke: {native.get('status')}\n60s Cmax result: {native.get('paired_summary',{}).get('ALL',{}).get('Cmax_ratio_median','N/A')}\nProduction ranker: HEURISTIC\nGAT: NOT YET\nNext: {result['next_step']}",flush=True)
 
+
+# First runnable 0.5 m GRC-ALNS. Kept here to reuse the established runner and
+# avoid another phase-specific framework or result file.
+GRC_SEEDS=(20261301,20261302)
+
+
+def load_v05_states(role):
+    whitelist=set(d.validate_split(d.read(d.SPLIT))[role]);db=d.connect(d.DATABASE_V05,readonly=True)
+    names={s:d.metadata(db,s+'_feature_names') for s in ('C2','C4')}
+    if {k:len(v) for k,v in names.items()}!={'C2':87,'C4':130}:raise ValueError('V05 needs complete 87/130 schemas')
+    states=[]
+    for state in db.execute('SELECT s.*,i.split,i.workbook,i.parents FROM states s JOIN instances i USING(instance_id) WHERE i.split=? ORDER BY state_id',(role,)):
+        if state['workbook'] not in whitelist:raise PermissionError('V05 workbook outside role whitelist')
+        parents=d.unpack(state['parents']);context=d.unpack(state['context'],parents);pool=[]
+        for row in db.execute('SELECT * FROM candidates WHERE state_id=? ORDER BY candidate_id',(state['state_id'],)):
+            if row['status'] is None:raise ValueError('V05 contains unlabeled candidate')
+            if row['status']=='NUMERIC_FAILURE':raise ValueError('NUMERIC_FAILURE excluded from learning')
+            candidate=d.unpack(row['payload'],parents);direction=d.unpack(row['direction'])
+            c2=np.frombuffer(row['c2'],dtype='<f4');c4=None if row['c4'] is None else np.frombuffer(row['c4'],dtype='<f4')
+            pool.append({'candidate_id':row['candidate_id'],'family':row['family'],'candidate':candidate,'direction':direction,
+                'C2_features':c2,'C4_features':c4,'status':row['status'],'reference_cmax':row['reference_cmax'],
+                'y_feasible':row['y_feasible'],'material':d.material_positive({**dict(row),'Cs':state['Cs']}),
+                'projected':candidate.projected_process_makespan,'split_delta':candidate.split_count_delta,
+                'dp_travel':direction.total_empty_travel})
+        states.append({'state_id':state['state_id'],'instance_id':state['instance_id'],'workbook':state['workbook'],'tier':state['tier'],
+            'stage':state['stage'],'seed':state['seed'],'iteration':state['iteration'],'Cs':state['Cs'],'current':context['solution'],
+            'directions':context['directions'],'pool':pool})
+    db.close();return states,names
+
+
+def _v05_c2(state,method):
+    learned=method!='HEURISTIC' and all(method+'_C2' in r for r in state['pool'])
+    key=(lambda r:(-r[method+'_C2'],r['candidate_id'])) if learned else (lambda r:r['candidate_id'])
+    return family_c2(state['pool'],key,lambda r:r['family'],k=8,seed=state['seed'],iteration=state['iteration'])
+
+
+def _v05_c4(state,c2,method):
+    eligible=[r for r in c2 if r['C4_features'] is not None]
+    heuristic=lambda r:(r['projected'],r['dp_travel'],r['split_delta'],r['candidate_id'])
+    learned=method!='HEURISTIC' and all(method+'_C4' in r for r in eligible)
+    key=(lambda r:(-r[method+'_C4'],heuristic(r))) if learned else heuristic
+    return family_c4(eligible,key,lambda r:r['family'],k=2,seed=state['seed'],iteration=state['iteration'])
+
+
+def _v05_metrics(states,method):
+    stages={'C2':[],'C4':[]}
+    for state in states:
+        c2=_v05_c2(state,method);c4=_v05_c4(state,c2,method)
+        for label,selected in (('C2',c2),('C4',c4)):
+            base=capture_metrics([{**r,'Cs':state['Cs']} for r in state['pool']],[{**r,'Cs':state['Cs']} for r in selected])
+            positives=sum(r['material'] for r in state['pool']);captured=sum(r['material'] for r in selected)
+            best_selected=max(((state['Cs']-r['reference_cmax'])/state['Cs'] for r in selected if r['status']=='FEASIBLE_CERTIFIED'),default=None)
+            pool_best=max(((state['Cs']-r['reference_cmax'])/state['Cs'] for r in state['pool'] if r['status']=='FEASIBLE_CERTIFIED'),default=None)
+            stages[label].append({**base,'state_id':state['state_id'],'tier':state['tier'],'stage':state['stage'],
+                'material_candidates':positives,'material_candidates_captured':captured,'material_zero_capture':None if not positives else captured==0,
+                'best_selected_improvement':best_selected,'pool_best_improvement':pool_best,'deadlock_selected':sum(r['status']=='DEADLOCK' for r in selected)})
+    out={}
+    for label,rows in stages.items():
+        summary=group_summary(rows)
+        groups={'ALL':rows,**{t:[r for r in rows if r['tier']==t] for t in d.TIERS}}
+        for group,items in groups.items():
+            available=sum(r['material_candidates'] for r in items);selected=sum(r['material_candidates_captured'] for r in items)
+            summary[group]['material_candidate_capture']=None if not available else selected/available
+            material_states=[r for r in items if r['material_candidates']>0]
+            summary[group]['material_zero_capture']=None if not material_states else statistics.fmean(r['material_zero_capture'] for r in material_states)
+            summary[group]['best_selected_improvement_median']=median(r['best_selected_improvement'] for r in material_states)
+            summary[group]['deadlock_selected_rate']=sum(r['deadlock_selected'] for r in items)/sum(r['selected_count'] for r in items) if sum(r['selected_count'] for r in items) else None
+            summary[group]['pool_material_states']=sum(r['material_candidates']>0 for r in items)
+        out[label]=summary
+    return out
+
+
+def _set_mlp_scores(states,stage,model,mean,std):
+    rows=[r for state in states for r in state['pool'] if r[stage+'_features'] is not None]
+    scores=predict_scores(model,[r[stage+'_features'] for r in rows],mean,std)
+    for row,score in zip(rows,scores):row['MLP_'+stage]=float(score)
+
+
+def _train_v05_mlp(stage,train_states,dev_states,names,scalers,rows=None):
+    from mrta_ranker.model import ranking_loss,save_v05_mlp
+    started=time.perf_counter();torch.manual_seed(20261310+(stage=='C4'));all_rows=rows or [r for s in train_states for r in s['pool'] if r[stage+'_features'] is not None]
+    x=torch.from_numpy(transform([r[stage+'_features'] for r in all_rows],scalers[stage+'_mean'],scalers[stage+'_std']))
+    yf=torch.tensor([r['y_feasible'] for r in all_rows],dtype=torch.float32);ym=torch.tensor([r['material'] for r in all_rows],dtype=torch.float32)
+    pos=max(1,int(ym.sum()));pos_weight=torch.tensor((len(all_rows)-pos)/pos,dtype=torch.float32)
+    state_counts=Counter(id(r.get('_state')) for r in all_rows) if all('_state' in r for r in all_rows) else None
+    weights=torch.ones(len(all_rows)) if state_counts is None else torch.tensor([1/state_counts[id(r['_state'])] for r in all_rows])
+    model=CandidateMLP(len(names[stage]),objective='material');opt=torch.optim.AdamW(model.parameters(),lr=.001,weight_decay=.0001)
+    best=None;best_state=None;history=[];stale=0
+    for epoch in range(1,31):
+        model.train();opt.zero_grad(set_to_none=True);feas,material=model(x)
+        lf=nn.functional.binary_cross_entropy_with_logits(feas,yf,reduction='none')
+        lm=nn.functional.binary_cross_entropy_with_logits(material,ym,pos_weight=pos_weight,reduction='none')
+        loss=((lf+lm)*weights).sum()/weights.sum();loss.backward();opt.step()
+        _set_mlp_scores(dev_states,stage,model,scalers[stage+'_mean'],scalers[stage+'_std'])
+        if stage=='C2': metric=_v05_metrics(dev_states,'MLP')['C2']['ALL']
+        else: metric=_v05_metrics(dev_states,'MLP')['C4']['ALL']
+        key=((metric['material_candidate_capture'] or 0),-(metric['material_zero_capture'] if metric['material_zero_capture'] is not None else 1),-float(loss.detach()))
+        history.append({'epoch':epoch,'loss':float(loss.detach()),'dev':metric})
+        if best is None or key>best:best=key;best_state=deepcopy(model.state_dict());best_epoch=epoch;stale=0
+        else:stale+=1
+        if stale>=5:break
+    model.load_state_dict(best_state);path=MODELS/f'mlp_{stage.lower()}_v05.pt';save_v05_mlp(path,model,stage,names[stage],scalers[stage+'_mean'],scalers[stage+'_std'],history[best_epoch-1]['dev'])
+    return model,{'rows':len(all_rows),'positives':pos,'epochs':epoch,'selected_epoch':best_epoch,'training_seconds':time.perf_counter()-started,'history':history}
+
+
+def _gat_score_states(model,states,stage,scalers,*,include_weld_edges=True,gradient=False):
+    from mrta_ranker.model import build_static_graph
+    graph_cache={};embedding_cache={};forward_calls=0;started=time.perf_counter()
+    context=torch.enable_grad() if gradient else torch.inference_mode()
+    with context:
+        for state in states:
+            key=state['instance_id']
+            graph=graph_cache.get(key)
+            if graph is None:graph=build_static_graph(state['current'].parents,d.CONFIG_V05,include_weld_edges=include_weld_edges);graph_cache[key]=graph
+            embedding=embedding_cache.get(key)
+            if embedding is None:
+                embedding=model.encode_static(graph);forward_calls+=1
+                if not gradient:embedding_cache[key]=embedding
+            rows=[r for r in state['pool'] if r[stage+'_features'] is not None];candidates=[r['candidate'] for r in rows]
+            _,material=model.score_candidates(stage,graph,embedding,state['current'],candidates,[r[stage+'_features'] for r in rows],scalers[stage+'_mean'],scalers[stage+'_std'],d.CONFIG_V05)
+            for row,score in zip(rows,torch.sigmoid(material).detach().cpu().numpy()):row['GAT_'+stage]=float(score)
+    return {'seconds':time.perf_counter()-started,'static_forward_calls':forward_calls}
+
+
+def _train_v05_gat_stage(model,stage,train_states,dev_states,scalers,train_rows_by_state=None):
+    from mrta_ranker.model import build_static_graph
+    started=time.perf_counter();torch.manual_seed(20261320+(stage=='C4'))
+    if stage=='C4':
+        for name,p in model.named_parameters():p.requires_grad=name.startswith('numeric.C4') or name.startswith('feasibility.C4') or name.startswith('material.C4')
+    else:
+        for p in model.parameters():p.requires_grad=True
+    parameters=[p for p in model.parameters() if p.requires_grad];opt=torch.optim.AdamW(parameters,lr=.001,weight_decay=.0001)
+    all_rows=[r for s in train_states for r in (train_rows_by_state or {}).get(s['state_id'],s['pool']) if r[stage+'_features'] is not None]
+    positives=sum(r['material'] for r in all_rows);pos_weight=torch.tensor((len(all_rows)-positives)/max(1,positives))
+    graphs={s['instance_id']:build_static_graph(s['current'].parents,d.CONFIG_V05) for s in train_states}
+    best=None;best_state=None;history=[];gradient_norm=0.
+    epochs=4
+    for epoch in range(1,epochs+1):
+        model.train();losses=[]
+        for state in train_states:
+            rows=[r for r in (train_rows_by_state or {}).get(state['state_id'],state['pool']) if r[stage+'_features'] is not None]
+            if not rows:continue
+            graph=graphs[state['instance_id']];opt.zero_grad(set_to_none=True);embedding=model.encode_static(graph)
+            feas,material=model.score_candidates(stage,graph,embedding,state['current'],[r['candidate'] for r in rows],[r[stage+'_features'] for r in rows],scalers[stage+'_mean'],scalers[stage+'_std'],d.CONFIG_V05)
+            yf=torch.tensor([r['y_feasible'] for r in rows],dtype=torch.float32);ym=torch.tensor([r['material'] for r in rows],dtype=torch.float32)
+            loss=nn.functional.binary_cross_entropy_with_logits(feas,yf)+nn.functional.binary_cross_entropy_with_logits(material,ym,pos_weight=pos_weight)
+            loss.backward()
+            if stage=='C2':gradient_norm=max(gradient_norm,float(model.encoder.layer1.linear.weight.grad.abs().sum()))
+            opt.step();losses.append(float(loss))
+        model.eval();timing=_gat_score_states(model,dev_states,stage,scalers)
+        metric=_v05_metrics(dev_states,'GAT')[stage]['ALL'];key=((metric['material_candidate_capture'] or 0),-(metric['material_zero_capture'] if metric['material_zero_capture'] is not None else 1),-statistics.fmean(losses))
+        history.append({'epoch':epoch,'loss':statistics.fmean(losses),'dev':metric,'inference':timing})
+        if best is None or key>best:best=key;best_state=deepcopy(model.state_dict());best_epoch=epoch
+    model.load_state_dict(best_state)
+    if stage=='C2' and gradient_norm<=0:raise AssertionError('GAT encoder received no training gradient')
+    return {'rows':len(all_rows),'positives':positives,'epochs':epochs,'selected_epoch':best_epoch,'encoder_gradient_l1':gradient_norm,'training_seconds':time.perf_counter()-started,'history':history}
+
+
+def grc_train():
+    from mrta_ranker.model import GraphCandidateRanker,fit_scaler,save_graph_model
+    torch.set_num_threads(1);torch.use_deterministic_algorithms(True);train,names=load_v05_states('MLP_TRAIN');dev,_=load_v05_states('MLP_DEV')
+    for state in train:
+        for row in state['pool']:row['_state']=state
+    scalers={}
+    for stage in ('C2','C4'):
+        values=[r[stage+'_features'] for s in train for r in s['pool'] if r[stage+'_features'] is not None];scalers[stage+'_mean'],scalers[stage+'_std']=fit_scaler(values)
+    mlp_c2,mlp_c2_info=_train_v05_mlp('C2',train,dev,names,scalers)
+    _set_mlp_scores(train,'C2',mlp_c2,scalers['C2_mean'],scalers['C2_std']);_set_mlp_scores(dev,'C2',mlp_c2,scalers['C2_mean'],scalers['C2_std'])
+    gat=GraphCandidateRanker();gat_c2_info=_train_v05_gat_stage(gat,'C2',train,dev,scalers);_gat_score_states(gat,train,'C2',scalers);_gat_score_states(gat,dev,'C2',scalers)
+    hard={}
+    for state in train:
+        ids={r['candidate_id'] for method in ('HEURISTIC','MLP','GAT') for r in _v05_c2(state,method)}
+        eligible=[r for r in state['pool'] if r['C4_features'] is not None]
+        ids.update(r['candidate_id'] for r in eligible if r['material']);ids.update(r['candidate_id'] for r in eligible[:8])
+        hard[state['state_id']]=[r for r in eligible if r['candidate_id'] in ids]
+    hard_rows=[r for rows in hard.values() for r in rows]
+    mlp_c4,mlp_c4_info=_train_v05_mlp('C4',train,dev,names,scalers,hard_rows)
+    _set_mlp_scores(train,'C4',mlp_c4,scalers['C4_mean'],scalers['C4_std']);_set_mlp_scores(dev,'C4',mlp_c4,scalers['C4_mean'],scalers['C4_std'])
+    gat_c4_info=_train_v05_gat_stage(gat,'C4',train,dev,scalers,hard);_gat_score_states(gat,train,'C4',scalers);_gat_score_states(gat,dev,'C4',scalers)
+    training={'dataset':{'TRAIN':{'states':len(train),'candidates':sum(len(s['pool']) for s in train),'workbooks':len({s['workbook'] for s in train})},
+        'DEV':{'states':len(dev),'candidates':sum(len(s['pool']) for s in dev),'workbooks':len({s['workbook'] for s in dev})}},
+        'MLP':{'C2':mlp_c2_info,'C4':mlp_c4_info},'GAT':{'C2':gat_c2_info,'C4':gat_c4_info},'C4_hard_rows':len(hard_rows),
+        'config':{'MLP':[128,64],'GAT_layers':2,'GAT_heads':4,'GAT_hidden':64,'epochs_GAT':4,'material_threshold':.005}}
+    save_graph_model(MODELS/'gat_v05.pt',gat,names['C2'],names['C4'],scalers,training)
+    db=d.connect(d.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_training','summary',d.dumps(training)))
+    db.close();print(d.dumps(training),flush=True)
+
+
+def grc_offline():
+    from mrta_ranker.model import load_model,load_graph_model
+    states,names=load_v05_states('MLP_DEV');scalers={}
+    mlp_timing={}
+    for stage in ('C2','C4'):
+        model,meta=load_model(MODELS/f'mlp_{stage.lower()}_v05.pt');scalers[stage+'_mean']=meta['mean'];scalers[stage+'_std']=meta['std'];started=time.perf_counter();_set_mlp_scores(states,stage,model,meta['mean'],meta['std']);mlp_timing[stage]={'seconds':time.perf_counter()-started}
+    gat,meta=load_graph_model(MODELS/'gat_v05.pt');gat_timing={s:_gat_score_states(gat,states,s,meta['scalers']) for s in ('C2','C4')}
+    result={'HEURISTIC':_v05_metrics(states,'HEURISTIC'),'MLP':_v05_metrics(states,'MLP'),'GAT':_v05_metrics(states,'GAT'),'MLP_timing':mlp_timing,'GAT_timing':gat_timing}
+    # Relation ablation: identical trained parameters and dimensions; only weld-weld edges removed.
+    ablation={s:_gat_score_states(gat,states,s,meta['scalers'],include_weld_edges=False) for s in ('C2','C4')};result['GAT_NO_WELD_EDGES']=_v05_metrics(states,'GAT');result['ablation_timing']=ablation
+    db=d.connect(d.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_offline','summary',d.dumps(result)))
+    db.close();print(d.dumps(result),flush=True)
+
+
+def _grc_smoke_worker(job):
+    if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
+    from run_ppo_smoke import _range_parents
+    from mrta_ranker.ranking import V05MLPRanker,GATRanker
+    entry,seed,method=job;parents=_range_parents(entry,d.PPO)
+    ranker=None if method=='HEURISTIC' else V05MLPRanker(ROOT) if method=='MLP' else GATRanker(ROOT)
+    record,_=d.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=d.CONFIG_V05)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],'seed':seed,'method':method,**record}
+
+
+def _grc_smoke_init(mask_list):
+    d.bind_to_core(mask_list[(mp.current_process()._identity[0]-1)%len(mask_list)])
+
+
+def grc_smoke(workers=3):
+    if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
+    from run_ppo_smoke import _c2_entries
+    entries=_c2_entries(ROOT);entries=[entries[0],entries[2],entries[4]]
+    db=d.connect(d.DATABASE_V05);done={r[0] for r in db.execute("SELECT item_id FROM experiments WHERE experiment='grc_smoke'")}
+    jobs=[]
+    for entry in entries:
+        for seed in GRC_SEEDS:
+            methods=('HEURISTIC','MLP','GAT') if (entry['label'],seed)<=(entry['label'],GRC_SEEDS[0]) else ('GAT','MLP','HEURISTIC')
+            for method in methods:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,seed,method)))
+    db.close();masks=d.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=workers,mp_context=mp.get_context('spawn'),initializer=_grc_smoke_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_grc_smoke_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            row=future.result();db=d.connect(d.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_smoke',futures[future],d.dumps(row)))
+            db.close();print(f"smoke {futures[future]} Cmax@60={row['Cmax_at_60']} iterations={row['iterations']}",flush=True)
+
+
+def grc_report():
+    """Write the only GRC result report from normalized records in SQLite."""
+    db=d.connect(d.DATABASE_V05,readonly=True)
+    training=json.loads(db.execute("SELECT payload FROM experiments WHERE experiment='grc_training' AND item_id='summary'").fetchone()[0])
+    offline=json.loads(db.execute("SELECT payload FROM experiments WHERE experiment='grc_offline' AND item_id='summary'").fetchone()[0])
+    runs=[json.loads(r[0]) for r in db.execute("SELECT payload FROM experiments WHERE experiment='grc_smoke' ORDER BY item_id")];summary=d.dataset_summary(db)
+    material={split:db.execute("SELECT count(*) FROM candidates c JOIN states s USING(state_id) JOIN instances i USING(instance_id) WHERE i.split=? AND c.status='FEASIBLE_CERTIFIED' AND (s.Cs-c.reference_cmax)/s.Cs>=.005",(split,)).fetchone()[0] for split in ('MLP_TRAIN','MLP_DEV')};db.close()
+    pairs=[]
+    for tier in ('N35','N55','N85'):
+        for seed in GRC_SEEDS:
+            rows={r['method']:r for r in runs if r['tier']==tier and r['seed']==seed}
+            if len(rows)==3:pairs.append({'tier':tier,'seed':seed,**{m:rows[m]['Cmax_at_60'] for m in rows}})
+    def fmt(v):return '—' if v is None else f'{100*v:.2f}%'
+    wins={m:sum(p[m]<p['HEURISTIC']-1e-8 for p in pairs) for m in ('MLP','GAT')};losses={m:sum(p[m]>p['HEURISTIC']+1e-8 for p in pairs) for m in ('MLP','GAT')}
+    overhead={m:sum(r['ranker_inference_seconds'] for r in runs if r['method']==m) for m in ('MLP','GAT')};ratios={m:[p[m]/p['HEURISTIC']-1 for p in pairs] for m in ('MLP','GAT')}
+    same_edges=all(offline['GAT'][s][g]['material_candidate_capture']==offline['GAT_NO_WELD_EDGES'][s][g]['material_candidate_capture'] for s in ('C2','C4') for g in ('ALL','SMALL','MEDIUM','LARGE'))
+    lines=['# GRC-ALNS：第一版 GAT 结果','',
+        '**结论：保持 HEURISTIC production。** GAT 离线减少错误筛选，但真实60秒为3胜0平3负，N35两个seed均退化；关系边消融不降，当前不推荐切换默认方法。','',
+        f"TRAIN {summary['MLP_TRAIN']['states']} states / {summary['MLP_TRAIN']['candidates']} candidates / {material['MLP_TRAIN']} material positives；DEV {summary['MLP_DEV']['states']} / {summary['MLP_DEV']['candidates']} / {material['MLP_DEV']}。17/6 workbook隔离；6个缺失EARLY未回填；旧0.2 m数据未混入。",'',
+        '## 离线完整 C2→direction→C4','', '| method | tier | C2 material capture | C2 zero | C2 feasible | C4 material capture | C4 zero | C4 feasible |','|---|---|---:|---:|---:|---:|---:|---:|']
+    tier_names={'SMALL':'N35','MEDIUM':'N55','LARGE':'N85','ALL':'ALL'}
+    for method in ('HEURISTIC','MLP','GAT','GAT_NO_WELD_EDGES'):
+        for tier in ('SMALL','MEDIUM','LARGE','ALL'):
+            a,b=offline[method]['C2'][tier],offline[method]['C4'][tier]
+            lines.append(f"| {method} | {tier_names[tier]} | {fmt(a['material_candidate_capture'])} | {fmt(a['material_zero_capture'])} | {fmt(a['selected_candidate_feasibility_rate'])} | {fmt(b['material_candidate_capture'])} | {fmt(b['material_zero_capture'])} | {fmt(b['selected_candidate_feasibility_rate'])} |")
+    h2,g2=offline['HEURISTIC']['C2']['ALL'],offline['GAT']['C2']['ALL'];h4,g4=offline['HEURISTIC']['C4']['ALL'],offline['GAT']['C4']['ALL']
+    lines+=['',f"GAT相对heuristic：C2 material capture {fmt(h2['material_candidate_capture'])}→{fmt(g2['material_candidate_capture'])}，认证率 {fmt(h2['selected_candidate_feasibility_rate'])}→{fmt(g2['selected_candidate_feasibility_rate'])}，zero {fmt(h2['material_zero_capture'])}→{fmt(g2['material_zero_capture'])}；C4 capture {fmt(h4['material_candidate_capture'])}→{fmt(g4['material_candidate_capture'])}、zero {fmt(h4['material_zero_capture'])}→{fmt(g4['material_zero_capture'])}。C2收益仍有大部分被Top2丢失。",
+        f"删除weld-weld边后，{'全部分层Top-K指标相同' if same_edges else '指标发生变化'}。本轮不能把GAT相对MLP的增量归因于图关系；顺序编码、机器人资格边和优化差异尚未独立隔离。",'',
+        '## 真实60秒开发 smoke','', '| tier | seed | initial Cmax | HEURISTIC Cmax@60 | MLP | MLP Δ | GAT | GAT Δ |','|---|---:|---:|---:|---:|---:|---:|---:|']
+    by_key={(r['tier'],r['seed'],r['method']):r for r in runs}
+    for p in pairs:
+        initial=by_key[p['tier'],p['seed'],'HEURISTIC']['initial_cmax']
+        lines.append(f"| {p['tier']} | {p['seed']} | {initial:.6f} | {p['HEURISTIC']:.6f} | {p['MLP']:.6f} | {fmt(p['MLP']/p['HEURISTIC']-1)} | {p['GAT']:.6f} | {fmt(p['GAT']/p['HEURISTIC']-1)} |")
+    lines+=['',f"胜/平/负：MLP {wins['MLP']}/{len(pairs)-wins['MLP']-losses['MLP']}/{losses['MLP']}，median Δ={fmt(statistics.median(ratios['MLP']))}；GAT {wins['GAT']}/{len(pairs)-wins['GAT']-losses['GAT']}/{losses['GAT']}，median Δ={fmt(statistics.median(ratios['GAT']))}。N35两次退化，N55两次改善，N85一胜一负；没有跨workbook稳定性证据。",'',
+        '| method | iterations | reference calls | FEASIBLE/DEADLOCK/INFEASIBLE/NUMERIC | strict best@60 | ranker time | overshoot |','|---|---:|---:|---|---:|---:|---|']
+    for method in ('HEURISTIC','MLP','GAT'):
+        rows=[r for r in runs if r['method']==method];status={k:sum(r['reference_status'][k] for r in rows) for k in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE')}
+        lines.append(f"| {method} | {sum(r['iterations'] for r in rows)} | {sum(r['reference_calls'] for r in rows)} | {status['FEASIBLE']}/{status['DEADLOCK']}/{status['INFEASIBLE']}/{status['NUMERIC_FAILURE']} | {sum(r['strict_best_improvements_at60'] for r in rows)} | {sum(r['ranker_inference_seconds'] for r in rows):.3f}s | {min(r['overshoot'] for r in rows):.3f}–{max(r['overshoot'] for r in rows):.3f}s |")
+    gat_rows=[r for r in runs if r['method']=='GAT']
+    lines+=['','## 直接结论','',
+        f"- 训练：MLP C2/C4 rows={training['MLP']['C2']['rows']}/{training['MLP']['C4']['rows']}；GAT encoder梯度L1={training['GAT']['C2']['encoder_gradient_l1']:.6g}；C4 hard rows={training['C4_hard_rows']}。",
+        f"- 开销：DEV GAT C2/C4={offline['GAT_timing']['C2']['seconds']:.3f}/{offline['GAT_timing']['C4']['seconds']:.3f}s，静态attention各6次。在线GAT {overhead['GAT']:.3f}s，占360s的 {100*overhead['GAT']/360:.2f}%；build/forward/score={sum(r['graph_build_seconds'] for r in gat_rows):.3f}/{sum(r['static_graph_forward_seconds'] for r in gat_rows):.3f}/{sum(r['candidate_scoring_seconds'] for r in gat_rows):.3f}s。",
+        f"- 完整性：18/18有截止前认证Cmax，NUMERIC_FAILURE={sum(r['numeric_failure'] for r in runs)}。学习排序降低DEADLOCK、增加FEASIBLE reference，却未稳定降低Cmax。",
+        '- 决策：保留MLP/GAT为development选项；production继续BASELINE initialization + HEURISTIC C2/C4，不打开ID_TEST。',
+        '- 下一步：扩大development workbook复验N35/N85；在真实Top8分布下优化C4并隔离关系边/顺序编码；批处理动态candidate降低开销，然后冻结方法做独立validation。','',
+        '固定条件：0.5 m、M192=144+48、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/B32/certifier、TWO_OPT_STAR OFF。无额外reference预算。本结果不是SCI正式统计结论。','',
+        '完整回归：`pytest -q -p no:cacheprovider`，323 passed。','']
+    (ROOT/'docs/GRC_ALNS_GAT_FIRST_RESULTS.md').write_text('\n'.join(lines),encoding='utf-8')
+    print('\n'.join(lines[:8]),flush=True)
+
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=('train','offline','smoke','diagnose','finish','rank','audit','rank-finish'));parser.add_argument('--workers',type=int,default=3)
+    parser.add_argument('action',choices=('train','offline','smoke','diagnose','finish','rank','audit','rank-finish','grc-train','grc-offline','grc-smoke','grc-report'));parser.add_argument('--workers',type=int,default=3)
     args=parser.parse_args()
-    if args.action=='audit': rank_audit()
+    if args.action=='grc-train':grc_train()
+    elif args.action=='grc-offline':grc_offline()
+    elif args.action=='grc-smoke':grc_smoke(args.workers)
+    elif args.action=='grc-report':grc_report()
+    elif args.action=='audit': rank_audit()
     elif args.action=='rank-finish': rank_finish()
     elif args.action=='rank': rank_experiment(args.workers)
     elif args.action=='train': train()

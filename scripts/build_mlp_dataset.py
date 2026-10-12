@@ -8,33 +8,34 @@ import sys,time
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'src'))
 from mrta_ranker import dataset as d
 _WORKER_SOURCE=None
+_WORKER_V05=False
 _PARENT_CACHE={}
 
-def initialize_worker(masks):
-    global _WORKER_SOURCE
+def initialize_worker(masks,v05):
+    global _WORKER_SOURCE,_WORKER_V05
     index=(mp.current_process()._identity[0]-1)%len(masks)
-    d.bind_to_core(masks[index]);_WORKER_SOURCE=d.provenance()
+    d.bind_to_core(masks[index]);_WORKER_SOURCE=d.provenance();_WORKER_V05=v05
 
 
 def trajectory_job(entry,seed):
     if entry['instance_id'] not in _PARENT_CACHE: _PARENT_CACHE[entry['instance_id']]=d.load_parents(entry)
     parents=_PARENT_CACHE[entry['instance_id']]
-    record,contexts=d.run_trajectory(entry,seed,parents=parents,source=_WORKER_SOURCE)
-    db=d.connect()
+    record,contexts=d.run_trajectory(entry,seed,parents=parents,source=_WORKER_SOURCE,config=d.CONFIG_V05 if _WORKER_V05 else d.CONFIG)
+    db=d.connect(d.DATABASE_V05 if _WORKER_V05 else d.DATABASE)
     try: d.store_trajectory(db,entry,parents,seed,record,contexts)
     finally: db.close()
     return entry,seed,record
 
 
 def state_job(state_id,action):
-    db=d.connect();state=db.execute('SELECT * FROM states WHERE state_id=?',(state_id,)).fetchone()
+    db=d.connect(d.DATABASE_V05 if _WORKER_V05 else d.DATABASE);state=db.execute('SELECT * FROM states WHERE state_id=?',(state_id,)).fetchone()
     if action=='pools':
-        count=d.generate_state_pool(db,state);db.close();return state_id,count
+        count=d.generate_state_pool(db,state,d.CONFIG_V05 if _WORKER_V05 else d.CONFIG);db.close();return state_id,count
     context=d.state_context(db,state);parents=context['solution'].parents;count=0
     rows=list(db.execute('SELECT * FROM candidates WHERE state_id=? AND status IS NULL ORDER BY candidate_id',(state_id,)))
     for row in rows:
         candidate=d.unpack(row['payload'],parents)
-        label=d.label_candidate(candidate,context,row['candidate_id'])
+        label=d.label_candidate(candidate,context,row['candidate_id'],d.CONFIG_V05 if _WORKER_V05 else d.CONFIG)
         with db:
             if label['c4_names'] is not None:
                 old=d.metadata(db,'C4_feature_names')
@@ -47,13 +48,17 @@ def state_job(state_id,action):
     db.close();return state_id,count
 
 
-def build(action,workers=3):
-    split=d.validate_split(d.read(d.SPLIT));entries=d.representatives(split)
-    db=d.connect()
+def build(action,workers=3,v05=False):
+    split=d.validate_split(d.read(d.SPLIT));entries=(d.representatives_v05 if v05 else d.representatives)(split)
+    if v05:
+        entries=[{**entry,**d.static_geometry_summary(d.load_parents(entry),d.CONFIG_V05)} for entry in entries]
+    db=d.connect(d.DATABASE_V05 if v05 else d.DATABASE)
     old=d.metadata(db,'representatives')
     if old is not None and old!=entries: raise ValueError('Existing representatives differ from fixed static selection')
     with db:
         d.set_meta(db,'representatives',entries);d.set_meta(db,'solver_seeds',list(d.SEEDS))
+        if v05:
+            d.set_meta(db,'dataset_version','GRAPH_RANKER_V05');d.set_meta(db,'scientific_config',d.CONFIG_V05.scientific_mapping())
     masks=d.physical_core_affinities()[:workers]
     if len(masks)!=workers: raise ValueError('Not enough distinct physical cores')
     if action=='trajectories':
@@ -63,7 +68,7 @@ def build(action,workers=3):
     else: jobs=[(row[0],action) for row in db.execute('SELECT DISTINCT state_id FROM candidates WHERE status IS NULL')]
     if action!='trajectories' and db.execute('SELECT count(*) FROM trajectories').fetchone()[0]!=46: raise ValueError('Need all 46 trajectory outcomes before candidate labeling')
     if action!='trajectories' and db.execute("SELECT count(*) FROM trajectories WHERE json_extract(result,'$.numeric_failure')>0").fetchone()[0]: raise ValueError('Numeric failure in a source trajectory must be resolved before training data generation')
-    with ProcessPoolExecutor(max_workers=workers,mp_context=mp.get_context('spawn'),initializer=initialize_worker,initargs=(masks,)) as pool:
+    with ProcessPoolExecutor(max_workers=workers,mp_context=mp.get_context('spawn'),initializer=initialize_worker,initargs=(masks,v05)) as pool:
         futures=[pool.submit(trajectory_job,*job) if action=='trajectories' else pool.submit(state_job,*job) for job in jobs]
         for index,future in enumerate(as_completed(futures),1):
             result=future.result()
@@ -78,5 +83,5 @@ def build(action,workers=3):
 
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('action',choices=('trajectories','pools','labels'));parser.add_argument('--workers',type=int,default=3)
-    args=parser.parse_args();build(args.action,args.workers)
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('action',choices=('trajectories','pools','labels'));parser.add_argument('--workers',type=int,default=3);parser.add_argument('--v05',action='store_true')
+    args=parser.parse_args();build(args.action,args.workers,args.v05)

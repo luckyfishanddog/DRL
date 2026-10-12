@@ -8,7 +8,8 @@ from enum import Enum
 import ctypes,importlib,json,math,sqlite3,statistics,struct,time,zlib
 from ctypes import wintypes
 from pathlib import Path
-from mrta_reference.model import CanonicalSolution,ScientificConfig,ScheduleStatus
+from mrta_reference.model import CanonicalSolution,ScientificConfig,ScheduleStatus,SplitKind
+from mrta_reference.geometry import build_legal_pattern_catalog
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.provenance import SourceProvenance,REPOSITORY_ID,compute_source_tree_hash
 from mrta_reference.scheduler import FormalReferenceEvaluator
@@ -25,12 +26,14 @@ SPLIT=ROOT/'data/development/mlp_workbook_split_v1.json'
 DATASET=ROOT/'data/manifests/PPO_DATASET_MANIFEST_V1.json'
 ROLES=ROOT/'data/manifests/PPO_V2_DATA_ROLES_V1.json'
 DATABASE=ROOT/'data/development/mlp_candidate_dataset_v1.sqlite'
+DATABASE_V05=ROOT/'data/development/graph_ranker_dataset_v05.sqlite'
 RESULT=ROOT/'data/development/phase4_1b_mlp_results.json'
 STAGES=(('EARLY',5.0),('MID',30.0),('LATE',60.0))
 SEEDS=(20261121,20261122)
 TIERS=('SMALL','MEDIUM','LARGE')
 # Phase4-1A/B/C labels and checkpoints belong to the historical 0.2 domain.
 CONFIG=ScientificConfig(delta_x=0.20,delta_y=0.20)
+CONFIG_V05=ScientificConfig()
 def dumps(value): return json.dumps(value,ensure_ascii=False,separators=(',',':'),allow_nan=False)
 def read(path): return json.loads(Path(path).read_text(encoding='utf-8'))
 def provenance(): return SourceProvenance(REPOSITORY_ID,'LOCAL_DRL_USER_AUTHORIZED',compute_source_tree_hash(ROOT),True,False)
@@ -128,6 +131,44 @@ def representatives(split=None,manifest=None):
     return selected
 
 
+def representatives_v05(split=None,manifest=None):
+    """Workbook-isolated 35/55/85 selection using static weld counts only."""
+    split=validate_split(read(SPLIT) if split is None else split)
+    manifest=read(DATASET) if manifest is None else manifest
+    targets=(35,55,85);selected=[]
+    for role,counts in (('MLP_TRAIN',(6,6,5)),('MLP_DEV',(2,2,2))):
+        paths=sorted(split[role])
+        available={p:[e for e in manifest['instances'] if e['relative_path']==p and e['validation_status']=='VALID' and e['duplicate_of'] is None and 10<=e['actual_weld_count']<=90] for p in paths}
+        if any(not rows for rows in available.values()): raise ValueError('Workbook has no static eligible instance')
+        dp={(0,0,0):(0,())}
+        for path in paths:
+            choices=[min(available[path],key=lambda e:(abs(e['actual_weld_count']-target),e['sheet_name'],e['instance_id'])) for target in targets]
+            nxt={}
+            for used,(cost,assignment) in dp.items():
+                for t,entry in enumerate(choices):
+                    if used[t]>=counts[t]: continue
+                    capacity=tuple(n+int(i==t) for i,n in enumerate(used))
+                    proposal=(cost+abs(entry['actual_weld_count']-targets[t]),assignment+(t,))
+                    if capacity not in nxt or proposal<nxt[capacity]: nxt[capacity]=proposal
+            dp=nxt
+        assignment=dp[counts][1]
+        for path,t in zip(paths,assignment):
+            e=min(available[path],key=lambda row:(abs(row['actual_weld_count']-targets[t]),row['sheet_name'],row['instance_id']))
+            selected.append({**{k:e[k] for k in ('instance_id','relative_path','sheet_name','raw_file_sha256','instance_geometry_hash')},
+                'split':role,'target_tier':TIERS[t],'tier':TIERS[t],'N':e['actual_weld_count'],'target_N':targets[t]})
+    return selected
+
+
+def static_geometry_summary(parents,config=CONFIG_V05):
+    """Static-only selection descriptors; never evaluates a solution or schedule."""
+    catalog=build_legal_pattern_catalog(parents,config,FORMAL_SCOPE_V2)
+    xs=[v for p in parents for v in (p.start[0],p.end[0])]
+    ys=[v for p in parents for v in (p.start[1],p.end[1])]
+    return {'total_weld_length':sum(p.length for p in parents),'x_span':max(xs)-min(xs),'y_span':max(ys)-min(ys),
+        'x_split_opportunities':sum(any(q.kind is SplitKind.X_SPLIT for q in catalog[p.parent_id]) for p in parents),
+        'y_split_opportunities':sum(any(q.kind is SplitKind.Y_SPLIT for q in catalog[p.parent_id]) for p in parents)}
+
+
 def load_parents(entry,*,split=None,loader=None):
     split=validate_split(read(SPLIT) if split is None else split)
     if entry.get('split') not in ('MLP_TRAIN','MLP_DEV') or entry['relative_path'] not in split[entry['split']]:
@@ -141,10 +182,13 @@ def load_parents(entry,*,split=None,loader=None):
 
 class Capture:
     """Last certified accepted-state boundary at or before each target; no future backfill."""
-    def __init__(self): self.snapshots={};self.first_boundary_elapsed=None
+    def __init__(self): self.snapshots={};self.first_boundary_elapsed=None;self.initial=None;self.best60=None
     def __call__(self,event,value):
         if event!='boundary': return
         if self.first_boundary_elapsed is None: self.first_boundary_elapsed=value['elapsed']
+        if 'metrics' in value:
+            if self.initial is None: self.initial=deepcopy(value)
+            if value['elapsed']<=60.0 and (self.best60 is None or value['metrics'].cmax<self.best60['metrics'].cmax): self.best60=deepcopy(value)
         eligible=[stage for stage,target in STAGES if value['elapsed']<=target]
         if eligible:
             snapshot=dict(value);snapshot['adaptive']=deepcopy(value['adaptive'])
@@ -170,20 +214,35 @@ def generation_timers():
         for name,fn in originals.items(): setattr(pipeline,name,fn)
 
 
-def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None):
+def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None):
+    config=CONFIG if config is None else config
     parents=load_parents(entry) if parents is None else parents
     cap=Capture()
     with generation_timers() as timings:
-        result=pipeline.run_sa_oi_alns_v2(parents,CONFIG,search_config(),seed=seed,source_provenance=source or provenance(),observer=cap,**({'ranker':ranker} if ranker is not None else {}))
+        result=pipeline.run_sa_oi_alns_v2(parents,config,search_config(),seed=seed,source_provenance=source or provenance(),observer=cap,**({'ranker':ranker} if ranker is not None else {}))
     st=result.stats
-    record={'Cmax_at_60':checkpoint_cmax(result),'final_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
+    from mrta_reference.solution import block_map
+    best=cap.best60;blocks=None if best is None else block_map(best['solution'],config)
+    loads=None if best is None else [sum(config.process_time(blocks[b].length) for b in route.block_ids) for route in best['solution'].routes]
+    record={'initial_cmax':None if cap.initial is None else cap.initial['metrics'].cmax,
+        'Cmax_at_60':checkpoint_cmax(result),'final_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
         'certified':bool(result.final_certification and result.final_certification.certified),'iterations':st.iterations,
         'accepted_moves':sum(st.accepted_by_family.values()),'global_best_updates':len(st.best_improvement_cmax),
         'reference_calls':st.nref+st.init_reference_calls,'reference_seconds':st.reference_scheduler_time,
+        'reference_status':{'FEASIBLE':st.n_feasible,'DEADLOCK':st.n_deadlock,'INFEASIBLE':st.n_infeasible,'NUMERIC_FAILURE':st.n_numeric_failure},
+        'direction_feasible':sum(st.decision_family_funnel[f]['direction_feasible'] for f in pipeline.DECISION_FAMILIES),
+        'c2_selected':st.kdp_count,'best60_process_loads':loads,
+        'best60_empty_travel':None if best is None else best['metrics'].total_empty_travel,
+        'best60_waiting':None if best is None else best['metrics'].total_waiting,
         'numeric_failure':st.n_numeric_failure+st.init_status_counts.get('NUMERIC_FAILURE',0),
         'actual_runtime':result.runtime,'overshoot':st.overshoot,**timings,
         'ranker_inference_seconds':0.0 if ranker is None else ranker.inference_seconds,
+        'graph_build_seconds':0.0 if ranker is None else getattr(ranker,'graph_build_seconds',0.0),
+        'static_graph_forward_seconds':0.0 if ranker is None else getattr(ranker,'static_forward_seconds',0.0),
+        'candidate_scoring_seconds':0.0 if ranker is None else getattr(ranker,'candidate_scoring_seconds',0.0),
+        'ranking_seconds':0.0 if ranker is None else getattr(ranker,'ranking_seconds',0.0),
         'best_events':st.best_events,'raw_attempts':st.raw_attempts,'valid_unique':sum(st.valid_by_family.values()),
+        'strict_best_improvements_at60':max(0,sum(elapsed<=60.0 for elapsed,_ in st.best_events)-1),
         'status':result.status.value,'termination_reason':result.termination_reason,
         'first_boundary_elapsed':cap.first_boundary_elapsed,
         'missing_state_stages':[stage for stage,_ in STAGES if stage not in cap.snapshots]}
@@ -202,6 +261,7 @@ def connect(path=DATABASE,*,readonly=False):
         CREATE TABLE IF NOT EXISTS trajectories(instance_id TEXT NOT NULL REFERENCES instances,seed INTEGER NOT NULL,result TEXT NOT NULL,PRIMARY KEY(instance_id,seed));
         CREATE TABLE IF NOT EXISTS states(state_id TEXT PRIMARY KEY,instance_id TEXT NOT NULL REFERENCES instances,seed INTEGER NOT NULL,stage TEXT NOT NULL,tier TEXT NOT NULL,iteration INTEGER NOT NULL,elapsed REAL NOT NULL,Cs REAL NOT NULL,context BLOB NOT NULL,pool_complete INTEGER NOT NULL DEFAULT 0,UNIQUE(instance_id,seed,stage));
         CREATE TABLE IF NOT EXISTS candidates(state_id TEXT NOT NULL REFERENCES states,candidate_id INTEGER NOT NULL,family TEXT NOT NULL,payload BLOB NOT NULL,c2 BLOB NOT NULL,c4 BLOB,direction BLOB,status TEXT,y_feasible INTEGER,y_improvement REAL,reference_cmax REAL,direction_seconds REAL,reference_seconds REAL,PRIMARY KEY(state_id,candidate_id));
+        CREATE TABLE IF NOT EXISTS experiments(experiment TEXT NOT NULL,item_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(experiment,item_id));
         CREATE VIEW IF NOT EXISTS candidate_records AS SELECT c.*,i.split,i.workbook,s.instance_id,s.seed,s.stage,s.tier,s.iteration,s.Cs FROM candidates c JOIN states s USING(state_id) JOIN instances i USING(instance_id);
         ''')
     db.row_factory=sqlite3.Row
@@ -230,16 +290,17 @@ def state_context(db,state):
     return unpack(state['context'],parents)
 
 
-def generate_state_pool(db,state):
+def generate_state_pool(db,state,config=None):
+    config=CONFIG if config is None else config
     context=state_context(db,state);parents=context['solution'].parents
     stats=SearchStats(FORMAL_SCOPE_V2.scope_id,state['seed']);stats.iterations=context['iteration']
-    _,pool,_=pipeline.generate_candidate_pool(context['solution'],context['directions'],CONFIG,search_config(),stats,
+    _,pool,_=pipeline.generate_candidate_pool(context['solution'],context['directions'],config,search_config(),stats,
         seed=state['seed']+context['iteration']*65537,current_schedule=context['schedule'],adaptive_state=deepcopy(context['adaptive']),scope=FORMAL_SCOPE_V2,enable_x_split=True)
     pool=sorted(pool,key=lambda c:c.cheap_score)
     if (stats.raw_attempts,stats.attempted_by_family['ATOMIC'],stats.attempted_by_family['LNS_REPAIRED'])!=(192,144,48): raise ValueError('Expected 144 atomic + 48 LNS attempts')
     with db:
         for rank,candidate in enumerate(pool):
-            features=extract_c2_features(context['solution'],context['directions'],state['Cs'],candidate,CONFIG)
+            features=extract_c2_features(context['solution'],context['directions'],state['Cs'],candidate,config)
             old=metadata(db,'C2_feature_names')
             if old is not None and old!=list(features): raise ValueError('C2 schema drift')
             if old is None: set_meta(db,'C2_feature_names',list(features))
@@ -248,20 +309,21 @@ def generate_state_pool(db,state):
     return len(pool)
 
 
-def label_candidate(candidate,context,cheap_rank):
+def label_candidate(candidate,context,cheap_rank,config=None):
     """One real direction DP and at most one B32 reference evaluation."""
-    start=time.perf_counter();direction=optimize_directions_with_initial_feasibility(candidate.solution,CONFIG)
+    config=CONFIG if config is None else config
+    start=time.perf_counter();direction=optimize_directions_with_initial_feasibility(candidate.solution,config)
     dp_seconds=time.perf_counter()-start;cmax=None;ref_seconds=0.0;c4=None
     if direction.total_empty_travel is None:
         status='DIRECTION_INFEASIBLE'
     else:
-        c4_features=extract_c4_features(context['solution'],context['directions'],context['metrics'].cmax,candidate,CONFIG,direction=direction,cheap_rank=cheap_rank)
+        c4_features=extract_c4_features(context['solution'],context['directions'],context['metrics'].cmax,candidate,config,direction=direction,cheap_rank=cheap_rank)
         c4=feature_blob(c4_features)
         start=time.perf_counter()
-        schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(candidate.solution,CONFIG,orientations={r:direction.directions[r] for r in range(4)})
+        schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(candidate.solution,config,orientations={r:direction.directions[r] for r in range(4)})
         ref_seconds=time.perf_counter()-start;status=schedule.status.value
         if status=='FEASIBLE':
-            certification=certify_schedule(candidate.solution,schedule,CONFIG,scope=FORMAL_SCOPE_V2)
+            certification=certify_schedule(candidate.solution,schedule,config,scope=FORMAL_SCOPE_V2)
             if certification.certified and schedule.cmax is not None and math.isfinite(schedule.cmax): status='FEASIBLE_CERTIFIED';cmax=schedule.cmax
             else: status='NUMERIC_FAILURE'
     targets=make_training_targets(status,context['metrics'].cmax,cmax)

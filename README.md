@@ -66,3 +66,15 @@ The optional `COORDINATION_AWARE_C2` preserves family access and the cheap-score
 On the four existing S1 states, C2 material selections increased 3→4 while unchanged C4 retained 1→1. Across nine additional N35/N55/N85 consumed-development states, C2 certified rate increased 30.56%→43.06%, material selections 7/49→9/49 and DEADLOCK 48/72→39/72; unchanged C4 retained 2/49 in both cases. In 24 fresh native 60-second runs, all certified and all 12 paired Cmax@60 values tied exactly. Coordination scoring used 1.150 s across its twelve runs (0.160% of wall-clock budgets), with no M/K/reference-budget change.
 
 Production therefore remains baseline initialization + `BASELINE_C2` + heuristic C4. The inexpensive proxy is retained only as a development ablation. Evidence now supports collecting new 0.50-domain TRAIN/DEV labels for a ranking-aligned MLP-C2 study, with C4 trained on the real C2 hard distribution; no MLP/GAT training was started here. Details: [coordination-aware C2 report](docs/C2_COORDINATION_AWARE_SCREENING.md) and the existing [raw diagnostic database](data/development/s1_screening_diagnostic.sqlite). Full regression: **320 passed**.
+
+## First runnable GRC-ALNS (0.50 m)
+
+The new workbook-isolated dataset contains **98 TRAIN states / 11,924 candidates** and **34 DEV states / 4,184 candidates**, with **590/356 material positives** and zero numeric failures. It keeps the existing 17 TRAIN / 6 DEV workbook split; missing EARLY states are not backfilled. The historical 0.20 dataset and checkpoints are unchanged.
+
+Fixed 0.50-domain MLP-C2/C4 and a two-layer, four-head, hidden-64 GAT are now optional rankers. GAT fuses one cached parent-weld/robot static graph per instance with order-sensitive before/after route summaries; C2 has no candidate direction/reference input, while C4 receives only direction-stage features. Production remains heuristic.
+
+On DEV, heuristic→GAT C2 material capture is **8.99%→14.61%**, certified rate **31.99%→42.28%**, and material zero-capture **43.75%→37.50%**. C4 capture is **2.25%→4.78%**, but much of the C2 gain is still lost. Removing weld-weld edges leaves every reported stratified Top-K metric unchanged, so this first version does not establish an incremental graph-relation benefit.
+
+The required 18 native 60-second development runs all have certified Cmax@60 and zero numeric failures. Relative to heuristic, MLP is **1/0/5** and GAT **3/0/3** wins/ties/losses: GAT loses both N35 pairs, wins both N55 pairs, and splits N85. GAT ranking consumes 30.896 s across its six 60-second runs (8.58% of their wall-clock budgets). Therefore GAT is retained as a runnable development/paper method, but is **not recommended as production default**. Full evidence and per-tier tables: [GRC-ALNS first results](docs/GRC_ALNS_GAT_FIRST_RESULTS.md); raw candidates, labels, offline metrics and run records: `data/development/graph_ranker_dataset_v05.sqlite`.
+
+Final regression after GRC integration: **323 passed** with `pytest -q -p no:cacheprovider`.

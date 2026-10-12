@@ -70,3 +70,86 @@ class LearnedRanker:
             scores={id(c):float(s) for c,s in zip(pool,self.scores('C4',features))}
             return family_c4(pool,lambda c:(-scores[id(c)],c.rerank_key),lambda c:decision_family(c.screened),k=k,seed=seed,iteration=iteration)
         finally: self.inference_seconds+=time.perf_counter()-start
+
+
+class V05MLPRanker:
+    """Self-contained 0.5 m MLP C2/C4 ranker; production default remains heuristic."""
+    def __init__(self,root=None):
+        from .model import load_model
+        import torch
+        torch.set_num_threads(1);root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+        self.models={};self.inference_seconds=0.;self.ranking_seconds=0.
+        for stage in ('C2','C4'):
+            model,meta=load_model(root/f'models/mlp_{stage.lower()}_v05.pt')
+            self.models[stage]=(model,meta)
+    def _scores(self,stage,features):
+        from .model import predict_scores
+        model,meta=self.models[stage]
+        if any(list(row)!=meta['feature_names'] for row in features): raise ValueError('V05 MLP feature columns differ')
+        return predict_scores(model,[list(row.values()) for row in features],meta['mean'],meta['std'])
+    def select_c2(self,current,directions,cs,pool,config,*,seed,iteration,k=8):
+        start=time.perf_counter()
+        try:
+            features=[extract_c2_features(current,directions,cs,c,config) for c in pool]
+            if not pool:return ()
+            scores={id(c):float(v) for c,v in zip(pool,self._scores('C2',features))};rank=time.perf_counter()
+            result=family_c2(pool,lambda c:(-scores[id(c)],c.cheap_score),decision_family,k=k,seed=seed,iteration=iteration)
+            self.ranking_seconds+=time.perf_counter()-rank;return result
+        finally:self.inference_seconds+=time.perf_counter()-start
+    def select_c4(self,current,directions,cs,pool,config,*,seed,iteration,k=2):
+        start=time.perf_counter()
+        try:
+            features=[extract_c4_features(current,directions,cs,c.screened,config,direction=c.direction,cheap_rank=c.cheap_rank) for c in pool]
+            if not pool:return ()
+            scores={id(c):float(v) for c,v in zip(pool,self._scores('C4',features))};rank=time.perf_counter()
+            result=family_c4(pool,lambda c:(-scores[id(c)],c.rerank_key),lambda c:decision_family(c.screened),k=k,seed=seed,iteration=iteration)
+            self.ranking_seconds+=time.perf_counter()-rank;return result
+        finally:self.inference_seconds+=time.perf_counter()-start
+
+
+class GATRanker:
+    """Cache one static graph forward per instance and score only dynamic candidates."""
+    def __init__(self,root=None,*,include_weld_edges=True):
+        from .model import load_graph_model
+        import torch
+        torch.set_num_threads(1);root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+        self.model,self.meta=load_graph_model(root/'models/gat_v05.pt');self.include_weld_edges=include_weld_edges
+        self.inference_seconds=0.;self.graph_build_seconds=0.;self.static_forward_seconds=0.;self.candidate_scoring_seconds=0.;self.ranking_seconds=0.;self.static_forward_calls=0
+        self._key=None;self._graph=None;self._embeddings=None
+    def _static(self,parents,config):
+        import torch
+        from .model import build_static_graph
+        key=tuple((p.parent_id,p.start,p.end) for p in parents)
+        if key==self._key:return self._graph,self._embeddings
+        start=time.perf_counter();graph=build_static_graph(parents,config,include_weld_edges=self.include_weld_edges);self.graph_build_seconds+=time.perf_counter()-start
+        start=time.perf_counter()
+        with torch.inference_mode(): embeddings=self.model.encode_static(graph)
+        self.static_forward_seconds+=time.perf_counter()-start;self.static_forward_calls+=1
+        self._key=key;self._graph=graph;self._embeddings=embeddings;return graph,embeddings
+    def _scores(self,stage,current,candidates,features,config):
+        import torch
+        graph,embeddings=self._static(current.parents,config);mean=self.meta['scalers'][stage+'_mean'];std=self.meta['scalers'][stage+'_std']
+        names=self.meta['c2_names' if stage=='C2' else 'c4_names']
+        if any(list(row)!=names for row in features):raise ValueError('GAT feature columns differ')
+        start=time.perf_counter()
+        with torch.inference_mode(): _,material=self.model.score_candidates(stage,graph,embeddings,current,candidates,[list(r.values()) for r in features],mean,std,config)
+        self.candidate_scoring_seconds+=time.perf_counter()-start;return torch.sigmoid(material).numpy()
+    def select_c2(self,current,directions,cs,pool,config,*,seed,iteration,k=8):
+        start=time.perf_counter()
+        try:
+            features=[extract_c2_features(current,directions,cs,c,config) for c in pool]
+            if not pool:return ()
+            scores={id(c):float(v) for c,v in zip(pool,self._scores('C2',current,pool,features,config))};rank=time.perf_counter()
+            result=family_c2(pool,lambda c:(-scores[id(c)],c.cheap_score),decision_family,k=k,seed=seed,iteration=iteration)
+            self.ranking_seconds+=time.perf_counter()-rank;return result
+        finally:self.inference_seconds+=time.perf_counter()-start
+    def select_c4(self,current,directions,cs,pool,config,*,seed,iteration,k=2):
+        start=time.perf_counter()
+        try:
+            candidates=[c.screened for c in pool]
+            features=[extract_c4_features(current,directions,cs,c.screened,config,direction=c.direction,cheap_rank=c.cheap_rank) for c in pool]
+            if not pool:return ()
+            scores={id(c):float(v) for c,v in zip(pool,self._scores('C4',current,candidates,features,config))};rank=time.perf_counter()
+            result=family_c4(pool,lambda c:(-scores[id(c)],c.rerank_key),lambda c:decision_family(c.screened),k=k,seed=seed,iteration=iteration)
+            self.ranking_seconds+=time.perf_counter()-rank;return result
+        finally:self.inference_seconds+=time.perf_counter()-start

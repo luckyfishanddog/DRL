@@ -371,3 +371,57 @@ def test_existing_candidate_dataset_workbooks_still_disjoint():
     assert not groups['MLP_TRAIN']&groups['MLP_DEV']
     assert db.execute('SELECT count(*) FROM candidates').fetchone()[0]==14893
     db.close()
+
+
+def test_v05_selection_and_domain_are_isolated_from_historical_dataset():
+    split=d.validate_split(d.read(d.SPLIT));old=d.representatives(split);new=d.representatives_v05(split)
+    assert d.DATABASE_V05!=d.DATABASE and d.CONFIG.delta_x==d.CONFIG.delta_y==.2
+    assert (d.CONFIG_V05.delta_x,d.CONFIG_V05.delta_y,d.CONFIG_V05.min_child_length)==(.5,.5,.2)
+    assert len(new)==23 and {e['relative_path'] for e in new}=={e['relative_path'] for e in old}
+    for role,counts in (('MLP_TRAIN',(6,6,5)),('MLP_DEV',(2,2,2))):
+        rows=[e for e in new if e['split']==role]
+        assert tuple(sum(e['target_tier']==tier for e in rows) for tier in d.TIERS)==counts
+    parents=d.load_parents(new[0]);summary=d.static_geometry_summary(parents,d.CONFIG_V05)
+    assert len(parents)==new[0]['N'] and summary['total_weld_length']>0
+    assert summary['x_split_opportunities']>=0 and summary['y_split_opportunities']>=0
+
+
+def test_grc_graph_parent_robot_edges_order_and_training_gradient():
+    torch=pytest.importorskip('torch');import numpy as np
+    from dataclasses import replace
+    from test_search_sa import _base,_family_candidates,FAST
+    from mrta_ranker.model import build_static_graph,GraphCandidateRanker
+    from mrta_reference.solution import canonicalize
+    from mrta_search.lns import atomic_complete_candidate
+    current=_base();graph=build_static_graph(current.parents,FAST);n=len(current.parents)
+    assert graph.node_features.shape==(n+4,18) and graph.parent_index=={p.parent_id:i for i,p in enumerate(sorted(current.parents,key=lambda p:p.parent_id))}
+    qualification={(int(a),int(b)) for (a,b),t in zip(graph.edge_index.t(),graph.edge_type) if int(t)==3}
+    for parent in range(n):
+        assert (parent,n+2) in qualification and (parent,n+3) in qualification
+        assert (parent,n) not in qualification and (parent,n+1) not in qualification
+    model=GraphCandidateRanker();embedding=model.encode_static(graph)
+    reversed_solution=canonicalize(current.parents,current.patterns,{2:tuple(reversed(current.routes[2].block_ids)),3:current.routes[3].block_ids},FAST)
+    first=atomic_complete_candidate(current,((),(),(0,0),(0,0)),_family_candidates()[0],FAST)
+    second=replace(first,canonical_solution=reversed_solution)
+    a=model._solution_routes(first.solution,embedding,graph.parent_index,FAST)
+    b=model._solution_routes(second.solution,embedding,graph.parent_index,FAST)
+    assert not torch.allclose(a,b)
+    feas,material=model.score_candidates('C2',graph,embedding,current,[first,second],[np.zeros(87),np.zeros(87)],np.zeros(87),np.ones(87),FAST)
+    (feas.sum()+material.sum()).backward()
+    assert model.encoder.layer1.linear.weight.grad is not None
+    assert float(model.encoder.layer1.linear.weight.grad.abs().sum())>0
+
+
+def test_gat_ranker_static_attention_is_cached_per_instance():
+    torch=pytest.importorskip('torch')
+    from test_search_sa import _base,FAST
+    from mrta_ranker.ranking import GATRanker
+    class Encoder:
+        def __init__(self):self.calls=0
+        def encode_static(self,graph):self.calls+=1;return torch.zeros(len(graph.node_features),64)
+    ranker=GATRanker.__new__(GATRanker);ranker.model=Encoder();ranker.include_weld_edges=True
+    ranker.graph_build_seconds=ranker.static_forward_seconds=0.;ranker.static_forward_calls=0
+    ranker._key=ranker._graph=ranker._embeddings=None
+    first=ranker._static(_base().parents,FAST);second=ranker._static(_base().parents,FAST)
+    assert first[0] is second[0] and first[1] is second[1]
+    assert ranker.static_forward_calls==ranker.model.calls==1
