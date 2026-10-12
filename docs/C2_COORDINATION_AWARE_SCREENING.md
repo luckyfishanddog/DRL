@@ -17,6 +17,8 @@
 | deadlock | 125 | 9.362 | 14.107 | 16.234 | 17.232 | 0.000 | 0.500 |
 
 同轨 overlap 对“认证可行风险更低”的 pairwise AUC 为 **0.819**，有实际区分力；首任务次序量 AUC 仅 **0.564**，且前三类中位数均为 0，因此只作 Pareto/tie-break，不给独立大权重。44 个 material candidate 的 overlap 中位数为 6.750 m，明显低于 DEADLOCK 的 14.107 m，指标没有系统性排斥 material candidate。
+负载代价并非为零：13 个离线状态中 9 个发生换位，共 15 个名额。与被换出的 baseline 名额相比，换入候选的状态均值 projected-process-makespan 高 1.68%（最大 9.40%），load-spread delta 平均不利 81.3 s，但 overlap 低 2.19 m。因此本方法只保留 2 个风险名额，并用原 Top8 的 projected-process-makespan 上限限制负载代价；不把几何风险当作全局排名目标。
+family 分布没有失去访问机会：按 STRUCTURAL/WHOLE/Y/X，S1 为 21/3/4/4→21/3/4/4；额外状态为 43/8/12/9→39/12/12/9。
 
 ## S1 四个固定状态重放
 
@@ -27,7 +29,7 @@
 | 20261083:2 | 15 | 3/2/10.13% | 3/2/10.13% | 0→0 |
 | 20261083:8 | 8 | 1/1/11.96% | 1/1/11.96% | 1→1 |
 
-合计 C2 认证可行 **5→6**，material **3→4**（443 个池内 material 的 6.82%→9.09%），material-zero 状态 **2→1**。C4 material 仍为 **1→1**。新 C2 在严重 seed 20261081 的 iteration 2 找回一个 10.94% 改善，但原 C4 没有选择它。
+合计 C2 认证可行 **5→6**，material **3→4**（443 个池内 material 的 6.82%→9.09%），material-zero 状态 **2→1**。C4 material 仍为 **1→1**。新 C2 在严重 seed 20261081 的 iteration 2 找回一个 10.94% 改善，但原 C4 没有选择它。四状态 C2 选择总耗时为 0.412→5.464 ms。
 
 ## 其他 consumed-development 状态
 
@@ -44,14 +46,14 @@
 
 离线标注 9 个状态、1003 次 B32 reference，用时 319.38 s；它们与在线 60 秒调用分表统计。
 
-| tier | 状态/material状态 | pool material | Baseline C2 feas/material/dead | New C2 feas/material/dead | Baseline→New C4 material | C4 zero（material状态） |
-|---|---:|---:|---:|---:|---:|---:|
-| N35 | 4/2 | 6 | 13/2/18 | 19/3/12 | 1→1 | 1→1 |
-| N55 | 3/3 | 27 | 6/3/18 | 9/4/15 | 1→1 | 2→2 |
-| N85 | 2/1 | 16 | 3/2/12 | 3/2/12 | 0→0 | 1→1 |
-| ALL | 9/6 | 49 | 22/7/48 | 31/9/39 | 2→2 | 4→4 |
+| tier | 状态/material状态 | pool material | Baseline C2 feas/material/dead | New C2 feas/material/dead | C2 zero B→C | C4 material B→C | C4 zero B→C |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| N35 | 4/2 | 6 | 13/2/18 | 19/3/12 | 0→0 | 1→1 | 1→1 |
+| N55 | 3/3 | 27 | 6/3/18 | 9/4/15 | 0→0 | 1→1 | 2→2 |
+| N85 | 2/1 | 16 | 3/2/12 | 3/2/12 | 0→0 | 0→0 | 1→1 |
+| ALL | 9/6 | 49 | 22/7/48 | 31/9/39 | 0→0 | 2→2 | 4→4 |
 
-额外状态中 C2 认证可行率为 **30.56%→43.06%**，material capture 为 **7/49→9/49（14.29%→18.37%）**，DEADLOCK 为 **48/72→39/72**。N55_I6 iteration 2 的 C2 最佳认证改善从 1.75% 提到 18.80%。N85没有变化。原 C4 的 material 仍是 2/49，六个 material-state 中 zero capture 仍为 4；因此新增 C2 收益没有传到 Top2。
+额外状态中 C2 认证可行率为 **30.56%→43.06%**，material capture 为 **7/49→9/49（14.29%→18.37%）**，DEADLOCK 为 **48/72→39/72（66.67%→54.17%）**。有 material 的状态中，C2 zero capture 为 0→0。各规模 C2 最佳认证改善：N35 1.99%→1.99%，N55 2.05%→18.80%，N85 7.94%→7.94%。原 C4 的 material 仍是 2/49，六个 material-state 中 zero capture 仍为 4；因此新增 C2 收益没有传到 Top2。九状态 C2 选择总耗时为 1.052→125.171 ms。
 
 ## 24 次真实 60 秒配对
 
@@ -74,12 +76,12 @@
 
 | tier | mean Cmax B→C | completed iter B/C | accepted B/C | strict best updates B/C | FEAS B/C | DEAD B/C | C2 time B/C |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| N35 | 1679.746→1679.746 | 46/45 | 28/29 | 11/11 | 103/106 | 55/52 | 6.8/1067.4 ms |
+| N35 | 1679.746→1679.746 | 46/45 | 28/29 | 10/10 | 103/106 | 55/52 | 6.8/1067.4 ms |
 | N55 | 5329.655→5329.655 | 17/17 | 6/6 | 5/5 | 16/16 | 30/30 | 3.7/48.3 ms |
 | N85 | 6366.534→6366.534 | 8/8 | 5/5 | 5/5 | 14/14 | 11/10 | 2.0/34.0 ms |
-| ALL | 4458.645→4458.645 | 71/70 | 39/40 | 21/21 | 133/136 | 96/92 | 12.5/1149.7 ms |
+| ALL | 4458.645→4458.645 | 71/70 | 39/40 | 20/20 | 133/136 | 96/92 | 12.5/1149.7 ms |
 
-24/24 在 60 秒有认证解，NUMERIC_FAILURE 和 certifier error 均为 0。**12/12 配对 Cmax 完全持平**，改善/持平/恶化为 **0/12/0**；N35、N55、N85 均无严重退化。总在线 C2 时间为 12.5→1149.7 ms，新增方法占其 12×60 秒预算的 **0.160%**，约 16.42 ms/iteration。它减少 4 个 search DEADLOCK、增加 3 个 FEASIBLE，但没有改变 Cmax。
+24/24 在 60 秒有认证解，NUMERIC_FAILURE 和 certifier error 均为 0。**12/12 配对 Cmax 完全持平**，改善/持平/恶化为 **0/12/0**；N35、N55、N85 均无严重退化。60 秒内严格 Cmax 改善次数为 **20→20**。overshoot 为 1.180–9.777 s；6 个 run 在截止后才得到更优解，均未计入 Cmax@60。总在线 C2 时间为 12.5→1149.7 ms，新增方法占其 12×60 秒预算的 **0.160%**，约 16.42 ms/iteration。它减少 4 个 search DEADLOCK、增加 3 个 FEASIBLE，但没有改变 Cmax。
 
 完整逐 run solution、四机器人 process loads、empty travel、waiting、候选有效率、best events、overshoot 和状态计数保存在既有 `data/development/s1_screening_diagnostic.sqlite` 的 `c2_experiments/search60` 记录。最大 Kdp 为 8、单 iteration reference 上限为 4，预算未扩大。
 
@@ -95,7 +97,7 @@
 
 ## 验证
 
-- 定向回归：65 passed。
-- 完整 pytest：320 passed in 94.36 s.
+- 定向回归：138 passed。
+- 完整 pytest：320 passed in 36.21 s.
 - 新指标纯函数、baseline 默认行为、family access、唯一候选、Kdp8、最多两个 risk slot、加工负载 cutoff 以及不调用 direction/scheduler 均有回归覆盖。
 - 旧 S1 的 443 条标签、此前 36 条诊断结果和所有历史实验保持不变。

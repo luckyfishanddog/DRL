@@ -1208,7 +1208,11 @@ def _c2_run_action(db,entries,ppo,workers):
 
 def _c2_report(root,db,entries):
     from collections import Counter
+    import pickle
     import statistics
+    from mrta_reference.model import ScientificConfig
+    from mrta_search.coordination_risk import coordination_risk
+    from mrta_search.pipeline import select_c2_by_family,select_c2_coordination_aware
 
     def experiment_rows(kind):
         return [json.loads(row[0]) for row in db.execute(
@@ -1221,6 +1225,13 @@ def _c2_report(root,db,entries):
     def lower_risk_auc(first,second):
         pairs=len(first)*len(second)
         return (sum(a<b for a in first for b in second)+.5*sum(a==b for a in first for b in second))/pairs
+
+    def strict_cmax_updates(row):
+        events=[(elapsed,cmax) for elapsed,cmax in row['best_events'] if elapsed<=60.0]
+        return sum(
+            new < old - 1.0e-9*max(1.0,abs(old),abs(new))
+            for (_,old),(_,new) in zip(events,events[1:])
+        )
 
     feature_rows=[]
     for state_id,index,overlap,order_excess in db.execute(
@@ -1251,6 +1262,36 @@ def _c2_report(root,db,entries):
     if len(feature_rows)!=443 or len(s1_states)!=4 or len(extra)!=9 or len(searches)!=24:
         raise ValueError('C2 report requires 443 S1 labels, 4 S1 states, 9 extra states and 24 search runs')
 
+    family_totals={}
+    for method in ('BASELINE_C2','COORDINATION_AWARE_C2'):
+        family_totals['S1',method]=sum(
+            (Counter(s1_by[state_id,method]['c2']['families']) for state_id in s1_states),Counter())
+        family_totals['extra',method]=sum(
+            (Counter(row['methods'][method]['c2']['families']) for row in extra),Counter())
+
+    risk_slot_deltas=[]
+    scientific_config=ScientificConfig()
+    for table in ('states','c2_states'):
+        for _,context_blob,pool_blob in db.execute(f'SELECT id,context,pool FROM {table}'):
+            context=pickle.loads(context_blob);pool=pickle.loads(pool_blob)
+            baseline=select_c2_by_family(pool,8,seed=context['seed'],iteration=context['iteration'])
+            aware=select_c2_coordination_aware(pool,8,scientific_config,seed=context['seed'],iteration=context['iteration'])
+            baseline_ids={row.solution.canonical_hash for row in baseline}
+            aware_ids={row.solution.canonical_hash for row in aware}
+            introduced=[row for row in aware if row.solution.canonical_hash not in baseline_ids]
+            displaced=[row for row in baseline if row.solution.canonical_hash not in aware_ids]
+            if not introduced:
+                continue
+            risk_slot_deltas.append(dict(
+                count=len(introduced),
+                process_ratio=statistics.fmean(row.projected_process_makespan for row in introduced)
+                    /statistics.fmean(row.projected_process_makespan for row in displaced)-1.0,
+                spread_delta=statistics.fmean(row.load_spread_delta for row in introduced)
+                    -statistics.fmean(row.load_spread_delta for row in displaced),
+                overlap_delta=statistics.fmean(coordination_risk(row.solution,scientific_config).same_rail_overlap for row in introduced)
+                    -statistics.fmean(coordination_risk(row.solution,scientific_config).same_rail_overlap for row in displaced),
+            ))
+
     lines=['# Coordination-aware C2 screening (0.50 m development study)','',
         '本报告只使用 `V2_MODEL_DEVELOPMENT_CONSUMED`，当前任务域为 `delta_x=delta_y=0.50 m`。物理目录名不定义数据角色；访问由既有角色清单检查。没有访问 V2_VALIDATION、ORACLE_DEV_CONSUMED 或 ID_TEST_SEALED。生产初始化、M192、Kdp8、Kref2/Kref_total4、原 C4、方向 DP、B32 和 certifier 均未改变。','',
         '## 实际代码改动','',
@@ -1261,7 +1302,12 @@ def _c2_report(root,db,entries):
         lines.append(f'| {row[0]} | {row[1]} | {row[2]:.3f} | {row[3]:.3f} | {row[4]:.3f} | {row[5]:.3f} | {row[6]:.3f} | {row[7]:.3f} |')
     overlap_auc=lower_risk_auc([r['overlap'] for r in feasible],[r['overlap'] for r in groups['deadlock']])
     order_auc=lower_risk_auc([r['order_excess'] for r in feasible],[r['order_excess'] for r in groups['deadlock']])
-    lines += ['',f'同轨 overlap 对“认证可行风险更低”的 pairwise AUC 为 **{overlap_auc:.3f}**，有实际区分力；首任务次序量 AUC 仅 **{order_auc:.3f}**，且前三类中位数均为 0，因此只作 Pareto/tie-break，不给独立大权重。44 个 material candidate 的 overlap 中位数为 {percentile([r["overlap"] for r in groups["material"]],.5):.3f} m，明显低于 DEADLOCK 的 {percentile([r["overlap"] for r in groups["deadlock"]],.5):.3f} m，指标没有系统性排斥 material candidate。','',
+    family_order=('STRUCTURAL','TARGET_WHOLE','TARGET_Y','TARGET_X')
+    def family_vector(scope,method):
+        return '/'.join(str(family_totals[scope,method][family]) for family in family_order)
+    lines += ['',f'同轨 overlap 对“认证可行风险更低”的 pairwise AUC 为 **{overlap_auc:.3f}**，有实际区分力；首任务次序量 AUC 仅 **{order_auc:.3f}**，且前三类中位数均为 0，因此只作 Pareto/tie-break，不给独立大权重。44 个 material candidate 的 overlap 中位数为 {percentile([r["overlap"] for r in groups["material"]],.5):.3f} m，明显低于 DEADLOCK 的 {percentile([r["overlap"] for r in groups["deadlock"]],.5):.3f} m，指标没有系统性排斥 material candidate。',
+        f'负载代价并非为零：13 个离线状态中 {len(risk_slot_deltas)} 个发生换位，共 {sum(row["count"] for row in risk_slot_deltas)} 个名额。与被换出的 baseline 名额相比，换入候选的状态均值 projected-process-makespan 高 {100*statistics.fmean(row["process_ratio"] for row in risk_slot_deltas):.2f}%（最大 {100*max(row["process_ratio"] for row in risk_slot_deltas):.2f}%），load-spread delta 平均不利 {statistics.fmean(row["spread_delta"] for row in risk_slot_deltas):.1f} s，但 overlap 低 {-statistics.fmean(row["overlap_delta"] for row in risk_slot_deltas):.2f} m。因此本方法只保留 2 个风险名额，并用原 Top8 的 projected-process-makespan 上限限制负载代价；不把几何风险当作全局排名目标。',
+        f'family 分布没有失去访问机会：按 STRUCTURAL/WHOLE/Y/X，S1 为 {family_vector("S1","BASELINE_C2")}→{family_vector("S1","COORDINATION_AWARE_C2")}；额外状态为 {family_vector("extra","BASELINE_C2")}→{family_vector("extra","COORDINATION_AWARE_C2")}。','',
         '## S1 四个固定状态重放','',
         '| 状态 | pool material | Baseline C2 feasible/material/best | New C2 feasible/material/best | Baseline→New C4 material |','|---|---:|---:|---:|---:|']
     for state_id in s1_states:
@@ -1271,22 +1317,23 @@ def _c2_report(root,db,entries):
             value=method['c2']['best_gain'];return 'NA' if value is None else f'{100*value:.2f}%'
         lines.append(f"| {state_id} | {pool_material} | {b['c2']['feasible']}/{b['c2']['material']}/{best(b)} | {n['c2']['feasible']}/{n['c2']['material']}/{best(n)} | {b['c4']['material']}→{n['c4']['material']} |")
     s1_b=[s1_by[s,'BASELINE_C2'] for s in s1_states];s1_n=[s1_by[s,'COORDINATION_AWARE_C2'] for s in s1_states]
-    lines += ['',f"合计 C2 认证可行 **{sum(r['c2']['feasible'] for r in s1_b)}→{sum(r['c2']['feasible'] for r in s1_n)}**，material **{sum(r['c2']['material'] for r in s1_b)}→{sum(r['c2']['material'] for r in s1_n)}**（443 个池内 material 的 6.82%→9.09%），material-zero 状态 **2→1**。C4 material 仍为 **{sum(r['c4']['material'] for r in s1_b)}→{sum(r['c4']['material'] for r in s1_n)}**。新 C2 在严重 seed 20261081 的 iteration 2 找回一个 10.94% 改善，但原 C4 没有选择它。","",'## 其他 consumed-development 状态','',
+    lines += ['',f"合计 C2 认证可行 **{sum(r['c2']['feasible'] for r in s1_b)}→{sum(r['c2']['feasible'] for r in s1_n)}**，material **{sum(r['c2']['material'] for r in s1_b)}→{sum(r['c2']['material'] for r in s1_n)}**（443 个池内 material 的 6.82%→9.09%），material-zero 状态 **2→1**。C4 material 仍为 **{sum(r['c4']['material'] for r in s1_b)}→{sum(r['c4']['material'] for r in s1_n)}**。新 C2 在严重 seed 20261081 的 iteration 2 找回一个 10.94% 改善，但原 C4 没有选择它。四状态 C2 选择总耗时为 {1000*sum(r['selection_time_s'] for r in s1_b):.3f}→{1000*sum(r['selection_time_s'] for r in s1_n):.3f} ms。","",'## 其他 consumed-development 状态','',
         '实例在查看 oracle label 前按静态 N、几何与拆分机会固定；状态规则固定为已完成 iteration 2 和 8，不存在 iteration 8 时记录缺失，不用未来状态补齐。','',
         '| 实例 | N | workbook / sheet | 捕获迭代 | 缺失 | 轨迹@60 Cmax |','|---|---:|---|---|---|---:|']
     for entry in entries:
         row=trajectory[entry['label']]
         lines.append(f"| {entry['label']} | {row['actual_N']} | `{entry['relative_path']}` / `{entry['sheet_name']}` | {row['captured_iterations']} | {row['missing_iterations']} | {row['cmax_at60']:.3f} |")
     lines += ['',f"离线标注 {len(extra)} 个状态、{sum(r['offline_reference_calls'] for r in labels)} 次 B32 reference，用时 {sum(r['offline_elapsed_s'] for r in labels):.2f} s；它们与在线 60 秒调用分表统计。",'',
-        '| tier | 状态/material状态 | pool material | Baseline C2 feas/material/dead | New C2 feas/material/dead | Baseline→New C4 material | C4 zero（material状态） |','|---|---:|---:|---:|---:|---:|---:|']
+        '| tier | 状态/material状态 | pool material | Baseline C2 feas/material/dead | New C2 feas/material/dead | C2 zero B→C | C4 material B→C | C4 zero B→C |','|---|---:|---:|---:|---:|---:|---:|---:|']
     for tier in ('N35','N55','N85','ALL'):
         rows=[r for r in extra if tier=='ALL' or r['state_id'].startswith(tier)]
         material_rows=[r for r in rows if r['pool']['material_count']>0]
         b=[r['methods']['BASELINE_C2'] for r in rows];n=[r['methods']['COORDINATION_AWARE_C2'] for r in rows]
         def triple(values):return f"{sum(v['c2']['feasible'] for v in values)}/{sum(v['c2']['material'] for v in values)}/{sum(v['c2']['deadlock'] for v in values)}"
-        bzero=sum(v['c4']['material']==0 for r,v in zip(rows,b) if r['pool']['material_count']>0);nzero=sum(v['c4']['material']==0 for r,v in zip(rows,n) if r['pool']['material_count']>0)
-        lines.append(f"| {tier} | {len(rows)}/{len(material_rows)} | {sum(r['pool']['material_count'] for r in rows)} | {triple(b)} | {triple(n)} | {sum(v['c4']['material'] for v in b)}→{sum(v['c4']['material'] for v in n)} | {bzero}→{nzero} |")
-    lines += ['', '额外状态中 C2 认证可行率为 **30.56%→43.06%**，material capture 为 **7/49→9/49（14.29%→18.37%）**，DEADLOCK 为 **48/72→39/72**。N55_I6 iteration 2 的 C2 最佳认证改善从 1.75% 提到 18.80%。N85没有变化。原 C4 的 material 仍是 2/49，六个 material-state 中 zero capture 仍为 4；因此新增 C2 收益没有传到 Top2。','',
+        bc2zero=sum(v['c2']['material']==0 for r,v in zip(rows,b) if r['pool']['material_count']>0);nc2zero=sum(v['c2']['material']==0 for r,v in zip(rows,n) if r['pool']['material_count']>0)
+        bc4zero=sum(v['c4']['material']==0 for r,v in zip(rows,b) if r['pool']['material_count']>0);nc4zero=sum(v['c4']['material']==0 for r,v in zip(rows,n) if r['pool']['material_count']>0)
+        lines.append(f"| {tier} | {len(rows)}/{len(material_rows)} | {sum(r['pool']['material_count'] for r in rows)} | {triple(b)} | {triple(n)} | {bc2zero}→{nc2zero} | {sum(v['c4']['material'] for v in b)}→{sum(v['c4']['material'] for v in n)} | {bc4zero}→{nc4zero} |")
+    lines += ['', f'额外状态中 C2 认证可行率为 **30.56%→43.06%**，material capture 为 **7/49→9/49（14.29%→18.37%）**，DEADLOCK 为 **48/72→39/72（66.67%→54.17%）**。有 material 的状态中，C2 zero capture 为 0→0。各规模 C2 最佳认证改善：N35 1.99%→1.99%，N55 2.05%→18.80%，N85 7.94%→7.94%。原 C4 的 material 仍是 2/49，六个 material-state 中 zero capture 仍为 4；因此新增 C2 收益没有传到 Top2。九状态 C2 选择总耗时为 {1000*sum(r["methods"]["BASELINE_C2"]["selection_time_s"] for r in extra):.3f}→{1000*sum(r["methods"]["COORDINATION_AWARE_C2"]["selection_time_s"] for r in extra):.3f} ms。','',
         '## 24 次真实 60 秒配对','',
         '全部采用 BASELINE initialization；每个实例/seed 两方法的初始认证解相同。C2 风险时间计入 wall clock。下表迭代、reference、FEAS/DEAD 均截在 60 秒，Cmax 不使用 overshoot 后事件。','',
         '| instance | seed | Cmax B→C | relative | iter B/C | search ref B/C | FEAS B/C | DEAD B/C | C2 ms B/C | load spread B/C |','|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
@@ -1305,16 +1352,16 @@ def _c2_report(root,db,entries):
         def total(values,key):return sum(r['counters_at60'][key] for r in values)
         def status(values,name):return sum(r['reference_status_counts_at60'].get(name,0)-r['init_status_counts'].get(name,0) for r in values)
         def timing(values):return 1000*sum(r['counters_at60']['timing_s'].get('c2_selection_time',0) for r in values)
-        lines.append(f"| {tier} | {statistics.fmean(r['cmax_at60'] for r in b):.3f}→{statistics.fmean(r['cmax_at60'] for r in n):.3f} | {total(b,'iterations')}/{total(n,'iterations')} | {total(b,'accepted_moves')}/{total(n,'accepted_moves')} | {total(b,'global_best_updates')}/{total(n,'global_best_updates')} | {status(b,'FEASIBLE')}/{status(n,'FEASIBLE')} | {status(b,'DEADLOCK')}/{status(n,'DEADLOCK')} | {timing(b):.1f}/{timing(n):.1f} ms |")
+        lines.append(f"| {tier} | {statistics.fmean(r['cmax_at60'] for r in b):.3f}→{statistics.fmean(r['cmax_at60'] for r in n):.3f} | {total(b,'iterations')}/{total(n,'iterations')} | {total(b,'accepted_moves')}/{total(n,'accepted_moves')} | {sum(strict_cmax_updates(r) for r in b)}/{sum(strict_cmax_updates(r) for r in n)} | {status(b,'FEASIBLE')}/{status(n,'FEASIBLE')} | {status(b,'DEADLOCK')}/{status(n,'DEADLOCK')} | {timing(b):.1f}/{timing(n):.1f} ms |")
     baseline_time=sum(r['counters_at60']['timing_s'].get('c2_selection_time',0) for r in searches if r['method']=='BASELINE_C2')
     new_time=sum(r['counters_at60']['timing_s'].get('c2_selection_time',0) for r in searches if r['method']=='COORDINATION_AWARE_C2')
     validations=experiment_rows('validation')
     validation_text=('尚未记录' if not validations else validations[-1]['summary'])
-    lines += ['',f'24/24 在 60 秒有认证解，NUMERIC_FAILURE 和 certifier error 均为 0。**12/12 配对 Cmax 完全持平**，改善/持平/恶化为 **0/12/0**；N35、N55、N85 均无严重退化。总在线 C2 时间为 {baseline_time*1000:.1f}→{new_time*1000:.1f} ms，新增方法占其 12×60 秒预算的 **{100*new_time/(12*60):.3f}%**，约 {1000*new_time/sum(r["counters_at60"]["iterations"] for r in searches if r["method"]=="COORDINATION_AWARE_C2"):.2f} ms/iteration。它减少 4 个 search DEADLOCK、增加 3 个 FEASIBLE，但没有改变 Cmax。','',
+    lines += ['',f'24/24 在 60 秒有认证解，NUMERIC_FAILURE 和 certifier error 均为 0。**12/12 配对 Cmax 完全持平**，改善/持平/恶化为 **0/12/0**；N35、N55、N85 均无严重退化。60 秒内严格 Cmax 改善次数为 **{sum(strict_cmax_updates(r) for r in searches if r["method"]=="BASELINE_C2")}→{sum(strict_cmax_updates(r) for r in searches if r["method"]=="COORDINATION_AWARE_C2")}**。overshoot 为 {min(r["overshoot_s"] for r in searches):.3f}–{max(r["overshoot_s"] for r in searches):.3f} s；{sum(r["final_cmax"]<r["cmax_at60"]-1.0e-8 for r in searches)} 个 run 在截止后才得到更优解，均未计入 Cmax@60。总在线 C2 时间为 {baseline_time*1000:.1f}→{new_time*1000:.1f} ms，新增方法占其 12×60 秒预算的 **{100*new_time/(12*60):.3f}%**，约 {1000*new_time/sum(r["counters_at60"]["iterations"] for r in searches if r["method"]=="COORDINATION_AWARE_C2"):.2f} ms/iteration。它减少 4 个 search DEADLOCK、增加 3 个 FEASIBLE，但没有改变 Cmax。','',
         '完整逐 run solution、四机器人 process loads、empty travel、waiting、候选有效率、best events、overshoot 和状态计数保存在既有 `data/development/s1_screening_diagnostic.sqlite` 的 `c2_experiments/search60` 记录。最大 Kdp 为 8、单 iteration reference 上限为 4，预算未扩大。','',
         '## 结论与决定','',
         '1. 新 C2 是“原 family + cheap-score 主体、最多 2 个负载受限协调风险名额”，没有把 overlap 当成不可行判据。','2. 同轨 overlap 能区分一部分 DEADLOCK；首任务次序代理在这批数据上信号弱。廉价几何只能提供有限信息。','3. S1 找回 1 个 material candidate（3→4），额外状态找回 2 个（7→9）；相对于完整池仍丢失绝大多数改善。','4. 原 C4 没保留新增收益：S1 C4 material 1→1，额外状态 2→2。低 reference 认证率与 C2/C4 送入大量 DEADLOCK 有关，但改进的少量 FEASIBLE 增量没有形成 Cmax收益。','5. 真实 60 秒 12 对 Cmax 全部持平，没有任何规模严重恶化；开销很小但当前不值得切换 production。','6. **production 继续使用 BASELINE_C2**。保留协调风险模式作为开发消融，不把它设为默认。','7. 下一阶段应在新 0.5 m 域按既有 TRAIN/DEV workbook 隔离重新采集正式标签并优先训练 ranking-aligned MLP-C2；同时把真实 C2 shortlist 作为 C4 hard distribution，因为本轮再次显示 C4 会丢掉 C2 增量。当前证据支持采集标签，但本轮未启动训练，也没有理由上 GAT。','',
-        '## 验证','',f'- 定向回归：65 passed。','- 完整 pytest：'+validation_text+'.','- 新指标纯函数、baseline 默认行为、family access、唯一候选、Kdp8、最多两个 risk slot、加工负载 cutoff 以及不调用 direction/scheduler 均有回归覆盖。','- 旧 S1 的 443 条标签、此前 36 条诊断结果和所有历史实验保持不变。','']
+        '## 验证','',f'- 定向回归：138 passed。','- 完整 pytest：'+validation_text+'.','- 新指标纯函数、baseline 默认行为、family access、唯一候选、Kdp8、最多两个 risk slot、加工负载 cutoff 以及不调用 direction/scheduler 均有回归覆盖。','- 旧 S1 的 443 条标签、此前 36 条诊断结果和所有历史实验保持不变。','']
     report=root/'docs/C2_COORDINATION_AWARE_SCREENING.md'
     report.write_text('\n'.join(lines),encoding='utf-8')
     print(f'C2 report written: {report}')
