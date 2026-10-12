@@ -485,3 +485,65 @@ def test_v2_production_pool_keeps_historical_explicit_configs(monkeypatch):
     assert {k:v for k,v in asdict(production).items() if k not in ('m','m_lns')}=={k:v for k,v in asdict(historical).items() if k not in ('m','m_lns')}
     pipeline.run_sa_oi_alns_v2((),search_config=historical)
     assert calls[-1] is historical
+
+
+
+def test_coordination_risk_is_pure_pre_direction_geometry(monkeypatch):
+    from mrta_search.coordination_risk import coordination_risk
+    import mrta_search.direction as direction
+    import mrta_reference.scheduler as scheduler
+    monkeypatch.setattr(direction,'optimize_directions_with_initial_feasibility',
+                        lambda *a,**k: (_ for _ in ()).throw(AssertionError('direction called')))
+    monkeypatch.setattr(scheduler,'reference_schedule',
+                        lambda *a,**k: (_ for _ in ()).throw(AssertionError('scheduler called')))
+    current=_base()
+    before=(current,current.canonical_hash,random.getstate())
+    first=coordination_risk(current,FAST)
+    second=coordination_risk(current,FAST)
+    assert first==second
+    assert first.same_rail_overlap>=0. and first.first_task_order_excess>=0.
+    assert before==(current,current.canonical_hash,random.getstate())
+
+
+def test_coordination_c2_keeps_family_access_unique_kdp_and_baseline_default():
+    from mrta_search.pipeline import (
+        BASELINE_C2, COORDINATION_AWARE_C2, decision_family,
+        select_c2_by_family,select_c2_coordination_aware,
+    )
+    rows=_family_candidates()
+    baseline=select_c2_by_family(rows,8,seed=11,iteration=2)
+    selected=select_c2_coordination_aware(rows,8,FAST,seed=11,iteration=2)
+    assert SearchConfig().c2_mode==BASELINE_C2
+    assert SearchConfig(c2_mode=COORDINATION_AWARE_C2).kdp==8
+    with pytest.raises(ValueError,match='unknown C2 mode'):
+        SearchConfig(c2_mode='ORACLE')
+    assert len(selected)==8==len(baseline)
+    assert len({id(row) for row in selected})==8
+    assert {decision_family(row) for row in selected}=={
+        'STRUCTURAL','TARGET_WHOLE','TARGET_Y','TARGET_X'
+    }
+    # The selector does not mutate cheap scores or the original baseline path.
+    assert select_c2_by_family(rows,8,seed=11,iteration=2)==baseline
+
+
+def test_coordination_c2_uses_at_most_two_load_competitive_risk_slots():
+    from dataclasses import replace
+    from itertools import permutations
+    from mrta_search.pipeline import select_c2_by_family,select_c2_coordination_aware
+    parents=_base().parents
+    block_ids=tuple(p.parent_id+'::whole' for p in parents)
+    rows=[]
+    for rank,order in enumerate(list(permutations(block_ids))[:10]):
+        solution=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+            {2:order[:2],3:order[2:]},FAST,revision=rank+1)
+        row=replace(_family_candidates()[0],solution=solution,cheap_score=(rank,),
+                    projected_process_makespan=float(rank+1))
+        rows.append(row)
+    baseline=select_c2_by_family(rows,8,seed=5,iteration=0)
+    selected=select_c2_coordination_aware(rows,8,FAST,seed=5,iteration=0)
+    introduced=set(map(id,selected))-set(map(id,baseline))
+    assert len(introduced)<=2
+    cutoff=max(row.projected_process_makespan for row in baseline)
+    assert all(row.projected_process_makespan<=cutoff+FAST.numeric_epsilon
+               for row in selected if id(row) in introduced)
+    assert selected[:6]==baseline[:6]

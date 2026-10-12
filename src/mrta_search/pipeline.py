@@ -65,6 +65,7 @@ from .neighborhood import (
     screen_raw_attempts,
 )
 from .stats import ACTIVE_MOVE_TYPES, SearchStats
+from .coordination_risk import CoordinationRisk, coordination_risk
 
 
 REFERENCE_POLICY_ID = DEVELOPMENT_NO_REPAIR_V1
@@ -74,6 +75,8 @@ SA_OI_ALNS_V2_PRODUCTION_POOL_SIZE = 192
 PATTERN_TRANSITION_BALANCED_FAMILY_V1 = "PATTERN_TRANSITION_BALANCED_FAMILY_V1"
 V2_C2_PATTERN_FAMILY_STRATIFIED_V1 = "V2_C2_PATTERN_FAMILY_STRATIFIED_V1"
 V2_C4_FAMILY_EXPLORE_EXPLOIT_V1 = "V2_C4_FAMILY_EXPLORE_EXPLOIT_V1"
+BASELINE_C2 = "BASELINE_C2"
+COORDINATION_AWARE_C2 = "COORDINATION_AWARE_C2"
 DECISION_FAMILIES = ("STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X")
 
 
@@ -87,6 +90,7 @@ class SearchConfig:
     kinit_ref: int = 2
     feasibility_bootstrap_budget: int = 1
     initialization_clearance_aware: bool = False
+    c2_mode: str = BASELINE_C2
     m_atomic: int | None = None
     m_lns: int = 16
     kref_total: int = 4
@@ -124,6 +128,8 @@ class SearchConfig:
             raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
         if self.feasibility_bootstrap_budget not in (0, 1):
             raise ValueError("B_init_bootstrap must be 0 or 1")
+        if self.c2_mode not in (BASELINE_C2, COORDINATION_AWARE_C2):
+            raise ValueError("unknown C2 mode")
         atomic = self.m - self.m_lns if self.m_atomic is None else self.m_atomic
         if min(atomic, self.m_lns) < 0 or atomic + self.m_lns > self.m:
             raise ValueError("atomic + LNS attempts must not exceed M")
@@ -292,6 +298,99 @@ def select_c2_by_family(candidates, kdp: int, *, seed: int, iteration: int):
     selected_ids = {id(row) for row in selected}
     selected.extend(row for row in ranked if id(row) not in selected_ids)
     return tuple(selected[:kdp])
+
+
+def select_c2_coordination_aware(
+    candidates,
+    kdp: int,
+    config: ScientificConfig,
+    *,
+    seed: int,
+    iteration: int,
+    coordination_slots: int = 2,
+):
+    """Retain family/cheap-score access and diversify at most two slots.
+
+    Risk candidates must remain within the baseline Top-K processing-load
+    cutoff and be Pareto-undominated on projected load, static overlap and
+    first-task order excess. No oracle or downstream evaluation is used.
+    """
+    ranked = tuple(sorted(candidates, key=lambda item: item.cheap_score))
+    if kdp <= 0 or not ranked:
+        return ()
+    coordination_slots = min(max(0, coordination_slots), kdp)
+    selected = []
+    selected_ids: set[int] = set()
+    families = DECISION_FAMILIES
+    if kdp < len(families):
+        offset = (seed + iteration) % len(families)
+        families = families[offset:] + families[:offset]
+    for family in families:
+        candidate = next((row for row in ranked if decision_family(row) == family), None)
+        if candidate is not None and len(selected) < kdp:
+            selected.append(candidate)
+            selected_ids.add(id(candidate))
+    baseline_slots = max(len(selected), kdp - coordination_slots)
+    for candidate in ranked:
+        if len(selected) >= baseline_slots:
+            break
+        if id(candidate) not in selected_ids:
+            selected.append(candidate)
+            selected_ids.add(id(candidate))
+    baseline_cutoff = max(
+        candidate.projected_process_makespan
+        for candidate in ranked[: min(kdp, len(ranked))]
+    )
+    eligible = tuple(
+        candidate for candidate in ranked
+        if id(candidate) not in selected_ids
+        and candidate.projected_process_makespan
+        <= baseline_cutoff + config.numeric_epsilon
+    )
+    risks: dict[int, CoordinationRisk] = {
+        id(candidate): coordination_risk(candidate.solution, config)
+        for candidate in eligible
+    }
+    pareto = []
+    for candidate in eligible:
+        risk = risks[id(candidate)]
+        dominated = any(
+            other.projected_process_makespan
+            <= candidate.projected_process_makespan + config.numeric_epsilon
+            and risks[id(other)].same_rail_overlap
+            <= risk.same_rail_overlap + config.numeric_epsilon
+            and risks[id(other)].first_task_order_excess
+            <= risk.first_task_order_excess + config.numeric_epsilon
+            and (
+                other.projected_process_makespan
+                < candidate.projected_process_makespan - config.numeric_epsilon
+                or risks[id(other)].same_rail_overlap
+                < risk.same_rail_overlap - config.numeric_epsilon
+                or risks[id(other)].first_task_order_excess
+                < risk.first_task_order_excess - config.numeric_epsilon
+            )
+            for other in eligible if other is not candidate
+        )
+        if not dominated:
+            pareto.append(candidate)
+    pareto.sort(key=lambda candidate: (
+        risks[id(candidate)].total,
+        risks[id(candidate)].same_rail_overlap,
+        risks[id(candidate)].first_task_order_excess,
+        candidate.cheap_score,
+    ))
+    for candidate in pareto:
+        if len(selected) >= kdp:
+            break
+        selected.append(candidate)
+        selected_ids.add(id(candidate))
+    for candidate in ranked:
+        if len(selected) >= kdp:
+            break
+        if id(candidate) not in selected_ids:
+            selected.append(candidate)
+            selected_ids.add(id(candidate))
+    return tuple(selected)
 
 
 def select_c4_by_family(candidates, kref: int, *, seed: int, iteration: int):
@@ -550,16 +649,24 @@ def evaluate_iteration(
     )
 
     cheap_ranked = tuple(sorted(complete, key=lambda item: item.cheap_score))
+    c2_started = time.perf_counter()
     if ranker is not None:
         if not family_access or current_schedule is None or current_schedule.cmax is None:
             raise ValueError("Learned ranking requires a certified V2 current state")
         c2 = ranker.select_c2(current,current_directions,current_schedule.cmax,cheap_ranked,config,
                              seed=stats.seed,iteration=stats.iterations,k=search_config.kdp)
     else:
-        c2 = (
-            select_c2_by_family(cheap_ranked, search_config.kdp, seed=stats.seed, iteration=stats.iterations)
-            if family_access else cheap_ranked[: search_config.kdp]
-        )
+        if family_access and search_config.c2_mode == COORDINATION_AWARE_C2:
+            c2 = select_c2_coordination_aware(
+                cheap_ranked, search_config.kdp, config,
+                seed=stats.seed, iteration=stats.iterations,
+            )
+        else:
+            c2 = (
+                select_c2_by_family(cheap_ranked, search_config.kdp, seed=stats.seed, iteration=stats.iterations)
+                if family_access else cheap_ranked[: search_config.kdp]
+            )
+    stats.c2_selection_time += time.perf_counter() - c2_started
     if observer is not None:
         observer("selection", (tuple(complete), tuple(c2)))
     stats.kdp_count += len(c2)

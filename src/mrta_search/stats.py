@@ -73,6 +73,7 @@ class SearchStats:
 
     candidate_generation_time: float = 0.0
     cheap_screen_time: float = 0.0
+    c2_selection_time: float = 0.0
     direction_dp_time: float = 0.0
     reference_scheduler_time: float = 0.0
     certifier_time: float = 0.0

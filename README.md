@@ -58,3 +58,11 @@ Four native S1 pools contain 44 certified ≥0.5% improvements; C2 retains 3 and
 A geometry-only clearance partition replaces the fifth construction when explicitly enabled, within the original 5/5/1 initialization budgets and existing bounded direction attempts. It fixes I3's serial fallback, but is **not recommended as the default**: all 16 fresh paired 60-second runs certified; I3 improves in both seeds, S1 improves slightly/moderately but both improved runs have zero search Cmax gain, S2 worsens 39.67%/21.70%, and N55 improves slightly. Production initialization stays **BASELINE**, with heuristic C2/C4. No MLP/GAT training.
 
 Report and raw diagnostics: [initialization and screening results](docs/INITIALIZATION_AND_S1_SCREENING_FIX.md), [fixed states and actual labels](data/development/s1_screening_diagnostic.sqlite). Historical results remain unchanged. Final full regression: **317 passed**.
+
+## Coordination-aware C2 development result (0.50 m)
+
+The optional `COORDINATION_AWARE_C2` preserves family access and the cheap-score backbone, with at most two load-competitive Pareto slots using same-rail X-overlap and first-task order risk. `BASELINE_C2` remains the production default.
+
+On the four existing S1 states, C2 material selections increased 3→4 while unchanged C4 retained 1→1. Across nine additional N35/N55/N85 consumed-development states, C2 certified rate increased 30.56%→43.06%, material selections 7/49→9/49 and DEADLOCK 48/72→39/72; unchanged C4 retained 2/49 in both cases. In 24 fresh native 60-second runs, all certified and all 12 paired Cmax@60 values tied exactly. Coordination scoring used 1.150 s across its twelve runs (0.160% of wall-clock budgets), with no M/K/reference-budget change.
+
+Production therefore remains baseline initialization + `BASELINE_C2` + heuristic C4. The inexpensive proxy is retained only as a development ablation. Evidence now supports collecting new 0.50-domain TRAIN/DEV labels for a ranking-aligned MLP-C2 study, with C4 trained on the real C2 hard distribution; no MLP/GAT training was started here. Details: [coordination-aware C2 report](docs/C2_COORDINATION_AWARE_SCREENING.md) and the existing [raw diagnostic database](data/development/s1_screening_diagnostic.sqlite). Full regression: **320 passed**.

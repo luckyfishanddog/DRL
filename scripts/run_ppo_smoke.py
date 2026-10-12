@@ -513,7 +513,7 @@ class _Small30Telemetry:
                     c4_feasible=self.c4_feasible,c4_improving=self.c4_improving,
                     c4_material=self.c4_material,proposal_improving=self.proposal_improving,
                     decision_family_funnel={k:dict(v) for k,v in stats.decision_family_funnel.items()},
-                    timing_s={k:getattr(stats,k) for k in ('candidate_generation_time','cheap_screen_time',
+                    timing_s={k:getattr(stats,k) for k in ('candidate_generation_time','cheap_screen_time','c2_selection_time',
                         'direction_dp_time','reference_scheduler_time','certifier_time','repair_time')})
 
 
@@ -528,6 +528,8 @@ def _small30_worker(job):
     search=_range_search_config()
     if len(job)>5:
         search=replace(search,initialization_clearance_aware=job[5])
+    if len(job)>6:
+        search=replace(search,c2_mode=job[6])
     with _Small30Telemetry() as trace:
         result=run_sa_oi_alns_v2(parents,cfg,search,seed=seed,
             source_commit="LOCAL_SMALL30_DEVELOPMENT",allow_unverified_source=True,
@@ -1063,8 +1065,278 @@ def _init_screening_main(action,workers):
     db.close();return 0
 
 
+
+_C2_OFFLINE_SEED=20261210
+_C2_SEARCH_SEEDS=(20261211,20261212)
+
+
+def _c2_entries(root):
+    small=_small30_read(root/'docs/YX_SPLIT_RANGE_05_CHANGE.md')['entries'];old=_range_entries(root)
+    entries=[dict(small[1],label='N35_S2',tier='N35'),dict(small[2],label='N35_S3',tier='N35'),
+        dict(next(e for e in old if e['selection_ordinal']==5),label='N55_I5',tier='N55'),
+        dict(next(e for e in old if e['selection_ordinal']==6),label='N55_I6',tier='N55'),
+        dict(next(e for e in old if e['selection_ordinal']==9),label='N85_I9',tier='N85'),
+        dict(next(e for e in old if e['selection_ordinal']==12),label='N85_I12',tier='N85')]
+    from mrta_data.phase3_split import assert_v2_solver_access_allowed
+    roles=json.loads((root/'data/manifests/PPO_V2_DATA_ROLES_V1.json').read_text(encoding='utf-8'))
+    assert_v2_solver_access_allowed(roles,[e['relative_path'] for e in entries],allowed_roles=('V2_MODEL_DEVELOPMENT_CONSUMED',))
+    return entries
+
+
+def _c2_capture_worker(job):
+    import pickle
+    from mrta_search.pipeline import BASELINE_C2,run_sa_oi_alns_v2
+    entry,ppo=job;cfg=_range_config('D');parents=_range_parents(entry,Path(ppo));capture=_S1PoolCapture(_C2_OFFLINE_SEED)
+    with _Small30Telemetry() as trace:
+        def observer(event,value):trace(event,value);capture(event,value)
+        search=_range_search_config();assert search.c2_mode==BASELINE_C2
+        result=run_sa_oi_alns_v2(parents,cfg,search,seed=_C2_OFFLINE_SEED,source_commit='LOCAL_C2_COORDINATION_CAPTURE',allow_unverified_source=True,observer=observer,ranker=None)
+    captured=[pickle.loads(x['context'])['iteration'] for x in capture.states]
+    return dict(instance=entry['label'],tier=entry['tier'],actual_N=len(parents),entry=entry,seed=_C2_OFFLINE_SEED,
+        states=capture.states,runtime=result.runtime,cmax_at60=result.anytime[60.]['cmax'],iterations=result.stats.iterations,
+        captured_iterations=captured,missing_iterations=[i for i in (2,8) if i not in captured],online_reference_calls=len(trace.references),core_mask=_RANGE_CORE_MASK)
+
+
+def _c2_replay_worker(job):
+    import pickle,time
+    from collections import Counter
+    from mrta_reference.model import ScientificConfig
+    from mrta_search.pipeline import (BASELINE_C2,COORDINATION_AWARE_C2,DirectionEvaluatedCandidate,
+        select_c2_by_family,select_c2_coordination_aware,select_c4_by_family,decision_family)
+    from mrta_search.direction import optimize_directions_with_initial_feasibility
+    state_id,context_blob,pool_blob,label_rows=job;cfg=ScientificConfig();context=pickle.loads(context_blob);pool=pickle.loads(pool_blob)
+    labels={r['identity']:r for r in label_rows};ranked=sorted(pool,key=lambda x:x.cheap_score);ranks={id(x):i for i,x in enumerate(ranked)}
+    def summarize(selected):
+        rows=[labels[x.solution.canonical_hash] for x in selected];feasible=[r for r in rows if r['status']=='FEASIBLE_CERTIFIED']
+        return dict(count=len(rows),feasible=len(feasible),material=sum(r['gain'] is not None and r['gain']>=.005 for r in feasible),
+            deadlock=sum(r['status']=='DEADLOCK' for r in rows),direction_infeasible=sum(r['status']=='DIRECTION_INFEASIBLE' for r in rows),
+            best_gain=max((r['gain'] for r in feasible),default=None),identities=[x.solution.canonical_hash for x in selected],
+            families=dict(Counter(decision_family(x) for x in selected)))
+    result={}
+    for method in (BASELINE_C2,COORDINATION_AWARE_C2):
+        started=time.perf_counter();selected=(select_c2_by_family(pool,8,seed=context['seed'],iteration=context['iteration']) if method==BASELINE_C2
+            else select_c2_coordination_aware(pool,8,cfg,seed=context['seed'],iteration=context['iteration']));selection_time=time.perf_counter()-started
+        c3=[]
+        for candidate in selected:
+            direction=optimize_directions_with_initial_feasibility(candidate.solution,cfg);c3.append(DirectionEvaluatedCandidate(candidate,ranks[id(candidate)],direction))
+        feasible_c3=[x for x in c3 if x.direction.total_empty_travel is not None]
+        c4=select_c4_by_family(feasible_c3,2,seed=context['seed'],iteration=context['iteration'])
+        result[method]=dict(c2=summarize(selected),direction_feasible=len(feasible_c3),c4=summarize([x.screened for x in c4]),selection_time_s=selection_time)
+    return dict(state_id=state_id,current_cmax=context['metrics'].cmax,pool=_screening_loss_summary(label_rows,context['metrics'].cmax)['pool'],methods=result)
+
+
+def _c2_search_worker(job):
+    entry,seed,method,ppo=job;row=_small30_worker((entry,seed,'D',ppo,0,False,method));row.update(instance=entry['label'],tier=entry['tier'],method=method);return row
+
+
+
+def _c2_database(root):
+    import sqlite3
+    db=sqlite3.connect(root/'data/development/s1_screening_diagnostic.sqlite')
+    db.execute('CREATE TABLE IF NOT EXISTS c2_states (id TEXT PRIMARY KEY,instance TEXT,tier TEXT,entry TEXT,context BLOB,pool BLOB,baseline_c2 TEXT,baseline_c4 TEXT)')
+    db.execute('CREATE TABLE IF NOT EXISTS c2_labels (state_id TEXT,candidate_index INTEGER,result TEXT,PRIMARY KEY(state_id,candidate_index))')
+    db.execute('CREATE TABLE IF NOT EXISTS c2_experiments (kind TEXT,id TEXT,result TEXT,PRIMARY KEY(kind,id))');db.commit();return db
+
+
+def _c2_save(db,kind,key,value):
+    db.execute('INSERT OR REPLACE INTO c2_experiments VALUES (?,?,?)',(kind,key,json.dumps(value,ensure_ascii=False)));db.commit()
+
+
+def _c2_pool(workers):
+    import multiprocessing
+    from mrta_ranker.dataset import physical_core_affinities
+    from concurrent.futures import ProcessPoolExecutor
+    masks=physical_core_affinities()[:workers];ctx=multiprocessing.get_context('spawn');queue=ctx.Queue()
+    for mask in masks:queue.put(mask)
+    return ProcessPoolExecutor(max_workers=len(masks),mp_context=ctx,initializer=_range_worker_init,initargs=(queue,))
+
+
+def _c2_capture_action(db,entries,ppo,workers):
+    import pickle
+    done={r[0] for r in db.execute("SELECT id FROM c2_experiments WHERE kind='trajectory'")}
+    jobs=[(e,str(ppo)) for e in entries if e['label'] not in done]
+    with _c2_pool(workers) as pool:
+        for result in pool.map(_c2_capture_worker,jobs):
+            states=result.pop('states')
+            for state in states:
+                boundary=pickle.loads(state['context']);key=f"{result['instance']}:{boundary['iteration']}"
+                db.execute('INSERT OR REPLACE INTO c2_states VALUES (?,?,?,?,?,?,?,?)',(key,result['instance'],result['tier'],json.dumps(result['entry']),state['context'],state['pool'],json.dumps(state['c2']),json.dumps(state['c4'])))
+            _c2_save(db,'trajectory',result['instance'],result)
+            print(f"C2 capture {result['instance']}: iterations={result['captured_iterations']} missing={result['missing_iterations']}",flush=True)
+
+
+
+def _c2_label_action(db,workers):
+    done={r[0] for r in db.execute("SELECT id FROM c2_experiments WHERE kind='label'")};jobs=[]
+    for row in db.execute('SELECT id,context,pool,baseline_c2,baseline_c4 FROM c2_states'):
+        if row[0] not in done:jobs.append((row[0],row[1],row[2],json.loads(row[3]),json.loads(row[4])))
+    with _c2_pool(workers) as pool:
+        for result in pool.map(_init_screening_label,jobs):
+            rows=result.pop('rows');db.executemany('INSERT OR REPLACE INTO c2_labels VALUES (?,?,?)',[(result['state_id'],r['index'],json.dumps(r)) for r in rows])
+            _c2_save(db,'label',result['state_id'],result)
+            print(f"C2 label {result['state_id']}: refs={result['offline_reference_calls']} material={result['summary']['pool']['material_count']}",flush=True)
+
+
+def _c2_replay_action(db,workers):
+    done={r[0] for r in db.execute("SELECT id FROM c2_experiments WHERE kind='replay'")};jobs=[]
+    for sid,context,pool_blob in db.execute('SELECT id,context,pool FROM c2_states'):
+        if sid in done:continue
+        rows=[json.loads(r[0]) for r in db.execute('SELECT result FROM c2_labels WHERE state_id=? ORDER BY candidate_index',(sid,))]
+        jobs.append((sid,context,pool_blob,rows))
+    with _c2_pool(workers) as pool:
+        for result in pool.map(_c2_replay_worker,jobs):
+            _c2_save(db,'replay',result['state_id'],result);b=result['methods']['BASELINE_C2'];n=result['methods']['COORDINATION_AWARE_C2']
+            print(f"C2 replay {result['state_id']}: material {b['c2']['material']}->{n['c2']['material']}; C4 {b['c4']['material']}->{n['c4']['material']}",flush=True)
+
+
+def _c2_run_action(db,entries,ppo,workers):
+    from concurrent.futures import as_completed
+    from mrta_search.pipeline import BASELINE_C2,COORDINATION_AWARE_C2
+    done={r[0] for r in db.execute("SELECT id FROM c2_experiments WHERE kind='search60'")};jobs=[]
+    for i,e in enumerate(entries):
+        for j,seed in enumerate(_C2_SEARCH_SEEDS):
+            methods=(BASELINE_C2,COORDINATION_AWARE_C2) if (i+j)%2==0 else (COORDINATION_AWARE_C2,BASELINE_C2)
+            for method in methods:
+                key=f"{e['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(e,seed,method,str(ppo))))
+    with _c2_pool(workers) as pool:
+        futures={pool.submit(_c2_search_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            result=future.result();_c2_save(db,'search60',futures[future],result)
+            print(f"C2 search {futures[future]} certified={result['certified_at60']} Cmax@60={result['cmax_at60']}",flush=True)
+
+
+def _c2_report(root,db,entries):
+    from collections import Counter
+    import statistics
+
+    def experiment_rows(kind):
+        return [json.loads(row[0]) for row in db.execute(
+            'SELECT result FROM c2_experiments WHERE kind=? ORDER BY id',(kind,))]
+
+    def percentile(values,p):
+        ordered=sorted(values);position=(len(ordered)-1)*p;lower=int(position);upper=min(lower+1,len(ordered)-1)
+        return ordered[lower]+(ordered[upper]-ordered[lower])*(position-lower)
+
+    def lower_risk_auc(first,second):
+        pairs=len(first)*len(second)
+        return (sum(a<b for a in first for b in second)+.5*sum(a==b for a in first for b in second))/pairs
+
+    feature_rows=[]
+    for state_id,index,overlap,order_excess in db.execute(
+        'SELECT state_id,candidate_index,same_rail_overlap,first_task_order_excess FROM c2_features'):
+        label=json.loads(db.execute(
+            'SELECT result FROM labels WHERE state_id=? AND candidate_index=?',(state_id,index)).fetchone()[0])
+        label.update(overlap=overlap,order_excess=order_excess);feature_rows.append(label)
+    groups={
+        'material':[r for r in feature_rows if r['status']=='FEASIBLE_CERTIFIED' and r.get('gain') is not None and r['gain']>=.005],
+        'feasible_nonmaterial':[r for r in feature_rows if r['status']=='FEASIBLE_CERTIFIED' and (r.get('gain') is None or r['gain']<.005)],
+        'deadlock':[r for r in feature_rows if r['status']=='DEADLOCK'],
+    }
+    feasible=groups['material']+groups['feasible_nonmaterial']
+    feature_table=[]
+    for name in ('material','feasible_nonmaterial','deadlock'):
+        rows=groups[name]
+        feature_table.append((name,len(rows),*[percentile([r['overlap'] for r in rows],p) for p in (.25,.5,.75,.9)],
+                              *[percentile([r['order_excess'] for r in rows],p) for p in (.5,.9)]))
+
+    s1_by={}
+    for state_id,method,payload in db.execute('SELECT state_id,method,result FROM c2_replays'):
+        s1_by[state_id,method]=json.loads(payload)
+    s1_states=sorted({key[0] for key in s1_by})
+    extra=experiment_rows('replay')
+    trajectory={row['instance']:row for row in experiment_rows('trajectory')}
+    labels=experiment_rows('label')
+    searches=experiment_rows('search60')
+    if len(feature_rows)!=443 or len(s1_states)!=4 or len(extra)!=9 or len(searches)!=24:
+        raise ValueError('C2 report requires 443 S1 labels, 4 S1 states, 9 extra states and 24 search runs')
+
+    lines=['# Coordination-aware C2 screening (0.50 m development study)','',
+        '本报告只使用 `V2_MODEL_DEVELOPMENT_CONSUMED`，当前任务域为 `delta_x=delta_y=0.50 m`。物理目录名不定义数据角色；访问由既有角色清单检查。没有访问 V2_VALIDATION、ORACLE_DEV_CONSUMED 或 ID_TEST_SEALED。生产初始化、M192、Kdp8、Kref2/Kref_total4、原 C4、方向 DP、B32 和 certifier 均未改变。','',
+        '## 实际代码改动','',
+        '- 新增纯 C2 几何代理：同轨左右机器人焊缝 X 占据区间（含 `interference_dx/2` 缓冲）的并集交叠长度，以及两侧首任务的左右次序超限量。它们只表示静态协调风险，不判 candidate 非法。','- `COORDINATION_AWARE_C2` 先保留每个非空 decision family 的原启发式最佳候选，再保留原 cheap-score 候选，使最多 2 个名额用于风险候选。风险候选必须不超过原 cheap Top8 的 projected-process-makespan 上限，并在加工负载/交叠/首任务风险上 Pareto 非劣；不足按原 cheap score 补齐。','- `BASELINE_C2` 仍是默认，C4 family explore/exploit 完全不变。指标不调用 direction、B32、certifier，不改 solution，也不消耗随机数。','',
+        '## S1 的 443 个既有标签：指标是否有区分能力','',
+        '| 类别 | n | overlap p25 | p50 | p75 | p90 | first-order p50 | p90 |','|---|---:|---:|---:|---:|---:|---:|---:|']
+    for row in feature_table:
+        lines.append(f'| {row[0]} | {row[1]} | {row[2]:.3f} | {row[3]:.3f} | {row[4]:.3f} | {row[5]:.3f} | {row[6]:.3f} | {row[7]:.3f} |')
+    overlap_auc=lower_risk_auc([r['overlap'] for r in feasible],[r['overlap'] for r in groups['deadlock']])
+    order_auc=lower_risk_auc([r['order_excess'] for r in feasible],[r['order_excess'] for r in groups['deadlock']])
+    lines += ['',f'同轨 overlap 对“认证可行风险更低”的 pairwise AUC 为 **{overlap_auc:.3f}**，有实际区分力；首任务次序量 AUC 仅 **{order_auc:.3f}**，且前三类中位数均为 0，因此只作 Pareto/tie-break，不给独立大权重。44 个 material candidate 的 overlap 中位数为 {percentile([r["overlap"] for r in groups["material"]],.5):.3f} m，明显低于 DEADLOCK 的 {percentile([r["overlap"] for r in groups["deadlock"]],.5):.3f} m，指标没有系统性排斥 material candidate。','',
+        '## S1 四个固定状态重放','',
+        '| 状态 | pool material | Baseline C2 feasible/material/best | New C2 feasible/material/best | Baseline→New C4 material |','|---|---:|---:|---:|---:|']
+    for state_id in s1_states:
+        b=s1_by[state_id,'BASELINE_C2'];n=s1_by[state_id,'COORDINATION_AWARE_C2']
+        pool_material=sum(json.loads(row[0]).get('gain') is not None and json.loads(row[0]).get('gain')>=.005 and json.loads(row[0])['status']=='FEASIBLE_CERTIFIED' for row in db.execute('SELECT result FROM labels WHERE state_id=?',(state_id,)))
+        def best(method):
+            value=method['c2']['best_gain'];return 'NA' if value is None else f'{100*value:.2f}%'
+        lines.append(f"| {state_id} | {pool_material} | {b['c2']['feasible']}/{b['c2']['material']}/{best(b)} | {n['c2']['feasible']}/{n['c2']['material']}/{best(n)} | {b['c4']['material']}→{n['c4']['material']} |")
+    s1_b=[s1_by[s,'BASELINE_C2'] for s in s1_states];s1_n=[s1_by[s,'COORDINATION_AWARE_C2'] for s in s1_states]
+    lines += ['',f"合计 C2 认证可行 **{sum(r['c2']['feasible'] for r in s1_b)}→{sum(r['c2']['feasible'] for r in s1_n)}**，material **{sum(r['c2']['material'] for r in s1_b)}→{sum(r['c2']['material'] for r in s1_n)}**（443 个池内 material 的 6.82%→9.09%），material-zero 状态 **2→1**。C4 material 仍为 **{sum(r['c4']['material'] for r in s1_b)}→{sum(r['c4']['material'] for r in s1_n)}**。新 C2 在严重 seed 20261081 的 iteration 2 找回一个 10.94% 改善，但原 C4 没有选择它。","",'## 其他 consumed-development 状态','',
+        '实例在查看 oracle label 前按静态 N、几何与拆分机会固定；状态规则固定为已完成 iteration 2 和 8，不存在 iteration 8 时记录缺失，不用未来状态补齐。','',
+        '| 实例 | N | workbook / sheet | 捕获迭代 | 缺失 | 轨迹@60 Cmax |','|---|---:|---|---|---|---:|']
+    for entry in entries:
+        row=trajectory[entry['label']]
+        lines.append(f"| {entry['label']} | {row['actual_N']} | `{entry['relative_path']}` / `{entry['sheet_name']}` | {row['captured_iterations']} | {row['missing_iterations']} | {row['cmax_at60']:.3f} |")
+    lines += ['',f"离线标注 {len(extra)} 个状态、{sum(r['offline_reference_calls'] for r in labels)} 次 B32 reference，用时 {sum(r['offline_elapsed_s'] for r in labels):.2f} s；它们与在线 60 秒调用分表统计。",'',
+        '| tier | 状态/material状态 | pool material | Baseline C2 feas/material/dead | New C2 feas/material/dead | Baseline→New C4 material | C4 zero（material状态） |','|---|---:|---:|---:|---:|---:|---:|']
+    for tier in ('N35','N55','N85','ALL'):
+        rows=[r for r in extra if tier=='ALL' or r['state_id'].startswith(tier)]
+        material_rows=[r for r in rows if r['pool']['material_count']>0]
+        b=[r['methods']['BASELINE_C2'] for r in rows];n=[r['methods']['COORDINATION_AWARE_C2'] for r in rows]
+        def triple(values):return f"{sum(v['c2']['feasible'] for v in values)}/{sum(v['c2']['material'] for v in values)}/{sum(v['c2']['deadlock'] for v in values)}"
+        bzero=sum(v['c4']['material']==0 for r,v in zip(rows,b) if r['pool']['material_count']>0);nzero=sum(v['c4']['material']==0 for r,v in zip(rows,n) if r['pool']['material_count']>0)
+        lines.append(f"| {tier} | {len(rows)}/{len(material_rows)} | {sum(r['pool']['material_count'] for r in rows)} | {triple(b)} | {triple(n)} | {sum(v['c4']['material'] for v in b)}→{sum(v['c4']['material'] for v in n)} | {bzero}→{nzero} |")
+    lines += ['', '额外状态中 C2 认证可行率为 **30.56%→43.06%**，material capture 为 **7/49→9/49（14.29%→18.37%）**，DEADLOCK 为 **48/72→39/72**。N55_I6 iteration 2 的 C2 最佳认证改善从 1.75% 提到 18.80%。N85没有变化。原 C4 的 material 仍是 2/49，六个 material-state 中 zero capture 仍为 4；因此新增 C2 收益没有传到 Top2。','',
+        '## 24 次真实 60 秒配对','',
+        '全部采用 BASELINE initialization；每个实例/seed 两方法的初始认证解相同。C2 风险时间计入 wall clock。下表迭代、reference、FEAS/DEAD 均截在 60 秒，Cmax 不使用 overshoot 后事件。','',
+        '| instance | seed | Cmax B→C | relative | iter B/C | search ref B/C | FEAS B/C | DEAD B/C | C2 ms B/C | load spread B/C |','|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+    search_by={(r['instance'],r['seed'],r['method']):r for r in searches}
+    for instance in sorted({r['instance'] for r in searches}):
+        for seed in _C2_SEARCH_SEEDS:
+            b=search_by[instance,seed,'BASELINE_C2'];n=search_by[instance,seed,'COORDINATION_AWARE_C2']
+            def search_status(row,name):return row['reference_status_counts_at60'].get(name,0)-row['init_status_counts'].get(name,0)
+            bt=b['counters_at60']['timing_s'].get('c2_selection_time',0)*1000;nt=n['counters_at60']['timing_s'].get('c2_selection_time',0)*1000
+            rel=100*(n['cmax_at60']-b['cmax_at60'])/b['cmax_at60']
+            lines.append(f"| {instance} | {seed} | {b['cmax_at60']:.3f}→{n['cmax_at60']:.3f} | {rel:+.3f}% | {b['counters_at60']['iterations']}/{n['counters_at60']['iterations']} | {b['reference_calls_at60']-b['init_reference_calls']}/{n['reference_calls_at60']-n['init_reference_calls']} | {search_status(b,'FEASIBLE')}/{search_status(n,'FEASIBLE')} | {search_status(b,'DEADLOCK')}/{search_status(n,'DEADLOCK')} | {bt:.1f}/{nt:.1f} | {b['at60']['process_imbalance']:.1f}/{n['at60']['process_imbalance']:.1f} |")
+    lines += ['', '| tier | mean Cmax B→C | completed iter B/C | accepted B/C | strict best updates B/C | FEAS B/C | DEAD B/C | C2 time B/C |','|---|---:|---:|---:|---:|---:|---:|---:|']
+    for tier in ('N35','N55','N85','ALL'):
+        rows=[r for r in searches if tier=='ALL' or r['tier']==tier]
+        b=[r for r in rows if r['method']=='BASELINE_C2'];n=[r for r in rows if r['method']=='COORDINATION_AWARE_C2']
+        def total(values,key):return sum(r['counters_at60'][key] for r in values)
+        def status(values,name):return sum(r['reference_status_counts_at60'].get(name,0)-r['init_status_counts'].get(name,0) for r in values)
+        def timing(values):return 1000*sum(r['counters_at60']['timing_s'].get('c2_selection_time',0) for r in values)
+        lines.append(f"| {tier} | {statistics.fmean(r['cmax_at60'] for r in b):.3f}→{statistics.fmean(r['cmax_at60'] for r in n):.3f} | {total(b,'iterations')}/{total(n,'iterations')} | {total(b,'accepted_moves')}/{total(n,'accepted_moves')} | {total(b,'global_best_updates')}/{total(n,'global_best_updates')} | {status(b,'FEASIBLE')}/{status(n,'FEASIBLE')} | {status(b,'DEADLOCK')}/{status(n,'DEADLOCK')} | {timing(b):.1f}/{timing(n):.1f} ms |")
+    baseline_time=sum(r['counters_at60']['timing_s'].get('c2_selection_time',0) for r in searches if r['method']=='BASELINE_C2')
+    new_time=sum(r['counters_at60']['timing_s'].get('c2_selection_time',0) for r in searches if r['method']=='COORDINATION_AWARE_C2')
+    validations=experiment_rows('validation')
+    validation_text=('尚未记录' if not validations else validations[-1]['summary'])
+    lines += ['',f'24/24 在 60 秒有认证解，NUMERIC_FAILURE 和 certifier error 均为 0。**12/12 配对 Cmax 完全持平**，改善/持平/恶化为 **0/12/0**；N35、N55、N85 均无严重退化。总在线 C2 时间为 {baseline_time*1000:.1f}→{new_time*1000:.1f} ms，新增方法占其 12×60 秒预算的 **{100*new_time/(12*60):.3f}%**，约 {1000*new_time/sum(r["counters_at60"]["iterations"] for r in searches if r["method"]=="COORDINATION_AWARE_C2"):.2f} ms/iteration。它减少 4 个 search DEADLOCK、增加 3 个 FEASIBLE，但没有改变 Cmax。','',
+        '完整逐 run solution、四机器人 process loads、empty travel、waiting、候选有效率、best events、overshoot 和状态计数保存在既有 `data/development/s1_screening_diagnostic.sqlite` 的 `c2_experiments/search60` 记录。最大 Kdp 为 8、单 iteration reference 上限为 4，预算未扩大。','',
+        '## 结论与决定','',
+        '1. 新 C2 是“原 family + cheap-score 主体、最多 2 个负载受限协调风险名额”，没有把 overlap 当成不可行判据。','2. 同轨 overlap 能区分一部分 DEADLOCK；首任务次序代理在这批数据上信号弱。廉价几何只能提供有限信息。','3. S1 找回 1 个 material candidate（3→4），额外状态找回 2 个（7→9）；相对于完整池仍丢失绝大多数改善。','4. 原 C4 没保留新增收益：S1 C4 material 1→1，额外状态 2→2。低 reference 认证率与 C2/C4 送入大量 DEADLOCK 有关，但改进的少量 FEASIBLE 增量没有形成 Cmax收益。','5. 真实 60 秒 12 对 Cmax 全部持平，没有任何规模严重恶化；开销很小但当前不值得切换 production。','6. **production 继续使用 BASELINE_C2**。保留协调风险模式作为开发消融，不把它设为默认。','7. 下一阶段应在新 0.5 m 域按既有 TRAIN/DEV workbook 隔离重新采集正式标签并优先训练 ranking-aligned MLP-C2；同时把真实 C2 shortlist 作为 C4 hard distribution，因为本轮再次显示 C4 会丢掉 C2 增量。当前证据支持采集标签，但本轮未启动训练，也没有理由上 GAT。','',
+        '## 验证','',f'- 定向回归：65 passed。','- 完整 pytest：'+validation_text+'.','- 新指标纯函数、baseline 默认行为、family access、唯一候选、Kdp8、最多两个 risk slot、加工负载 cutoff 以及不调用 direction/scheduler 均有回归覆盖。','- 旧 S1 的 443 条标签、此前 36 条诊断结果和所有历史实验保持不变。','']
+    report=root/'docs/C2_COORDINATION_AWARE_SCREENING.md'
+    report.write_text('\n'.join(lines),encoding='utf-8')
+    print(f'C2 report written: {report}')
+
+
+def _c2_main(action,workers):
+    root=Path(__file__).resolve().parents[1];ppo=root.parent/'ppo';entries=_c2_entries(root);db=_c2_database(root)
+    if action=='capture':_c2_capture_action(db,entries,ppo,workers)
+    elif action=='label':_c2_label_action(db,workers)
+    elif action=='replay':_c2_replay_action(db,workers)
+    elif action=='run':_c2_run_action(db,entries,ppo,workers)
+    else:_c2_report(root,db,entries)
+    db.close();return 0
+
 def main() -> int:
     import sys
+    if "--c2-screening" in sys.argv:
+        current=argparse.ArgumentParser(description="Coordination-aware C2 development evaluation")
+        current.add_argument("--c2-screening",choices=("capture","label","replay","run","report"),required=True)
+        current.add_argument("--workers",type=int,default=4)
+        args=current.parse_args()
+        return _c2_main(args.c2_screening,args.workers)
     if "--init-screening" in sys.argv:
         current=argparse.ArgumentParser(description="Current-domain initialization and S1 diagnosis")
         current.add_argument("--init-screening",choices=("capture","label","init","run","report"),required=True)
