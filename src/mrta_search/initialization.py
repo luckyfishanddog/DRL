@@ -58,6 +58,7 @@ class InitializationStrategy(str, Enum):
 
 RAIL_SERIAL_BOOTSTRAP = "RAIL_SERIAL_BOOTSTRAP"
 V3_DIRECTION_FEASIBILITY_REFERENCE_BUDGET = 4
+CLEARANCE_BALANCED_BOOTSTRAP = "CLEARANCE_BALANCED_BOOTSTRAP"
 
 
 @dataclass(frozen=True)
@@ -144,10 +145,11 @@ def _construct(
     insertion_limit: int,
     strategy: InitializationStrategy,
     legacy_robot_tie_first: bool = False,
+    clearance_aware: bool = False,
 ) -> CanonicalSolution:
     if strategy is InitializationStrategy.RAIL_MONOTONE_BALANCED:
         return _construct_rail_monotone_balanced_bootstrap(
-            parents, patterns, config
+            parents, patterns, config, clearance_aware=clearance_aware
         )
     parent_by_id = {parent.parent_id: parent for parent in parents}
     all_blocks = {
@@ -350,6 +352,8 @@ def _construct_rail_monotone_balanced_bootstrap(
     parents: Sequence[ParentWeld],
     patterns: tuple[SplitPattern, ...],
     config: ScientificConfig,
+    *,
+    clearance_aware: bool = False,
 ) -> CanonicalSolution:
     """Build the deterministic four-robot V3 monotone/load-balanced seed."""
     parent_by_id = {parent.parent_id: parent for parent in parents}
@@ -389,8 +393,23 @@ def _construct_rail_monotone_balanced_bootstrap(
                 prefix_loads[-1] + config.process_time(block.length)
             )
         total = prefix_loads[-1]
+        boundaries = range(len(ordered) + 1)
+        if clearance_aware:
+            # A load-balanced cut can put overlapping weld envelopes on opposite
+            # robots, which monotone route ordering alone does not prevent.
+            # Prefer separated, nonempty partitions when geometry permits one;
+            # otherwise preserve the original construction (no false guarantee).
+            separated = [
+                i for i in range(1, len(ordered))
+                if max(max(b.start[0], b.end[0]) for b in ordered[:i])
+                + config.interference_dx
+                <= min(min(b.start[0], b.end[0]) for b in ordered[i:])
+                + config.numeric_epsilon
+            ]
+            if separated:
+                boundaries = separated
         boundary = min(
-            range(len(ordered) + 1),
+            boundaries,
             key=lambda index: (
                 max(prefix_loads[index], total - prefix_loads[index]),
                 abs(prefix_loads[index] - (total - prefix_loads[index])),
@@ -476,6 +495,7 @@ def build_initial_solution(
     kinit_ref: int = 2,
     feasibility_bootstrap_budget: int = 1,
     portfolio: bool = False,
+    clearance_aware: bool = False,
     reference_evaluator: ReferenceEvaluator | None = None,
     certifier: Certifier = certify_schedule,
     scope: FormalScope | None = None,
@@ -519,6 +539,7 @@ def build_initial_solution(
                 insertion_limit=insertion_limit,
                 strategy=strategy,
                 legacy_robot_tie_first=(not portfolio and construction_index == 1),
+                clearance_aware=clearance_aware,
             )
         except (ValueError, ArithmeticError, OverflowError) as error:
             attempts.append(
@@ -742,6 +763,14 @@ def build_initial_solution(
             and certification.certified
         ):
             feasible.append((official_metrics(solution, schedule, config), attempt))
+
+    if clearance_aware:
+        attempts = [replace(a, strategy=CLEARANCE_BALANCED_BOOTSTRAP)
+                    if a.strategy == InitializationStrategy.RAIL_MONOTONE_BALANCED.value
+                    else a for a in attempts]
+        feasible = [(m, replace(a, strategy=CLEARANCE_BALANCED_BOOTSTRAP)
+                     if a.strategy == InitializationStrategy.RAIL_MONOTONE_BALANCED.value else a)
+                    for m, a in feasible]
 
     if feasible:
         best_metrics, best_attempt = feasible[0]

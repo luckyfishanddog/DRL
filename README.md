@@ -49,3 +49,12 @@ Three static-selected instances from distinct consumed-development workbooks hav
 Nine pairs: **4 improved / 3 tied / 2 worse**; paired relative median **0%**, mean **−3.66%**; mean Cmax 2540.199→2464.717 s. S1 (X-rich) changes **+55.17%, +6.77%, −7.63%**; S2 improves all three; S3 stays at initialization Cmax. The deterioration persists for one geometry, not for all N35 instances. S1 has similar initialization but weaker C4 certification/search gains. Targeted I3 replay identifies serial fallback using only R0/R2; the better A initial solution was rebuilt and certified in D.
 
 Next: retain 0.5 as the task model, investigate I3 initialization robustness and S1 C2/C4/reference selection at fixed M192 before broader learning. No MLP/GAT training or parameter changes were made. Complete per-run initialization, four-robot loads, outer-cut usage and failure diagnostics are appended to [the existing range report](docs/YX_SPLIT_RANGE_05_CHANGE.md).
+
+
+## Initialization and S1 screening follow-up (0.50 m)
+
+Four native S1 pools contain 44 certified ≥0.5% improvements; C2 retains 3 and C4 retains 1. Whole-pool direction-feasible certification is 70.38%, versus 17.24% in C2 and 12.50% in C4. Prioritize C2 screening, then C4; no pool-size or scheduler change.
+
+A geometry-only clearance partition replaces the fifth construction when explicitly enabled, within the original 5/5/1 initialization budgets and existing bounded direction attempts. It fixes I3's serial fallback, but is **not recommended as the default**: all 16 fresh paired 60-second runs certified; I3 improves in both seeds, S1 improves slightly/moderately but both improved runs have zero search Cmax gain, S2 worsens 39.67%/21.70%, and N55 improves slightly. Production initialization stays **BASELINE**, with heuristic C2/C4. No MLP/GAT training.
+
+Report and raw diagnostics: [initialization and screening results](docs/INITIALIZATION_AND_S1_SCREENING_FIX.md), [fixed states and actual labels](data/development/s1_screening_diagnostic.sqlite). Historical results remain unchanged. Final full regression: **317 passed**.

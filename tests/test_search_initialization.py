@@ -249,3 +249,88 @@ def test_v3_flexible_rail_assignment_is_deterministic_and_preserves_patterns():
     ]
     assert len(occurrences) == 1
     assert occurrences[0] in (0, 1, 2, 3)
+
+
+
+def test_clearance_construction_is_geometry_only_deterministic_and_formally_legal(monkeypatch):
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import canonicalize
+    parents=_v3_fixture() + (ParentWeld('mandatory',(8.,5.),(8.,7.)),
+                              ParentWeld('shared',(12.,6.),(13.,6.)))
+    # No workbook, historical solution, or seed-specific input is available here.
+    def forbidden(*args,**kwargs):
+        raise AssertionError('initializer must construct from supplied geometry')
+    monkeypatch.setattr('builtins.open',forbidden)
+    patterns=_patterns(parents,FAST)
+    one=_construct_rail_monotone_balanced_bootstrap(parents,patterns,FAST,clearance_aware=True)
+    two=_construct_rail_monotone_balanced_bootstrap(parents,patterns,FAST,clearance_aware=True)
+    assert one==two
+    catalog=build_legal_pattern_catalog(parents,FAST,FORMAL_SCOPE_V2)
+    assert all(p in catalog[p.parent_id] for p in one.patterns)
+    assert next(p for p in one.patterns if p.parent_id=='mandatory').mandatory
+    assert canonicalize(parents,one.patterns,one.routes,FAST,scope=FORMAL_SCOPE_V2)==one
+    blocks=block_map(one,FAST,scope=FORMAL_SCOPE_V2)
+    assert all(b.length>=.2-FAST.numeric_epsilon for b in blocks.values())
+    assert all(robot_is_eligible(blocks[b],r.robot_id,FAST) for r in one.routes for b in r.block_ids)
+
+
+def test_clearance_partition_prefers_separation_but_preserves_no_gap_fallback():
+    parents=(ParentWeld('a',(1.,9.),(4.,9.)),ParentWeld('b',(3.,9.),(5.,9.)),
+             ParentWeld('c',(8.,9.),(9.,9.)),ParentWeld('d',(10.,9.),(11.,9.)))
+    patterns=_patterns(parents,FAST)
+    sol=_construct_rail_monotone_balanced_bootstrap(parents,patterns,FAST,clearance_aware=True)
+    blocks=block_map(sol,FAST)
+    left=[blocks[b] for b in sol.routes[0].block_ids];right=[blocks[b] for b in sol.routes[1].block_ids]
+    assert left and right
+    assert max(max(b.start[0],b.end[0]) for b in left)+FAST.interference_dx<=min(min(b.start[0],b.end[0]) for b in right)
+    overlap=(ParentWeld('x',(1.,9.),(10.,9.)),ParentWeld('y',(2.,9.),(11.,9.)))
+    patterns=_patterns(overlap,FAST)
+    assert _construct_rail_monotone_balanced_bootstrap(overlap,patterns,FAST,clearance_aware=True)==_construct_rail_monotone_balanced_bootstrap(overlap,patterns,FAST)
+
+
+def test_clearance_portfolio_preserves_five_slots_and_existing_reference_limits(monkeypatch):
+    from mrta_search import initialization as init
+    calls=[];fallback_calls=[]
+    original=init._v3_direction_feasibility_candidates
+    def bounded(*args,**kwargs):
+        rows=original(*args,**kwargs);fallback_calls.append(len(rows));return rows
+    monkeypatch.setattr(init,'_v3_direction_feasibility_candidates',bounded)
+    def deadlock(*args,**kwargs):
+        calls.append(1);return ScheduleResult(ScheduleStatus.DEADLOCK)
+    stats=_stats()
+    result=build_initial_solution(_v3_fixture(),FAST,stats,construction_budget=5,kinit_ref=5,
+        feasibility_bootstrap_budget=1,portfolio=True,clearance_aware=True,reference_evaluator=deadlock)
+    assert result.status is InitializationStatus.INITIALIZATION_FAILED
+    assert {a.construction_index for a in result.attempts if a.construction_index<5}==set(range(5))
+    assert sum(a.construction_index==5 for a in result.attempts)<=1
+    assert len(fallback_calls)<=1 and sum(fallback_calls)<=4
+    normal=sum(a.schedule is not None for a in result.attempts if a.construction_index<5)
+    assert normal<=5 and len(calls)<=5+4+1
+    assert len(calls)==stats.init_reference_calls and stats.nref==0
+    assert stats.construction_attempts<=6  # five normal + original serial fallback
+
+
+def test_clearance_accepted_initializations_are_independently_certified_and_repeatable():
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    results=[build_initial_solution(_v3_fixture(),FAST,_stats(),construction_budget=5,kinit_ref=5,
+        portfolio=True,clearance_aware=True,scope=FORMAL_SCOPE_V2) for _ in range(2)]
+    assert results[0].solution==results[1].solution
+    assert results[0].directions==results[1].directions
+    for result in results:
+        assert result.status is InitializationStatus.SUCCESS
+        assert certify_schedule(result.solution,result.schedule,FAST,scope=FORMAL_SCOPE_V2).certified
+        assert all(a.certification and a.certification.certified for a in result.attempts
+                   if a.schedule and a.schedule.status is ScheduleStatus.FEASIBLE)
+
+
+def test_clearance_default_remains_baseline_and_never_hides_certifier_failure():
+    from mrta_search.pipeline import SearchConfig
+    from mrta_reference.certifier import CertificationReport
+    assert SearchConfig().initialization_clearance_aware is False
+    def reject(*args,**kwargs):
+        return CertificationReport(False,('deliberate independent certification rejection',),None)
+    result=build_initial_solution(_v3_fixture(),FAST,_stats(),construction_budget=5,kinit_ref=5,
+        portfolio=True,clearance_aware=True,certifier=reject)
+    assert result.status is InitializationStatus.NUMERIC_FAILURE
+    assert result.solution is None

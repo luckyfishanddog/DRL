@@ -522,10 +522,14 @@ def _small30_worker(job):
     from mrta_reference.certifier import certify_schedule
     from mrta_reference.scope import FORMAL_SCOPE_V2
     from mrta_search.pipeline import run_sa_oi_alns_v2
-    entry,seed,group,ppo,_=job
+    entry,seed,group,ppo,_=job[:5]
     cfg=_range_config(group);parents=_range_parents(entry,Path(ppo))
+    from dataclasses import replace
+    search=_range_search_config()
+    if len(job)>5:
+        search=replace(search,initialization_clearance_aware=job[5])
     with _Small30Telemetry() as trace:
-        result=run_sa_oi_alns_v2(parents,cfg,_range_search_config(),seed=seed,
+        result=run_sa_oi_alns_v2(parents,cfg,search,seed=seed,
             source_commit="LOCAL_SMALL30_DEVELOPMENT",allow_unverified_source=True,
             formal_result=False,observer=trace,ranker=None)
     cmax=result.anytime[60.]['cmax']
@@ -551,7 +555,8 @@ def _small30_worker(job):
         certified_at60=bool(certification and certification.certified),cmax_at60=cmax,at60=at60,
         checkpoint_errors=[] if certification is None else list(certification.errors),
         counters_at60=trace.at60,reference_calls_at60=len(before),reference_status_counts_at60=dict(counts),
-        init_status_counts=dict(stats.init_status_counts),
+        init_status_counts=dict(stats.init_status_counts),init_reference_calls=stats.init_reference_calls,
+        construction_attempts=stats.construction_attempts,
         rejection_diagnostics_at60=[dict(status=k[0],diagnostic=k[1],count=v) for k,v in rejected.items()],
         candidate_valid_rate_at60=trace.at60.get('valid_candidates',0)/max(1,trace.at60.get('raw_attempts',0)),
         best_events=[list(e) for e in stats.best_events],
@@ -717,8 +722,355 @@ def _small30_main(action,workers):
     return 0 if len(data['runs'])==18 and all(r.get('certified_at60') for r in data['runs']) else 2
 
 
+
+# Current .5-domain diagnosis. The existing historical range entry points stay unchanged.
+def _init_screening_entries(root):
+    small = _small30_read(root/'docs/YX_SPLIT_RANGE_05_CHANGE.md')['entries']
+    old = _range_entries(root)
+    # N55: lowest existing static selection ordinal; never selected by Cmax.
+    entries = [dict(next(e for e in old if e['selection_ordinal']==3), label='I3'),
+               dict(small[0], label='S1'), dict(small[1], label='S2'),
+               dict(min((e for e in old if e['tier'].upper()=='MEDIUM'),
+                        key=lambda e:e['selection_ordinal']), label='N55')]
+    from mrta_data.phase3_split import assert_v2_solver_access_allowed
+    roles=json.loads((root/'data/manifests/PPO_V2_DATA_ROLES_V1.json').read_text(encoding='utf-8'))
+    assert_v2_solver_access_allowed(roles,[e['relative_path'] for e in entries],
+        allowed_roles=('V2_MODEL_DEVELOPMENT_CONSUMED',))
+    return entries
+
+
+class _S1PoolCapture:
+    """Capture actual native pools after completed iterations 2 and 8, before mutation."""
+    def __init__(self, seed):
+        self.seed=seed; self.boundary=None; self.pending=None; self.states=[]
+    def __call__(self,event,value):
+        import pickle
+        if event=='boundary':
+            self.boundary=(pickle.loads(pickle.dumps(value)) if value['iteration'] in (2,8) else dict(value))
+        elif event=='selection':
+            if self.boundary['iteration'] not in (2,8) or self.boundary['elapsed']>60.:
+                self.pending=None; return
+            complete,c2=value
+            context=dict(self.boundary,seed=self.seed,
+                generation_seed=self.seed+self.boundary['iteration']*65537,
+                rule='current accepted state after completed iterations 2 and 8; next native pool',
+                adaptive_snapshot_phase='completed iteration boundary, before generation')
+            self.pending=dict(context=pickle.dumps(context),pool=pickle.dumps(complete),
+                c2=[c.solution.canonical_hash for c in c2])
+        elif event=='iteration_evaluation' and self.pending is not None:
+            c3,c4,_=value
+            self.pending['c3']=pickle.dumps(c3)
+            self.pending['c4']=[r.direction_candidate.screened.solution.canonical_hash for r in c4]
+            self.pending['online_c4']=[dict(identity=r.direction_candidate.screened.solution.canonical_hash,
+                status=r.schedule.status.value,cmax=None if r.metrics is None else r.metrics.cmax)
+                for r in c4]
+            self.states.append(self.pending);self.pending=None
+
+
+def _init_screening_capture(job):
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    entry,seed,ppo=job;cfg=_range_config('D');parents=_range_parents(entry,Path(ppo))
+    capture=_S1PoolCapture(seed)
+    with _Small30Telemetry() as trace:
+        def observe(event,value):
+            trace(event,value);capture(event,value)
+        result=run_sa_oi_alns_v2(parents,cfg,_range_search_config(),seed=seed,
+            source_commit='LOCAL_S1_NATIVE_POOL_DIAGNOSIS',allow_unverified_source=True,
+            observer=observe,ranker=None)
+    return dict(seed=seed,states=capture.states,runtime=result.runtime,
+        cmax_at60=result.anytime[60.]['cmax'],iterations=result.stats.iterations,
+        online_reference_calls=len(trace.references),online_statuses=dict(result.stats.init_status_counts),
+        actual_N=len(parents),core_mask=_RANGE_CORE_MASK)
+
+
+def _screening_loss_summary(rows,current_cmax):
+    """All gains use this accepted state's Cmax, never global best."""
+    from collections import Counter
+    def group(selected):
+        feasible=[r for r in selected if r['status']=='FEASIBLE_CERTIFIED']
+        positive=[r for r in feasible if (current_cmax-r['cmax'])/current_cmax>=.005]
+        return dict(count=len(selected),statuses=dict(Counter(r['status'] for r in selected)),
+            material_count=len(positive),best_cmax=min((r['cmax'] for r in feasible),default=None),
+            best_gain=max(((current_cmax-r['cmax'])/current_cmax for r in feasible),default=None))
+    pool=group(rows); c2=group([r for r in rows if r['c2']])
+    direction=group([r for r in rows if r['c2'] and r['direction_feasible']])
+    c4=group([r for r in rows if r['c4']])
+    if pool['material_count']==0:
+        loss='generation/reference (no certified material candidate in captured pool)'
+    elif c2['material_count']==0: loss='C2 screening'
+    elif c4['material_count']==0: loss='C4 screening'
+    else: loss='captured C4 retains material improvement'
+    return dict(current_cmax=current_cmax,pool=pool,c2=c2,direction=direction,c4=c4,
+        material_lost_c2=pool['material_count']-c2['material_count'],
+        material_lost_c4=direction['material_count']-c4['material_count'],primary_loss=loss)
+
+
+def _init_screening_label(job):
+    import pickle,time
+    from mrta_search.direction import optimize_directions_with_initial_feasibility
+    from mrta_search.pipeline import decision_family
+    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    state_id,context_blob,pool_blob,c2,c4=job
+    context=pickle.loads(context_blob);pool=pickle.loads(pool_blob);cfg=_range_config('D')
+    state_cert=certify_schedule(context['solution'],context['schedule'],cfg,scope=FORMAL_SCOPE_V2)
+    if not state_cert.certified: raise ValueError(state_cert.errors)
+    evaluator=FormalReferenceEvaluator(FORMAL_SCOPE_V2);rows=[];started=time.perf_counter();calls=0
+    for index,candidate in enumerate(pool):
+        sol=candidate.solution;identity=sol.canonical_hash
+        tick=time.perf_counter();direction=optimize_directions_with_initial_feasibility(sol,cfg)
+        dp_s=time.perf_counter()-tick
+        row=dict(index=index,identity=identity,c2=identity in c2,c4=identity in c4,
+            family=decision_family(candidate),direction_feasible=direction.total_empty_travel is not None,
+            direction_status=direction.status.value,directions=direction.directions,direction_s=dp_s,status='DIRECTION_INFEASIBLE',
+            cmax=None,reference_s=0.,certifier_s=0.,diagnostics=list(direction.diagnostics))
+        if row['direction_feasible']:
+            tick=time.perf_counter();calls+=1
+            try:
+                schedule=evaluator(sol,cfg,orientations={r:direction.directions[r] for r in range(4)})
+                row.update(status=schedule.status.value,diagnostics=list(schedule.diagnostics))
+                row['reference_s']=time.perf_counter()-tick
+                if schedule.status.value=='FEASIBLE':
+                    tick=time.perf_counter();cert=certify_schedule(sol,schedule,cfg,scope=FORMAL_SCOPE_V2)
+                    row['certifier_s']=time.perf_counter()-tick
+                    row.update(status='FEASIBLE_CERTIFIED' if cert.certified else 'NUMERIC_FAILURE',
+                        cmax=schedule.cmax if cert.certified else None,certification_errors=list(cert.errors))
+            except (ArithmeticError,OverflowError,ValueError) as exc:
+                row.update(status='NUMERIC_FAILURE',diagnostics=[str(exc)],reference_s=time.perf_counter()-tick)
+        row['gain']=None if row['cmax'] is None else (context['metrics'].cmax-row['cmax'])/context['metrics'].cmax
+        rows.append(row)
+    return dict(state_id=state_id,rows=rows,offline_reference_calls=calls,offline_elapsed_s=time.perf_counter()-started,
+        summary=_screening_loss_summary(rows,context['metrics'].cmax))
+
+
+
+def _init_screening_init(job):
+    from dataclasses import replace
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    entry,variant,ppo=job;cfg=_range_config('D');parents=_range_parents(entry,Path(ppo))
+    search=replace(_range_search_config(budget=None,iterations=0),
+        initialization_clearance_aware=variant=='IMPROVED')
+    with _Small30Telemetry() as trace:
+        result=run_sa_oi_alns_v2(parents,cfg,search,seed=20261101,
+            source_commit='LOCAL_INIT_EQUAL_BUDGET_DIAGNOSIS',allow_unverified_source=True,observer=trace)
+    init=result.initialization
+    details=None if init.solution is None else _small30_solution_details(
+        init.solution,init.schedule,result.best_metrics,cfg)
+    return dict(instance=entry['label'],variant=variant,N=len(parents),workbook=entry['relative_path'],
+        sheet=entry['sheet_name'],certified=bool(result.final_certification and result.final_certification.certified),
+        first_certified=trace.first_init,chosen=details,strategy=init.winning_strategy,
+        fallback=init.winning_strategy=='RAIL_SERIAL_BOOTSTRAP',init_time_s=result.stats.init_time,
+        total_elapsed_s=result.runtime,reference_calls=result.stats.init_reference_calls,
+        construction_attempts=result.stats.construction_attempts,core_mask=_RANGE_CORE_MASK,
+        references=trace.references,attempts=[dict(index=a.construction_index,strategy=a.strategy,
+            duplicate=a.duplicate,direction_status=None if a.directions is None else a.directions.status.value,
+            status=None if a.schedule is None else a.schedule.status.value,
+            cmax=None if a.schedule is None else a.schedule.cmax,diagnostics=list(a.diagnostics),
+            certified=bool(a.certification and a.certification.certified)) for a in init.attempts])
+
+
+def _init_screening_run(job):
+    entry,seed,variant,ppo=job
+    row=_small30_worker((entry,seed,'D',ppo,0,variant=='IMPROVED'))
+    row.update(instance=entry['label'],variant=variant,tier='INITIALIZATION_DEVELOPMENT')
+    return row
+
+
+
+def _init_screening_search_lines(db):
+    from statistics import mean,median
+    runs=[json.loads(r[0]) for r in db.execute("SELECT result FROM results WHERE kind='search60' ORDER BY id")]
+    decision=next((json.loads(r[0]) for r in db.execute("SELECT result FROM results WHERE kind='decision' AND id='production'")),{})
+    lines=['## 16次真实60秒对比','',
+        '零搜索可行性与预算全部通过，因此保留S2退化风险，继续按既定四实例×两个新seed×两个variant实际运行。没有用旧结果代替BASELINE。每个worker绑定独立物理核；两个variant按实例/seed交替提交，均使用单进程原生60秒预算。初始化计入60秒；唯一算法差异是第五初始化构造。',
+        f'实际完成{len(runs)}/16。采用native best-event截止60秒的Cmax，所选解运行后再次独立认证，overshoot final值不用于比较。严格Cmax更新数排除等Cmax次级指标更新。16次完整逐run结果保存在SQLite results/search60。','',
+        '|实例|seed|variant|初始化Cmax|Cmax@60|搜索下降s|初始化s|完整迭代≤60|accepted≤60|严格Cmax更新≤60|valid candidate比例|',
+        '|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+    for r in runs:
+        events=[float(c) for t,c in r['best_events'] if t<=60.]
+        strict=sum(b<a-1e-9 for a,b in zip(events,events[1:]))
+        count=r['counters_at60'];initial_cmax=r['chosen_initial']['cmax']
+        lines.append(f"|{r['instance']}|{r['seed']}|{r['variant']}|{initial_cmax:.2f}|{r['cmax_at60']:.2f}|{initial_cmax-r['cmax_at60']:.2f}|{r['init_time_s']:.3f}|{count['iterations']}|{count['accepted_moves']}|{strict}|{r['candidate_valid_rate_at60']*100:.2f}%|")
+    lines += ['', '|实例|seed|variant|@60四机器人process load s|负载差s|init ref / 总ref≤60|FEASIBLE/DEADLOCK/INFEASIBLE/NUMERIC≤60|认证@60|runtime / overshoot s|',
+        '|---|---:|---|---|---:|---:|---|---|---|']
+    for r in runs:
+        q=r['at60'];loads='/'.join(f'{x:.2f}' for x in q['process_loads']);statuses=r['reference_status_counts_at60']
+        counts='/'.join(str(statuses.get(k,0)) for k in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE'))
+        lines.append(f"|{r['instance']}|{r['seed']}|{r['variant']}|{loads}|{q['process_imbalance']:.2f}|{r['init_reference_calls']} / {r['reference_calls_at60']}|{counts}|{'是' if r['certified_at60'] else '否'}|{r['elapsed_s']:.3f} / {r['overshoot_s']:.3f}|")
+    lines += ['', '|实例|seed|BASELINE Cmax@60|IMPROVED Cmax@60|绝对差s|相对差|', '|---|---:|---:|---:|---:|---:|']
+    paired=[]
+    for label in ('I3','S1','S2','N55'):
+        for seed in (20261101,20261102):
+            a=next((r for r in runs if r['instance']==label and r['seed']==seed and r['variant']=='BASELINE'),None)
+            b=next((r for r in runs if r['instance']==label and r['seed']==seed and r['variant']=='IMPROVED'),None)
+            if a is None or b is None:continue
+            delta=b['cmax_at60']-a['cmax_at60'];relative=delta/a['cmax_at60']*100.
+            paired.append(dict(instance=label,seed=seed,delta=delta,relative=relative))
+            lines.append(f"|{label}|{seed}|{a['cmax_at60']:.2f}|{b['cmax_at60']:.2f}|{delta:+.2f}|{relative:+.2f}%|")
+    if paired:
+        wins=sum(r['delta'] < -1e-8 for r in paired);losses=sum(r['delta'] > 1e-8 for r in paired)
+        lines += ['',f"全部{len(paired)}对：{wins}改善 / {len(paired)-wins-losses}持平 / {losses}恶化；绝对差均值{mean(r['delta'] for r in paired):+.2f}s、中位数{median(r['delta'] for r in paired):+.2f}s；相对差均值{mean(r['relative'] for r in paired):+.2f}%、中位数{median(r['relative'] for r in paired):+.2f}%。这些规模不能混称为同一个SMALL结论。",'',
+            '|实例|两个seed相对差均值|两个seed绝对差均值s|','|---|---:|---:|']
+        for label in ('I3','S1','S2','N55'):
+            rows=[r for r in paired if r['instance']==label]
+            if rows:lines.append(f"|{label}|{mean(r['relative'] for r in rows):+.2f}%|{mean(r['delta'] for r in rows):+.2f}|")
+    lines += ['', '生产决定：'+decision.get('reason','等待全部16次结果，不提前推荐策略。'),'',
+        'S1改进初始化两个seed均完成19次迭代、global-best更新=0、C4认证=0，@60 Cmax等于初始化Cmax。其reference（含初始化）各有41个DEADLOCK/1个FEASIBLE，不能将初始化下降当作ALNS搜索提升；未对这些新trajectory状态另做全池标注，不能据选中项推断全池无好候选。',
+        'S1原初始化的固定池诊断与初始化对比是两个问题：新初始化带来的trajectory变化不改变已测得的C2/C4漏选事实，不能把初始化收益包装为排序器已修复。','']
+    return lines
+
+
+def _init_screening_report(root,db):
+    import pickle
+    from collections import Counter
+    def results(kind):
+        return [json.loads(r[0]) for r in db.execute('SELECT result FROM results WHERE kind=? ORDER BY id',(kind,))]
+    screenings=results('screening');initial=results('initialization');trajectories=results('trajectory')
+    labels=[json.loads(r[0]) for r in db.execute('SELECT result FROM labels')]
+    entries=_init_screening_entries(root)
+    validation=results('validation')[0]
+    lines=['# 初始化鲁棒性与S1筛选诊断（0.5 m开发域）','',
+        '结论：S1主要在C2流失真实改善，C4也存在独立漏选。空间分界初始化原型修复了I3串行退化并改善S1初始化，但使S2初始化恶化43.95%，后续已执行16次真实60秒配对。heuristic C2/C4保持原版；生产初始化决定见后文。','',
+        '## 实际改动','',
+        '- 在既有第五个RAIL_MONOTONE_BALANCED构造内加入可选空间分界：若存在满足左右任务X包络间距≥interference_dx的非空分区，选择其中加工负载最均衡者；否则沿用原分界。共享焊缝上下轨分配、WHOLE/mandatory Y选择及方向算法均保持原规则。',
+        '- `SearchConfig.initialization_clearance_aware=False`为默认；显式True才启用CLEARANCE_BALANCED_BOOTSTRAP。保留原版消融。没有第六个正常构造，没有额外reference上限。',
+        '- 复用run_ppo_smoke.py的`--init-screening capture/label/init/run/report`入口；固定状态、完整候选、标签、零搜索结果保存在唯一SQLite。未新建runner、protocol、manifest或hash系统。',
+        '- 全部采用delta_x=delta_y=0.50、最短子段0.20、干涉距离0.50；M192=144+48、Kdp8/Kref2/Kref_total4、原SA、原family policy、TWO_OPT_STAR OFF、B32及独立certifier。共享覆盖[5.5,6.5]仍是任务层假设，未进行URDF/IK验证。','',
+        '## 固定实例与状态规则','',
+        '全部经既有角色清单检查，仅使用V2_MODEL_DEVELOPMENT_CONSUMED。物理目录名ID_TEST不代表角色为封存测试；S1/S2所在workbook在清单中的角色确实为已消耗development。N55按既有静态选择序号最小的MEDIUM固定，未读取Cmax挑选。','',
+        '|实例|实际N|workbook|sheet|','|---|---:|---|---|']
+    for e in entries:
+        n=26 if e['label']=='I3' else 55 if e['label']=='N55' else 35
+        lines.append(f"|{e['label']}|{n}|{e['relative_path']}|{e['sheet_name']}|")
+    lines += ['', 'S1使用20261081、20261083，各在第2、第8次已完成迭代后的current accepted state，捕获紧接着的原生生成/筛选迭代（按1起算为第3、第9次）。选择不依赖Cmax或候选标签。保存了实际solution、directions、schedule、current Cmax、seed、iteration、生成seed、SA随机状态、温度、自适应权重/记录、完整valid unique pool及C2/C3/C4。原始捕获的adaptive快照位于selection时，已明确记录；生成只追加LNS选择历史，权重与boundary时一致。后续observer实现已在boundary冻结对象。全池来自真实运行，没有由历史最终解推断或伪造重放。', '',
+        '|seed|完成迭代|状态时间s|current Cmax|valid unique|pool最优改善|C2最优改善|direction通过|direction后最优改善|C4最优改善|material数量 pool/C2/C4|',
+        '|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|']
+    def gain(value):return '无认证候选' if value is None else f'{value*100:.2f}%'
+    for result in screenings:
+        sid=result['state_id'];ctx=pickle.loads(db.execute('SELECT context FROM states WHERE id=?',(sid,)).fetchone()[0]);q=result['summary']
+        lines.append(f"|{ctx['seed']}|{ctx['iteration']}|{ctx['elapsed']:.3f}|{q['current_cmax']:.2f}|{q['pool']['count']}|{gain(q['pool']['best_gain'])}|{gain(q['c2']['best_gain'])}|{q['direction']['count']}/8|{gain(q['direction']['best_gain'])}|{gain(q['c4']['best_gain'])}|{q['pool']['material_count']}/{q['c2']['material_count']}/{q['c4']['material_count']}|")
+    total=Counter(r['status'] for r in labels);c2=[r for r in labels if r['c2']];c4=[r for r in labels if r['c4']]
+    lines += ['', '## S1各阶段的真实损失','',
+        'material improvement严格按该current accepted state的(Cs−Cc)/Cs≥0.005，未混用global-best。全池上限是当前direction+B32产生并独立认证的上限，不是数学最优；DEADLOCK仅表示该有界调度没有找到解。','',
+        '|阶段|候选数|认证FEASIBLE|DEADLOCK|direction-infeasible|INFEASIBLE|NUMERIC_FAILURE|material|',
+        '|---|---:|---:|---:|---:|---:|---:|---:|']
+    for name,rows in [('完整valid unique pool',labels),('C2 Top8',c2),('direction-feasible C2',[r for r in c2 if r['direction_feasible']]),('C4 Top2',c4)]:
+        count=Counter(r['status'] for r in rows);material=sum(r['gain'] is not None and r['gain']>=.005 for r in rows)
+        lines.append(f"|{name}|{len(rows)}|{count['FEASIBLE_CERTIFIED']}|{count['DEADLOCK']}|{count['DIRECTION_INFEASIBLE']}|{count['INFEASIBLE']}|{count['NUMERIC_FAILURE']}|{material}|")
+    lines += ['',
+        '- Generation：四个池均有8–15个认证material候选，最佳改善9.01%–11.96%。本次四状态的失败不能归因于生成器完全没有好候选，也不能据此保证整条trajectory始终有好候选。',
+        '- C2：44个material仅保留3个，漏掉41个（93.18%）。20261081两个状态全部漏掉；20261083两个状态保留了全池最优候选。按候选数量capture为6.82%，这与按最佳改善幅度衡量的capture不同。',
+        '- Direction：32个C2候选中29个通过，3个direction-infeasible不进入C4。C2认证候选的改善上限与direction-feasible C2上限相同；这3个不能记为C4排序损失。',
+        '- C4：C2保留的3个material只选中1个。20261083早期状态丢掉2个，包括全池最佳10.13%改善；中期状态保住11.96%改善。其余两个状态C2已经没有material，不向C4归责。按条件候选数量capture为33.33%。',
+        '- Reference：direction-feasible全池297/422认证（70.38%），C2中5/29（17.24%），C4中1/8（12.50%）；C4其余7个均DEADLOCK。这说明筛选后的集合强烈偏向当前B32难以排出的候选，不是整个池都没有可行改善。C2的24个DEADLOCK诊断共出现31条同轨机器人阻塞关系；常涉及WELD/POST停留及MOVE冲突，没有把DEADLOCK称为绝对不可行，也未修改调度器。',
+        '- 结构：C2的DEADLOCK含16个STRUCTURAL、4个TARGET_Y、3个TARGET_WHOLE、1个TARGET_X；C4的DEADLOCK含4个STRUCTURAL、2个TARGET_WHOLE、1个TARGET_X。损失不限于新增外侧拆分。',
+        '- 四个池的8个C4候选在线与离线状态、Cmax逐项完全一致。离线原始标签独立计时/计数，未使用旧0.2域标签。','',
+        '|固定状态|离线reference calls|离线wall-clock s（各工作进程）|', '|---|---:|---:|']
+    for r in screenings:lines.append(f"|{r['state_id']}|{r['offline_reference_calls']}|{r['offline_elapsed_s']:.3f}|")
+    lines += ['',f"离线合计{sum(r['offline_reference_calls'] for r in screenings)}次reference；进程耗时之和{sum(r['offline_elapsed_s'] for r in screenings):.3f}s，四池并行，不能解释为单进程总墙钟。在线轨迹另行计数如下；其Cmax只用于说明本次真实捕获运行，不与旧历史结果充当配对比较。真实wall-clock截止会使完成迭代数变化，不能保证与旧60秒终点相同。",'',
+        '|seed|本次Cmax@60|总runtime s|overshoot s|总完成迭代（含overshoot）|在线reference calls（含初始化与overshoot）|',
+        '|---:|---:|---:|---:|---:|---:|']
+    for r in trajectories:lines.append(f"|{r['seed']}|{r['cmax_at60']:.2f}|{r['runtime']:.3f}|{max(0,r['runtime']-60):.3f}|{r['iterations']}|{r['online_reference_calls']}|")
+    lines += ['', '## 初始化：实际失败原因与零搜索比较','',
+        '另有4次原版零搜索失败原因诊断，合计24次初始化reference，独立保存在results/initial_failure；不混入422次全池离线标注、8次初始化对比或16次60秒配对的计数。',
+        '原版I3：LOAD_FIRST、X_ORDER_AWARE及RAIL_MONOTONE均被B32判DEADLOCK；RAIL_BALANCED/SPATIAL_SPREAD在首任务同轨顺序检查失败。单调构造下轨左右X包络重叠0.712m，方向备用尝试仍失败，最后R0/R2串行fallback认证。S1也有首任务顺序失败与同轨阻塞；仅按四机器人加工负载平衡不足以保证有可排出的路线。','',
+        '每个variant仍最多5个正常构造，Kinit_ref=5；唯一第五构造DEADLOCK时仍最多4次原有有界方向reference尝试，串行fallback仍最多1次。所以“5”不是总reference硬上限；原规则总上界是5+4+1。此次没有增加任何上限，失败构造/重复构造按原规则跳过。所有接受解经过canonicalization、direction、B32及独立certifier。零搜索使用同一组实例和固定seed20261101（构造不读取seed），初始化耗时来自原计时器，首认证时间从run开始计。','',
+        '|实例|variant|认证|选中Cmax|四机器人process load s|负载差s|串行fallback|reference calls|首认证s|初始化s|总runtime s|',
+        '|---|---|---|---:|---|---:|---|---:|---:|---:|---:|']
+    for r in initial:
+        q=r['chosen'];loads='/'.join(f'{x:.2f}' for x in q['process_loads'])
+        lines.append(f"|{r['instance']}|{r['variant']}|{'是' if r['certified'] else '否'}|{q['cmax']:.2f}|{loads}|{q['process_imbalance']:.2f}|{'是' if r['fallback'] else '否'}|{r['reference_calls']}|{r['first_certified']['elapsed']:.3f}|{r['init_time_s']:.3f}|{r['total_elapsed_s']:.3f}|")
+    lines += ['', '|实例|初始化Cmax配对变化(IMPROVED−BASELINE)|相对变化|', '|---|---:|---:|']
+    for label in ('I3','S1','S2','N55'):
+        a=next(r for r in initial if r['instance']==label and r['variant']=='BASELINE')['chosen']['cmax']
+        b=next(r for r in initial if r['instance']==label and r['variant']=='IMPROVED')['chosen']['cmax']
+        lines.append(f'|{label}|{b-a:+.2f}s|{(b/a-1)*100:+.2f}%|')
+    lines += ['',
+        '8/8零搜索结果认证、NUMERIC_FAILURE=0、独立认证错误=0。I3由只有R0/R2工作变为四机器人工作，Cmax改善39.38%；S1改善23.23%；N55 Cmax相同。但S2为取得空间间隔，使上轨负载分成893.18/2849.41，负载差从728.23增至2042.87，Cmax恶化43.95%。这是空间分界与加工均衡之间的真实权衡，需要检验60秒搜索能否补偿，不是通过增加reference预算获得胜利。',
+        '新构造完全由当前几何和当前0.5合法WHOLE/Y候选独立生成；没有读历史A优秀解或按实例ID/seed特判。历史A重建结果仅保留为旧证据，不作为本次初始化输入。', '',
+        *_init_screening_search_lines(db),
+        '## 测试与明确下一步','',
+        f'完整命令：`D:\\pybullet_test\\.venv\\Scripts\\python.exe -B -m pytest -q -p no:cacheprovider`（DRL项目目录）。**{validation["passed"]} passed in {validation["elapsed_s"]:.2f}s**。覆盖原五槽位/预算、几何独立构造与重复性、0.5目录/mandatory Y/0.2长度、独立认证拒绝不得接受、固定iteration捕获、current-state material边界、direction与numeric不误归责C4、在线/离线调用隔离；既有X固定机器人、同轨/连续干涉与历史数值回归全部通过。','',
+        '没有发现需要绕过或修改正式合法性/调度约束的代码错误。发现的是初始化空间分界策略弱点和C2/C4启发式目标失配；新的prototype也暴露只追求空间分离的负载代价。',
+        '下一步优先做新0.5域C2筛选改进，重点检验如何在原M192/Kdp8内保留认证改善并减少同轨阻塞倾向；C4随后处理已通过C2的漏选。当前不需要扩大候选池或增加operator。初始化后续仍需同时约束空间冲突与负载代价，推荐决定以本轮配对结果为依据。',
+        '四个状态已提供“有真实好候选而排序漏掉”的必要证据，支持将来有针对性地采集0.5域C2/C4标签；覆盖范围仍不足以直接启动大规模训练。本轮未采集新的MLP训练集、未训练MLP/GAT，旧14,893标签与所有历史实验未改动。','']
+    (root/'docs/INITIALIZATION_AND_S1_SCREENING_FIX.md').write_text('\n'.join(lines),encoding='utf-8')
+    print('Report complete: S1 screening and actual initialization/search comparisons.',flush=True)
+
+def _init_screening_main(action,workers):
+    import sqlite3,pickle,multiprocessing
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    from mrta_ranker.dataset import physical_core_affinities
+    root=Path(__file__).resolve().parents[1];ppo=root.parent/'ppo'
+    entries=_init_screening_entries(root)
+    db=sqlite3.connect(root/'data/development/s1_screening_diagnostic.sqlite')
+    db.execute('CREATE TABLE IF NOT EXISTS states (id TEXT PRIMARY KEY, context BLOB, pool BLOB, c3 BLOB, c2 TEXT, c4 TEXT, online_c4 TEXT)')
+    db.execute('CREATE TABLE IF NOT EXISTS labels (state_id TEXT, candidate_index INTEGER, result TEXT, PRIMARY KEY(state_id,candidate_index))')
+    db.execute('CREATE TABLE IF NOT EXISTS results (kind TEXT, id TEXT, result TEXT, PRIMARY KEY(kind,id))')
+    db.commit()
+    def save(kind,key,value):
+        db.execute('INSERT OR REPLACE INTO results VALUES (?,?,?)',(kind,str(key),json.dumps(value,ensure_ascii=False)));db.commit()
+    masks=physical_core_affinities()[:workers];context=multiprocessing.get_context('spawn');queue=context.Queue()
+    for mask in masks:queue.put(mask)
+    if action=='capture':
+        done={int(r[0]) for r in db.execute("SELECT id FROM results WHERE kind='trajectory'")}
+        jobs=[(entries[1],seed,str(ppo)) for seed in (20261081,20261083) if seed not in done]
+        with ProcessPoolExecutor(max_workers=min(len(masks),2),mp_context=context,initializer=_range_worker_init,initargs=(queue,)) as pool:
+            for result in pool.map(_init_screening_capture,jobs):
+                for state in result.pop('states'):
+                    boundary=pickle.loads(state['context']);key=f"{result['seed']}:{boundary['iteration']}"
+                    db.execute('INSERT INTO states VALUES (?,?,?,?,?,?,?)',(key,state['context'],state['pool'],state['c3'],json.dumps(state['c2']),json.dumps(state['c4']),json.dumps(state['online_c4'])))
+                save('trajectory',result['seed'],result)
+                print(f"S1 native trajectory {result['seed']}: captured, Cmax@60={result['cmax_at60']:.2f}",flush=True)
+    elif action=='label':
+        done={r[0] for r in db.execute("SELECT id FROM results WHERE kind='screening'")}
+        jobs=[(r[0],r[1],r[2],json.loads(r[3]),json.loads(r[4])) for r in db.execute('SELECT id,context,pool,c2,c4 FROM states') if r[0] not in done]
+        with ProcessPoolExecutor(max_workers=len(masks),mp_context=context,initializer=_range_worker_init,initargs=(queue,)) as pool:
+            for result in pool.map(_init_screening_label,jobs):
+                rows=result.pop('rows')
+                db.executemany('INSERT INTO labels VALUES (?,?,?)',[(result['state_id'],r['index'],json.dumps(r)) for r in rows])
+                save('screening',result['state_id'],result)
+                print(json.dumps(result,ensure_ascii=False),flush=True)
+    elif action in ('init','run'):
+        kind='initialization' if action=='init' else 'search60'
+        done={r[0] for r in db.execute('SELECT id FROM results WHERE kind=?',(kind,))}
+        if action=='run':
+            checks=[json.loads(r[0]) for r in db.execute("SELECT result FROM results WHERE kind='initialization'")]
+            if len(checks)!=8 or not all(r['certified'] for r in checks):
+                raise ValueError('Complete the eight certified zero-search comparisons before search60')
+            i3=next(r for r in checks if r['instance']=='I3' and r['variant']=='IMPROVED')
+            if i3['fallback'] or not all(x>0 for x in i3['chosen']['process_loads']):
+                raise ValueError('I3 four-robot repair was not effective; search60 not justified')
+        jobs=[]
+        for i,entry in enumerate(entries):
+            seeds=(20261101,) if action=='init' else (20261101,20261102)
+            for j,seed in enumerate(seeds):
+                variants=('BASELINE','IMPROVED') if (i+j)%2==0 else ('IMPROVED','BASELINE')
+                for variant in variants:
+                    key=f"{entry['label']}:{seed}:{variant}"
+                    if key not in done:
+                        job=(entry,variant,str(ppo)) if action=='init' else (entry,seed,variant,str(ppo))
+                        jobs.append((key,job))
+        worker=_init_screening_init if action=='init' else _init_screening_run
+        with ProcessPoolExecutor(max_workers=len(masks),mp_context=context,initializer=_range_worker_init,initargs=(queue,)) as pool:
+            futures={pool.submit(worker,job):key for key,job in jobs}
+            for future in as_completed(futures):
+                result=future.result();save(kind,futures[future],result)
+                print(f"{kind} {futures[future]} certified={result.get('certified',result.get('certified_at60'))} Cmax={result.get('cmax_at60',result.get('chosen',{}).get('cmax'))}",flush=True)
+    else:
+        _init_screening_report(root,db)
+    db.close();return 0
+
+
 def main() -> int:
     import sys
+    if "--init-screening" in sys.argv:
+        current=argparse.ArgumentParser(description="Current-domain initialization and S1 diagnosis")
+        current.add_argument("--init-screening",choices=("capture","label","init","run","report"),required=True)
+        current.add_argument("--workers",type=int,default=4)
+        args=current.parse_args()
+        return _init_screening_main(args.init_screening,args.workers)
     if "--small30" in sys.argv:
         current=argparse.ArgumentParser(description="N30-39 development-only range recheck")
         current.add_argument("--small30",choices=("select","run","report","i3"),required=True)

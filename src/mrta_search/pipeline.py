@@ -86,6 +86,7 @@ class SearchConfig:
     construction_budget: int = 4
     kinit_ref: int = 2
     feasibility_bootstrap_budget: int = 1
+    initialization_clearance_aware: bool = False
     m_atomic: int | None = None
     m_lns: int = 16
     kref_total: int = 4
@@ -766,6 +767,7 @@ def run_bounded_sa_oi(
             kinit_ref=search_config.kinit_ref,
             feasibility_bootstrap_budget=search_config.feasibility_bootstrap_budget,
             portfolio=True,
+            clearance_aware=search_config.initialization_clearance_aware,
             reference_evaluator=reference_evaluator,
             scope=scope,
         )

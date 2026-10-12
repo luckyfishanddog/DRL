@@ -270,7 +270,8 @@ def test_small30_checkpoint_never_uses_overshoot_even_for_equal_cmax(monkeypatch
     assert runner._small30_pick_snapshot([after],100.) is None
 
 
-def test_small30_real_initial_certification_and_counter_hook_restoration(monkeypatch):
+@pytest.mark.parametrize("clearance_aware",[False,True])
+def test_small30_real_initial_certification_and_counter_hook_restoration(monkeypatch,clearance_aware):
     from mrta_reference.model import ParentWeld
     from mrta_search.stats import SearchStats
     runner=_small30_runner(monkeypatch)
@@ -281,7 +282,7 @@ def test_small30_real_initial_certification_and_counter_hook_restoration(monkeyp
     monkeypatch.setattr(runner,'_RANGE_CORE_MASK',1,raising=False)
     original=SearchStats.record_reference
     entry=dict(selection_ordinal=1,instance_id='unit::sheet',relative_path='unit.xlsx',sheet_name='sheet')
-    row=runner._small30_worker((entry,20261081,'D','.',0))
+    row=runner._small30_worker((entry,20261081,'D','.',0,clearance_aware))
     assert SearchStats.record_reference is original
     assert row['certified_at60'] and row['final_certified']
     assert row['first_certified_initial']['status']=='FEASIBLE'
@@ -305,3 +306,78 @@ def test_small30_report_append_preserves_historical_results(monkeypatch,tmp_path
               candidates=[],selection_rule='unit',entries=[],runs=[],i3_diagnostics=[])
     runner._small30_write(report,data)
     assert report.read_text(encoding='utf-8').split('\n\n## SMALL_30_39复核',1)[0]==prefix
+
+
+
+def test_screening_material_target_uses_current_accepted_state_and_exact_boundary(monkeypatch):
+    r=_small30_runner(monkeypatch)
+    def row(cmax,c2=True,c4=False):
+        return dict(cmax=cmax,status='FEASIBLE_CERTIFIED',c2=c2,c4=c4,direction_feasible=True)
+    summary=r._screening_loss_summary([row(99.501),row(99.5),row(90.,False)],100.)
+    assert summary['pool']['material_count']==2
+    assert summary['c2']['material_count']==1
+    assert summary['material_lost_c2']==1 and summary['material_lost_c4']==1
+    assert summary['primary_loss']=='C4 screening'
+    # Same labels against a better global-best would incorrectly erase both gains.
+    assert r._screening_loss_summary([row(99.5)],90.)['pool']['material_count']==0
+
+
+@pytest.mark.parametrize('rows,expected',[
+    ([dict(status='DEADLOCK',cmax=None,c2=True,c4=True,direction_feasible=True)],'generation/reference'),
+    ([dict(status='FEASIBLE_CERTIFIED',cmax=90.,c2=False,c4=False,direction_feasible=True)],'C2 screening'),
+    ([dict(status='FEASIBLE_CERTIFIED',cmax=90.,c2=True,c4=False,direction_feasible=True)],'C4 screening'),
+    ([dict(status='FEASIBLE_CERTIFIED',cmax=90.,c2=True,c4=True,direction_feasible=True)],'captured C4'),
+])
+def test_screening_stage_attribution_follows_actual_labels(monkeypatch,rows,expected):
+    assert _small30_runner(monkeypatch)._screening_loss_summary(rows,100.)['primary_loss'].startswith(expected)
+
+
+def test_screening_direction_and_numeric_failures_are_not_c4_ranking_errors(monkeypatch):
+    r=_small30_runner(monkeypatch)
+    rows=[dict(status='DIRECTION_INFEASIBLE',cmax=None,c2=True,c4=False,direction_feasible=False),
+          dict(status='NUMERIC_FAILURE',cmax=None,c2=True,c4=True,direction_feasible=True),
+          dict(status='FEASIBLE_CERTIFIED',cmax=90.,c2=False,c4=False,direction_feasible=True)]
+    s=r._screening_loss_summary(rows,100.)
+    assert s['c2']['count']==2 and s['direction']['count']==1
+    assert s['c4']['statuses']=={'NUMERIC_FAILURE':1}
+    assert s['material_lost_c4']==0 and s['primary_loss']=='C2 screening'
+
+
+def test_native_pool_capture_freezes_context_and_only_uses_predetermined_iterations(monkeypatch):
+    import pickle
+    from types import SimpleNamespace
+    r=_small30_runner(monkeypatch);capture=r._S1PoolCapture(123)
+    adaptive={'weights':[1.]}
+    boundary=dict(iteration=2,elapsed=5.,adaptive=adaptive,metrics=SimpleNamespace(cmax=100.))
+    capture('boundary',boundary);adaptive['weights'].append(9.)
+    candidate=SimpleNamespace(solution=SimpleNamespace(canonical_hash='a'))
+    capture('selection',((candidate,),(candidate,)))
+    capture('iteration_evaluation',((),(),None))
+    state=pickle.loads(capture.states[0]['context'])
+    assert state['adaptive']['weights']==[1.]
+    assert state['generation_seed']==123+2*65537
+    capture('boundary',dict(boundary,iteration=3))
+    capture('selection',((candidate,),()));capture('iteration_evaluation',((),(),None))
+    assert len(capture.states)==1
+
+
+def test_offline_labels_do_not_modify_online_reference_stats(monkeypatch):
+    import pickle
+    from types import SimpleNamespace
+    from mrta_reference.model import ParentWeld,ScientificConfig
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    from mrta_search.stats import SearchStats
+    r=_small30_runner(monkeypatch)
+    parents=(ParentWeld('p',(1.,9.),(2.,9.)),)
+    search=r._range_search_config(budget=None,iterations=0)
+    result=run_sa_oi_alns_v2(parents,ScientificConfig(),search,seed=1,
+        source_commit='UNIT_OFFLINE_SEPARATION',allow_unverified_source=True)
+    before=result.stats.init_reference_calls+result.stats.nref
+    context=dict(solution=result.best_solution,schedule=result.best_schedule,metrics=result.best_metrics)
+    candidate=SimpleNamespace(solution=result.best_solution)
+    monkeypatch.setattr('mrta_search.pipeline.decision_family',lambda c:'TARGET_WHOLE')
+    labeled=r._init_screening_label(('unit',pickle.dumps(context),pickle.dumps((candidate,)),[],[]))
+    assert labeled['offline_reference_calls']==1 and labeled['offline_elapsed_s']>0.
+    assert labeled['rows'][0]['status']=='FEASIBLE_CERTIFIED'
+    assert result.stats.init_reference_calls+result.stats.nref==before
