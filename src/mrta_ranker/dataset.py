@@ -243,6 +243,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
             welds=sorted((op for op in best['schedule'].operations if op.robot_id==robot and op.kind is OperationKind.WELD),key=lambda op:op.sequence_index)
             empty_by_robot.append(sum(math.dist(left.end,right.start)/config.empty_speed for left,right in zip(welds,welds[1:])))
             waiting_by_robot.append(sum(op.duration for op in best['schedule'].operations if op.robot_id==robot and op.kind is OperationKind.WAIT))
+    split_counts=None if best is None else dict(Counter(pattern.kind.value for pattern in best['solution'].patterns))
     strict_improvements=strict_cmax_improvement_count(st.best_events)
     record={'initial_cmax':None if cap.initial is None else cap.initial['metrics'].cmax,
         'Cmax_at_60':checkpoint_cmax(result),'final_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
@@ -256,6 +257,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'best60_empty_travel':None if best is None else best['metrics'].total_empty_travel,
         'best60_waiting':None if best is None else best['metrics'].total_waiting,
         'best60_empty_travel_by_robot':empty_by_robot,'best60_waiting_by_robot':waiting_by_robot,
+        'best60_split_counts':split_counts,
         'numeric_failure':st.n_numeric_failure+st.init_status_counts.get('NUMERIC_FAILURE',0),
         'actual_runtime':result.runtime,'overshoot':st.overshoot,**timings,
         'ranker_inference_seconds':0.0 if ranker is None else ranker.inference_seconds,
@@ -272,6 +274,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'search_reference_status':dict(Counter(st.reference_status_sequence)),
         'status':result.status.value,'termination_reason':result.termination_reason,
         'first_boundary_elapsed':cap.first_boundary_elapsed,
+        'time_to_first_certified':None if cap.initial is None else cap.initial['elapsed'],
         'missing_state_stages':[stage for stage,_ in STAGES if stage not in cap.snapshots]}
     record['valid_60s_outcome']=not record['numeric_failure'] and record['certified'] and record['Cmax_at_60'] is not None
     return record,cap.snapshots

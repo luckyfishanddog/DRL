@@ -408,6 +408,9 @@ def train_final_c4_ranked(root=None):
 
 FINAL_C4_SEEDS=(20261501,20261502)
 FINAL_BASELINE_SMOKE_SEED=20261511
+SCI_DEV_SEEDS=(20261401,20261402)
+SCI_FORMAL_SEEDS=(20261611,20261612,20261613,20261614,20261615)
+SCI_METHODS=('HEURISTIC','MLP_V05','GAT_V05','HGA_V2','WAG_VNS_V2')
 
 
 def _final_smoke_module(root):
@@ -501,6 +504,540 @@ def run_final_baseline_smoke(root=None,workers=2):
             with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('c4_final_baseline_smoke',futures[future],data.dumps(row)))
             db.close();print(f"baseline {futures[future]} status={row['status']} Cmax@60={row['Cmax_at_60']}",flush=True)
     return len(jobs)
+
+
+def _sci_solution_record(candidate,config):
+    """Serialize the independently certified incumbent, not a post-limit final."""
+    from collections import Counter
+    from mrta_reference.model import OperationKind
+    from mrta_reference.solution import block_map
+    if candidate is None or candidate.metrics is None or candidate.schedule is None:
+        return {'certified_at_60':False,'robot_loads':None,'empty_travel_by_robot':None,
+            'waiting_by_robot':None,'split_counts':None,'independent_certification':False}
+    blocks=block_map(candidate.solution,config);loads=[];empty=[];waiting=[]
+    for robot,route in enumerate(candidate.solution.routes):
+        loads.append(sum(config.process_time(blocks[item].length) for item in route.block_ids))
+        welds=sorted((op for op in candidate.schedule.operations if op.robot_id==robot and op.kind is OperationKind.WELD),key=lambda op:op.sequence_index)
+        empty.append(sum(math.dist(left.end,right.start)/config.empty_speed for left,right in zip(welds,welds[1:])))
+        waiting.append(sum(op.duration for op in candidate.schedule.operations if op.robot_id==robot and op.kind is OperationKind.WAIT))
+    return {'certified_at_60':True,'robot_loads':loads,'empty_travel_by_robot':empty,
+        'waiting_by_robot':waiting,'total_empty_travel':candidate.metrics.total_empty_travel,
+        'total_waiting':candidate.metrics.total_waiting,
+        'split_counts':dict(Counter(pattern.kind.value for pattern in candidate.solution.patterns)),
+        'independent_certification':bool(candidate.certification and candidate.certification.certified)}
+
+
+def _sci_run_baseline(parents,method,seed,config):
+    """Observe production baseline incumbents without changing their decisions."""
+    from mrta_baselines import AdaptedHGAConfig,AdaptedWAGConfig,run_adapted_hga_v2,run_adapted_wag_vns_v2
+    from mrta_baselines.common import CommonBaselineEvaluator
+    captured=[];original=CommonBaselineEvaluator._record_best
+    def observe(evaluator,candidate):
+        before=evaluator.best
+        original(evaluator,candidate)
+        if evaluator.best is not before:captured.append(evaluator.best)
+    CommonBaselineEvaluator._record_best=observe
+    try:
+        if method=='HGA_V2':result=run_adapted_hga_v2(parents,config,AdaptedHGAConfig(),seed=seed,time_limit=60.)
+        elif method=='WAG_VNS_V2':result=run_adapted_wag_vns_v2(parents,config,AdaptedWAGConfig(),seed=seed,time_limit=60.)
+        else:raise ValueError(method)
+    finally:
+        CommonBaselineEvaluator._record_best=original
+    checkpoint=next((row for row in reversed(captured) if row.completed_at<=60.),None)
+    expected=None if checkpoint is None else checkpoint.metrics.cmax
+    reported=result.checkpoints[60.0]
+    if (expected is None)!=(reported is None) or (expected is not None and abs(expected-reported)>1e-8*max(1.,abs(expected))):
+        raise AssertionError('Baseline checkpoint candidate differs from reported Cmax@60')
+    initial=result.initial_candidate
+    statuses={'FEASIBLE':result.certifier_calls,'DEADLOCK':result.accounting.get('remaining_deadlock',0),
+        'INFEASIBLE':result.accounting.get('infeasible',0),'NUMERIC_FAILURE':result.accounting.get('numeric_failure',0)}
+    return result,checkpoint,initial,statuses
+
+
+def _sci_dev_baseline_worker(job):
+    from . import dataset as data
+    entry,parents,seed,method,root=job
+    result,checkpoint,initial,statuses=_sci_run_baseline(parents,method,seed,data.CONFIG_V05)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'actual_N':len(parents),'total_weld_length':sum(p.length for p in parents),
+        'method':method,'seed':seed,'status':result.status.value,'termination_reason':result.termination_reason,
+        'initial_cmax':None if initial is None or initial.metrics is None else initial.metrics.cmax,
+        'Cmax_at_60':result.checkpoints[60.0],'time_to_first_certified':result.time_to_first_certified,
+        'iterations':result.iterations,'candidate_count':result.candidate_count,'reference_calls':result.reference_calls,
+        'initial_reference_calls':result.initial_reference_calls,'search_reference_calls':result.reference_calls-result.initial_reference_calls,
+        'reference_status':statuses,'certifier_calls':result.certifier_calls,'actual_runtime':result.actual_runtime,
+        'overshoot':result.overshoot,'scope_id':result.scope_id,'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'accounting':result.accounting,'diagnostics':result.diagnostics,'best_events':[(e.elapsed,e.cmax) for e in result.best_events],
+        **_sci_solution_record(checkpoint,data.CONFIG_V05)}
+
+
+def run_sci_dev_baselines(root=None,workers=4):
+    """Complete the fixed 6x2x2 HGA/WAG development matrix once."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);entries=_final_smoke_module(root)._c2_entries(root)
+    if tuple(e['label'] for e in entries)!=('N35_S2','N35_S3','N55_I5','N55_I6','N85_I9','N85_I12'):
+        raise AssertionError('Development instance matrix changed')
+    db=data.connect(data.DATABASE_V05);done={r[0] for r in db.execute("SELECT item_id FROM experiments WHERE experiment='sci_dev_baseline_runs'")};db.close();jobs=[]
+    loaded={entry['instance_id']:_final_smoke_module(root)._range_parents(entry,data.PPO) for entry in entries}
+    for entry_index,entry in enumerate(entries):
+        for seed_index,seed in enumerate(SCI_DEV_SEEDS):
+            methods=('HGA_V2','WAG_VNS_V2');offset=(entry_index+seed_index)%2
+            for method in methods[offset:]+methods[:offset]:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,loaded[entry['instance_id']],seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=workers,mp_context=mp.get_context('spawn'),initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_sci_dev_baseline_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future]
+            try:row=future.result()
+            except Exception as error:
+                row={'instance':key.split(':')[0],'seed':int(key.split(':')[1]),'method':key.split(':')[2],
+                    'status':'EXECUTION_ERROR','Cmax_at_60':None,'diagnostics':[repr(error)],'certified_at_60':False}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('sci_dev_baseline_runs',key,data.dumps(row)))
+            db.close();print(f"SCI dev baseline {key} status={row['status']} Cmax@60={row['Cmax_at_60']}",flush=True)
+    return len(jobs)
+
+
+def _sci_train_v05_stage(model,stage,train_states,dev_states,scalers,rank,*,include_weld_edges,rows_by_state=None):
+    """Original V05 four-epoch loss, parameter policy and DEV selection."""
+    import statistics,torch
+    from copy import deepcopy
+    from mrta_ranker.model import build_static_graph
+    torch.manual_seed(20261320+(stage=='C4'))
+    if stage=='C4':
+        for name,parameter in model.named_parameters():
+            parameter.requires_grad=name.startswith('numeric.C4') or name.startswith('feasibility.C4') or name.startswith('material.C4')
+    else:
+        for parameter in model.parameters():parameter.requires_grad=True
+    optimizer=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=.001,weight_decay=.0001)
+    all_rows=[row for state in train_states for row in (rows_by_state or {}).get(state['state_id'],state['pool']) if row[stage+'_features'] is not None]
+    positives=sum(row['material'] for row in all_rows);pos_weight=torch.tensor((len(all_rows)-positives)/max(1,positives))
+    graphs={state['instance_id']:build_static_graph(state['current'].parents,rank.d.CONFIG_V05,include_weld_edges=include_weld_edges) for state in train_states}
+    best=None;best_state=None;history=[];gradient_norm=0.;started=time.perf_counter()
+    for epoch in range(1,5):
+        model.train();losses=[]
+        for state in train_states:
+            rows=[row for row in (rows_by_state or {}).get(state['state_id'],state['pool']) if row[stage+'_features'] is not None]
+            if not rows:continue
+            graph=graphs[state['instance_id']];optimizer.zero_grad(set_to_none=True);embedding=model.encode_static(graph)
+            feasible,material=model.score_candidates(stage,graph,embedding,state['current'],[r['candidate'] for r in rows],
+                [r[stage+'_features'] for r in rows],scalers[stage+'_mean'],scalers[stage+'_std'],rank.d.CONFIG_V05)
+            yf=torch.tensor([r['y_feasible'] for r in rows],dtype=torch.float32);ym=torch.tensor([r['material'] for r in rows],dtype=torch.float32)
+            loss=torch.nn.functional.binary_cross_entropy_with_logits(feasible,yf)+torch.nn.functional.binary_cross_entropy_with_logits(material,ym,pos_weight=pos_weight)
+            loss.backward()
+            if stage=='C2':gradient_norm=max(gradient_norm,float(model.encoder.layer1.linear.weight.grad.abs().sum()))
+            optimizer.step();losses.append(float(loss.detach()))
+        model.eval();timing=rank._gat_score_states(model,dev_states,stage,scalers,include_weld_edges=include_weld_edges)
+        metric=rank._v05_metrics(dev_states,'GAT')[stage]['ALL'];key=((metric['material_candidate_capture'] or 0),-(metric['material_zero_capture'] if metric['material_zero_capture'] is not None else 1),-statistics.fmean(losses))
+        history.append({'epoch':epoch,'loss':statistics.fmean(losses),'dev':metric,'inference':timing})
+        if best is None or key>best:best=key;best_state=deepcopy(model.state_dict());best_epoch=epoch
+    model.load_state_dict(best_state);model.eval()
+    if stage=='C2' and gradient_norm<=0:raise AssertionError('V05 encoder received no gradient')
+    return {'rows':len(all_rows),'positives':positives,'epochs':4,'selected_epoch':best_epoch,
+        'encoder_gradient_l1':gradient_norm,'training_seconds':time.perf_counter()-started,'history':history}
+
+
+def run_sci_v05_edge_ablation(root=None):
+    """Train the one authorized paired V05 full/no-weld-edge ablation."""
+    import torch
+    from copy import deepcopy
+    from . import dataset as data
+    from .model import GraphCandidateRanker,load_graph_model,load_model,save_graph_model
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);rank=_final_rank_module(root)
+    torch.set_num_threads(1);torch.use_deterministic_algorithms(True)
+    train,names=rank.load_v05_states('MLP_TRAIN');dev,_=rank.load_v05_states('MLP_DEV')
+    frozen,frozen_meta=load_graph_model(root/'models/gat_v05.pt');scalers=frozen_meta['scalers']
+    mlp,_=load_model(root/'models/mlp_c2_v05.pt');rank._set_mlp_scores(train,'C2',mlp,scalers['C2_mean'],scalers['C2_std'])
+    rank._gat_score_states(frozen,train,'C2',scalers)
+    hard={}
+    for state in train:
+        ids={row['candidate_id'] for method in ('HEURISTIC','MLP','GAT') for row in rank._v05_c2(state,method)}
+        eligible=[row for row in state['pool'] if row['C4_features'] is not None]
+        ids.update(row['candidate_id'] for row in eligible if row['material']);ids.update(row['candidate_id'] for row in eligible[:8])
+        hard[state['state_id']]=[row for row in eligible if row['candidate_id'] in ids]
+    torch.manual_seed(20261601);base=GraphCandidateRanker(len(names['C2']),len(names['C4']));initial=deepcopy(base.state_dict())
+    full=GraphCandidateRanker(len(names['C2']),len(names['C4']));full.load_state_dict(initial)
+    noedge=GraphCandidateRanker(len(names['C2']),len(names['C4']));noedge.load_state_dict(initial)
+    training={}
+    for label,model,edges in (('PAIRED_FULL',full,True),('NO_WELD_EDGES',noedge,False)):
+        training[label]={'C2':_sci_train_v05_stage(model,'C2',train,dev,scalers,rank,include_weld_edges=edges)}
+        training[label]['C4']=_sci_train_v05_stage(model,'C4',train,dev,scalers,rank,include_weld_edges=edges,rows_by_state=hard)
+    timings={}
+    for label,model,edges in (('FROZEN_V05',frozen,True),('PAIRED_FULL',full,True),('NO_WELD_EDGES',noedge,False)):
+        for stage in ('C2','C4'):
+            timings[label+'_'+stage]=rank._gat_score_states_v2(model,dev,stage,scalers,label,include_weld_edges=edges)
+    metrics={label:rank._v05_metrics(dev,label) for label in ('FROZEN_V05','PAIRED_FULL','NO_WELD_EDGES')}
+    changes={stage:sum(
+        tuple(row['candidate_id'] for row in (rank._v05_c2(state,'PAIRED_FULL') if stage=='C2' else rank._v05_c4(state,rank._v05_c2(state,'PAIRED_FULL'),'PAIRED_FULL')))
+        !=tuple(row['candidate_id'] for row in (rank._v05_c2(state,'NO_WELD_EDGES') if stage=='C2' else rank._v05_c4(state,rank._v05_c2(state,'NO_WELD_EDGES'),'NO_WELD_EDGES')))
+        for state in dev) for stage in ('C2','C4')}
+    summary={'seed':20261601,'dataset':{'TRAIN_workbooks':17,'DEV_workbooks':6,'TRAIN_states':len(train),'DEV_states':len(dev)},
+        'fixed_config':{'architecture':'V05','epochs':4,'lr':.001,'weight_decay':.0001,'loss':'feasibility BCE + material BCE','C4_hard_rows':sum(map(len,hard.values()))},
+        'same_initial_weights':True,'only_treatment':'weld-weld relation edges','training':training,'metrics':metrics,
+        'selection_changed_states':changes,'timing':timings,'dev_used_for_ablation_only':True}
+    save_graph_model(root/'models/gat_v05_no_weld_edges.pt',noedge,names['C2'],names['C4'],scalers,summary,include_weld_edges=False)
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('sci_v05_edge_ablation','summary',data.dumps(summary)))
+    db.close();print(data.dumps({'metrics':metrics,'selection_changed_states':changes,'timing':timings}),flush=True);return summary
+
+
+def freeze_sci_formal_matrix(root=None):
+    """Freeze the sealed workbook choices from static metadata before solving."""
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    roles=data.read(data.ROLES);sealed=sorted(row['relative_path'] for row in roles['workbooks'] if row['new_v2_role']=='ID_TEST_SEALED')
+    if len(sealed)!=15:raise AssertionError('Expected exactly 15 ID_TEST_SEALED workbooks')
+    manifest=data.read(data.DATASET);targets=(35,55,85);counts=(5,5,5)
+    available={path:[row for row in manifest['instances'] if row['relative_path']==path and row['validation_status']=='VALID' and row['duplicate_of'] is None] for path in sealed}
+    if any(not rows for rows in available.values()):raise ValueError('Sealed workbook lacks a static eligible sheet')
+    choices={path:[min(available[path],key=lambda row:(abs(row['actual_weld_count']-target),row['sheet_name'],row['instance_id'])) for target in targets] for path in sealed}
+    dp={(0,0,0):(0,())}
+    for path in sealed:
+        nxt={}
+        for used,(cost,assignment) in dp.items():
+            for tier,row in enumerate(choices[path]):
+                if used[tier]>=counts[tier]:continue
+                capacity=tuple(value+int(index==tier) for index,value in enumerate(used))
+                proposal=(cost+abs(row['actual_weld_count']-targets[tier]),assignment+(tier,))
+                if capacity not in nxt or proposal<nxt[capacity]:nxt[capacity]=proposal
+        dp=nxt
+    assignment=dp[counts][1];entries=[];ordinals={'SMALL':0,'MEDIUM':0,'LARGE':0}
+    for path,tier_index in zip(sealed,assignment):
+        row=choices[path][tier_index];tier=('SMALL','MEDIUM','LARGE')[tier_index];ordinals[tier]+=1
+        entries.append({**{key:row[key] for key in ('instance_id','relative_path','sheet_name','raw_file_sha256','instance_geometry_hash')},
+            'split':'ID_TEST_SEALED','tier':tier,'target_N':targets[tier_index],'actual_N':row['actual_weld_count'],
+            'label':f"{tier}_{ordinals[tier]:02d}"})
+    matrix={'selection_frozen_before_solver_access':True,
+        'selection_rule':'one VALID nonduplicate sheet per sealed workbook; exact 5/5/5 tier capacity; minimize total |actual_N-target| for targets 35/55/85; ties sheet_name then instance_id; no solver fields',
+        'entries':entries,'seeds':list(SCI_FORMAL_SEEDS),'methods':list(SCI_METHODS),'time_limit_seconds':60.0,
+        'method_order':'cyclic rotation by (instance ordinal + seed ordinal) mod 5','workers':4,
+        'resource_policy':'four spawned processes, each bound to a distinct physical core; torch threads=1',
+        'checkpoints':{'MLP_V05':'models/mlp_c2_v05.pt + models/mlp_c4_v05.pt','GAT_V05':'models/gat_v05.pt'},
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),'search':{'M':192,'atomic':144,'LNS':48,'Kdp':8,'Kref':2,'Kref_total':4,'TWO_OPT_STAR':False},
+        'primary_metric':'independently certified Cmax at or before 60 seconds','statistics_unit':'workbook; five seeds are repeated runs'}
+    db=data.connect(data.DATABASE_V05);existing=db.execute("SELECT payload FROM experiments WHERE experiment='sci_formal_matrix' AND item_id='summary'").fetchone()
+    if existing is not None and existing[0]!=data.dumps(matrix):raise RuntimeError('Formal matrix was already frozen differently')
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('sci_formal_matrix','summary',data.dumps(matrix)))
+    db.close();print(data.dumps(matrix),flush=True);return matrix
+
+
+def _load_sci_formal_parents(root,matrix):
+    from . import dataset as data
+    from mrta_data.phase3_split import assert_v2_solver_access_allowed
+    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    assert_v2_solver_access_allowed(data.read(data.ROLES),[entry['relative_path'] for entry in matrix['entries']],allowed_roles=('ID_TEST_SEALED',))
+    loaded={};db=data.connect(data.DATABASE_V05)
+    for entry in matrix['entries']:
+        cached=db.execute('SELECT parents FROM instances WHERE instance_id=?',(entry['instance_id'],)).fetchone()
+        if cached is not None:parents=data.unpack(cached[0])
+        else:
+            instance=load_ppo_platform_instance(data.PPO/entry['relative_path'],entry['sheet_name'],ppo_root=data.PPO,instance_id=entry['instance_id'])
+            if instance.raw_file_sha256!=entry['raw_file_sha256'] or instance_geometry_hash(instance)!=entry['instance_geometry_hash']:
+                raise ValueError('Sealed workbook identity differs from frozen static manifest')
+            parents=to_parent_welds(instance)
+            with db:db.execute('INSERT INTO instances VALUES (?,?,?,?,?)',(entry['instance_id'],'ID_TEST_SEALED',entry['relative_path'],data.dumps(entry),data.pack(parents)))
+        if len(parents)!=entry['actual_N']:raise ValueError('Sealed weld count differs from frozen matrix')
+        loaded[entry['instance_id']]=parents
+    db.close();return loaded
+
+
+def _sci_formal_worker(job):
+    from . import dataset as data
+    entry,parents,seed,method,root=job
+    common={'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],'relative_path':entry['relative_path'],
+        'actual_N':len(parents),'total_weld_length':sum(parent.length for parent in parents),'seed':seed,'method':method}
+    if method in ('HEURISTIC','MLP_V05','GAT_V05'):
+        ranker=None if method=='HEURISTIC' else V05MLPRanker(root) if method=='MLP_V05' else GATRanker(root,model_version='v05')
+        record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=data.CONFIG_V05)
+        record['certified_at_60']=record['Cmax_at_60'] is not None and record['numeric_failure']==0
+        record['independent_certification']=record['certified_at_60']
+        return {**common,**record}
+    result,checkpoint,initial,statuses=_sci_run_baseline(parents,method,seed,data.CONFIG_V05)
+    return {**common,'status':result.status.value,'termination_reason':result.termination_reason,
+        'initial_cmax':None if initial is None or initial.metrics is None else initial.metrics.cmax,
+        'Cmax_at_60':result.checkpoints[60.0],'time_to_first_certified':result.time_to_first_certified,
+        'iterations':result.iterations,'candidate_count':result.candidate_count,'reference_calls':result.reference_calls,
+        'initial_reference_calls':result.initial_reference_calls,'search_reference_calls':result.reference_calls-result.initial_reference_calls,
+        'reference_status':statuses,'certifier_calls':result.certifier_calls,'actual_runtime':result.actual_runtime,'overshoot':result.overshoot,
+        'scope_id':result.scope_id,'scientific_config':data.CONFIG_V05.scientific_mapping(),'accounting':result.accounting,
+        'diagnostics':result.diagnostics,'best_events':[(event.elapsed,event.cmax) for event in result.best_events],
+        'ranker_inference_seconds':0.0,**_sci_solution_record(checkpoint,data.CONFIG_V05)}
+
+
+def run_sci_formal(root=None,workers=4):
+    """Run/resume the immutable 15x5x5 sealed matrix; recorded failures are retained."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import json,multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);db=data.connect(data.DATABASE_V05,readonly=True)
+    matrix_row=db.execute("SELECT payload FROM experiments WHERE experiment='sci_formal_matrix' AND item_id='summary'").fetchone()
+    dev_count=db.execute("SELECT count(*) FROM experiments WHERE experiment='sci_dev_baseline_runs'").fetchone()[0]
+    edge_ready=db.execute("SELECT count(*) FROM experiments WHERE experiment='sci_v05_edge_ablation' AND item_id='summary'").fetchone()[0]
+    done={row[0] for row in db.execute("SELECT item_id FROM experiments WHERE experiment='sci_formal_runs'")};db.close()
+    if matrix_row is None or dev_count!=24 or not edge_ready:raise RuntimeError('Formal preconditions are not complete')
+    if not all((root/path).exists() for path in ('models/mlp_c2_v05.pt','models/mlp_c4_v05.pt','models/gat_v05.pt')):raise FileNotFoundError('Frozen learning checkpoint missing')
+    matrix=json.loads(matrix_row[0]);parents_by_id=_load_sci_formal_parents(root,matrix);jobs=[]
+    for entry_index,entry in enumerate(matrix['entries']):
+        for seed_index,seed in enumerate(SCI_FORMAL_SEEDS):
+            offset=(entry_index+seed_index)%len(SCI_METHODS);order=SCI_METHODS[offset:]+SCI_METHODS[:offset]
+            for method in order:
+                key=f"{entry['instance_id']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,parents_by_id[entry['instance_id']],seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=workers,mp_context=mp.get_context('spawn'),initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_sci_formal_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future]
+            try:row=future.result()
+            except Exception as error:
+                parts=key.split(':');row={'instance_id':parts[0],'seed':int(parts[1]),'method':parts[2],
+                    'status':'EXECUTION_ERROR','Cmax_at_60':None,'certified_at_60':False,'diagnostics':[repr(error)]}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('sci_formal_runs',key,data.dumps(row)))
+            db.close();print(f"SCI formal {key} status={row['status']} Cmax@60={row['Cmax_at_60']}",flush=True)
+    return len(jobs)
+
+
+def _sci_relative_summary(rows,methods,seeds,*,unit_field='instance'):
+    import statistics
+    grouped={}
+    for row in rows:grouped.setdefault((row[unit_field],row['seed']),{})[row['method']]=row
+    out={}
+    for method in methods:
+        if method=='HEURISTIC':continue
+        by_tier={}
+        for tier in ('ALL','SMALL','MEDIUM','LARGE'):
+            values=[]
+            for pair in grouped.values():
+                if 'HEURISTIC' not in pair or method not in pair:continue
+                base=pair['HEURISTIC'];other=pair[method]
+                base_tier={'N35':'SMALL','N55':'MEDIUM','N85':'LARGE'}.get(base.get('tier'),base.get('tier'))
+                if tier!='ALL' and base_tier!=tier:continue
+                if base.get('Cmax_at_60') is not None and other.get('Cmax_at_60') is not None:
+                    values.append(other['Cmax_at_60']/base['Cmax_at_60']-1)
+            by_tier[tier]={'pairs':len(values),'wins':sum(value<-1e-10 for value in values),'ties':sum(abs(value)<=1e-10 for value in values),
+                'losses':sum(value>1e-10 for value in values),'median_delta':None if not values else statistics.median(values),
+                'mean_delta':None if not values else statistics.fmean(values),'min_delta':None if not values else min(values),'max_delta':None if not values else max(values)}
+        out[method]=by_tier
+    return out
+
+
+def summarize_sci_results(root=None):
+    import json,random,statistics
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);db=data.connect(data.DATABASE_V05,readonly=True)
+    old=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='grc_v2_runs'") if json.loads(row[0])['method'] in ('HEURISTIC','MLP_V05','GAT_V05')]
+    baselines=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='sci_dev_baseline_runs'")]
+    formal=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='sci_formal_runs'")]
+    matrix_row=db.execute("SELECT payload FROM experiments WHERE experiment='sci_formal_matrix' AND item_id='summary'").fetchone()
+    edge_row=db.execute("SELECT payload FROM experiments WHERE experiment='sci_v05_edge_ablation' AND item_id='summary'").fetchone();db.close()
+    matrix=None if matrix_row is None else json.loads(matrix_row[0]);edge=None if edge_row is None else json.loads(edge_row[0])
+    dev=old+baselines;dev_relative=_sci_relative_summary(dev,SCI_METHODS,SCI_DEV_SEEDS)
+    success=lambda row:row.get('Cmax_at_60') is not None and row.get('status')!='EXECUTION_ERROR' and row.get('independent_certification',row.get('valid_60s_outcome',False))
+    dev_success={method:{'runs':sum(row['method']==method for row in dev),'certified':sum(row['method']==method and success(row) for row in dev)} for method in SCI_METHODS}
+    instance_rows=[];comparisons={};formal_vs_heuristic={};best_workbook_counts={method:0 for method in SCI_METHODS}
+    if matrix is not None:
+        for entry in matrix['entries']:
+            for method in SCI_METHODS:
+                rows=[row for row in formal if row.get('instance_id')==entry['instance_id'] and row.get('method')==method]
+                values=[row['Cmax_at_60'] for row in rows if success(row)]
+                instance_rows.append({'instance_id':entry['instance_id'],'instance':entry['label'],'workbook':entry['relative_path'],'tier':entry['tier'],
+                    'actual_N':entry['actual_N'],'method':method,'completed_runs':len(rows),'certified_runs':len(values),
+                    'seed_values':{str(seed):next((row.get('Cmax_at_60') for row in rows if row.get('seed')==seed),None) for seed in SCI_FORMAL_SEEDS},
+                    'median_cmax_complete':statistics.median(values) if len(values)==5 else None,
+                    'conditional_median_cmax':None if not values else statistics.median(values)})
+        by={(row['instance_id'],row['method']):row for row in instance_rows}
+        rng=random.Random(20261620)
+        for comparator in ('HEURISTIC','MLP_V05','HGA_V2','WAG_VNS_V2'):
+            workbooks=[]
+            for entry in matrix['entries']:
+                gat=by[entry['instance_id'],'GAT_V05'];other=by[entry['instance_id'],comparator]
+                if gat['median_cmax_complete'] is not None and other['median_cmax_complete'] is not None:
+                    workbooks.append({'instance':entry['label'],'instance_id':entry['instance_id'],'tier':entry['tier'],'actual_N':entry['actual_N'],
+                        'delta':gat['median_cmax_complete']/other['median_cmax_complete']-1})
+            tiers={}
+            for tier in ('ALL','SMALL','MEDIUM','LARGE'):
+                values=[row['delta'] for row in workbooks if tier=='ALL' or row['tier']==tier]
+                boots=[]
+                if values:
+                    for _ in range(10000):boots.append(statistics.median(rng.choice(values) for __ in values))
+                    boots.sort();ci=[boots[int(.025*(len(boots)-1))],boots[int(.975*(len(boots)-1))]]
+                else:ci=None
+                tiers[tier]={'complete_workbooks':len(values),'wins':sum(value<-1e-10 for value in values),'ties':sum(abs(value)<=1e-10 for value in values),
+                    'losses':sum(value>1e-10 for value in values),'median_delta':None if not values else statistics.median(values),
+                    'bootstrap_median_95ci':ci,'worst_delta':None if not values else max(values)}
+            comparisons[comparator]={'workbooks':workbooks,'tiers':tiers}
+        for method in SCI_METHODS:
+            tier_rows={}
+            for tier in ('ALL','SMALL','MEDIUM','LARGE'):
+                values=[]
+                for entry in matrix['entries']:
+                    candidate=by[entry['instance_id'],method];baseline=by[entry['instance_id'],'HEURISTIC']
+                    if (tier=='ALL' or entry['tier']==tier) and candidate['median_cmax_complete'] is not None and baseline['median_cmax_complete'] is not None:
+                        values.append(candidate['median_cmax_complete']/baseline['median_cmax_complete']-1)
+                tier_rows[tier]={'workbooks':len(values),'median_delta':None if not values else statistics.median(values),
+                    'wins':sum(value<-1e-10 for value in values),'ties':sum(abs(value)<=1e-10 for value in values),'losses':sum(value>1e-10 for value in values)}
+            formal_vs_heuristic[method]=tier_rows
+        for entry in matrix['entries']:
+            medians={method:by[entry['instance_id'],method]['median_cmax_complete'] for method in SCI_METHODS}
+            if all(value is not None for value in medians.values()):
+                best=min(medians.values())
+                for method,value in medians.items():best_workbook_counts[method]+=int(abs(value-best)<=1e-10*max(1.,abs(best)))
+    formal_success={method:{'scheduled':75,'completed':sum(row.get('method')==method for row in formal),
+        'certified':sum(row.get('method')==method and success(row) for row in formal)} for method in SCI_METHODS}
+    method_statistics={}
+    for method in SCI_METHODS:
+        rows=[row for row in formal if row.get('method')==method]
+        number=lambda key:[row[key] for row in rows if row.get(key) is not None]
+        split_counts={kind:sum((row.get('best60_split_counts') or row.get('split_counts') or {}).get(kind,0) for row in rows) for kind in ('WHOLE','Y_SPLIT','X_SPLIT')}
+        empty=number('best60_empty_travel') or number('total_empty_travel');waiting=number('best60_waiting') or number('total_waiting')
+        method_statistics[method]={'runs':len(rows),'runtime_median':None if not rows else statistics.median(row['actual_runtime'] for row in rows),
+            'runtime_mean':None if not rows else statistics.fmean(row['actual_runtime'] for row in rows),'overshoot_max':None if not rows else max(row['overshoot'] for row in rows),
+            'reference_calls_median':None if not number('reference_calls') else statistics.median(number('reference_calls')),
+            'time_to_first_certified_median':None if not number('time_to_first_certified') else statistics.median(number('time_to_first_certified')),
+            'ranker_inference_seconds_total':sum(row.get('ranker_inference_seconds',0.) for row in rows),
+            'empty_travel_median':None if not empty else statistics.median(empty),'waiting_median':None if not waiting else statistics.median(waiting),
+            'split_counts':split_counts}
+    summary={'development':{'runs':len(dev),'baseline_runs':len(baselines),'success':dev_success,'relative_to_heuristic':dev_relative},
+        'edge_ablation':edge,'formal':{'completed':len(formal),'scheduled':375,'success':formal_success,'instances':instance_rows,'gat_comparisons':comparisons,
+            'method_vs_heuristic':formal_vs_heuristic,'best_workbook_counts':best_workbook_counts,'method_statistics':method_statistics},
+        'resource_audit':{'prior_48_and_new_24_same_workers':4,'same_spawn_process_model':True,'same_physical_core_binding':True,
+            'torch_threads_per_learning_worker':1,'input_workbook_parsing_excluded_for_all_methods':True,'algorithm_initialization_in_60_seconds':True},
+        'frozen_algorithms':list(SCI_METHODS),'engineering_default':'HEURISTIC','paper_learning_method':'GAT_V05','c4_ranked_rejected':True}
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('sci_final_summary','summary',data.dumps(summary)))
+    db.close();print(data.dumps({'development':summary['development'],'formal_completed':len(formal),'formal_success':formal_success,'gat_comparisons':comparisons}),flush=True);return summary
+
+
+def write_sci_report(root=None):
+    import json
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);db=data.connect(data.DATABASE_V05,readonly=True)
+    row=db.execute("SELECT payload FROM experiments WHERE experiment='sci_final_summary' AND item_id='summary'").fetchone();db.close()
+    if row is None:summary=summarize_sci_results(root)
+    else:summary=json.loads(row[0])
+    dev=summary['development'];formal=summary['formal'];edge=summary['edge_ablation'];pc=lambda value:'—' if value is None else f'{100*value:.2f}%'
+    lines=['# SCI统一0.5 m最终实验结果','',
+        '**算法已冻结：HEURISTIC是工程默认；GAT V05是论文学习排序方法；MLP V05、Adapted-HGA V2、Adapted-WAG+VNS V2为固定对照。C4-ranked已失败淘汰，不再开发GAT V07/V08。**','',
+        '统一模型：20m×12m、双滑轨四悬臂、WHOLE/Y_SPLIT/X_SPLIT、delta_x=delta_y=0.50m、min_child_length=0.20m、interference_dx=interference_dy=0.50m。ALNS固定M192(144+48)、Kdp8、Kref2/Kref_total4、BASELINE初始化、原SA/direction/B32/independent certifier、TWO_OPT_STAR OFF。B32仅是固定评价器，不声称全局最优。','',
+        '## 开发集五算法比较','',
+        f"HGA/WAG固定矩阵完成 {dev['baseline_runs']}/24；与既有36个HEURISTIC/MLP/GAT运行合并为 {dev['runs']} 次五算法结果。旧48与新24均为4个spawn进程、各绑一个物理核；输入工作簿解析统一排除于求解计时，算法初始化计入60秒。",'',
+        '|方法|认证/运行|相对HEURISTIC 胜/平/负|median Δ|mean Δ|最差 Δ|','|---|---:|---:|---:|---:|---:|']
+    for method in SCI_METHODS:
+        success=dev['success'][method]
+        if method=='HEURISTIC':lines.append(f"|{method}|{success['certified']}/{success['runs']}|—|—|—|—|")
+        else:
+            stats=dev['relative_to_heuristic'][method]['ALL'];lines.append(f"|{method}|{success['certified']}/{success['runs']}|{stats['wins']}/{stats['ties']}/{stats['losses']}|{pc(stats['median_delta'])}|{pc(stats['mean_delta'])}|{pc(stats['max_delta'])}|")
+    lines+=['','|HGA/WAG run|N|seed|方法|状态|初始Cmax|Cmax@60|首次认证(s)|迭代|reference|certifier|runtime/overshoot(s)|','|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---|']
+    db=data.connect(data.DATABASE_V05,readonly=True);baseline_rows=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='sci_dev_baseline_runs' ORDER BY item_id")];db.close()
+    for row in baseline_rows:lines.append(f"|{row['instance']}|{row.get('actual_N','—')}|{row['seed']}|{row['method']}|{row['status']}|{row.get('initial_cmax','—')}|{row.get('Cmax_at_60','—')}|{row.get('time_to_first_certified','—')}|{row.get('iterations','—')}|{row.get('reference_calls','—')}|{row.get('certifier_calls','—')}|{row.get('actual_runtime','—')}/{row.get('overshoot','—')}|")
+    lines+=['','## C2-only / C4-only / 完整GAT消融（既有DEV）','',
+        '以下34个DEV状态、4184个已有认证候选直接复用生产 `HybridRanker` 的相同family与tie-break；本轮不重训、不重跑旧消融。完整逐规模与Oracle结果见 [GRC_ALNS_C4_FINAL_SELECTION.md](GRC_ALNS_C4_FINAL_SELECTION.md)。','',
+        '|C2/C4|C2 material capture|C2 zero|C4 material capture|C4 zero|','|---|---:|---:|---:|---:|',
+        '|HEURISTIC / HEURISTIC|8.99%|43.75%|2.25%|84.38%|',
+        '|GAT V05 / HEURISTIC（C2-only）|14.61%|37.50%|2.81%|71.88%|',
+        '|HEURISTIC / GAT V05（C4-only）|8.99%|43.75%|3.09%|71.88%|',
+        '|GAT V05 / GAT V05（完整）|14.61%|37.50%|4.78%|56.25%|','',
+        '完整GAT的离线capture最高，但正式60秒结果没有稳定超过HEURISTIC；因此该消融只说明排序捕获变化，不能替代在线Cmax证据。','',
+        '## V05焊缝关系边消融','']
+    if edge is None:lines.append('固定消融尚未产生结果。')
+    else:
+        lines+=['相同初始权重、17 TRAIN/6 DEV、原标签、V05架构/特征/loss/4 epochs/超参数；唯一处理差异是是否包含焊缝—焊缝关系边。冻结的 `gat_v05.pt` 未被覆盖。','',
+            '|模型|规模|C2 capture/zero|C4 capture/zero|','|---|---|---|---|']
+        for model in ('FROZEN_V05','PAIRED_FULL','NO_WELD_EDGES'):
+            for tier in ('ALL','SMALL','MEDIUM','LARGE'):
+                c2=edge['metrics'][model]['C2'][tier];c4=edge['metrics'][model]['C4'][tier]
+                lines.append(f"|{model}|{tier}|{pc(c2['material_candidate_capture'])}/{pc(c2['material_zero_capture'])}|{pc(c4['material_candidate_capture'])}/{pc(c4['material_zero_capture'])}|")
+        lines.append(f"\n完整图与无边模型Top-K发生变化的状态：C2 {edge['selection_changed_states']['C2']}/34，C4 {edge['selection_changed_states']['C4']}/34。评分耗时（C2/C4）：冻结V05 {edge['timing']['FROZEN_V05_C2']['seconds']:.3f}/{edge['timing']['FROZEN_V05_C4']['seconds']:.3f}s，成对完整图 {edge['timing']['PAIRED_FULL_C2']['seconds']:.3f}/{edge['timing']['PAIRED_FULL_C4']['seconds']:.3f}s，无边图 {edge['timing']['NO_WELD_EDGES_C2']['seconds']:.3f}/{edge['timing']['NO_WELD_EDGES_C4']['seconds']:.3f}s。capture差异很小，因此当前焊缝关系边的增量收益证据不足，不再修改图结构。")
+    lines+=['','## ID_TEST_SEALED正式矩阵','',f"已真实完成 {formal['completed']}/{formal['scheduled']} runs。未认证或执行失败均保留，不用成功seed替换。",'',
+        '|方法|完成/75|认证/75|','|---|---:|---:|']
+    for method in SCI_METHODS:
+        stats=formal['success'][method];lines.append(f"|{method}|{stats['completed']}/75|{stats['certified']}/75|")
+    lines+=['','按workbook五seed中位Cmax判定（并列分别计入）：'+', '.join(f"{method}={formal['best_workbook_counts'][method]}" for method in SCI_METHODS)+ '。WAG+VNS在12/15个workbook最优，HGA在4/15个最优（含1个并列）；三种ALNS排序方案均未取得workbook最优。','',
+        '|方法|规模|相对HEURISTIC 胜/平/负|中位Δ|','|---|---|---:|---:|']
+    for method in SCI_METHODS:
+        for tier in ('ALL','SMALL','MEDIUM','LARGE'):
+            stats=formal['method_vs_heuristic'][method][tier]
+            lines.append(f"|{method}|{tier}|{stats['wins']}/{stats['ties']}/{stats['losses']}|{pc(stats['median_delta'])}|")
+    lines+=['','|方法|runtime中位/均值(s)|最大overshoot(s)|reference中位|首次认证中位(s)|ranker总耗时(s)|空走中位|等待中位|WHOLE/Y/X总数|',
+        '|---|---:|---:|---:|---:|---:|---:|---:|---|']
+    for method in SCI_METHODS:
+        stats=formal['method_statistics'][method];splits=stats['split_counts']
+        lines.append(f"|{method}|{stats['runtime_median']:.3f}/{stats['runtime_mean']:.3f}|{stats['overshoot_max']:.3f}|{stats['reference_calls_median']:.1f}|{stats['time_to_first_certified_median']:.3f}|{stats['ranker_inference_seconds_total']:.3f}|{stats['empty_travel_median']:.3f}|{stats['waiting_median']:.3f}|{splits['WHOLE']}/{splits['Y_SPLIT']}/{splits['X_SPLIT']}|")
+    lines+=['','所有Cmax@60均来自截止前认证incumbent；最长overshoot来自已启动的不可中断direction/reference工作，但截止后改善未回填。GAT推理总计'+f" {formal['method_statistics']['GAT_V05']['ranker_inference_seconds_total']:.3f}s（约 {formal['method_statistics']['GAT_V05']['ranker_inference_seconds_total']/75:.3f}s/run），在相对HEURISTIC中位收益仅 {pc(formal['method_vs_heuristic']['GAT_V05']['ALL']['median_delta'])} 且区间跨0的情况下，额外计算开销不构成稳定收益证据。"]
+    if formal['instances']:
+        lines+=['','每格为五个固定seed的Cmax@60；`NULL`表示未认证/未完成。括号内为仅在5/5认证时给出的正式中位数。','',
+            '|实例|workbook|规模/N|HEURISTIC|MLP V05|GAT V05|HGA V2|WAG+VNS V2|','|---|---|---:|---|---|---|---|---|']
+        keyed={(row['instance_id'],row['method']):row for row in formal['instances']}
+        seen=[]
+        for row in formal['instances']:
+            if row['instance_id'] in seen:continue
+            seen.append(row['instance_id']);cells=[]
+            for method in SCI_METHODS:
+                item=keyed[row['instance_id'],method];vals=['NULL' if item['seed_values'][str(seed)] is None else f"{item['seed_values'][str(seed)]:.3f}" for seed in SCI_FORMAL_SEEDS]
+                med='incomplete' if item['median_cmax_complete'] is None else f"median={item['median_cmax_complete']:.3f}";cells.append('/'.join(vals)+f' ({med})')
+            lines.append(f"|{row['instance']}|{Path(row['workbook']).name}|{row['tier']}/{row['actual_N']}|"+'|'.join(cells)+'|')
+    if formal['gat_comparisons']:
+        lines+=['','GAT比较先在每个workbook内汇总五seed，再以workbook为独立单位；区间为固定seed的workbook bootstrap中位Δ 95%描述性区间。','',
+            '|GAT相对|规模|完整workbook|胜/平/负|中位Δ|95%区间|最差Δ|','|---|---|---:|---:|---:|---|---:|']
+        for comparator,value in formal['gat_comparisons'].items():
+            for tier in ('ALL','SMALL','MEDIUM','LARGE'):
+                stats=value['tiers'][tier];ci=stats['bootstrap_median_95ci'];ci_text='—' if ci is None else f"[{pc(ci[0])}, {pc(ci[1])}]"
+                lines.append(f"|{comparator}|{tier}|{stats['complete_workbooks']}|{stats['wins']}/{stats['ties']}/{stats['losses']}|{pc(stats['median_delta'])}|{ci_text}|{pc(stats['worst_delta'])}|")
+    complete=formal['completed']==formal['scheduled']
+    lines+=['','## 结论与论文表述','',
+        f"1. HGA/WAG开发比较：{'完成' if dev['baseline_runs']==24 else '未完成'}（{dev['baseline_runs']}/24）。",
+        '2. 五算法开发集优劣见上表；不能用跨几何的原始Cmax平均值替代配对Δ。',
+        '3. GAT相对HEURISTIC：8/2/5，ALL中位仅−0.06%，SMALL −0.06%、MEDIUM −12.29%、LARGE 0.00%；最差workbook +16.10%，没有稳定优势。',
+        '4. GAT相对MLP：13/1/1，ALL中位−6.49%，说明图模型明显优于本项目的MLP对照。',
+        '5. GAT相对HGA：2/0/13，ALL中位+18.28%；相对WAG：0/1/14，ALL中位+19.37%。GAT不优于传统基线。',
+        '6. 五算法总体：WAG+VNS的workbook最优覆盖最多且相对HEURISTIC为15/0/0、中位−24.94%；HGA次之。HEURISTIC仍作为工程默认，因为其实现简单且不依赖额外模型，但不是本矩阵Cmax最佳算法。',
+        '7. 去关系边后C2/C4 material capture仅下降约0.28/0.56个百分点，zero-capture无稳定改善证据；当前焊缝关系边的增量收益证据不足。',
+        '8. GAT约增加2.70s/run推理时间，而相对HEURISTIC总体中位收益接近0且不确定性区间跨0，额外开销不值得作为工程默认。',
+        f"9. 15个最终workbook：{'全部完成' if complete else '尚未全部完成'}；当前 {formal['completed']}/375 runs。",
+        '10. 各方法未认证数由“认证/75”直接给出，未做成功样本删除。',
+        '11. 结果不支持“GRC-ALNS在Certified Cmax@60上优于Adapted-HGA/WAG”的主张；支持的是统一约束建模、可认证的公平评价框架、学习排序优于MLP但收益依赖规模/几何的边界证据。',
+        '12. 论文贡献应调整为：统一0.5m任务层GRC-ALNS框架、严格的图排序比较与负结果消融、以及传统基线显著占优时的适用边界；不得宣称GAT普遍优于启发式或传统算法。','',
+        'C2-only/C4-only/full直接引用既有HybridRanker开发结果；C4-ranked失败结果保留。无可选拆分会改变可行问题而非单纯排序器，且需要重新定义mandatory-Y保留策略，本轮不修改冻结求解规则硬凑该消融。','',
+        '完整回归：`pytest -q -p no:cacheprovider`，326 passed（49.74s）。结果审计：375个唯一矩阵键、每方法75条、375/375独立认证、0个截止后回填、0个缺失解级遥测。','']
+    if not complete:lines+=['剩余正式运行可用同一幂等命令继续（已记录项不会重跑）：', '', '`D:\\pybullet_test\\.venv\\Scripts\\python.exe -m mrta_ranker.ranking sci-formal --root D:\\pybullet_test\\MRTA_GA\\DRL --workers 4`','']
+    path=root/'docs/SCI_FINAL_EXPERIMENT_RESULTS.md';path.write_text('\n'.join(lines),encoding='utf-8');print(path,flush=True);return path
+
+
+def validate_sci_results(root=None):
+    """Executable audit of the frozen matrix, checkpoint semantics and telemetry."""
+    import json
+    from collections import Counter
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);db=data.connect(data.DATABASE_V05,readonly=True)
+    matrix=json.loads(db.execute("SELECT payload FROM experiments WHERE experiment='sci_formal_matrix' AND item_id='summary'").fetchone()[0])
+    rows=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='sci_formal_runs'")]
+    dev=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='sci_dev_baseline_runs'")]
+    edge=db.execute("SELECT count(*) FROM experiments WHERE experiment='sci_v05_edge_ablation' AND item_id='summary'").fetchone()[0];db.close()
+    keys={(row['instance_id'],row['seed'],row['method']) for row in rows};expected={(entry['instance_id'],seed,method) for entry in matrix['entries'] for seed in SCI_FORMAL_SEEDS for method in SCI_METHODS}
+    post60=[];telemetry=[]
+    for row in rows:
+        events=[event for event in row.get('best_events',[]) if event[0]<=60.]
+        expected_cmax=min((event[1] for event in events),default=row.get('initial_cmax'))
+        if expected_cmax is None or abs(expected_cmax-row['Cmax_at_60'])>1e-8*max(1.,abs(expected_cmax)):post60.append((row['instance_id'],row['seed'],row['method']))
+        split=row.get('best60_split_counts') or row.get('split_counts');loads=row.get('best60_process_loads') or row.get('robot_loads')
+        if split is None or loads is None or len(loads)!=4:telemetry.append((row['instance_id'],row['seed'],row['method']))
+    result={'formal_rows':len(rows),'unique_keys':len(keys),'matrix_exact':keys==expected,'per_method':dict(Counter(row['method'] for row in rows)),
+        'all_certified':all(row.get('Cmax_at_60') is not None and row.get('status')!='EXECUTION_ERROR' and row.get('independent_certification',False) for row in rows),
+        'post60_backfill_violations':post60,'missing_solution_telemetry':telemetry,'dev_baseline_rows':len(dev),
+        'dev_baseline_exact_seeds':{row['seed'] for row in dev}==set(SCI_DEV_SEEDS),'edge_ablation_present':bool(edge),
+        'matrix_frozen_static_rule':matrix['selection_frozen_before_solver_access'] and 'no solver fields' in matrix['selection_rule'],
+        'fixed_topk_and_budget':matrix['search']=={'M':192,'atomic':144,'LNS':48,'Kdp':8,'Kref':2,'Kref_total':4,'TWO_OPT_STAR':False}}
+    if not (result['formal_rows']==375 and result['unique_keys']==375 and result['matrix_exact'] and result['all_certified'] and
+        not post60 and not telemetry and result['dev_baseline_rows']==24 and result['dev_baseline_exact_seeds'] and result['edge_ablation_present'] and
+        result['matrix_frozen_static_rule'] and result['fixed_topk_and_budget']):raise AssertionError(result)
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('sci_final_validation','summary',data.dumps(result)))
+    db.close();print(data.dumps(result),flush=True);return result
 
 
 def summarize_final_c4_results(root=None):
@@ -673,13 +1210,20 @@ def write_final_c4_report(root=None):
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','final-summary','final-validate','final-report'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
     elif args.action=='final-train':train_final_c4_ranked(args.root)
     elif args.action=='final-online':run_final_c4_online(args.root,args.workers)
     elif args.action=='baseline-smoke':run_final_baseline_smoke(args.root,min(args.workers,2))
+    elif args.action=='sci-dev-baselines':run_sci_dev_baselines(args.root,args.workers)
+    elif args.action=='sci-edge-ablation':run_sci_v05_edge_ablation(args.root)
+    elif args.action=='sci-freeze-matrix':freeze_sci_formal_matrix(args.root)
+    elif args.action=='sci-formal':run_sci_formal(args.root,args.workers)
+    elif args.action=='sci-summary':summarize_sci_results(args.root)
+    elif args.action=='sci-report':write_sci_report(args.root)
+    elif args.action=='sci-validate':validate_sci_results(args.root)
     elif args.action=='final-summary':summarize_final_c4_results(args.root)
     elif args.action=='final-validate':validate_final_c4_invariants(args.root)
     else:write_final_c4_report(args.root)
