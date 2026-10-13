@@ -67,6 +67,14 @@ On the four existing S1 states, C2 material selections increased 3→4 while unc
 
 Production therefore remains baseline initialization + `BASELINE_C2` + heuristic C4. The inexpensive proxy is retained only as a development ablation. Evidence now supports collecting new 0.50-domain TRAIN/DEV labels for a ranking-aligned MLP-C2 study, with C4 trained on the real C2 hard distribution; no MLP/GAT training was started here. Details: [coordination-aware C2 report](docs/C2_COORDINATION_AWARE_SCREENING.md) and the existing [raw diagnostic database](data/development/s1_screening_diagnostic.sqlite). Full regression: **320 passed**.
 
+## Region-cooperative initialization (0.50 m)
+
+`REGION_COOPERATIVE_INITIALIZATION` is an optional, deterministic replacement for the low-contribution `SPATIAL_SPREAD` slot. It jointly assigns flexible welds to rails, selects load-dominant X boundaries with overlap as a soft risk, and applies bounded nearest/farthest insertion plus two 2-opt passes. The original five-slot/Kinit/fallback/reference limits remain unchanged; the production default switch remains off.
+
+All **10/10 zero-search** and **48/48 real 60-second** consumed-development runs certified. Region+HEURISTIC versus baseline+HEURISTIC is **9/3/0 wins/ties/losses**, median Cmax change **−4.56%**. Region+GAT versus Region+HEURISTIC is **6/2/4**, median **−0.07%** and mean **+0.14%**; frozen GAT V05 has no stable independent gain on the stronger seed. I3 is repaired, S2 improves instead of regressing, S1 still falls back, and the roughly 50% initial improvements on N55-I6/N85-I9 are followed by little or no further search improvement.
+
+Because the upgraded method was developed only on consumed-development workbooks, production remains `BASELINE` until new independent workbooks are available. The frozen region method is the candidate for that test; the next structural research question is Critical-Rail Region Reallocation, not further initialization/GAT tuning. Results: [region-cooperative initialization report](docs/REGION_COOPERATIVE_INITIALIZATION_RESULTS.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
+
 ## First runnable GRC-ALNS (0.50 m)
 
 The new workbook-isolated dataset contains **98 TRAIN states / 11,924 candidates** and **34 DEV states / 4,184 candidates**, with **590/356 material positives** and zero numeric failures. It keeps the existing 17 TRAIN / 6 DEV workbook split; missing EARLY states are not backfilled. The historical 0.20 dataset and checkpoints are unchanged.

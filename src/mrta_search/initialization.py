@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
@@ -12,6 +12,7 @@ from mrta_reference.model import FormalScope
 from mrta_reference.scheduler import resolve_reference_evaluator
 from mrta_reference.geometry import (
     blocks_for_pattern,
+    finite_x_split_validator,
     generate_y_split_patterns,
     oriented_endpoints,
     robot_is_eligible,
@@ -54,6 +55,7 @@ class InitializationStrategy(str, Enum):
     X_ORDER_AWARE = "X_ORDER_AWARE"
     SPATIAL_SPREAD = "SPATIAL_SPREAD"
     RAIL_MONOTONE_BALANCED = "RAIL_MONOTONE_BALANCED_BOOTSTRAP"
+    REGION_COOPERATIVE_INITIALIZATION = "REGION_COOPERATIVE_INITIALIZATION"
 
 
 RAIL_SERIAL_BOOTSTRAP = "RAIL_SERIAL_BOOTSTRAP"
@@ -147,6 +149,10 @@ def _construct(
     legacy_robot_tie_first: bool = False,
     clearance_aware: bool = False,
 ) -> CanonicalSolution:
+    if strategy is InitializationStrategy.REGION_COOPERATIVE_INITIALIZATION:
+        return _construct_region_cooperative_initialization(
+            parents, patterns, config
+        )
     if strategy is InitializationStrategy.RAIL_MONOTONE_BALANCED:
         return _construct_rail_monotone_balanced_bootstrap(
             parents, patterns, config, clearance_aware=clearance_aware
@@ -348,6 +354,356 @@ def _block_x_key(block: WeldingBlock) -> tuple[float, float, float, str]:
     )
 
 
+def _route_empty_proxy(
+    route: Sequence[str],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> float:
+    """Minimum empty travel for a fixed block order, excluding the common home leg."""
+    if len(route) < 2:
+        return 0.0
+    states = {direction: 0.0 for direction in (0, 1)}
+    for index in range(1, len(route)):
+        previous = blocks[route[index - 1]]
+        current = blocks[route[index]]
+        next_states = {}
+        for direction in (0, 1):
+            start = current.start if direction == 0 else current.end
+            next_states[direction] = min(
+                cost
+                + math.dist(
+                    previous.end if old_direction == 0 else previous.start,
+                    start,
+                )
+                / config.empty_speed
+                for old_direction, cost in states.items()
+            )
+        states = next_states
+    return min(states.values())
+
+
+def _nearest_route(
+    block_ids: Sequence[str],
+    robot: int,
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> tuple[str, ...]:
+    pending = set(block_ids)
+    result: list[str] = []
+    point = (
+        config.workspace_x[0] if robot in (0, 2) else config.workspace_x[1],
+        config.by[1] if robot < 2 else config.by[0],
+    )
+    while pending:
+        options = []
+        for block_id in sorted(pending):
+            block = blocks[block_id]
+            for direction, (start, end) in enumerate(
+                ((block.start, block.end), (block.end, block.start))
+            ):
+                options.append((math.dist(point, start), block_id, direction, end))
+        _, selected, _, point = min(options, key=lambda item: item[:3])
+        result.append(selected)
+        pending.remove(selected)
+    return tuple(result)
+
+
+def _farthest_insertion_route(
+    block_ids: Sequence[str],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> tuple[str, ...]:
+    if not block_ids:
+        return ()
+    first = max(
+        block_ids,
+        key=lambda item: (max(blocks[item].start[0], blocks[item].end[0]), item),
+    )
+    route = [first]
+    pending = set(block_ids) - {first}
+    while pending:
+        before = _route_empty_proxy(route, blocks, config)
+        options = []
+        for block_id in sorted(pending):
+            insertions = []
+            for position in range(len(route) + 1):
+                candidate = route[:position] + [block_id] + route[position:]
+                insertions.append(
+                    (_route_empty_proxy(candidate, blocks, config) - before, position)
+                )
+            delta, position = min(insertions)
+            options.append((delta, block_id, position))
+        _, selected, position = max(options, key=lambda item: (item[0], item[1]))
+        route.insert(position, selected)
+        pending.remove(selected)
+    return tuple(route)
+
+
+def _bounded_two_opt(
+    route: Sequence[str],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+    *,
+    max_passes: int = 2,
+) -> tuple[str, ...]:
+    current = tuple(route)
+    current_cost = _route_empty_proxy(current, blocks, config)
+    for _ in range(max_passes):
+        best = (current_cost, current)
+        for left in range(max(0, len(current) - 1)):
+            for right in range(left + 1, len(current)):
+                candidate = (
+                    current[:left]
+                    + tuple(reversed(current[left : right + 1]))
+                    + current[right + 1 :]
+                )
+                cost = _route_empty_proxy(candidate, blocks, config)
+                if (cost, candidate) < best:
+                    best = (cost, candidate)
+        if best[1] == current:
+            break
+        current_cost, current = best
+    return current
+
+
+def _route_order_risk(
+    route: Sequence[str],
+    robot: int,
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> float:
+    centers = [
+        (blocks[item].start[0] + blocks[item].end[0]) / 2.0 for item in route
+    ]
+    sign = 1.0 if robot in (0, 2) else -1.0
+    return sum(
+        abs(right - left) / config.empty_speed
+        for left, right in zip(centers, centers[1:])
+        if sign * (right - left) < -config.numeric_epsilon
+    )
+
+
+def _improve_region_route(
+    block_ids: Sequence[str],
+    robot: int,
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> tuple[str, ...]:
+    """Choose one bounded WAG-inspired ordering without running WAG/VNS."""
+    monotone = tuple(
+        sorted(
+            block_ids,
+            key=lambda item: _block_x_key(blocks[item]),
+            reverse=robot in (1, 3),
+        )
+    )
+    nearest = _nearest_route(block_ids, robot, blocks, config)
+    farthest = _farthest_insertion_route(block_ids, blocks, config)
+    candidates = {
+        monotone,
+        _bounded_two_opt(nearest, blocks, config),
+        _bounded_two_opt(farthest, blocks, config),
+    }
+    return min(
+        candidates,
+        key=lambda route: (
+            _route_empty_proxy(route, blocks, config)
+            + 0.10 * _route_order_risk(route, robot, blocks, config),
+            _route_order_risk(route, robot, blocks, config),
+            route,
+        ),
+    )
+
+
+def _region_boundary_plan(
+    block_ids: Sequence[str],
+    pair: tuple[int, int],
+    fixed: Mapping[int, Sequence[str]],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> tuple[tuple[object, ...], tuple[tuple[str, ...], tuple[str, ...]]]:
+    """Cheaply select a contiguous X boundary; overlap is a penalty, not a veto."""
+    ordered = tuple(sorted(block_ids, key=lambda item: _block_x_key(blocks[item])))
+    best = None
+    for boundary in range(len(ordered) + 1):
+        left = tuple(fixed.get(pair[0], ())) + ordered[:boundary]
+        right = ordered[boundary:] + tuple(fixed.get(pair[1], ()))
+        left = tuple(sorted(left, key=lambda item: _block_x_key(blocks[item])))
+        right = tuple(
+            sorted(right, key=lambda item: _block_x_key(blocks[item]), reverse=True)
+        )
+        loads = tuple(
+            sum(config.process_time(blocks[item].length) for item in route)
+            for route in (left, right)
+        )
+        empty = tuple(
+            _route_empty_proxy(route, blocks, config) for route in (left, right)
+        )
+        overlap = 0.0
+        if left and right:
+            left_max = max(
+                max(blocks[item].start[0], blocks[item].end[0]) for item in left
+            )
+            right_min = min(
+                min(blocks[item].start[0], blocks[item].end[0]) for item in right
+            )
+            overlap = max(0.0, left_max + config.interference_dx - right_min)
+        objective = (
+            max(loads, default=0.0)
+            + 0.10 * max(empty, default=0.0)
+            + 0.02 * overlap / config.empty_speed
+        )
+        score = (
+            objective,
+            max(loads, default=0.0),
+            abs(loads[0] - loads[1]),
+            sum(empty),
+            overlap,
+            boundary,
+        )
+        candidate = (score, (left, right))
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    assert best is not None
+    return best
+
+
+def _construct_region_cooperative_initialization(
+    parents: Sequence[ParentWeld],
+    patterns: tuple[SplitPattern, ...],
+    config: ScientificConfig,
+) -> CanonicalSolution:
+    """Deterministic rail allocation, X-boundary balancing and bounded route ordering."""
+    parent_by_id = {parent.parent_id: parent for parent in parents}
+    blocks = {
+        block.block_id: block
+        for pattern in patterns
+        for block in blocks_for_pattern(parent_by_id[pattern.parent_id], pattern, config)
+    }
+    pattern_by_parent = {pattern.parent_id: pattern for pattern in patterns}
+    fixed: dict[int, list[str]] = {robot: [] for robot in range(4)}
+    rail_fixed: list[list[str]] = [[], []]
+    flexible: list[str] = []
+    for block_id, block in blocks.items():
+        pattern = pattern_by_parent[block.parent_id]
+        if pattern.kind is SplitKind.X_SPLIT:
+            child = int(block_id.rsplit("::", 1)[1])
+            upper = pattern.rail is not None and pattern.rail.value == "UPPER"
+            robot = (0, 1)[child] if upper else (2, 3)[child]
+            if not robot_is_eligible(block, robot, config):
+                raise ValueError(f"{block_id}: fixed X child is not robot eligible")
+            fixed[robot].append(block_id)
+            continue
+        eligible_rails = tuple(
+            rail
+            for rail, pair in enumerate(((0, 1), (2, 3)))
+            if any(robot_is_eligible(block, robot, config) for robot in pair)
+        )
+        if len(eligible_rails) == 2:
+            flexible.append(block_id)
+        elif len(eligible_rails) == 1:
+            rail_fixed[eligible_rails[0]].append(block_id)
+        else:
+            raise ValueError(f"{block_id}: no eligible rail for region initialization")
+
+    orders = (
+        tuple(
+            sorted(
+                flexible,
+                key=lambda item: (
+                    -config.process_time(blocks[item].length),
+                    _block_x_key(blocks[item]),
+                ),
+            )
+        ),
+        tuple(sorted(flexible, key=lambda item: _block_x_key(blocks[item]))),
+        tuple(
+            sorted(flexible, key=lambda item: _block_x_key(blocks[item]), reverse=True)
+        ),
+    )
+    candidates = []
+    for order in dict.fromkeys(orders):
+        groups = [list(rail_fixed[0]), list(rail_fixed[1])]
+        for block_id in order:
+            proposals = []
+            for rail in (0, 1):
+                proposed = [list(groups[0]), list(groups[1])]
+                proposed[rail].append(block_id)
+                plans = tuple(
+                    _region_boundary_plan(
+                        proposed[index],
+                        ((0, 1), (2, 3))[index],
+                        fixed,
+                        blocks,
+                        config,
+                    )
+                    for index in (0, 1)
+                )
+                loads = tuple(
+                    sum(config.process_time(blocks[item].length) for item in route)
+                    for _, routes in plans
+                    for route in routes
+                )
+                rail_totals = (loads[0] + loads[1], loads[2] + loads[3])
+                proposals.append(
+                    (
+                        (
+                            max(plan[0][0] for plan in plans),
+                            max(loads, default=0.0),
+                            abs(rail_totals[0] - rail_totals[1]),
+                            rail,
+                        ),
+                        rail,
+                    )
+                )
+            _, selected_rail = min(proposals)
+            groups[selected_rail].append(block_id)
+
+        plans = tuple(
+            _region_boundary_plan(
+                groups[index],
+                ((0, 1), (2, 3))[index],
+                fixed,
+                blocks,
+                config,
+            )
+            for index in (0, 1)
+        )
+        route_ids = [route for _, routes in plans for route in routes]
+        improved = tuple(
+            _improve_region_route(route, robot, blocks, config)
+            for robot, route in enumerate(route_ids)
+        )
+        loads = tuple(
+            sum(config.process_time(blocks[item].length) for item in route)
+            for route in improved
+        )
+        empty = tuple(
+            _route_empty_proxy(route, blocks, config) for route in improved
+        )
+        score = (
+            max(loads, default=0.0) + 0.10 * max(empty, default=0.0),
+            max(loads, default=0.0),
+            max(abs(loads[0] - loads[1]), abs(loads[2] - loads[3])),
+            sum(empty),
+            improved,
+        )
+        candidates.append((score, improved))
+    _, routes = min(candidates)
+    return canonicalize(
+        parents,
+        patterns,
+        tuple(Route(robot, routes[robot]) for robot in range(4)),
+        config,
+        revision=0,
+        x_split_validator=(
+            finite_x_split_validator(parents, config)
+            if any(pattern.kind is SplitKind.X_SPLIT for pattern in patterns)
+            else None
+        ),
+    )
+
+
 def _construct_rail_monotone_balanced_bootstrap(
     parents: Sequence[ParentWeld],
     patterns: tuple[SplitPattern, ...],
@@ -496,6 +852,7 @@ def build_initial_solution(
     feasibility_bootstrap_budget: int = 1,
     portfolio: bool = False,
     clearance_aware: bool = False,
+    region_cooperative: bool = False,
     reference_evaluator: ReferenceEvaluator | None = None,
     certifier: Certifier = certify_schedule,
     scope: FormalScope | None = None,
@@ -503,10 +860,25 @@ def build_initial_solution(
     reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     if scope is not None and certifier is not certify_schedule:
         raise ValueError("formal initialization requires the common certifier")
-    strategies = tuple(InitializationStrategy)[:construction_budget]
-    if construction_budget < 1 or construction_budget > len(InitializationStrategy):
+    baseline_strategies = (
+        InitializationStrategy.LOAD_FIRST,
+        InitializationStrategy.RAIL_BALANCED,
+        InitializationStrategy.X_ORDER_AWARE,
+        InitializationStrategy.SPATIAL_SPREAD,
+        InitializationStrategy.RAIL_MONOTONE_BALANCED,
+    )
+    cooperative_strategies = (
+        InitializationStrategy.LOAD_FIRST,
+        InitializationStrategy.RAIL_BALANCED,
+        InitializationStrategy.X_ORDER_AWARE,
+        InitializationStrategy.REGION_COOPERATIVE_INITIALIZATION,
+        InitializationStrategy.RAIL_MONOTONE_BALANCED,
+    )
+    strategy_pool = cooperative_strategies if region_cooperative else baseline_strategies
+    strategies = strategy_pool[:construction_budget]
+    if construction_budget < 1 or construction_budget > len(baseline_strategies):
         raise ValueError(
-            f"B_init_pool must be between 1 and {len(InitializationStrategy)}"
+            f"B_init_pool must be between 1 and {len(baseline_strategies)}"
         )
     if not (1 <= kinit_ref <= construction_budget):
         raise ValueError("require 1 <= Kinit_ref <= B_init_pool")

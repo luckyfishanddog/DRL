@@ -90,6 +90,7 @@ class SearchConfig:
     kinit_ref: int = 2
     feasibility_bootstrap_budget: int = 1
     initialization_clearance_aware: bool = False
+    initialization_region_cooperative: bool = False
     c2_mode: str = BASELINE_C2
     m_atomic: int | None = None
     m_lns: int = 16
@@ -120,9 +121,9 @@ class SearchConfig:
             raise ValueError("require 1 <= Kref <= Kdp <= M")
         if self.insertion_limit < 2:
             raise ValueError("I_init must be at least 2")
-        if not (1 <= self.construction_budget <= len(InitializationStrategy)):
+        if not (1 <= self.construction_budget <= 5):
             raise ValueError(
-                f"B_init_pool must be between 1 and {len(InitializationStrategy)}"
+                "B_init_pool must be between 1 and 5"
             )
         if not (1 <= self.kinit_ref <= self.construction_budget):
             raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
@@ -875,6 +876,7 @@ def run_bounded_sa_oi(
             feasibility_bootstrap_budget=search_config.feasibility_bootstrap_budget,
             portfolio=True,
             clearance_aware=search_config.initialization_clearance_aware,
+            region_cooperative=search_config.initialization_region_cooperative,
             reference_evaluator=reference_evaluator,
             scope=scope,
         )

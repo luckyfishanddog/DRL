@@ -225,16 +225,25 @@ def generation_timers():
         for name,fn in originals.items(): setattr(pipeline,name,fn)
 
 
-def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None):
+def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None,search=None):
     config=CONFIG if config is None else config
     parents=load_parents(entry) if parents is None else parents
     cap=Capture()
     with generation_timers() as timings:
-        result=pipeline.run_sa_oi_alns_v2(parents,config,search_config(),seed=seed,source_provenance=source or provenance(),observer=cap,**({'ranker':ranker} if ranker is not None else {}))
+        result=pipeline.run_sa_oi_alns_v2(parents,config,search or search_config(),seed=seed,source_provenance=source or provenance(),observer=cap,**({'ranker':ranker} if ranker is not None else {}))
     st=result.stats
     from mrta_reference.solution import block_map
     best=cap.best60;blocks=None if best is None else block_map(best['solution'],config)
+    checkpoint_certification=(
+        None if best is None
+        else certify_schedule(best['solution'],best['schedule'],config,scope=FORMAL_SCOPE_V2)
+    )
     loads=None if best is None else [sum(config.process_time(blocks[b].length) for b in route.block_ids) for route in best['solution'].routes]
+    initial_blocks=None if cap.initial is None else block_map(cap.initial['solution'],config)
+    initial_loads=(None if cap.initial is None else [
+        sum(config.process_time(initial_blocks[b].length) for b in route.block_ids)
+        for route in cap.initial['solution'].routes
+    ])
     empty_by_robot=waiting_by_robot=None
     if best is not None:
         from mrta_reference.model import OperationKind
@@ -246,6 +255,11 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
     split_counts=None if best is None else dict(Counter(pattern.kind.value for pattern in best['solution'].patterns))
     strict_improvements=strict_cmax_improvement_count(st.best_events)
     record={'initial_cmax':None if cap.initial is None else cap.initial['metrics'].cmax,
+        'initial_process_loads':initial_loads,
+        'initial_empty_travel':None if cap.initial is None else cap.initial['metrics'].total_empty_travel,
+        'initial_waiting':None if cap.initial is None else cap.initial['metrics'].total_waiting,
+        'initialization_seconds':st.init_time,
+        'initialization_strategy':result.initialization.winning_strategy,
         'Cmax_at_60':checkpoint_cmax(result),'final_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
         'certified':bool(result.final_certification and result.final_certification.certified),'iterations':st.iterations,
         'accepted_moves':sum(st.accepted_by_family.values()),'global_best_updates':len(st.best_improvement_cmax),
@@ -273,10 +287,12 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'initial_reference_status':dict(st.init_status_counts),
         'search_reference_status':dict(Counter(st.reference_status_sequence)),
         'status':result.status.value,'termination_reason':result.termination_reason,
+        'certified_at_60':bool(checkpoint_certification and checkpoint_certification.certified),
+        'checkpoint_certification_errors':([] if checkpoint_certification is None else list(checkpoint_certification.errors)),
         'first_boundary_elapsed':cap.first_boundary_elapsed,
         'time_to_first_certified':None if cap.initial is None else cap.initial['elapsed'],
         'missing_state_stages':[stage for stage,_ in STAGES if stage not in cap.snapshots]}
-    record['valid_60s_outcome']=not record['numeric_failure'] and record['certified'] and record['Cmax_at_60'] is not None
+    record['valid_60s_outcome']=not record['numeric_failure'] and record['certified_at_60'] and record['Cmax_at_60'] is not None
     return record,cap.snapshots
 
 

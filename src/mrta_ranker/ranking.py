@@ -1,5 +1,6 @@
 """Score replacement only: preserve production C2 family coverage and C4 rotation."""
 from __future__ import annotations
+import json
 import time
 import math
 from pathlib import Path
@@ -1207,10 +1208,253 @@ def write_final_c4_report(root=None):
     path=root/'docs/GRC_ALNS_C4_FINAL_SELECTION.md';path.write_text('\n'.join(lines),encoding='utf-8');print(path,flush=True);return path
 
 
+REGION_INITIALIZATION_SEEDS=(20261701,20261702)
+REGION_INITIALIZATION_METHODS=(
+    'BASELINE_HEURISTIC',
+    'REGION_HEURISTIC',
+    'BASELINE_GAT_V05',
+    'REGION_GAT_V05',
+)
+
+
+def _region_initialization_entries(root):
+    """Fixed consumed-development cases; selection never reads solver outcomes."""
+    from mrta_data.phase3_split import assert_v2_solver_access_allowed
+    from . import dataset as data
+    smoke=_final_smoke_module(root)
+    small=smoke._small30_read(root/'docs/YX_SPLIT_RANGE_05_CHANGE.md')['entries']
+    old=smoke._range_entries(root)
+    search=(
+        dict(small[0],label='N35_S1',tier='N35'),
+        dict(small[1],label='N35_S2',tier='N35'),
+        dict(next(e for e in old if e['selection_ordinal']==5),label='N55_I5',tier='N55'),
+        dict(next(e for e in old if e['selection_ordinal']==6),label='N55_I6',tier='N55'),
+        dict(next(e for e in old if e['selection_ordinal']==9),label='N85_I9',tier='N85'),
+        dict(next(e for e in old if e['selection_ordinal']==12),label='N85_I12',tier='N85'),
+    )
+    zero=(
+        dict(next(e for e in old if e['selection_ordinal']==3),label='I3',tier='N26'),
+        search[0],search[1],search[2],search[4],
+    )
+    unique={entry['relative_path']:entry for entry in (*zero,*search)}
+    assert_v2_solver_access_allowed(
+        data.read(data.ROLES),
+        list(unique),
+        allowed_roles=('V2_MODEL_DEVELOPMENT_CONSUMED',),
+    )
+    return zero,search
+
+
+def _region_solution_record(solution,schedule,metrics,config):
+    from collections import Counter
+    from mrta_reference.model import OperationKind
+    from mrta_reference.solution import block_map
+    blocks=block_map(solution,config);loads=[];empty=[];waiting=[]
+    for robot,route in enumerate(solution.routes):
+        loads.append(sum(config.process_time(blocks[item].length) for item in route.block_ids))
+        welds=sorted((op for op in schedule.operations if op.robot_id==robot and op.kind is OperationKind.WELD),key=lambda op:op.sequence_index)
+        empty.append(sum(math.dist(left.end,right.start)/config.empty_speed for left,right in zip(welds,welds[1:])))
+        waiting.append(sum(op.duration for op in schedule.operations if op.robot_id==robot and op.kind is OperationKind.WAIT))
+    return {'cmax':metrics.cmax,'process_loads':loads,'process_imbalance':metrics.process_imbalance,
+        'empty_travel_by_robot':empty,'waiting_by_robot':waiting,
+        'total_empty_travel':metrics.total_empty_travel,'total_waiting':metrics.total_waiting,
+        'split_counts':dict(Counter(pattern.kind.value for pattern in solution.patterns)),
+        'routes':[list(route.block_ids) for route in solution.routes]}
+
+
+def _region_initialization_zero_worker(job):
+    from collections import Counter
+    from dataclasses import replace
+    from . import dataset as data
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import block_map,official_metrics
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    entry,variant,root=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO);config=data.CONFIG_V05
+    search=replace(data.search_config(),max_iterations=0,time_limit=None,checkpoints=(),
+        initialization_region_cooperative=variant=='REGION')
+    started=time.perf_counter()
+    result=run_sa_oi_alns_v2(parents,config,search,seed=20261700,
+        source_provenance=data.provenance())
+    wall=time.perf_counter()-started;initial=result.initialization
+    if initial.solution is None or initial.schedule is None:
+        chosen=None;certified=False;errors=[]
+    else:
+        certification=certify_schedule(initial.solution,initial.schedule,config,scope=FORMAL_SCOPE_V2)
+        certified=certification.certified;errors=list(certification.errors)
+        chosen=_region_solution_record(initial.solution,initial.schedule,
+            official_metrics(initial.solution,initial.schedule,config),config)
+    attempts=[];cheap=[]
+    for attempt in initial.attempts:
+        loads=None;empty=None
+        if attempt.solution is not None:
+            blocks=block_map(attempt.solution,config)
+            loads=[sum(config.process_time(blocks[item].length) for item in route.block_ids)
+                   for route in attempt.solution.routes]
+        if attempt.directions is not None:empty=attempt.directions.total_empty_travel
+        row={'index':attempt.construction_index,'strategy':attempt.strategy,
+            'constructed':attempt.solution is not None,'duplicate':attempt.duplicate,
+            'direction_status':None if attempt.directions is None else attempt.directions.status.value,
+            'process_loads':loads,'max_process_load':None if loads is None else max(loads),
+            'load_spread':None if loads is None else max(loads)-min(loads),
+            'empty_travel_proxy':empty,'reference_evaluated':attempt.schedule is not None,
+            'reference_status':None if attempt.schedule is None else attempt.schedule.status.value,
+            'reference_cmax':None if attempt.schedule is None else attempt.schedule.cmax,
+            'independently_certified':bool(attempt.certification and attempt.certification.certified),
+            'diagnostics':list(attempt.diagnostics)}
+        attempts.append(row)
+        if row['direction_status']=='FEASIBLE' and not row['duplicate']:
+            cheap.append((row['max_process_load'],math.inf if empty is None else empty,row['index'],row['strategy']))
+    cheap_rank={strategy:index+1 for index,(*_,strategy) in enumerate(sorted(cheap))}
+    for row in attempts:row['cheap_rank']=cheap_rank.get(row['strategy'])
+    stats=result.stats
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],'actual_N':len(parents),
+        'variant':variant,'status':result.status.value,'certified':certified,
+        'certification_errors':errors,'winning_strategy':initial.winning_strategy,'chosen':chosen,
+        'initialization_seconds':stats.init_time,'wall_seconds':wall,
+        'time_to_first_certified':None if not stats.best_events else stats.best_events[0][0],
+        'construction_attempts':stats.construction_attempts,'direction_dp_attempts':sum(a['direction_status'] is not None for a in attempts),
+        'reference_calls':stats.init_reference_calls,'reference_status':dict(stats.init_status_counts),
+        'deadlock_calls':stats.init_status_counts.get('DEADLOCK',0),
+        'serial_fallback':initial.winning_strategy=='RAIL_SERIAL_BOOTSTRAP','attempts':attempts}
+
+
+def run_region_initialization_zero(root=None,workers=4):
+    """Run/resume five fixed zero-search baseline/cooperative comparisons."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    zero,_=_region_initialization_entries(root);db=data.connect(data.DATABASE_V05)
+    experiment='region_cooperative_initialization_zero'
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(experiment,))};db.close()
+    jobs=[]
+    for index,entry in enumerate(zero):
+        order=('BASELINE','REGION') if index%2==0 else ('REGION','BASELINE')
+        for variant in order:
+            key=f"{entry['label']}:{variant}"
+            if key not in done:jobs.append((key,(entry,variant,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_region_initialization_zero_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future];row=future.result();db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',(experiment,key,data.dumps(row)))
+            db.close();print(f"region zero {key} status={row['status']} Cmax={None if row['chosen'] is None else row['chosen']['cmax']}",flush=True)
+    return len(jobs)
+
+
+def _region_initialization_online_worker(job):
+    from dataclasses import replace
+    from . import dataset as data
+    entry,seed,method,root=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO)
+    region=method.startswith('REGION_');gat=method.endswith('GAT_V05')
+    search=replace(data.search_config(),initialization_region_cooperative=region)
+    ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05') if gat else None
+    record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,
+        config=data.CONFIG_V05,search=search)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],
+        'actual_N':len(parents),'seed':seed,'method':method,
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),**record}
+
+
+def run_region_initialization_online(root=None,workers=4):
+    """Run/resume the fixed 6x2x4 consumed-development 60-second matrix."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    _,entries=_region_initialization_entries(root);experiment='region_cooperative_initialization_runs'
+    db=data.connect(data.DATABASE_V05)
+    zero=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='region_cooperative_initialization_zero'")]
+    if len(zero)!=10 or not all(row['certified'] for row in zero):
+        db.close();raise RuntimeError('Ten certified zero-search comparisons are required first')
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(experiment,))};db.close();jobs=[]
+    for entry_index,entry in enumerate(entries):
+        for seed_index,seed in enumerate(REGION_INITIALIZATION_SEEDS):
+            offset=(entry_index+seed_index)%len(REGION_INITIALIZATION_METHODS)
+            order=REGION_INITIALIZATION_METHODS[offset:]+REGION_INITIALIZATION_METHODS[:offset]
+            for method in order:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_region_initialization_online_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future]
+            try:row=future.result()
+            except Exception as error:
+                instance,seed,method=key.split(':');row={'instance':instance,'seed':int(seed),'method':method,
+                    'status':'EXECUTION_ERROR','Cmax_at_60':None,'certified_at_60':False,'diagnostics':[repr(error)]}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',(experiment,key,data.dumps(row)))
+            db.close();print(f"region run {key} status={row['status']} Cmax@60={row.get('Cmax_at_60')}",flush=True)
+    return len(jobs)
+
+
+def summarize_region_initialization(root=None):
+    import statistics
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    db=data.connect(data.DATABASE_V05,readonly=True)
+    zero=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='region_cooperative_initialization_zero' ORDER BY item_id")]
+    runs=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='region_cooperative_initialization_runs' ORDER BY item_id")]
+    db.close();index={(row['instance'],row['seed'],row['method']):row for row in runs}
+    paired={}
+    comparisons=(('REGION_HEURISTIC','BASELINE_HEURISTIC'),('REGION_GAT_V05','BASELINE_GAT_V05'),('REGION_GAT_V05','REGION_HEURISTIC'))
+    for method,base in comparisons:
+        rows=[]
+        for row in runs:
+            if row['method']!=method:continue
+            other=index.get((row['instance'],row['seed'],base))
+            if other and row.get('Cmax_at_60') is not None and other.get('Cmax_at_60') is not None:
+                rows.append({'instance':row['instance'],'tier':row['tier'],'seed':row['seed'],
+                    'delta_seconds':row['Cmax_at_60']-other['Cmax_at_60'],
+                    'delta_percent':100*(row['Cmax_at_60']/other['Cmax_at_60']-1)})
+        by_tier={}
+        for tier in ('N35','N55','N85','ALL'):
+            subset=[row for row in rows if tier=='ALL' or row['tier']==tier]
+            by_tier[tier]={'count':len(subset),'wins':sum(r['delta_seconds']<-1e-8 for r in subset),
+                'ties':sum(abs(r['delta_seconds'])<=1e-8 for r in subset),'losses':sum(r['delta_seconds']>1e-8 for r in subset),
+                'mean_delta_percent':None if not subset else statistics.mean(r['delta_percent'] for r in subset),
+                'median_delta_percent':None if not subset else statistics.median(r['delta_percent'] for r in subset)}
+        paired[f'{method}_vs_{base}']={'rows':rows,'by_tier':by_tier}
+    return {'zero':zero,'runs':runs,'paired':paired}
+
+
+def validate_region_initialization(root=None):
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);summary=summarize_region_initialization(root)
+    zero=summary['zero'];runs=summary['runs']
+    if len(zero)!=10 or not all(row['certified'] for row in zero):raise AssertionError('zero-search matrix incomplete or uncertified')
+    expected_base=['LOAD_FIRST','RAIL_BALANCED','X_ORDER_AWARE','SPATIAL_SPREAD','RAIL_MONOTONE_BALANCED_BOOTSTRAP']
+    expected_region=['LOAD_FIRST','RAIL_BALANCED','X_ORDER_AWARE','REGION_COOPERATIVE_INITIALIZATION','RAIL_MONOTONE_BALANCED_BOOTSTRAP']
+    for row in zero:
+        normal=[a['strategy'] for a in row['attempts'] if a['index']<5]
+        if normal!=(expected_region if row['variant']=='REGION' else expected_base):raise AssertionError('normal initialization slots changed')
+        if row['construction_attempts']>6 or row['reference_calls']>10:raise AssertionError('initialization budget exceeded')
+    if len(runs)!=48 or not all(row.get('certified_at_60') for row in runs):raise AssertionError('60-second matrix incomplete or uncertified')
+    expected=data.CONFIG_V05.scientific_mapping()
+    if any(row['scientific_config']!=expected or row['numeric_failure'] for row in runs):raise AssertionError('scientific config or numeric status changed')
+    for instance in {row['instance'] for row in runs}:
+        for prefix in ('BASELINE','REGION'):
+            values={row['initial_cmax'] for row in runs if row['instance']==instance and row['method'].startswith(prefix)}
+            if len(values)!=1:raise AssertionError('ranker or seed changed deterministic initialization')
+    result={'zero_rows':len(zero),'online_rows':len(runs),'all_certified':True,
+        'max_construction_attempts':max(row['construction_attempts'] for row in zero),
+        'max_initial_reference_calls':max(row['reference_calls'] for row in zero),
+        'max_online_overshoot':max(row['overshoot'] for row in runs)}
+    print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -1226,4 +1470,8 @@ if __name__=='__main__':
     elif args.action=='sci-validate':validate_sci_results(args.root)
     elif args.action=='final-summary':summarize_final_c4_results(args.root)
     elif args.action=='final-validate':validate_final_c4_invariants(args.root)
-    else:write_final_c4_report(args.root)
+    elif args.action=='final-report':write_final_c4_report(args.root)
+    elif args.action=='region-init-zero':run_region_initialization_zero(args.root,args.workers)
+    elif args.action=='region-init-online':run_region_initialization_online(args.root,args.workers)
+    elif args.action=='region-init-summary':print(json.dumps(summarize_region_initialization(args.root),ensure_ascii=False,indent=2))
+    else:validate_region_initialization(args.root)

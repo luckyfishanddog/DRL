@@ -11,6 +11,7 @@ import pytest
 from mrta_search.initialization import (
     RAIL_SERIAL_BOOTSTRAP,
     InitializationStatus,
+    _construct_region_cooperative_initialization,
     _construct_rail_monotone_balanced_bootstrap,
     _patterns,
     bounded_insertion_positions,
@@ -334,3 +335,72 @@ def test_clearance_default_remains_baseline_and_never_hides_certifier_failure():
         portfolio=True,clearance_aware=True,certifier=reject)
     assert result.status is InitializationStatus.NUMERIC_FAILURE
     assert result.solution is None
+
+
+def test_region_cooperative_is_deterministic_balanced_eligible_and_certified():
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    parents=_v3_fixture() + (
+        ParentWeld('mandatory',(8.,5.),(8.,7.)),
+        ParentWeld('shared',(12.,6.),(13.,6.)),
+    )
+    patterns=_patterns(parents,FAST)
+    first=_construct_region_cooperative_initialization(parents,patterns,FAST)
+    second=_construct_region_cooperative_initialization(parents,patterns,FAST)
+    assert first==second and first.patterns==patterns
+    blocks=block_map(first,FAST,scope=FORMAL_SCOPE_V2)
+    assert all(robot_is_eligible(blocks[item],route.robot_id,FAST)
+               for route in first.routes for item in route.block_ids)
+    assert all(route.block_ids for route in first.routes)
+    result=build_initial_solution(parents,FAST,_stats(),construction_budget=5,kinit_ref=5,
+        portfolio=True,region_cooperative=True,scope=FORMAL_SCOPE_V2)
+    assert result.status is InitializationStatus.SUCCESS
+    assert result.certification is not None and result.certification.certified
+
+
+def test_region_cooperative_replaces_only_spatial_slot_and_preserves_budget(monkeypatch):
+    from mrta_search import initialization as init
+    calls=[];fallback=[];original=init._v3_direction_feasibility_candidates
+    def bounded(*args,**kwargs):
+        rows=original(*args,**kwargs);fallback.append(len(rows));return rows
+    monkeypatch.setattr(init,'_v3_direction_feasibility_candidates',bounded)
+    def deadlock(*args,**kwargs):
+        calls.append(1);return ScheduleResult(ScheduleStatus.DEADLOCK)
+    baseline=build_initial_solution(_v3_fixture(),FAST,_stats(),construction_budget=5,kinit_ref=5,
+        portfolio=True,reference_evaluator=deadlock)
+    enhanced=build_initial_solution(_v3_fixture(),FAST,_stats(),construction_budget=5,kinit_ref=5,
+        portfolio=True,region_cooperative=True,reference_evaluator=deadlock)
+    assert [row.strategy for row in baseline.attempts[:5]]==[
+        'LOAD_FIRST','RAIL_BALANCED','X_ORDER_AWARE','SPATIAL_SPREAD',
+        'RAIL_MONOTONE_BALANCED_BOOTSTRAP']
+    assert [row.strategy for row in enhanced.attempts[:5]]==[
+        'LOAD_FIRST','RAIL_BALANCED','X_ORDER_AWARE','REGION_COOPERATIVE_INITIALIZATION',
+        'RAIL_MONOTONE_BALANCED_BOOTSTRAP']
+    assert baseline.status is enhanced.status is InitializationStatus.INITIALIZATION_FAILED
+    assert len(calls)<=2*(5+4+1)
+    assert all(value<=4 for value in fallback)
+
+
+def test_region_cooperative_default_switch_is_off_and_certifier_rejection_is_fatal():
+    from mrta_reference.certifier import CertificationReport
+    from mrta_search.pipeline import SearchConfig
+    assert SearchConfig().initialization_region_cooperative is False
+    def reject(*args,**kwargs):
+        return CertificationReport(False,('deliberate rejection',),None)
+    result=build_initial_solution(_v3_fixture(),FAST,_stats(),construction_budget=5,kinit_ref=5,
+        portfolio=True,region_cooperative=True,certifier=reject)
+    assert result.status is InitializationStatus.NUMERIC_FAILURE
+    assert result.solution is None
+
+
+def test_region_cooperative_preserves_x_split_child_robot_ownership():
+    from mrta_reference.geometry import generate_x_split_patterns
+    from mrta_reference.model import Rail
+    parent=ParentWeld('x',(2.,9.),(18.,9.))
+    pattern=next(row for row in generate_x_split_patterns(parent,10.,FAST,rail=Rail.UPPER)
+                 if row.point_id=='BX_CENTER')
+    solution=_construct_region_cooperative_initialization((parent,),(pattern,),FAST)
+    assert solution.routes[0].block_ids==('x::0',)
+    assert solution.routes[1].block_ids==('x::1',)
+    assert not solution.routes[2].block_ids and not solution.routes[3].block_ids
+    blocks=block_map(solution,FAST)
+    assert all(block.length>=FAST.min_child_length-FAST.numeric_epsilon for block in blocks.values())
