@@ -1651,10 +1651,264 @@ def validate_crrr(root=None):
     print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
 
 
+CRRR_ACCESS_METHOD='REGION_CRRR_ACCESS_C2_HEURISTIC'
+
+
+def _crrr_access_candidate_record(candidate,pool,config):
+    from mrta_search.coordination_risk import coordination_risk
+    from mrta_search.pipeline import decision_family
+    provenance=dict(candidate.provenance);risk=coordination_risk(candidate.solution,config)
+    ranked=sorted(pool,key=lambda row:row.cheap_score)
+    return {'canonical_hash':candidate.solution.canonical_hash,
+        'source_kind':candidate.source_kind.value,'decision_family':decision_family(candidate),
+        'operator':provenance.get('operator'),'scheme':provenance.get('scheme'),
+        'affected_parent_ids':list(provenance.get('affected_parent_ids',())),
+        'projected_process_makespan':candidate.projected_process_makespan,
+        'local_directed_travel_delta':candidate.local_directed_travel_delta,
+        'same_rail_overlap':risk.same_rail_overlap,
+        'first_task_order_excess':risk.first_task_order_excess,
+        'cheap_rank':ranked.index(candidate)+1}
+
+
+def _crrr_access_offline_worker(job):
+    """Rebuild one native pool and label only the old/new C2 union."""
+    from dataclasses import replace
+    from . import dataset as data
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.model import ScheduleStatus
+    from mrta_reference.scheduler import resolve_reference_evaluator
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import official_metrics
+    from mrta_search.direction import optimize_directions_with_initial_feasibility
+    from mrta_search.pipeline import (CRRR_ACCESS_C2,DECISION_FAMILIES,
+        decision_family,run_sa_oi_alns_v2,select_c2_by_family,select_c2_crrr_access)
+    entry,root,known_crrr=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO);captured={}
+    def observer(event,value):
+        if event=='boundary' and 'solution' not in captured:
+            captured.update(solution=value['solution'],schedule=value['schedule'])
+        elif event=='selection' and 'pool' not in captured:
+            captured.update(pool=value[0],actual_baseline=value[1])
+    search=replace(data.search_config(),initialization_region_cooperative=True,
+        enable_crrr=True,c2_mode='BASELINE_C2',max_iterations=1,time_limit=None,checkpoints=())
+    run_sa_oi_alns_v2(parents,data.CONFIG_V05,search,seed=20261701,
+        source_provenance=data.provenance(),observer=observer)
+    pool=tuple(captured['pool']);current=captured['solution'];schedule=captured['schedule']
+    started=time.perf_counter();baseline=select_c2_by_family(pool,search.kdp,seed=20261701,iteration=0)
+    baseline_seconds=time.perf_counter()-started
+    started=time.perf_counter();access=select_c2_crrr_access(pool,search.kdp,current,schedule,data.CONFIG_V05,
+        seed=20261701,iteration=0);access_seconds=time.perf_counter()-started
+    if tuple(captured['actual_baseline'])!=baseline:raise AssertionError('reconstructed baseline C2 drift')
+    ranked=tuple(sorted(pool,key=lambda row:row.cheap_score));protected=[]
+    for family in DECISION_FAMILIES:
+        candidate=next((row for row in ranked if decision_family(row)==family),None)
+        if candidate is not None and candidate in baseline:protected.append(candidate.solution.canonical_hash)
+    known={json.dumps(row['provenance'],sort_keys=True):row for row in known_crrr}
+    evaluator=resolve_reference_evaluator(FORMAL_SCOPE_V2,None);labels={}
+    union=[]
+    for candidate in (*baseline,*access.selected):
+        if candidate.solution.canonical_hash not in {row.solution.canonical_hash for row in union}:union.append(candidate)
+    for candidate in union:
+        key=json.dumps(dict(candidate.provenance),sort_keys=True)
+        if dict(candidate.provenance).get('operator')=='CRRR' and key in known:
+            source=known[key];labels[candidate.solution.canonical_hash]={
+                'reused_existing_label':True,'direction_feasible':source['direction_feasible'],
+                'reference_status':source['reference_status'],'certified':source['certified'],'cmax':source['cmax']}
+            continue
+        direction=optimize_directions_with_initial_feasibility(candidate.solution,data.CONFIG_V05)
+        label={'reused_existing_label':False,'direction_feasible':direction.total_empty_travel is not None,
+            'reference_status':None,'certified':False,'cmax':None}
+        if direction.total_empty_travel is not None:
+            result=evaluator(candidate.solution,data.CONFIG_V05,
+                orientations={robot:direction.directions[robot] for robot in range(4)})
+            label['reference_status']=result.status.value
+            if result.status is ScheduleStatus.FEASIBLE:
+                certification=certify_schedule(candidate.solution,result,data.CONFIG_V05,scope=FORMAL_SCOPE_V2)
+                label['certified']=certification.certified
+                if certification.certified:label['cmax']=official_metrics(candidate.solution,result,data.CONFIG_V05).cmax
+        labels[candidate.solution.canonical_hash]=label
+    def rows(selected):
+        return [{**_crrr_access_candidate_record(candidate,pool,data.CONFIG_V05),
+            'protected_family_representative':candidate.solution.canonical_hash in protected,
+            'offline_label':labels[candidate.solution.canonical_hash]} for candidate in selected]
+    known_improvements=[row for row in known_crrr if row.get('certified') and row.get('cmax') is not None
+        and row['cmax']<schedule.cmax-data.CONFIG_V05.numeric_epsilon]
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'actual_N':len(parents),'seed':20261701,'current_cmax':schedule.cmax,
+        'pool_size':len(pool),'baseline_top8':rows(baseline),'access_top8':rows(access.selected),
+        'competitive_crrr_count':len(access.competitive),'rejected_crrr_count':access.rejected_count,
+        'injected':None if access.injected is None else _crrr_access_candidate_record(access.injected,pool,data.CONFIG_V05),
+        'replaced':None if access.replaced is None else _crrr_access_candidate_record(access.replaced,pool,data.CONFIG_V05),
+        'protected_hashes':protected,'baseline_selection_seconds':baseline_seconds,
+        'access_selection_seconds':access_seconds,'known_crrr_label_count':len(known_crrr),
+        'known_crrr_improvement_count':len(known_improvements),
+        'known_crrr_best_cmax':min((row['cmax'] for row in known_improvements),default=None),
+        'online_mode_constant':CRRR_ACCESS_C2}
+
+
+def run_crrr_access_offline(root=None,workers=4):
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    _,entries=_region_initialization_entries(root);wanted={'N35_S1','N55_I5','N55_I6','N85_I9'}
+    entries=tuple(entry for entry in entries if entry['label'] in wanted)
+    db=data.connect(data.DATABASE_V05)
+    smoke={row['instance']:row for row in (json.loads(value) for value, in db.execute(
+        "SELECT payload FROM experiments WHERE experiment='crrr_native_smoke'"))}
+    if set(smoke)!=wanted:db.close();raise RuntimeError('Existing four-state CRRR labels are incomplete')
+    experiment='crrr_c2_access_offline';done={row[0] for row in db.execute(
+        'SELECT item_id FROM experiments WHERE experiment=?',(experiment,))};db.close()
+    jobs=[(entry['label'],(entry,root,smoke[entry['label']]['offline_candidates']))
+        for entry in entries if entry['label'] not in done]
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),
+            initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_crrr_access_offline_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future];row=future.result();db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',(experiment,key,data.dumps(row)))
+            db.close();print(f"CRRR C2 offline {key}: injected={row['injected'] is not None}",flush=True)
+    return len(jobs)
+
+
+def validate_crrr_access_offline(root=None):
+    from . import dataset as data
+    db=data.connect(data.DATABASE_V05);rows=[json.loads(row[0]) for row in db.execute(
+        "SELECT payload FROM experiments WHERE experiment='crrr_c2_access_offline' ORDER BY item_id")];db.close()
+    if len(rows)!=4:raise AssertionError('four offline access states required')
+    by_name={row['instance']:row for row in rows}
+    if any(len(row['baseline_top8'])!=8 or len(row['access_top8'])!=8 for row in rows):raise AssertionError('Top8 changed')
+    if any(sum(item['operator']=='CRRR' for item in row['access_top8'])>1 for row in rows):raise AssertionError('more than one CRRR in C2')
+    for row in rows:
+        old={item['canonical_hash'] for item in row['baseline_top8'] if item['protected_family_representative']}
+        new={item['canonical_hash'] for item in row['access_top8']}
+        if not old<=new:raise AssertionError('family representative displaced')
+    caught=[]
+    for name in ('N35_S1','N55_I5'):
+        row=by_name[name];injected=row['injected']
+        if injected is not None:
+            label=next(item['offline_label'] for item in row['access_top8'] if item['canonical_hash']==injected['canonical_hash'])
+            if label['certified'] and label['cmax']<row['current_cmax']-data.CONFIG_V05.numeric_epsilon:caught.append(name)
+    if not caught:raise AssertionError('no known certified improving CRRR retained')
+    if any(by_name[name]['injected'] is not None for name in ('N55_I6','N85_I9')):raise AssertionError('noncompetitive I6/I9 CRRR displaced baseline')
+    for row in rows:
+        if row['injected'] is None:continue
+        injected_label=next(item['offline_label'] for item in row['access_top8']
+            if item['canonical_hash']==row['injected']['canonical_hash'])
+        replaced_label=next(item['offline_label'] for item in row['baseline_top8']
+            if item['canonical_hash']==row['replaced']['canonical_hash'])
+        if (replaced_label['certified'] and replaced_label['cmax'] is not None
+                and (not injected_label['certified'] or injected_label['cmax'] is None
+                    or replaced_label['cmax']<injected_label['cmax']-data.CONFIG_V05.numeric_epsilon)):
+            raise AssertionError('offline replacement discards a better certified candidate')
+    if max(row['access_selection_seconds'] for row in rows)>0.02:
+        raise AssertionError('CRRR access C2 selection overhead is unexpectedly high')
+    result={'passed':True,'states':len(rows),'certified_improvement_caught':caught,
+        'max_access_selection_seconds':max(row['access_selection_seconds'] for row in rows),
+        'rows':rows};print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
+
+
+def _crrr_access_online_worker(job):
+    from dataclasses import replace
+    from . import dataset as data
+    from mrta_search.pipeline import CRRR_ACCESS_C2
+    entry,seed,root=job;smoke=_final_smoke_module(root);parents=smoke._range_parents(entry,data.PPO)
+    search=replace(data.search_config(),initialization_region_cooperative=True,
+        enable_crrr=True,c2_mode=CRRR_ACCESS_C2)
+    record,_=data.run_trajectory(entry,seed,parents=parents,config=data.CONFIG_V05,search=search)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],'actual_N':len(parents),
+        'seed':seed,'method':CRRR_ACCESS_METHOD,'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'search_config':{'m':search.m,'m_atomic':144,'m_lns':search.m_lns,
+            'original_lns_attempts':search.m_lns-search.crrr_attempts,'crrr_attempts':search.crrr_attempts,
+            'kdp':search.kdp,'kref':search.kref,'kref_total':search.kref_total,
+            'region_initialization':True,'c2_mode':search.c2_mode,'two_opt_star':search.enable_two_opt_star},**record}
+
+
+def run_crrr_access_online(root=None,workers=4):
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);validate_crrr_access_offline(root)
+    _,entries=_region_initialization_entries(root);experiment='crrr_c2_access_runs';db=data.connect(data.DATABASE_V05)
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(experiment,))};db.close()
+    jobs=[]
+    for entry in entries:
+        for seed in REGION_INITIALIZATION_SEEDS:
+            key=f"{entry['label']}:{seed}:{CRRR_ACCESS_METHOD}"
+            if key not in done:jobs.append((key,(entry,seed,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),
+            initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_crrr_access_online_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future]
+            try:row=future.result()
+            except Exception as error:
+                instance,seed,_=key.split(':',2);row={'instance':instance,'seed':int(seed),'method':CRRR_ACCESS_METHOD,
+                    'status':'EXECUTION_ERROR','Cmax_at_60':None,'certified_at_60':False,'diagnostics':[repr(error)]}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',(experiment,key,data.dumps(row)))
+            db.close();print(f"CRRR access run {key} status={row['status']} Cmax@60={row.get('Cmax_at_60')}",flush=True)
+    return len(jobs)
+
+
+def summarize_crrr_access(root=None):
+    import statistics
+    from . import dataset as data
+    db=data.connect(data.DATABASE_V05)
+    offline=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='crrr_c2_access_offline' ORDER BY item_id")]
+    old=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='region_cooperative_initialization_runs'")]
+    crrr=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='crrr_search_runs'")]
+    access=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='crrr_c2_access_runs'")];db.close()
+    old=[row for row in old if row['method']=='REGION_HEURISTIC'];crrr=[row for row in crrr if row['method']=='REGION_CRRR_HEURISTIC']
+    index={(row['instance'],row['seed'],row['method']):row for row in old+crrr+access}
+    comparisons={}
+    for base in ('REGION_CRRR_HEURISTIC','REGION_HEURISTIC'):
+        pairs=[]
+        for row in access:
+            other=index.get((row['instance'],row['seed'],base))
+            if other and row.get('Cmax_at_60') is not None and other.get('Cmax_at_60') is not None:
+                delta=100*(row['Cmax_at_60']/other['Cmax_at_60']-1)
+                pairs.append({'instance':row['instance'],'tier':row['tier'],'seed':row['seed'],
+                    'access_cmax':row['Cmax_at_60'],'baseline_cmax':other['Cmax_at_60'],'delta_percent':delta})
+        tiers={}
+        for tier in ('N35','N55','N85','ALL'):
+            subset=[row for row in pairs if tier=='ALL' or row['tier']==tier]
+            tiers[tier]={'count':len(subset),'wins':sum(row['delta_percent']<-1e-10 for row in subset),
+                'ties':sum(abs(row['delta_percent'])<=1e-10 for row in subset),'losses':sum(row['delta_percent']>1e-10 for row in subset),
+                'median_delta_percent':None if not subset else statistics.median(row['delta_percent'] for row in subset),
+                'mean_delta_percent':None if not subset else statistics.mean(row['delta_percent'] for row in subset),
+                'worst_delta_percent':None if not subset else max(row['delta_percent'] for row in subset)}
+        comparisons[f'access_vs_{base}']={'pairs':sorted(pairs,key=lambda row:(row['instance'],row['seed'])),'tiers':tiers}
+    funnel_keys=('attempted','constructed','valid_unique','competitive','rejected_by_access_gate','injected','c2_selected',
+        'direction_feasible','c4_selected','reference_evaluated','accepted','strict_cmax_improvements')
+    funnel={key:sum(row.get('crrr_funnel',{}).get(key,0) for row in access) for key in funnel_keys}
+    funnel['reference_status']={status:sum(row.get('crrr_funnel',{}).get('reference_status',{}).get(status,0) for row in access)
+        for status in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE')}
+    return {'offline':offline,'old_a':old,'old_b':crrr,'new_c':access,'comparisons':comparisons,'funnel':funnel,
+        'selection_seconds':{'c2_total':sum(row.get('c2_selection_seconds',0) for row in access),
+            'c4_total':sum(row.get('c4_selection_seconds',0) for row in access)}}
+
+
+def validate_crrr_access(root=None):
+    from . import dataset as data
+    offline=validate_crrr_access_offline(root);summary=summarize_crrr_access(root);rows=summary['new_c']
+    if len(rows)!=12 or not all(row.get('certified_at_60') for row in rows):raise AssertionError('12 certified access runs required')
+    if any(row['scientific_config']!=data.CONFIG_V05.scientific_mapping() for row in rows):raise AssertionError('scientific model changed')
+    if any(row['search_config']['c2_mode']!='CRRR_ACCESS_C2' for row in rows):raise AssertionError('access mode not recorded')
+    if any(row.get('max_per_iteration_attempts',192)>192 for row in rows):raise AssertionError('M192 exceeded')
+    if any(row['search_config']['kdp']!=8 or row['search_config']['kref']!=2 or row['search_config']['kref_total']!=4 for row in rows):raise AssertionError('selection budget changed')
+    result={'offline_passed':offline['passed'],'online_runs':len(rows),'all_certified':True,
+        'comparisons':summary['comparisons'],'funnel':summary['funnel'],'selection_seconds':summary['selection_seconds']}
+    print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -1678,4 +1932,8 @@ if __name__=='__main__':
     elif args.action=='crrr-smoke':run_crrr_smoke(args.root,args.workers)
     elif args.action=='crrr-online':run_crrr_online(args.root,args.workers)
     elif args.action=='crrr-summary':print(json.dumps(summarize_crrr(args.root),ensure_ascii=False,indent=2))
-    else:validate_crrr(args.root)
+    elif args.action=='crrr-validate':validate_crrr(args.root)
+    elif args.action=='crrr-access-offline':run_crrr_access_offline(args.root,args.workers)
+    elif args.action=='crrr-access-online':run_crrr_access_online(args.root,args.workers)
+    elif args.action=='crrr-access-summary':print(json.dumps(summarize_crrr_access(args.root),ensure_ascii=False,indent=2))
+    else:validate_crrr_access(args.root)

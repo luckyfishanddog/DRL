@@ -32,7 +32,7 @@ from mrta_reference.provenance import (
     resolve_source_provenance,
 )
 from mrta_reference.scheduler import build_operation_templates, build_robot_routes
-from mrta_reference.solution import official_metrics
+from mrta_reference.solution import block_map, official_metrics
 
 from .direction import (
     ConstrainedDirectionResult,
@@ -79,6 +79,7 @@ V2_C2_PATTERN_FAMILY_STRATIFIED_V1 = "V2_C2_PATTERN_FAMILY_STRATIFIED_V1"
 V2_C4_FAMILY_EXPLORE_EXPLOIT_V1 = "V2_C4_FAMILY_EXPLORE_EXPLOIT_V1"
 BASELINE_C2 = "BASELINE_C2"
 COORDINATION_AWARE_C2 = "COORDINATION_AWARE_C2"
+CRRR_ACCESS_C2 = "CRRR_ACCESS_C2"
 DECISION_FAMILIES = ("STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X")
 
 
@@ -133,7 +134,7 @@ class SearchConfig:
             raise ValueError("require 1 <= Kinit_ref <= B_init_pool")
         if self.feasibility_bootstrap_budget not in (0, 1):
             raise ValueError("B_init_bootstrap must be 0 or 1")
-        if self.c2_mode not in (BASELINE_C2, COORDINATION_AWARE_C2):
+        if self.c2_mode not in (BASELINE_C2, COORDINATION_AWARE_C2, CRRR_ACCESS_C2):
             raise ValueError("unknown C2 mode")
         atomic = self.m - self.m_lns if self.m_atomic is None else self.m_atomic
         if min(atomic, self.m_lns) < 0 or atomic + self.m_lns > self.m:
@@ -307,6 +308,165 @@ def select_c2_by_family(candidates, kdp: int, *, seed: int, iteration: int):
     selected_ids = {id(row) for row in selected}
     selected.extend(row for row in ranked if id(row) not in selected_ids)
     return tuple(selected[:kdp])
+
+
+@dataclass(frozen=True)
+class CRRRAccessResult:
+    """Deterministic C2 result plus access-gate diagnostics."""
+
+    selected: tuple[CompleteSearchCandidate, ...]
+    competitive: tuple[CompleteSearchCandidate, ...]
+    rejected_count: int
+    injected: CompleteSearchCandidate | None = None
+    replaced: CompleteSearchCandidate | None = None
+
+
+def _projected_process_makespan(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+) -> float:
+    blocks = block_map(solution, config)
+    return max(
+        sum(config.process_time(blocks[block_id].length) for block_id in route.block_ids)
+        for route in solution.routes
+    )
+
+
+def _metric_comparison(left, right, epsilon: float) -> tuple[int, int]:
+    improvements = sum(a < b - epsilon for a, b in zip(left, right))
+    regressions = sum(a > b + epsilon for a, b in zip(left, right))
+    return improvements, regressions
+
+
+def select_c2_crrr_access(
+    candidates,
+    kdp: int,
+    current: CanonicalSolution,
+    current_schedule: ScheduleResult,
+    config: ScientificConfig,
+    *,
+    seed: int,
+    iteration: int,
+) -> CRRRAccessResult:
+    """Give at most one coordination-competitive CRRR candidate C2 access.
+
+    The baseline family representatives remain protected. Every comparison
+    uses the same pre-direction quantities for CRRR and non-CRRR candidates:
+    projected process makespan, local travel change, static same-rail overlap,
+    and first-task order excess. No direction or reference result is read.
+    """
+    baseline = select_c2_by_family(
+        candidates, kdp, seed=seed, iteration=iteration,
+    )
+    if not baseline or kdp <= 0:
+        return CRRRAccessResult(tuple(baseline), (), 0)
+    ranked = tuple(sorted(candidates, key=lambda item: item.cheap_score))
+    crrr = tuple(
+        candidate for candidate in ranked
+        if isinstance(candidate, CompleteSearchCandidate)
+        and dict(candidate.provenance).get("operator") == CRRR_OPERATOR
+    )
+    baseline_ids = {id(candidate) for candidate in baseline}
+    if not crrr:
+        return CRRRAccessResult(tuple(baseline), (), len(crrr))
+
+    epsilon = config.numeric_epsilon
+    current_risk = coordination_risk(current, config)
+    current_metrics = (
+        _projected_process_makespan(current, config),
+        0.0,
+        current_risk.same_rail_overlap,
+        current_risk.first_task_order_excess,
+    )
+    current_cmax = current_schedule.cmax
+    if current_cmax is None:
+        return CRRRAccessResult(tuple(baseline), (), len(crrr))
+
+    candidate_metrics: dict[int, tuple[float, float, float, float]] = {}
+    competitive = []
+    for candidate in crrr:
+        risk = coordination_risk(candidate.solution, config)
+        metrics = (
+            candidate.projected_process_makespan,
+            candidate.local_directed_travel_delta,
+            risk.same_rail_overlap,
+            risk.first_task_order_excess,
+        )
+        candidate_metrics[id(candidate)] = metrics
+        improvements, regressions = _metric_comparison(
+            metrics, current_metrics, epsilon,
+        )
+        if (
+            candidate.projected_process_makespan <= current_cmax + epsilon
+            and improvements >= 2
+            and regressions <= 1
+        ):
+            competitive.append(candidate)
+    if not competitive:
+        return CRRRAccessResult(tuple(baseline), (), len(crrr))
+    if any(id(candidate) in baseline_ids for candidate in crrr):
+        return CRRRAccessResult(
+            tuple(baseline), tuple(competitive), len(crrr) - len(competitive),
+        )
+
+    protected_ids: set[int] = set()
+    for family in DECISION_FAMILIES:
+        representative = next(
+            (candidate for candidate in ranked if decision_family(candidate) == family),
+            None,
+        )
+        if representative is not None and id(representative) in baseline_ids:
+            protected_ids.add(id(representative))
+    replaceable = [
+        candidate for candidate in baseline if id(candidate) not in protected_ids
+    ]
+    if not replaceable:
+        return CRRRAccessResult(tuple(baseline), tuple(competitive), len(crrr) - len(competitive))
+
+    competitive.sort(key=lambda candidate: (
+        _metric_comparison(candidate_metrics[id(candidate)], current_metrics, epsilon)[1],
+        -_metric_comparison(candidate_metrics[id(candidate)], current_metrics, epsilon)[0],
+        candidate_metrics[id(candidate)][2] + candidate_metrics[id(candidate)][3],
+        candidate_metrics[id(candidate)][0],
+        candidate_metrics[id(candidate)][1],
+        candidate.candidate_identity,
+    ))
+    victim_metrics: dict[int, tuple[float, float, float, float]] = {}
+    for candidate in replaceable:
+        risk = coordination_risk(candidate.solution, config)
+        victim_metrics[id(candidate)] = (
+            candidate.projected_process_makespan,
+            candidate.local_directed_travel_delta,
+            risk.same_rail_overlap,
+            risk.first_task_order_excess,
+        )
+    choices = []
+    for challenger_index, challenger in enumerate(competitive):
+        for victim_index, victim in enumerate(baseline):
+            if victim not in replaceable:
+                continue
+            improvements, regressions = _metric_comparison(
+                candidate_metrics[id(challenger)], victim_metrics[id(victim)], epsilon,
+            )
+            if improvements >= 2 and regressions <= 2:
+                choices.append((
+                    -improvements,
+                    regressions,
+                    challenger_index,
+                    -victim_index,
+                    challenger.candidate_identity,
+                    challenger,
+                    victim,
+                ))
+    if not choices:
+        return CRRRAccessResult(tuple(baseline), tuple(competitive), len(crrr) - len(competitive))
+    *_, injected, replaced = min(choices)
+    selected = list(baseline)
+    selected[selected.index(replaced)] = injected
+    return CRRRAccessResult(
+        tuple(selected), tuple(competitive), len(crrr) - len(competitive),
+        injected, replaced,
+    )
 
 
 def select_c2_coordination_aware(
@@ -736,6 +896,15 @@ def evaluate_iteration(
                 cheap_ranked, search_config.kdp, config,
                 seed=stats.seed, iteration=stats.iterations,
             )
+        elif family_access and search_config.c2_mode == CRRR_ACCESS_C2:
+            access = select_c2_crrr_access(
+                cheap_ranked, search_config.kdp, current, current_schedule, config,
+                seed=stats.seed, iteration=stats.iterations,
+            )
+            c2 = access.selected
+            stats.crrr_access_competitive += len(access.competitive)
+            stats.crrr_access_rejected += access.rejected_count
+            stats.crrr_access_injected += int(access.injected is not None)
         else:
             c2 = (
                 select_c2_by_family(cheap_ranked, search_config.kdp, seed=stats.seed, iteration=stats.iterations)
@@ -773,11 +942,14 @@ def evaluate_iteration(
         elif candidate.source_kind is CandidateSourceKind.LNS_REPAIRED:
             stats.original_lns_c2_selected += 1
             stats.original_lns_direction_feasible += int(direction.total_empty_travel is not None)
+        else:
+            stats.atomic_c2_selected += 1
         if _x_patterns(candidate.solution):
             stats.x_pattern_candidates_c3 += 1
         if _y_patterns(candidate.solution):
             stats.y_pattern_candidates_c3 += 1
     feasible_c3 = [item for item in c3 if item.direction.total_empty_travel is not None]
+    c4_started = time.perf_counter()
     if ranker is not None:
         shortlist = ranker.select_c4(current,current_directions,current_schedule.cmax,feasible_c3,config,
                                      seed=stats.seed,iteration=stats.iterations,k=search_config.kref)
@@ -786,6 +958,7 @@ def evaluate_iteration(
             select_c4_by_family(feasible_c3, search_config.kref, seed=stats.seed, iteration=stats.iterations)
             if family_access else rerank_c3(feasible_c3, search_config.kref)
         )
+    stats.c4_selection_time += time.perf_counter() - c4_started
 
     cache: dict[tuple[object, ...], ReferenceEvaluatedCandidate] = {}
     c4 = []
@@ -798,6 +971,8 @@ def evaluate_iteration(
             stats.crrr_c4_selected += 1
         elif isinstance(item.screened, CompleteSearchCandidate) and item.screened.source_kind is CandidateSourceKind.LNS_REPAIRED:
             stats.original_lns_c4_selected += 1
+        else:
+            stats.atomic_c4_selected += 1
         move_name = _move_name(item.screened)
         family = _family_of(item.screened)
         has_x = bool(_x_patterns(_solution_of(item.screened)))

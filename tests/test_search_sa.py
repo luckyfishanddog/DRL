@@ -507,7 +507,7 @@ def test_coordination_risk_is_pure_pre_direction_geometry(monkeypatch):
 
 def test_coordination_c2_keeps_family_access_unique_kdp_and_baseline_default():
     from mrta_search.pipeline import (
-        BASELINE_C2, COORDINATION_AWARE_C2, decision_family,
+        BASELINE_C2, COORDINATION_AWARE_C2, CRRR_ACCESS_C2, decision_family,
         select_c2_by_family,select_c2_coordination_aware,
     )
     rows=_family_candidates()
@@ -515,6 +515,7 @@ def test_coordination_c2_keeps_family_access_unique_kdp_and_baseline_default():
     selected=select_c2_coordination_aware(rows,8,FAST,seed=11,iteration=2)
     assert SearchConfig().c2_mode==BASELINE_C2
     assert SearchConfig(c2_mode=COORDINATION_AWARE_C2).kdp==8
+    assert SearchConfig(c2_mode=CRRR_ACCESS_C2).kdp==8
     with pytest.raises(ValueError,match='unknown C2 mode'):
         SearchConfig(c2_mode='ORACLE')
     assert len(selected)==8==len(baseline)

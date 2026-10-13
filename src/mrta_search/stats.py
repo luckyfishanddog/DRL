@@ -74,6 +74,7 @@ class SearchStats:
     candidate_generation_time: float = 0.0
     cheap_screen_time: float = 0.0
     c2_selection_time: float = 0.0
+    c4_selection_time: float = 0.0
     direction_dp_time: float = 0.0
     reference_scheduler_time: float = 0.0
     certifier_time: float = 0.0
@@ -93,6 +94,9 @@ class SearchStats:
     crrr_strict_cmax_improvements: int = 0
     crrr_generation_time: float = 0.0
     crrr_rejection_reasons: Counter[str] = field(default_factory=Counter)
+    crrr_access_competitive: int = 0
+    crrr_access_rejected: int = 0
+    crrr_access_injected: int = 0
     original_lns_attempted: int = 0
     original_lns_constructed: int = 0
     original_lns_valid_unique: int = 0
@@ -101,6 +105,8 @@ class SearchStats:
     original_lns_c4_selected: int = 0
     original_lns_reference_evaluated: int = 0
     original_lns_reference_status: Counter[str] = field(default_factory=Counter)
+    atomic_c2_selected: int = 0
+    atomic_c4_selected: int = 0
 
     attempted_by_family: dict[str, int] = field(default_factory=_family_counter)
     constructed_by_family: dict[str, int] = field(default_factory=_family_counter)

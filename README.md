@@ -83,6 +83,12 @@ All 24 new consumed-development 60-second runs certified. CRRR+HEURISTIC versus 
 
 Decision: **CRRR is not a default neighborhood** and the enhanced search is not frozen as a new paper method. The code remains an optional ablation; no further GAT training or neighborhood stacking follows from this development result. Complete evidence: [CRRR search results](docs/CRRR_SEARCH_RESULTS.md). Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
 
+### CRRR C2 access follow-up
+
+The default-off `CRRR_ACCESS_C2` preserves the original four-family access and can replace at most one non-protected Top8 slot using a fixed, pre-direction comparison of projected process load, route-travel delta, same-rail overlap and first-task order risk. Offline replay retains the known improving S1/I5 CRRR candidates without injecting I6/I9 candidates; only I5 improves the known Top8 certified bound.
+
+All 12 new consumed-development 60-second runs certified. CRRR C2 access rises from 32 to 71 selections, but C4 remains 10 and all ten B32 results are `DEADLOCK`; CRRR accepted moves and strict Cmax improvements are both zero. Versus the original CRRR heuristic it is **1/11/0**, median 0.00%; the sole difference has no access injection or CRRR C4 evaluation and is not attributable to CRRR. Versus REGION+original LNS it remains **2/8/2**, median 0.00%, mean **+1.54%**, with the same **+20.95%** S1 regression. Decision: `CRRR_ACCESS_C2` and CRRR stay default-off, and no further CRRR score tuning is justified. Evidence: [CRRR C2 access results](docs/CRRR_C2_ACCESS_RESULTS.md). Current regression: **334 passed**.
+
 ## First runnable GRC-ALNS (0.50 m)
 
 The new workbook-isolated dataset contains **98 TRAIN states / 11,924 candidates** and **34 DEV states / 4,184 candidates**, with **590/356 material positives** and zero numeric failures. It keeps the existing 17 TRAIN / 6 DEV workbook split; missing EARLY states are not backfilled. The historical 0.20 dataset and checkpoints are unchanged.

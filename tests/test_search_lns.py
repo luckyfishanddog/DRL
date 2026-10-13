@@ -22,6 +22,9 @@ from mrta_search import (
 from mrta_search.pipeline import evaluate_iteration
 from mrta_search.lns import (
     CRRRBottleneck,
+    CRRR_OPERATOR,
+    CompleteCandidateIdentity,
+    CompleteSearchCandidate,
     build_crrr_candidate,
     identify_crrr_region,
     lns_pair,
@@ -377,6 +380,76 @@ def test_crrr_replaces_eight_original_lns_attempts_and_default_is_unchanged() ->
                for candidate in iteration.complete_candidates)
     assert enabled_stats.repair_reference_calls == 0
     assert enabled_stats.repair_full_direction_dp_calls == 0
+
+
+def test_crrr_access_c2_is_guarded_family_safe_and_limited_to_one(monkeypatch) -> None:
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    from mrta_search.coordination_risk import CoordinationRisk
+    from mrta_search import pipeline
+    from mrta_search.pipeline import select_c2_by_family, select_c2_crrr_access
+
+    current = _initial().best_solution
+    normal = tuple(
+        CompleteSearchCandidate(
+            CandidateSourceKind.LNS_REPAIRED,
+            current,
+            CompleteCandidateIdentity(0, CandidateSourceKind.LNS_REPAIRED.value, ("OLD", index)),
+            float(index + 1),
+            10.0 + index,
+            0,
+            0.0,
+            (("operator", "OLD"),),
+        )
+        for index in range(8)
+    )
+    changed = replace(current, revision=current.revision + 1)
+    challenger = CompleteSearchCandidate(
+        CandidateSourceKind.LNS_REPAIRED,
+        changed,
+        CompleteCandidateIdentity(0, CandidateSourceKind.LNS_REPAIRED.value, (CRRR_OPERATOR, 0)),
+        9.0,
+        -1.0,
+        0,
+        0.0,
+        (("operator", CRRR_OPERATOR),),
+    )
+    monkeypatch.setattr(pipeline, "_projected_process_makespan", lambda *args: 10.0)
+    monkeypatch.setattr(
+        pipeline,
+        "coordination_risk",
+        lambda solution, config: CoordinationRisk(4.0, 0.0)
+        if solution is changed else CoordinationRisk(5.0, 0.0),
+    )
+    monkeypatch.setattr(
+        pipeline, "optimize_directions_with_initial_feasibility",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("direction called")),
+    )
+    monkeypatch.setattr(
+        pipeline, "reference_schedule",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("reference called")),
+    )
+    schedule = ScheduleResult(
+        ScheduleStatus.FEASIBLE, cmax=100.0, robot_completion=(100.0,) * 4,
+    )
+    baseline = select_c2_by_family(normal + (challenger,), 8, seed=3, iteration=0)
+    access = select_c2_crrr_access(
+        normal + (challenger,), 8, current, schedule, FAST, seed=3, iteration=0,
+    )
+    assert len(access.selected) == 8
+    assert access.injected is challenger
+    assert sum(dict(row.provenance).get("operator") == CRRR_OPERATOR
+               for row in access.selected) == 1
+    assert baseline[0] in access.selected  # protected STRUCTURAL representative
+
+    rejected = replace(challenger, projected_process_makespan=11.0,
+                       local_directed_travel_delta=1.0)
+    no_access = select_c2_crrr_access(
+        normal + (rejected,), 8, current, schedule, FAST, seed=3, iteration=0,
+    )
+    assert no_access.injected is None
+    assert no_access.selected == select_c2_by_family(
+        normal + (rejected,), 8, seed=3, iteration=0,
+    )
 
 
 def test_crrr_preserves_x_split_child_robot_identity() -> None:
