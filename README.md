@@ -89,6 +89,14 @@ The default-off `CRRR_ACCESS_C2` preserves the original four-family access and c
 
 All 12 new consumed-development 60-second runs certified. CRRR C2 access rises from 32 to 71 selections, but C4 remains 10 and all ten B32 results are `DEADLOCK`; CRRR accepted moves and strict Cmax improvements are both zero. Versus the original CRRR heuristic it is **1/11/0**, median 0.00%; the sole difference has no access injection or CRRR C4 evaluation and is not attributable to CRRR. Versus REGION+original LNS it remains **2/8/2**, median 0.00%, mean **+1.54%**, with the same **+20.95%** S1 regression. Decision: `CRRR_ACCESS_C2` and CRRR stay default-off, and no further CRRR score tuning is justified. Evidence: [CRRR C2 access results](docs/CRRR_C2_ACCESS_RESULTS.md). Current regression: **334 passed**.
 
+## Equivalent LNS computation acceleration (0.50 m)
+
+The optional `lns_incremental_scoring` path removes repeated four-route load and directed-travel recomputation inside the unchanged original LNS repair. It caches route processing terms and adjacent directed arcs, updates only the affected route/arcs, and preserves the original floating-point accumulation order. The switch defaults to off; REGION initialization, 144 atomic + 48 LNS, C2/C4, SA, direction DP, B32, certifier and all evaluation budgets are unchanged.
+
+WHOLE/Y/X unit replay and native fixed-iteration N35/N55/N85 replay match candidate identities/order, C2 Top8, direction, C4 Top2, B32, SA and final solutions exactly. Single-process microbenchmarks show **3.09×–4.71×** LNS-repair and **1.22×–2.39×** complete candidate-generation speedups. In 24 instrumented 60-second consumed-development runs, all certify; accelerated versus legacy is **3/9/0 wins/ties/losses**, median Cmax change **0.00%**, mean **−1.82%**, worst **0.00%**. Iterations rise 133→202, search references 460→696, and strict Cmax decreases 33→37. Gains occur on one S1 seed and both I5 seeds; all N85 pairs tie.
+
+Decision: retain the equivalent acceleration as a default-off candidate for new independent validation. It improves real search opportunity without changing decisions, but does not close the historical HGA/WAG gap and is not a new search-method contribution. Evidence: [LNS equivalent acceleration report](docs/LNS_EQUIVALENT_ACCELERATION_RESULTS.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
+
 ## First runnable GRC-ALNS (0.50 m)
 
 The new workbook-isolated dataset contains **98 TRAIN states / 11,924 candidates** and **34 DEV states / 4,184 candidates**, with **590/356 material positives** and zero numeric failures. It keeps the existing 17 TRAIN / 6 DEV workbook split; missing EARLY states are not backfilled. The historical 0.20 dataset and checkpoints are unchanged.

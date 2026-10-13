@@ -65,6 +65,13 @@ def test_mandatory_pair_insertion_uses_final_route_not_old_index_difference(monk
     assert any(a.routes[0] == ("c::1", "a::whole", "c::0", "b::whole")
                and a.trace[0][1:3] == (0, 1) and a.trace[1][1:3] == (0, 0)
                for a in alternatives)
+    accelerated, accelerated_count = lns._parent_alternatives(
+        "c", (("a::whole", "b::whole"), (), (), ()), ((0, 0), (), (), ()),
+        blocks, pattern, FAST, insertion_limit=8, remaining_budget=10000,
+        incremental_scoring=True,
+    )
+    assert accelerated_count == len(alternatives)
+    assert accelerated == alternatives
 
 
 def test_collapsed_mandatory_y_is_rejected_by_scientific_evaluator():
@@ -168,6 +175,17 @@ def test_parent_destroy_repair_identity_replay_and_hard_budget(repair) -> None:
     assert first.candidate.candidate_identity == second.candidate.candidate_identity
     assert first.candidate.solution.canonical_json == second.candidate.solution.canonical_json
     assert first.candidate.source_kind is CandidateSourceKind.LNS_REPAIRED
+    accelerated = repair_partial_state(
+        initial.best_solution,
+        initial.best_directions,
+        partial,
+        DestroyOperator.RANDOM_REMOVAL,
+        repair,
+        FAST,
+        max_insertion_evaluations=200,
+        incremental_scoring=True,
+    )
+    assert accelerated == first
     actual = [
         block_id
         for route in first.candidate.solution.routes
@@ -263,19 +281,20 @@ def test_bounded_initial_portfolio_closes_known_handover_n50_failure() -> None:
 def test_atomic_and_lns_share_complete_candidate_pipeline() -> None:
     initial = _initial()
     stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 31)
+    search = SearchConfig(
+        m=32,
+        m_atomic=16,
+        m_lns=16,
+        kdp=16,
+        kref=4,
+        kref_total=4,
+        max_iterations=1,
+    )
     iteration = evaluate_iteration(
         initial.best_solution,
         initial.best_directions,
         FAST,
-        SearchConfig(
-            m=32,
-            m_atomic=16,
-            m_lns=16,
-            kdp=16,
-            kref=4,
-            kref_total=4,
-            max_iterations=1,
-        ),
+        search,
         stats,
         seed=31,
         current_schedule=initial.best_schedule,
@@ -289,6 +308,24 @@ def test_atomic_and_lns_share_complete_candidate_pipeline() -> None:
     assert stats.per_iteration_attempts[-1] == 32
     assert stats.repair_reference_calls == 0
     assert stats.repair_full_direction_dp_calls == 0
+
+    accelerated_stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 31)
+    accelerated = evaluate_iteration(
+        initial.best_solution,
+        initial.best_directions,
+        FAST,
+        replace(search, lns_incremental_scoring=True),
+        accelerated_stats,
+        seed=31,
+        current_schedule=initial.best_schedule,
+        adaptive_state=AdaptiveOperatorState(),
+    )
+    assert not SearchConfig().lns_incremental_scoring
+    assert accelerated.complete_candidates == iteration.complete_candidates
+    assert accelerated.c3_candidates == iteration.c3_candidates
+    assert accelerated.c4_candidates == iteration.c4_candidates
+    assert accelerated.proposal == iteration.proposal
+    assert accelerated_stats.repair_insertion_evaluations == stats.repair_insertion_evaluations
 
 
 def test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal() -> None:
@@ -484,6 +521,22 @@ def test_crrr_preserves_x_split_child_robot_identity() -> None:
     assert set(routes[1].block_ids) == {"x1::1", "x2::1"}
     assert not routes[2].block_ids and not routes[3].block_ids
     assert repaired.candidate.solution.patterns == patterns
+
+    partial = destroy_parents(
+        current, schedule, DestroyOperator.CRITICAL_LOAD_REMOVAL,
+        q=1, seed=0, config=FAST,
+    )
+    legacy = repair_partial_state(
+        current, ((0, 0), (0, 0), (), ()), partial,
+        DestroyOperator.CRITICAL_LOAD_REMOVAL, RepairOperator.REGRET_2_REPAIR,
+        FAST, max_insertion_evaluations=512,
+    )
+    accelerated = repair_partial_state(
+        current, ((0, 0), (0, 0), (), ()), partial,
+        DestroyOperator.CRITICAL_LOAD_REMOVAL, RepairOperator.REGRET_2_REPAIR,
+        FAST, max_insertion_evaluations=512, incremental_scoring=True,
+    )
+    assert accelerated == legacy
 
 
 def test_q6_destroy_repair_crosses_a_basin_atomic_short_budget_cannot() -> None:

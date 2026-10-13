@@ -176,6 +176,62 @@ def _loads(
     )  # type: ignore[return-value]
 
 
+def _route_arc_costs(
+    route: Sequence[str],
+    hints: Sequence[int],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> tuple[float, ...]:
+    """Cache the directed costs of one route without changing proxy semantics."""
+    costs = []
+    for index in range(len(route) - 1):
+        _, end = oriented_endpoints(blocks[route[index]], hints[index])
+        start, _ = oriented_endpoints(blocks[route[index + 1]], hints[index + 1])
+        costs.append(math.dist(end, start) / config.empty_speed)
+    return tuple(costs)
+
+
+def _proxy_from_arc_costs(costs: Sequence[Sequence[float]]) -> float:
+    # Keep the exact robot/arc accumulation order used by _directed_proxy.  A
+    # sum-of-route-totals would be faster but can perturb floating-point ties.
+    total = 0.0
+    for route_costs in costs:
+        for value in route_costs:
+            total += value
+    return total
+
+
+def _insert_route_arc_costs(
+    route: Sequence[str],
+    hints: Sequence[int],
+    costs: Sequence[float],
+    block: WeldingBlock,
+    position: int,
+    hint: int,
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> tuple[float, ...]:
+    """Update only the one or two arcs touched by an insertion."""
+    if not route:
+        return ()
+    before = tuple(costs[: max(0, position - 1)])
+    after = tuple(costs[position:])
+    inserted: list[float] = []
+    if position:
+        _, end = oriented_endpoints(blocks[route[position - 1]], hints[position - 1])
+        start, _ = oriented_endpoints(block, hint)
+        inserted.append(math.dist(end, start) / config.empty_speed)
+    if position < len(route):
+        _, end = oriented_endpoints(block, hint)
+        start, _ = oriented_endpoints(blocks[route[position]], hints[position])
+        inserted.append(math.dist(end, start) / config.empty_speed)
+    return before + tuple(inserted) + after
+
+
+def _insert_tuple(values: tuple[object, ...], position: int, value: object) -> tuple[object, ...]:
+    return values[:position] + (value,) + values[position:]
+
+
 def _hints_from_current(
     solution: CanonicalSolution, directions: DirectionVectors
 ) -> dict[str, int]:
@@ -334,6 +390,7 @@ def _parent_alternatives(
     *,
     insertion_limit: int,
     remaining_budget: int,
+    incremental_scoring: bool = False,
 ) -> tuple[tuple[_InsertionAlternative, ...], int]:
     parent_blocks = tuple(
         sorted(
@@ -342,6 +399,19 @@ def _parent_alternatives(
         )
     )
     base_proxy = _directed_proxy(routes, hints, blocks, config)
+    if incremental_scoring:
+        load_terms = tuple(
+            tuple(config.process_time(blocks[item].length) for item in route)
+            for route in routes
+        )
+        cached_loads = tuple(sum(terms) for terms in load_terms)
+        arc_costs = tuple(
+            _route_arc_costs(route, hints[robot], blocks, config)
+            for robot, route in enumerate(routes)
+        )
+        # This assertion protects the tie-sensitive score ordering while the
+        # optimized path is still an explicitly selected development option.
+        assert _proxy_from_arc_costs(arc_costs) == base_proxy
     alternatives: list[_InsertionAlternative] = []
     evaluated = 0
 
@@ -362,10 +432,26 @@ def _parent_alternatives(
         if evaluated >= remaining_budget:
             break
         routes1, hints1 = _insert_one(routes, hints, first, robot, position, hint)
+        if incremental_scoring:
+            load_terms1 = list(load_terms)
+            load_terms1[robot] = _insert_tuple(
+                load_terms[robot], position, config.process_time(first.length)
+            )
+            loads1 = list(cached_loads)
+            loads1[robot] = sum(load_terms1[robot])
+            arc_costs1 = list(arc_costs)
+            arc_costs1[robot] = _insert_route_arc_costs(
+                routes[robot], hints[robot], arc_costs[robot], first,
+                position, hint, blocks, config,
+            )
         if len(parent_blocks) == 1:
             evaluated += 1
-            loads = _loads(routes1, blocks, config)
-            delta = _directed_proxy(routes1, hints1, blocks, config) - base_proxy
+            if incremental_scoring:
+                loads = tuple(loads1)
+                delta = _proxy_from_arc_costs(arc_costs1) - base_proxy
+            else:
+                loads = _loads(routes1, blocks, config)
+                delta = _directed_proxy(routes1, hints1, blocks, config) - base_proxy
             trace = ((first.block_id, robot, position, hint),)
             alternatives.append(
                 _InsertionAlternative(
@@ -403,8 +489,24 @@ def _parent_alternatives(
                     routes2, hints2 = _insert_one(
                         routes1, hints1, second, robot2, position2, hint2
                     )
-                    loads = _loads(routes2, blocks, config)
-                    delta = _directed_proxy(routes2, hints2, blocks, config) - base_proxy
+                    if incremental_scoring:
+                        load_terms2 = list(load_terms1)
+                        load_terms2[robot2] = _insert_tuple(
+                            load_terms1[robot2], position2,
+                            config.process_time(second.length),
+                        )
+                        loads2 = list(loads1)
+                        loads2[robot2] = sum(load_terms2[robot2])
+                        arc_costs2 = list(arc_costs1)
+                        arc_costs2[robot2] = _insert_route_arc_costs(
+                            routes1[robot2], hints1[robot2], arc_costs1[robot2],
+                            second, position2, hint2, blocks, config,
+                        )
+                        loads = tuple(loads2)
+                        delta = _proxy_from_arc_costs(arc_costs2) - base_proxy
+                    else:
+                        loads = _loads(routes2, blocks, config)
+                        delta = _directed_proxy(routes2, hints2, blocks, config) - base_proxy
                     trace = (
                         (first.block_id, robot, position, hint),
                         (second.block_id, robot2, position2, hint2),
@@ -441,6 +543,7 @@ def repair_partial_state(
     *,
     insertion_limit: int = 8,
     max_insertion_evaluations: int = 4096,
+    incremental_scoring: bool = False,
 ) -> RepairResult:
     if partial.source_revision != current.revision:
         raise ValueError("stale partial state revision")
@@ -493,6 +596,7 @@ def repair_partial_state(
                 remaining_budget=min(
                     per_call_budget, max_insertion_evaluations - evaluations
                 ),
+                incremental_scoring=incremental_scoring,
             )
             evaluations += used
             alternatives_by_parent[parent_id] = alternatives

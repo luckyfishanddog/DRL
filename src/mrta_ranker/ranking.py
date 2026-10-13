@@ -1905,10 +1905,110 @@ def validate_crrr_access(root=None):
     print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
 
 
+LNS_ACCELERATION_SEEDS=(20261801,20261802)
+LNS_ACCELERATION_METHODS=('REGION_LNS_LEGACY_HEURISTIC','REGION_LNS_INCREMENTAL_HEURISTIC')
+
+
+def _lns_acceleration_online_worker(job):
+    """One fixed-budget run; the only method difference is LNS score caching."""
+    from dataclasses import replace
+    from . import dataset as data
+    entry,seed,method,root=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO)
+    accelerated=method=='REGION_LNS_INCREMENTAL_HEURISTIC'
+    search=replace(data.search_config(),initialization_region_cooperative=True,
+        enable_crrr=False,c2_mode='BASELINE_C2',lns_incremental_scoring=accelerated)
+    record,_=data.run_trajectory(entry,seed,parents=parents,config=data.CONFIG_V05,search=search)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],
+        'actual_N':len(parents),'seed':seed,'method':method,
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'search_config':{'m':search.m,'m_atomic':144,'m_lns':search.m_lns,
+            'kdp':search.kdp,'kref':search.kref,'kref_total':search.kref_total,
+            'region_initialization':True,'crrr':False,'crrr_access':False,
+            'two_opt_star':search.enable_two_opt_star,
+            'lns_incremental_scoring':accelerated},**record}
+
+
+def run_lns_acceleration_online(root=None,workers=4):
+    """Run/resume the alternating 6x2x2 consumed-development matrix."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    _,entries=_region_initialization_entries(root);experiment='lns_equivalent_acceleration_runs_instrumented'
+    db=data.connect(data.DATABASE_V05)
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(experiment,))};db.close();jobs=[]
+    for entry_index,entry in enumerate(entries):
+        for seed_index,seed in enumerate(LNS_ACCELERATION_SEEDS):
+            order=(LNS_ACCELERATION_METHODS if (entry_index+seed_index)%2==0
+                else tuple(reversed(LNS_ACCELERATION_METHODS)))
+            for method in order:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),
+            initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_lns_acceleration_online_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future]
+            try:row=future.result()
+            except Exception as error:
+                instance,seed,method=key.split(':');row={'instance':instance,'seed':int(seed),'method':method,
+                    'status':'EXECUTION_ERROR','Cmax_at_60':None,'certified_at_60':False,'diagnostics':[repr(error)]}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',(experiment,key,data.dumps(row)))
+            db.close();print(f"LNS acceleration {key} status={row['status']} Cmax@60={row.get('Cmax_at_60')}",flush=True)
+    return len(jobs)
+
+
+def summarize_lns_acceleration(root=None):
+    import statistics
+    from . import dataset as data
+    db=data.connect(data.DATABASE_V05,readonly=True)
+    rows=[json.loads(row[0]) for row in db.execute(
+        "SELECT payload FROM experiments WHERE experiment='lns_equivalent_acceleration_runs_instrumented' ORDER BY item_id")]
+    db.close();index={(row['instance'],row['seed'],row['method']):row for row in rows};pairs=[]
+    for row in rows:
+        if row['method']!='REGION_LNS_INCREMENTAL_HEURISTIC':continue
+        old=index.get((row['instance'],row['seed'],'REGION_LNS_LEGACY_HEURISTIC'))
+        if old is None or row.get('Cmax_at_60') is None or old.get('Cmax_at_60') is None:continue
+        pairs.append({'instance':row['instance'],'tier':row['tier'],'seed':row['seed'],
+            'old_cmax':old['Cmax_at_60'],'new_cmax':row['Cmax_at_60'],
+            'delta_percent':100*(row['Cmax_at_60']/old['Cmax_at_60']-1),
+            'old_iterations':old['iterations'],'new_iterations':row['iterations'],
+            'old_repair_seconds':old['search_repair_seconds'],'new_repair_seconds':row['search_repair_seconds'],
+            'old_generation_seconds':old['candidate_generation_seconds'],'new_generation_seconds':row['candidate_generation_seconds'],
+            'old_reference_calls':old['search_reference_calls'],'new_reference_calls':row['search_reference_calls'],
+            'old_strict':old['strict_best_improvements_at60'],'new_strict':row['strict_best_improvements_at60']})
+    tiers={}
+    for tier in ('N35','N55','N85','ALL'):
+        subset=[row for row in pairs if tier=='ALL' or row['tier']==tier]
+        tiers[tier]={'count':len(subset),'wins':sum(r['delta_percent']<-1e-10 for r in subset),
+            'ties':sum(abs(r['delta_percent'])<=1e-10 for r in subset),'losses':sum(r['delta_percent']>1e-10 for r in subset),
+            'median_delta_percent':None if not subset else statistics.median(r['delta_percent'] for r in subset),
+            'mean_delta_percent':None if not subset else statistics.mean(r['delta_percent'] for r in subset),
+            'worst_delta_percent':None if not subset else max(r['delta_percent'] for r in subset)}
+    return {'runs':rows,'pairs':sorted(pairs,key=lambda row:(row['instance'],row['seed'])),'tiers':tiers}
+
+
+def validate_lns_acceleration(root=None):
+    from . import dataset as data
+    summary=summarize_lns_acceleration(root);rows=summary['runs']
+    if len(rows)!=24 or not all(row.get('certified_at_60') for row in rows):raise AssertionError('24 certified LNS acceleration runs required')
+    expected=data.CONFIG_V05.scientific_mapping()
+    if any(row.get('scientific_config')!=expected for row in rows):raise AssertionError('scientific model changed')
+    if any(row['search_config']['m']!=192 or row['search_config']['m_atomic']!=144 or row['search_config']['m_lns']!=48 for row in rows):raise AssertionError('M192 changed')
+    if any(row['search_config']['kdp']!=8 or row['search_config']['kref']!=2 or row['search_config']['kref_total']!=4 for row in rows):raise AssertionError('evaluation budget changed')
+    if any(row.get('max_per_iteration_attempts',192)>192 for row in rows):raise AssertionError('candidate budget exceeded')
+    result={'online_runs':len(rows),'all_certified':True,'tiers':summary['tiers']}
+    print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -1936,4 +2036,7 @@ if __name__=='__main__':
     elif args.action=='crrr-access-offline':run_crrr_access_offline(args.root,args.workers)
     elif args.action=='crrr-access-online':run_crrr_access_online(args.root,args.workers)
     elif args.action=='crrr-access-summary':print(json.dumps(summarize_crrr_access(args.root),ensure_ascii=False,indent=2))
-    else:validate_crrr_access(args.root)
+    elif args.action=='crrr-access-validate':validate_crrr_access(args.root)
+    elif args.action=='lns-acceleration-online':run_lns_acceleration_online(args.root,args.workers)
+    elif args.action=='lns-acceleration-summary':print(json.dumps(summarize_lns_acceleration(args.root),ensure_ascii=False,indent=2))
+    else:validate_lns_acceleration(args.root)

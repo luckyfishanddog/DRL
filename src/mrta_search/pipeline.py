@@ -120,6 +120,7 @@ class SearchConfig:
     enable_two_opt_star: bool = False
     enable_crrr: bool = False
     crrr_attempts: int = 8
+    lns_incremental_scoring: bool = False
 
     def __post_init__(self) -> None:
         if not (1 <= self.kref <= self.kdp <= self.m):
@@ -767,6 +768,7 @@ def generate_candidate_pool(
                 config,
                 insertion_limit=search_config.repair_insertion_limit,
                 max_insertion_evaluations=search_config.repair_evaluation_cap,
+                incremental_scoring=search_config.lns_incremental_scoring,
             )
             stats.repair_time += time.perf_counter() - repair_started
             stats.candidate_generation_time += repair_started - generation_started
