@@ -198,6 +198,17 @@ class Capture:
 def checkpoint_cmax(result): return result.anytime[60.0]['cmax']
 
 
+def strict_cmax_improvement_count(events,deadline=60.0):
+    """Count only strict Cmax decreases, excluding equal-Cmax metric updates."""
+    eligible=[(elapsed,cmax) for elapsed,cmax in events if elapsed<=deadline]
+    if not eligible:return 0
+    incumbent=eligible[0][1];count=0
+    for _,cmax in eligible[1:]:
+        if cmax<incumbent-1e-9*max(1.0,abs(incumbent)):
+            count+=1;incumbent=cmax
+    return count
+
+
 @contextmanager
 def generation_timers():
     totals={'candidate_generation_seconds':0.0,'lns_seconds':0.0}
@@ -224,6 +235,15 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
     from mrta_reference.solution import block_map
     best=cap.best60;blocks=None if best is None else block_map(best['solution'],config)
     loads=None if best is None else [sum(config.process_time(blocks[b].length) for b in route.block_ids) for route in best['solution'].routes]
+    empty_by_robot=waiting_by_robot=None
+    if best is not None:
+        from mrta_reference.model import OperationKind
+        empty_by_robot=[];waiting_by_robot=[]
+        for robot in range(4):
+            welds=sorted((op for op in best['schedule'].operations if op.robot_id==robot and op.kind is OperationKind.WELD),key=lambda op:op.sequence_index)
+            empty_by_robot.append(sum(math.dist(left.end,right.start)/config.empty_speed for left,right in zip(welds,welds[1:])))
+            waiting_by_robot.append(sum(op.duration for op in best['schedule'].operations if op.robot_id==robot and op.kind is OperationKind.WAIT))
+    strict_improvements=strict_cmax_improvement_count(st.best_events)
     record={'initial_cmax':None if cap.initial is None else cap.initial['metrics'].cmax,
         'Cmax_at_60':checkpoint_cmax(result),'final_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
         'certified':bool(result.final_certification and result.final_certification.certified),'iterations':st.iterations,
@@ -235,6 +255,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'c2_selected':st.kdp_count,'best60_process_loads':loads,
         'best60_empty_travel':None if best is None else best['metrics'].total_empty_travel,
         'best60_waiting':None if best is None else best['metrics'].total_waiting,
+        'best60_empty_travel_by_robot':empty_by_robot,'best60_waiting_by_robot':waiting_by_robot,
         'numeric_failure':st.n_numeric_failure+st.init_status_counts.get('NUMERIC_FAILURE',0),
         'actual_runtime':result.runtime,'overshoot':st.overshoot,**timings,
         'ranker_inference_seconds':0.0 if ranker is None else ranker.inference_seconds,
@@ -245,7 +266,10 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'c2_ranker_seconds':0.0 if ranker is None else getattr(ranker,'c2_seconds',0.0),
         'c4_ranker_seconds':0.0 if ranker is None else getattr(ranker,'c4_seconds',0.0),
         'best_events':st.best_events,'raw_attempts':st.raw_attempts,'valid_unique':sum(st.valid_by_family.values()),
-        'strict_best_improvements_at60':max(0,sum(elapsed<=60.0 for elapsed,_ in st.best_events)-1),
+        'strict_best_improvements_at60':strict_improvements,
+        'initial_reference_calls':st.init_reference_calls,'search_reference_calls':st.nref,
+        'initial_reference_status':dict(st.init_status_counts),
+        'search_reference_status':dict(Counter(st.reference_status_sequence)),
         'status':result.status.value,'termination_reason':result.termination_reason,
         'first_boundary_elapsed':cap.first_boundary_elapsed,
         'missing_state_stages':[stage for stage,_ in STAGES if stage not in cap.snapshots]}
