@@ -182,8 +182,19 @@ def load_parents(entry,*,split=None,loader=None):
 
 class Capture:
     """Last certified accepted-state boundary at or before each target; no future backfill."""
-    def __init__(self): self.snapshots={};self.first_boundary_elapsed=None;self.initial=None;self.best60=None
+    def __init__(self):
+        self.snapshots={};self.first_boundary_elapsed=None;self.initial=None;self.best60=None
+        self.crrr_examples=[]
     def __call__(self,event,value):
+        if event=='crrr_attempt':
+            _,repaired,status=value
+            if repaired.candidate is not None and len(self.crrr_examples)<16:
+                self.crrr_examples.append({
+                    'status':status,
+                    'provenance':dict(repaired.candidate.provenance),
+                    'routes':[list(route.block_ids) for route in repaired.candidate.solution.routes],
+                })
+            return
         if event!='boundary': return
         if self.first_boundary_elapsed is None: self.first_boundary_elapsed=value['elapsed']
         if 'metrics' in value:
@@ -282,7 +293,22 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'c2_ranker_seconds':0.0 if ranker is None else getattr(ranker,'c2_seconds',0.0),
         'c4_ranker_seconds':0.0 if ranker is None else getattr(ranker,'c4_seconds',0.0),
         'best_events':st.best_events,'raw_attempts':st.raw_attempts,'valid_unique':sum(st.valid_by_family.values()),
+        'attempted_by_family':dict(st.attempted_by_family),
+        'max_per_iteration_attempts':max(st.per_iteration_attempts,default=0),
         'strict_best_improvements_at60':strict_improvements,
+        'crrr_funnel':{
+            'attempted':st.crrr_attempted,'constructed':st.crrr_constructed,
+            'valid_unique':st.crrr_valid_unique,'c2_selected':st.crrr_c2_selected,
+            'direction_feasible':st.crrr_direction_feasible,'c4_selected':st.crrr_c4_selected,
+            'reference_evaluated':st.crrr_reference_evaluated,
+            'reference_status':dict(st.crrr_reference_status),
+            'accepted':st.crrr_accepted,
+            'strict_cmax_improvements':st.crrr_strict_cmax_improvements,
+            'rejection_reasons':dict(st.crrr_rejection_reasons),
+        },
+        'crrr_generation_seconds':st.crrr_generation_time,
+        'search_repair_seconds':st.repair_time,
+        'crrr_examples':cap.crrr_examples,
         'initial_reference_calls':st.init_reference_calls,'search_reference_calls':st.nref,
         'initial_reference_status':dict(st.init_status_counts),
         'search_reference_status':dict(Counter(st.reference_status_sequence)),

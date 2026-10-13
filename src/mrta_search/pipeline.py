@@ -52,7 +52,9 @@ from .lns import (
     CompleteSearchCandidate,
     DestroyOperator,
     RepairOperator,
+    CRRR_OPERATOR,
     atomic_complete_candidate,
+    build_crrr_candidate,
     destroy_parents,
     destroy_size,
     lns_pair,
@@ -115,6 +117,8 @@ class SearchConfig:
     time_limit: float | None = None
     checkpoints: tuple[float, ...] = (1.0, 5.0, 30.0)
     enable_two_opt_star: bool = False
+    enable_crrr: bool = False
+    crrr_attempts: int = 8
 
     def __post_init__(self) -> None:
         if not (1 <= self.kref <= self.kdp <= self.m):
@@ -152,6 +156,10 @@ class SearchConfig:
             raise ValueError("max_iterations must be non-negative")
         if self.time_limit is not None and self.time_limit < 0.0:
             raise ValueError("time_limit must be non-negative")
+        if not (0 <= self.crrr_attempts <= 8):
+            raise ValueError("CRRR attempts must be in 0..8")
+        if self.enable_crrr and self.crrr_attempts > self.m_lns:
+            raise ValueError("CRRR attempts must replace existing LNS attempts")
 
 
 @dataclass(frozen=True)
@@ -460,6 +468,13 @@ def _move_name(candidate: CompleteSearchCandidate | ScreenedCandidate) -> str | 
     return candidate.candidate.key.move_type.value
 
 
+def _is_crrr(candidate: CompleteSearchCandidate | ScreenedCandidate) -> bool:
+    return (
+        isinstance(candidate, CompleteSearchCandidate)
+        and dict(candidate.provenance).get("operator") == CRRR_OPERATOR
+    )
+
+
 def _x_patterns(solution: CanonicalSolution):
     return tuple(
         pattern for pattern in solution.patterns if pattern.kind is SplitKind.X_SPLIT
@@ -565,10 +580,13 @@ def generate_candidate_pool(
             q_min=search_config.destroy_q_min,
             q_max=search_config.destroy_q_max,
         )
-        for ordinal in range(lns_offset, lns_offset + lns_budget):
+        crrr_budget = search_config.crrr_attempts if search_config.enable_crrr else 0
+        original_lns_budget = lns_budget - crrr_budget
+        for ordinal in range(lns_offset, lns_offset + original_lns_budget):
             stats.decision_family_funnel["STRUCTURAL"]["generated"] += 1
             stats.raw_attempts += 1
             stats.attempted_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            stats.original_lns_attempted += 1
             pair = adaptive_state.select(lns_rng)
             generation_started = time.perf_counter()
             partial = destroy_parents(
@@ -606,6 +624,7 @@ def generate_candidate_pool(
                 continue
             stats.constructed += 1
             stats.constructed_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            stats.original_lns_constructed += 1
             candidate = repaired.candidate
             stats.decision_family_funnel["STRUCTURAL"]["constructed"] += 1
             if candidate.solution.canonical_hash in seen_solutions:
@@ -617,6 +636,61 @@ def generate_candidate_pool(
             stats.decision_family_funnel["STRUCTURAL"]["cheap_valid"] += 1
             stats.cheap_feasible += 1
             stats.valid_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            stats.original_lns_valid_unique += 1
+
+        for crrr_index in range(crrr_budget):
+            ordinal = lns_offset + original_lns_budget + crrr_index
+            stats.decision_family_funnel["STRUCTURAL"]["generated"] += 1
+            stats.raw_attempts += 1
+            stats.attempted_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            stats.crrr_attempted += 1
+            generation_started = time.perf_counter()
+            repaired = build_crrr_candidate(
+                current,
+                current_directions,
+                current_schedule,
+                config,
+                attempt_index=crrr_index,
+                insertion_limit=search_config.repair_insertion_limit,
+                max_insertion_evaluations=search_config.repair_evaluation_cap,
+            )
+            elapsed = time.perf_counter() - generation_started
+            stats.candidate_generation_time += elapsed
+            stats.repair_time += elapsed
+            stats.crrr_generation_time += elapsed
+            stats.repair_insertion_evaluations += repaired.insertion_evaluations
+            candidate = repaired.candidate
+            status = (
+                "CONSTRUCTION_REJECTED"
+                if candidate is None
+                else "IDENTITY"
+                if candidate.solution.canonical_hash == current.canonical_hash
+                else "DUPLICATE"
+                if candidate.solution.canonical_hash in seen_solutions
+                else "VALID"
+            )
+            if observer is not None:
+                observer("crrr_attempt", (ordinal, repaired, status))
+            if candidate is None:
+                reason = repaired.rejection_reason or "REPAIR_FAILED"
+                stats.rejection_reasons[f"CRRR:{reason}"] += 1
+                stats.crrr_rejection_reasons[reason] += 1
+                continue
+            stats.constructed += 1
+            stats.constructed_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            stats.crrr_constructed += 1
+            stats.decision_family_funnel["STRUCTURAL"]["constructed"] += 1
+            if candidate.solution.canonical_hash in seen_solutions:
+                stats.duplicates += 1
+                stats.rejection_reasons["DUPLICATE_CANONICAL_SOLUTION"] += 1
+                stats.crrr_rejection_reasons["DUPLICATE_CANONICAL_SOLUTION"] += 1
+                continue
+            seen_solutions.add(candidate.solution.canonical_hash)
+            complete.append(candidate)
+            stats.decision_family_funnel["STRUCTURAL"]["cheap_valid"] += 1
+            stats.cheap_feasible += 1
+            stats.valid_by_family[CandidateSourceKind.LNS_REPAIRED.value] += 1
+            stats.crrr_valid_unique += 1
 
     return tuple(screened), tuple(complete), lns_rng
 
@@ -693,6 +767,12 @@ def evaluate_iteration(
             stats.c3_by_move[move_name] += 1
         c3.append(DirectionEvaluatedCandidate(candidate, cheap_rank, direction))
         funnel["direction_feasible"] += int(direction.total_empty_travel is not None)
+        if _is_crrr(candidate):
+            stats.crrr_c2_selected += 1
+            stats.crrr_direction_feasible += int(direction.total_empty_travel is not None)
+        elif candidate.source_kind is CandidateSourceKind.LNS_REPAIRED:
+            stats.original_lns_c2_selected += 1
+            stats.original_lns_direction_feasible += int(direction.total_empty_travel is not None)
         if _x_patterns(candidate.solution):
             stats.x_pattern_candidates_c3 += 1
         if _y_patterns(candidate.solution):
@@ -714,6 +794,10 @@ def evaluate_iteration(
         decision = decision_family(item.screened)
         funnel = stats.decision_family_funnel[decision]
         funnel["C4_selected"] += 1
+        if _is_crrr(item.screened):
+            stats.crrr_c4_selected += 1
+        elif isinstance(item.screened, CompleteSearchCandidate) and item.screened.source_kind is CandidateSourceKind.LNS_REPAIRED:
+            stats.original_lns_c4_selected += 1
         move_name = _move_name(item.screened)
         family = _family_of(item.screened)
         has_x = bool(_x_patterns(_solution_of(item.screened)))
@@ -748,6 +832,10 @@ def evaluate_iteration(
         }
         started = time.perf_counter()
         funnel["reference_evaluated"] += 1
+        if _is_crrr(item.screened):
+            stats.crrr_reference_evaluated += 1
+        elif isinstance(item.screened, CompleteSearchCandidate) and item.screened.source_kind is CandidateSourceKind.LNS_REPAIRED:
+            stats.original_lns_reference_evaluated += 1
         if decision == "TARGET_X":
             stats.mark_first_x("reference")
         try:
@@ -802,6 +890,10 @@ def evaluate_iteration(
                 else reference_ended - stats.run_started
             ),
         )
+        if _is_crrr(item.screened):
+            stats.crrr_reference_status[effective_status.value] += 1
+        elif isinstance(item.screened, CompleteSearchCandidate) and item.screened.source_kind is CandidateSourceKind.LNS_REPAIRED:
+            stats.original_lns_reference_status[effective_status.value] += 1
         evaluated = ReferenceEvaluatedCandidate(
             item, schedule, certification, metrics, False
         )
@@ -1099,6 +1191,12 @@ def run_bounded_sa_oi(
         family = _family_of(candidate)
         move_name = _move_name(candidate)
         stats.accepted_by_family[family] += 1
+        strict_cmax_improvement = proposal.metrics.cmax < current_before.cmax - 1.0e-9 * max(
+            1.0, abs(current_before.cmax), abs(proposal.metrics.cmax)
+        )
+        if _is_crrr(candidate):
+            stats.crrr_accepted += 1
+            stats.crrr_strict_cmax_improvements += int(strict_cmax_improvement)
         stats.decision_family_funnel[decision_family(candidate)]["accepted"] += 1
         accepted_has_x = bool(_x_patterns(_solution_of(candidate)))
         accepted_has_y = bool(_y_patterns(_solution_of(candidate)))
@@ -1133,9 +1231,7 @@ def run_bounded_sa_oi(
                 stats.y_pattern_global_best_updates += 1
         if global_best:
             reward = search_config.reward_global_best
-        elif current_metrics.cmax < current_before.cmax - 1.0e-9 * max(
-            1.0, abs(current_before.cmax), abs(current_metrics.cmax)
-        ):
+        elif strict_cmax_improvement:
             reward = search_config.reward_accepted_improvement
         else:
             reward = search_config.reward_accepted_non_improvement

@@ -44,6 +44,14 @@ class RepairOperator(str, Enum):
     REGRET_2_REPAIR = "REGRET_2_REPAIR"
 
 
+class CRRRBottleneck(str, Enum):
+    WAIT_BOUNDARY = "WAIT_BOUNDARY"
+    LOAD_BOUNDARY = "LOAD_BOUNDARY"
+
+
+CRRR_OPERATOR = "CRRR"
+
+
 OPERATOR_PAIRS = tuple(
     (destroy, repair)
     for destroy in DestroyOperator
@@ -98,6 +106,16 @@ class RepairResult:
     candidate: CompleteSearchCandidate | None
     insertion_evaluations: int
     rejection_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CRRRRegion:
+    bottleneck_type: CRRRBottleneck
+    affected_parent_ids: tuple[str, ...]
+    critical_robot: int
+    partner_robot: int
+    anchor_x: float
+    wait_duration: float
 
 
 @dataclass(frozen=True)
@@ -591,6 +609,386 @@ def repair_partial_state(
     return RepairResult(candidate, evaluations)
 
 
+def _block_mid_x(block: WeldingBlock) -> float:
+    return 0.5 * (block.start[0] + block.end[0])
+
+
+def _parent_mid_x(parent_id: str, blocks: Mapping[str, WeldingBlock]) -> float:
+    rows = [block for block in blocks.values() if block.parent_id == parent_id]
+    return sum(_block_mid_x(block) for block in rows) / len(rows)
+
+
+def _robot_by_block(solution: CanonicalSolution) -> dict[str, int]:
+    return {
+        block_id: robot
+        for robot, route in enumerate(solution.routes)
+        for block_id in route.block_ids
+    }
+
+
+def _weld_parent_neighbours(
+    schedule: ScheduleResult, robot: int, wait_operation
+) -> tuple[str, ...]:
+    """Associate WAIT with adjacent real WELDs; this is not a causal claim."""
+    welds = sorted(
+        (
+            operation
+            for operation in schedule.operations
+            if operation.robot_id == robot
+            and operation.kind is OperationKind.WELD
+            and operation.block_id is not None
+        ),
+        key=lambda operation: (
+            operation.start_time,
+            operation.end_time,
+            operation.sequence_index,
+            operation.operation_id,
+        ),
+    )
+    before = [op for op in welds if op.end_time <= wait_operation.start_time + 1.0e-9]
+    after = [op for op in welds if op.start_time >= wait_operation.end_time - 1.0e-9]
+    adjacent = []
+    if before:
+        adjacent.append(before[-1])
+    if after:
+        adjacent.append(after[0])
+    if not adjacent and welds:
+        adjacent.append(min(welds, key=lambda op: (
+            abs(op.sequence_index - wait_operation.sequence_index),
+            abs(op.start_time - wait_operation.start_time), op.operation_id,
+        )))
+    return tuple(dict.fromkeys(_parent_id(op.block_id) for op in adjacent))
+
+
+def identify_crrr_region(
+    current: CanonicalSolution,
+    schedule: ScheduleResult,
+    config: ScientificConfig,
+    *,
+    attempt_index: int,
+    min_parents: int = 2,
+    max_parents: int = 6,
+) -> CRRRRegion | None:
+    """Locate one bounded schedule- and geometry-anchored parent region."""
+    if attempt_index < 0 or attempt_index >= 8:
+        raise ValueError("CRRR attempt_index must be in 0..7")
+    if not (2 <= min_parents <= max_parents <= 6):
+        raise ValueError("CRRR parent bounds must satisfy 2 <= min <= max <= 6")
+    blocks = block_map(current, config)
+    robot_by_block = _robot_by_block(current)
+    critical_robot = max(
+        range(4), key=lambda robot: (schedule.robot_completion[robot], -robot)
+    )
+    partner_robot = critical_robot ^ 1
+    waits = sorted(
+        (
+            operation
+            for operation in schedule.operations
+            if operation.kind is OperationKind.WAIT
+            and operation.duration > config.numeric_epsilon
+        ),
+        key=lambda operation: (
+            -int(operation.robot_id == critical_robot), -operation.duration,
+            operation.robot_id, operation.start_time, operation.operation_id,
+        ),
+    )
+    use_wait = bool(waits) and attempt_index % 2 == 0
+    anchors: list[str] = []
+    wait_duration = 0.0
+    if use_wait:
+        wait = waits[(attempt_index // 2) % len(waits)]
+        critical_robot = wait.robot_id
+        partner_robot = critical_robot ^ 1
+        wait_duration = wait.duration
+        anchors.extend(_weld_parent_neighbours(schedule, critical_robot, wait))
+        anchor_points = [
+            _parent_mid_x(parent_id, blocks)
+            for parent_id in anchors
+            if any(block.parent_id == parent_id for block in blocks.values())
+        ]
+        anchor_x = (
+            sum(anchor_points) / len(anchor_points)
+            if anchor_points else 0.5 * (wait.start[0] + wait.end[0])
+        )
+        partner_welds = sorted(
+            (
+                operation
+                for operation in schedule.operations
+                if operation.robot_id == partner_robot
+                and operation.kind is OperationKind.WELD
+                and operation.block_id is not None
+                and operation.start_time <= wait.end_time + 1.0e-9
+                and operation.end_time >= wait.start_time - 1.0e-9
+            ),
+            key=lambda operation: (
+                abs(0.5 * (operation.start[0] + operation.end[0]) - anchor_x),
+                operation.sequence_index,
+            ),
+        )
+        anchors.extend(_parent_id(operation.block_id) for operation in partner_welds[:2])
+        bottleneck = CRRRBottleneck.WAIT_BOUNDARY
+    else:
+        left_robot = 0 if critical_robot < 2 else 2
+        right_robot = left_robot + 1
+        left_x = [_block_mid_x(blocks[item]) for item in current.routes[left_robot].block_ids]
+        right_x = [_block_mid_x(blocks[item]) for item in current.routes[right_robot].block_ids]
+        if left_x and right_x:
+            anchor_x = 0.5 * (max(left_x) + min(right_x))
+        else:
+            rail_x = left_x + right_x
+            anchor_x = sorted(rail_x)[len(rail_x) // 2] if rail_x else 0.0
+        bottleneck = CRRRBottleneck.LOAD_BOUNDARY
+    rail_parents = {
+        blocks[item].parent_id
+        for robot in (critical_robot, partner_robot)
+        for item in current.routes[robot].block_ids
+    }
+    ordered = sorted(
+        (parent.parent_id for parent in current.parents),
+        key=lambda parent_id: (
+            -int(parent_id in anchors), -int(parent_id in rail_parents),
+            abs(_parent_mid_x(parent_id, blocks) - anchor_x),
+            -int(any(
+                robot_by_block[block.block_id] == critical_robot
+                for block in blocks.values() if block.parent_id == parent_id
+            )),
+            parent_id,
+        ),
+    )
+    target_count = min(max_parents, max(min_parents, 2 + attempt_index % 5))
+    selected = tuple(sorted(ordered[:target_count]))
+    if len(selected) < min_parents:
+        return None
+    return CRRRRegion(
+        bottleneck, selected, critical_robot, partner_robot, anchor_x, wait_duration
+    )
+
+
+def _adjacency_by_parent(routes: Sequence[Sequence[str]]) -> dict[str, set[tuple[str, str]]]:
+    result: dict[str, set[tuple[str, str]]] = {}
+    for route in routes:
+        parents = tuple(_parent_id(item) for item in route)
+        for index, parent_id in enumerate(parents):
+            neighbours = result.setdefault(parent_id, set())
+            if index:
+                neighbours.add((parents[index - 1], parent_id))
+            if index + 1 < len(parents):
+                neighbours.add((parent_id, parents[index + 1]))
+    return result
+
+
+def _route_overlap_proxy(
+    routes: Sequence[Sequence[str]], blocks: Mapping[str, WeldingBlock]
+) -> float:
+    envelopes = []
+    for route in routes:
+        xs = [x for item in route for x in (blocks[item].start[0], blocks[item].end[0])]
+        envelopes.append(None if not xs else (min(xs), max(xs)))
+    total = 0.0
+    for left, right in ((0, 1), (2, 3)):
+        if envelopes[left] is not None and envelopes[right] is not None:
+            total += max(0.0, min(envelopes[left][1], envelopes[right][1])
+                         - max(envelopes[left][0], envelopes[right][0]))
+    return total
+
+
+def _first_task_order_risk(
+    routes: Sequence[Sequence[str]], blocks: Mapping[str, WeldingBlock]
+) -> float:
+    return sum(
+        max(0.0, _block_mid_x(blocks[routes[left][0]])
+            - _block_mid_x(blocks[routes[right][0]]))
+        for left, right in ((0, 1), (2, 3))
+        if routes[left] and routes[right]
+    )
+
+
+def _crrr_components(
+    routes: tuple[tuple[str, ...], ...],
+    hints: tuple[tuple[int, ...], ...],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+    *, current_max_load: float, current_travel: float, wait_duration: float,
+) -> tuple[float, float, float, float, float, float]:
+    loads = _loads(routes, blocks, config)
+    travel = _directed_proxy(routes, hints, blocks, config)
+    scale = max(current_max_load, 1.0)
+    travel_scale = max(current_travel, 1.0)
+    overlap = _route_overlap_proxy(routes, blocks) / max(config.workspace_x[1] - config.workspace_x[0], 1.0)
+    order_risk = _first_task_order_risk(routes, blocks) / max(config.workspace_x[1] - config.workspace_x[0], 1.0)
+    normalized = (
+        0.45 * max(loads) / scale
+        + 0.20 * (max(loads) - min(loads)) / scale
+        + 0.20 * travel / travel_scale
+        + 0.10 * overlap
+        + 0.05 * order_risk * (1.0 + min(wait_duration / scale, 1.0))
+    )
+    return normalized, max(loads), max(loads) - min(loads), travel, overlap, order_risk
+
+
+def build_crrr_candidate(
+    current: CanonicalSolution,
+    current_directions: DirectionVectors,
+    schedule: ScheduleResult,
+    config: ScientificConfig,
+    *, attempt_index: int, insertion_limit: int = 8,
+    max_insertion_evaluations: int = 4096,
+) -> RepairResult:
+    """Build one joint reassignment/reordering without direction or B32 access."""
+    region = identify_crrr_region(current, schedule, config, attempt_index=attempt_index)
+    if region is None:
+        return RepairResult(None, 0, "CRRR_NO_REGION")
+    selected = set(region.affected_parent_ids)
+    blocks = block_map(current, config)
+    patterns = {pattern.parent_id: pattern for pattern in current.patterns}
+    robot_by_block = _robot_by_block(current)
+    current_routes = tuple(route.block_ids for route in current.routes)
+    hints_by_block = _hints_from_current(current, current_directions)
+    current_hints = tuple(tuple(hints_by_block.get(item, 0) for item in route) for route in current_routes)
+    routes = tuple(tuple(item for item in route if _parent_id(item) not in selected) for route in current_routes)
+    hints = tuple(tuple(hints_by_block.get(item, 0) for item in route) for route in routes)
+    current_loads = _loads(current_routes, blocks, config)
+    current_travel = _directed_proxy(current_routes, current_hints, blocks, config)
+    scheme = attempt_index % 4
+    scheme_names = (
+        "SAME_RAIL_CONTIGUOUS_TRANSFER", "SAME_RAIL_BOUNDARY_EXCHANGE",
+        "WAIT_REGION_LOCAL_REORDER", "CROSS_RAIL_REALLOCATION",
+    )
+    projected_loads = list(_loads(routes, blocks, config))
+    placements: list[tuple[str, int]] = []
+    parent_order = sorted(selected, key=lambda parent_id: (
+        abs(_parent_mid_x(parent_id, blocks) - region.anchor_x), parent_id,
+    ))
+    if scheme == 2:
+        parent_order.reverse()
+    for parent_rank, parent_id in enumerate(parent_order):
+        parent_blocks = sorted(
+            (block for block in blocks.values() if block.parent_id == parent_id),
+            key=lambda block: (_block_mid_x(block), block.block_id),
+            reverse=scheme == 2 and parent_rank % 2 == 0,
+        )
+        pattern = patterns[parent_id]
+        for block in parent_blocks:
+            original_robot = robot_by_block[block.block_id]
+            eligible = [robot for robot in range(4) if robot_is_eligible(block, robot, config)]
+            if pattern.kind is SplitKind.X_SPLIT:
+                eligible = [original_robot]
+            if scheme == 0:
+                preferred = [region.partner_robot, original_robot]
+            elif scheme == 1:
+                swap = (region.partner_robot if original_robot == region.critical_robot
+                        else region.critical_robot if original_robot == region.partner_robot
+                        else original_robot)
+                preferred = [swap, original_robot]
+            elif scheme == 2:
+                preferred = [original_robot]
+            else:
+                preferred = sorted(
+                    (robot for robot in eligible if robot // 2 != original_robot // 2),
+                    key=lambda robot: (projected_loads[robot], robot),
+                ) + [original_robot]
+            target = next((robot for robot in preferred if robot in eligible), None)
+            if target is None:
+                target = min(eligible, key=lambda robot: (projected_loads[robot], robot))
+            placements.append((block.block_id, target))
+            projected_loads[target] += config.process_time(block.length)
+    evaluations = 0
+    trace: list[tuple[str, int, int, int]] = []
+    for block_id, target in placements:
+        if evaluations >= max_insertion_evaluations:
+            return RepairResult(None, evaluations, "CRRR_REPAIR_BUDGET_EXHAUSTED")
+        alternatives = []
+        for position in bounded_insertion_positions(len(routes[target]), insertion_limit):
+            if evaluations >= max_insertion_evaluations:
+                break
+            evaluations += 1
+            candidate_routes, candidate_hints = _insert_one(
+                routes, hints, blocks[block_id], target, position, hints_by_block.get(block_id, 0)
+            )
+            components = _crrr_components(
+                candidate_routes, candidate_hints, blocks, config,
+                current_max_load=max(current_loads), current_travel=current_travel,
+                wait_duration=region.wait_duration,
+            )
+            alternatives.append((components, position, candidate_routes, candidate_hints))
+        if not alternatives:
+            return RepairResult(None, evaluations, "CRRR_NO_LEGAL_INSERTION")
+        _, position, routes, hints = min(alternatives, key=lambda row: (row[0], row[1]))
+        trace.append((block_id, target, position, hints_by_block.get(block_id, 0)))
+    try:
+        solution = canonicalize(
+            current.parents, current.patterns,
+            tuple(Route(robot, routes[robot]) for robot in range(4)), config,
+            revision=current.revision + 1,
+            x_split_validator=(finite_x_split_validator(current.parents, config)
+                if any(pattern.kind is SplitKind.X_SPLIT for pattern in current.patterns) else None),
+        )
+        if tuple(pattern.pattern_id for pattern in solution.patterns) != tuple(
+            pattern.pattern_id for pattern in current.patterns
+        ):
+            raise ValueError("CRRR changed split pattern")
+        solution_blocks = block_map(solution, config)
+        if any(not robot_is_eligible(solution_blocks[item], route.robot_id, config)
+               for route in solution.routes for item in route.block_ids):
+            raise ValueError("robot eligibility failure")
+    except (ValueError, KeyError, IndexError) as error:
+        return RepairResult(None, evaluations, f"CRRR_CANONICAL_FAILURE:{error}")
+    final_routes = tuple(route.block_ids for route in solution.routes)
+    final_hints = tuple(tuple(hints_by_block.get(item, 0) for item in route) for route in final_routes)
+    final_robot_by_block = _robot_by_block(solution)
+    assignment_parent_ids = {
+        parent_id for parent_id in selected
+        if any(final_robot_by_block[block.block_id] != robot_by_block[block.block_id]
+               for block in blocks.values() if block.parent_id == parent_id)
+    }
+    before_adjacency = _adjacency_by_parent(current_routes)
+    after_adjacency = _adjacency_by_parent(final_routes)
+    adjacency_parent_ids = {
+        parent_id for parent_id in selected
+        if before_adjacency.get(parent_id, set()) != after_adjacency.get(parent_id, set())
+    }
+    changed_parent_ids = assignment_parent_ids | adjacency_parent_ids
+    if len(changed_parent_ids) < 2 or solution.canonical_hash == current.canonical_hash:
+        return RepairResult(None, evaluations, "CRRR_NO_JOINT_CHANGE")
+    final_loads = _loads(final_routes, solution_blocks, config)
+    components = _crrr_components(
+        final_routes, final_hints, solution_blocks, config,
+        current_max_load=max(current_loads), current_travel=current_travel,
+        wait_duration=region.wait_duration,
+    )
+    identity = CompleteCandidateIdentity(
+        current.revision, CandidateSourceKind.LNS_REPAIRED.value,
+        (CRRR_OPERATOR, region.bottleneck_type.value, attempt_index,
+         region.affected_parent_ids, tuple(tuple(route) for route in final_routes)),
+    )
+    provenance = (
+        ("operator", CRRR_OPERATOR),
+        ("bottleneck_type", region.bottleneck_type.value),
+        ("affected_parent_ids", region.affected_parent_ids),
+        ("removed_parent_ids", region.affected_parent_ids),
+        ("critical_robot", region.critical_robot),
+        ("partner_robot", region.partner_robot),
+        ("changed_parent_count", len(changed_parent_ids)),
+        ("assignment_changes", len(assignment_parent_ids)),
+        ("route_adjacency_changes", len(adjacency_parent_ids)),
+        ("scheme", scheme_names[scheme]),
+        ("cheap_score", tuple(round(value, 9) for value in components)),
+        ("repair_trace", tuple(
+            (parent_id, tuple(row for row in trace if _parent_id(row[0]) == parent_id))
+            for parent_id in region.affected_parent_ids
+        )),
+    )
+    return RepairResult(
+        CompleteSearchCandidate(
+            CandidateSourceKind.LNS_REPAIRED, solution, identity, max(final_loads),
+            _directed_proxy(final_routes, final_hints, solution_blocks, config) - current_travel,
+            0, (max(final_loads) - min(final_loads)) - (max(current_loads) - min(current_loads)),
+            provenance,
+        ),
+        evaluations,
+    )
+
+
 @dataclass
 class AdaptiveOperatorState:
     reaction: float = 0.2
@@ -655,6 +1053,10 @@ def lns_pair(candidate: CompleteSearchCandidate) -> tuple[DestroyOperator, Repai
     if candidate.source_kind is not CandidateSourceKind.LNS_REPAIRED:
         return None
     values = dict(candidate.provenance)
+    if values.get("operator") == CRRR_OPERATOR:
+        return None
+    if "destroy_operator" not in values or "repair_operator" not in values:
+        return None
     return (
         DestroyOperator(str(values["destroy_operator"])),
         RepairOperator(str(values["repair_operator"])),

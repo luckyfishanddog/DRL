@@ -1451,10 +1451,210 @@ def validate_region_initialization(root=None):
     print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
 
 
+CRRR_METHODS=('REGION_CRRR_HEURISTIC','REGION_CRRR_GAT_V05')
+
+
+def _crrr_smoke_worker(job):
+    """One native iteration plus explicitly separate offline CRRR certification."""
+    from dataclasses import replace
+    from . import dataset as data
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.model import ScheduleStatus
+    from mrta_reference.scheduler import resolve_reference_evaluator
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import official_metrics
+    from mrta_search.direction import optimize_directions_with_initial_feasibility
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    entry,root=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO);captured=[]
+    def observer(event,value):
+        if event=='crrr_attempt' and value[1].candidate is not None:
+            captured.append(value[1].candidate)
+    search=replace(data.search_config(),initialization_region_cooperative=True,
+        enable_crrr=True,max_iterations=1,time_limit=None,checkpoints=())
+    result=run_sa_oi_alns_v2(parents,data.CONFIG_V05,search,seed=20261701,
+        source_provenance=data.provenance(),observer=observer)
+    evaluator=resolve_reference_evaluator(FORMAL_SCOPE_V2,None);offline=[];seen=set()
+    for candidate in captured:
+        if candidate.solution.canonical_hash in seen:continue
+        seen.add(candidate.solution.canonical_hash);direction=optimize_directions_with_initial_feasibility(candidate.solution,data.CONFIG_V05)
+        row={'provenance':dict(candidate.provenance),'direction_feasible':direction.total_empty_travel is not None,
+            'reference_status':None,'certified':False,'cmax':None}
+        if direction.total_empty_travel is not None:
+            schedule=evaluator(candidate.solution,data.CONFIG_V05,
+                orientations={robot:direction.directions[robot] for robot in range(4)})
+            row['reference_status']=schedule.status.value
+            if schedule.status is ScheduleStatus.FEASIBLE:
+                certification=certify_schedule(candidate.solution,schedule,data.CONFIG_V05,scope=FORMAL_SCOPE_V2)
+                row['certified']=certification.certified
+                if certification.certified:row['cmax']=official_metrics(candidate.solution,schedule,data.CONFIG_V05).cmax
+        offline.append(row)
+    st=result.stats;initial=result.initialization
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'actual_N':len(parents),'status':result.status.value,
+        'initial_cmax':None if initial.schedule is None else initial.schedule.cmax,
+        'search_best_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
+        'search_certified':bool(result.final_certification and result.final_certification.certified),
+        'attempted_by_family':dict(st.attempted_by_family),'max_iteration_attempts':max(st.per_iteration_attempts,default=0),
+        'funnel':{'attempted':st.crrr_attempted,'constructed':st.crrr_constructed,
+            'valid_unique':st.crrr_valid_unique,'c2_selected':st.crrr_c2_selected,
+            'direction_feasible':st.crrr_direction_feasible,'c4_selected':st.crrr_c4_selected,
+            'reference_evaluated':st.crrr_reference_evaluated,'reference_status':dict(st.crrr_reference_status)},
+        'original_lns_funnel':{'attempted':st.original_lns_attempted,
+            'constructed':st.original_lns_constructed,'valid_unique':st.original_lns_valid_unique,
+            'c2_selected':st.original_lns_c2_selected,
+            'direction_feasible':st.original_lns_direction_feasible,
+            'c4_selected':st.original_lns_c4_selected,
+            'reference_evaluated':st.original_lns_reference_evaluated,
+            'reference_status':dict(st.original_lns_reference_status)},
+        'offline_candidates':offline}
+
+
+def run_crrr_smoke(root=None,workers=4):
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    _,entries=_region_initialization_entries(root)
+    wanted={'N35_S1','N55_I5','N55_I6','N85_I9'}
+    entries=tuple(entry for entry in entries if entry['label'] in wanted)
+    experiment='crrr_native_smoke';db=data.connect(data.DATABASE_V05)
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(experiment,))};db.close()
+    jobs=[(entry['label'],(entry,root)) for entry in entries if entry['label'] not in done]
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_crrr_smoke_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future];row=future.result();db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',(experiment,key,data.dumps(row)))
+            db.close();print(f"CRRR smoke {key}: {row['funnel']}",flush=True)
+    return len(jobs)
+
+
+def _crrr_online_worker(job):
+    from dataclasses import replace
+    from . import dataset as data
+    entry,seed,method,root=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO)
+    search=replace(data.search_config(),initialization_region_cooperative=True,enable_crrr=True)
+    ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05') if method.endswith('GAT_V05') else None
+    record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,
+        config=data.CONFIG_V05,search=search)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],
+        'actual_N':len(parents),'seed':seed,'method':method,
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'search_config':{'m':search.m,'m_atomic':144,'m_lns':search.m_lns,
+            'original_lns_attempts':search.m_lns-search.crrr_attempts,
+            'crrr_attempts':search.crrr_attempts,'kdp':search.kdp,'kref':search.kref,
+            'kref_total':search.kref_total,'region_initialization':True,'two_opt_star':search.enable_two_opt_star},
+        **record}
+
+
+def run_crrr_online(root=None,workers=4):
+    """Run/resume only the 24 new REGION+CRRR development runs."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    _,entries=_region_initialization_entries(root);experiment='crrr_search_runs'
+    db=data.connect(data.DATABASE_V05)
+    smoke_rows=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='crrr_native_smoke'")]
+    if len(smoke_rows)!=4 or not all(row['search_certified'] and row['funnel']['valid_unique'] for row in smoke_rows):
+        db.close();raise RuntimeError('Four certified native CRRR smoke states with valid candidates are required')
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(experiment,))};db.close();jobs=[]
+    for entry_index,entry in enumerate(entries):
+        for seed_index,seed in enumerate(REGION_INITIALIZATION_SEEDS):
+            order=CRRR_METHODS if (entry_index+seed_index)%2==0 else tuple(reversed(CRRR_METHODS))
+            for method in order:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_crrr_online_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future]
+            try:row=future.result()
+            except Exception as error:
+                instance,seed,method=key.split(':');row={'instance':instance,'seed':int(seed),'method':method,
+                    'status':'EXECUTION_ERROR','Cmax_at_60':None,'certified_at_60':False,'diagnostics':[repr(error)]}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',(experiment,key,data.dumps(row)))
+            db.close();print(f"CRRR run {key} status={row['status']} Cmax@60={row.get('Cmax_at_60')}",flush=True)
+    return len(jobs)
+
+
+def summarize_crrr(root=None):
+    import statistics
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    db=data.connect(data.DATABASE_V05,readonly=True)
+    smoke=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='crrr_native_smoke' ORDER BY item_id")]
+    old=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='region_cooperative_initialization_runs' ORDER BY item_id")]
+    new=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='crrr_search_runs' ORDER BY item_id")]
+    experiments=[row[0] for row in db.execute('SELECT DISTINCT experiment FROM experiments ORDER BY experiment')];db.close()
+    old=[row for row in old if row['method'] in ('REGION_HEURISTIC','REGION_GAT_V05')]
+    rows=old+new;index={(row['instance'],row['seed'],row['method']):row for row in rows}
+    comparisons=(('REGION_CRRR_HEURISTIC','REGION_HEURISTIC'),
+        ('REGION_CRRR_GAT_V05','REGION_GAT_V05'),
+        ('REGION_CRRR_GAT_V05','REGION_CRRR_HEURISTIC'))
+    paired={}
+    for method,base in comparisons:
+        pairs=[]
+        for key,row in index.items():
+            if row['method']!=method:continue
+            other=index.get((row['instance'],row['seed'],base))
+            if other and row.get('Cmax_at_60') is not None and other.get('Cmax_at_60') is not None:
+                pairs.append({'instance':row['instance'],'tier':row['tier'],'seed':row['seed'],
+                    'method_cmax':row['Cmax_at_60'],'baseline_cmax':other['Cmax_at_60'],
+                    'delta_seconds':row['Cmax_at_60']-other['Cmax_at_60'],
+                    'delta_percent':100*(row['Cmax_at_60']/other['Cmax_at_60']-1)})
+        by_tier={}
+        for tier in ('N35','N55','N85','ALL'):
+            subset=[row for row in pairs if tier=='ALL' or row['tier']==tier]
+            by_tier[tier]={'count':len(subset),'wins':sum(row['delta_seconds']<-1e-8 for row in subset),
+                'ties':sum(abs(row['delta_seconds'])<=1e-8 for row in subset),
+                'losses':sum(row['delta_seconds']>1e-8 for row in subset),
+                'mean_delta_percent':None if not subset else statistics.mean(row['delta_percent'] for row in subset),
+                'median_delta_percent':None if not subset else statistics.median(row['delta_percent'] for row in subset)}
+        paired[f'{method}_vs_{base}']={'rows':sorted(pairs,key=lambda row:(row['instance'],row['seed'])),'by_tier':by_tier}
+    funnel_keys=('attempted','constructed','valid_unique','c2_selected','direction_feasible','c4_selected','reference_evaluated','accepted','strict_cmax_improvements')
+    funnel={key:sum(row.get('crrr_funnel',{}).get(key,0) for row in new) for key in funnel_keys}
+    statuses={status:sum(row.get('crrr_funnel',{}).get('reference_status',{}).get(status,0) for row in new)
+        for status in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE')}
+    funnel['reference_status']=statuses
+    funnel['generation_seconds']=sum(row.get('crrr_generation_seconds',0) for row in new)
+    funnel['mean_attempt_seconds']=None if not funnel['attempted'] else funnel['generation_seconds']/funnel['attempted']
+    return {'smoke':smoke,'old':old,'new':new,'paired':paired,'funnel':funnel,'experiments':experiments}
+
+
+def validate_crrr(root=None):
+    from . import dataset as data
+    summary=summarize_crrr(root);old=summary['old'];new=summary['new'];smoke=summary['smoke']
+    if len(smoke)!=4 or not all(row['search_certified'] and row['funnel']['valid_unique'] for row in smoke):
+        raise AssertionError('CRRR native smoke incomplete')
+    if len(old)!=24 or len(new)!=24 or not all(row.get('certified_at_60') for row in old+new):
+        raise AssertionError('paired 24 old + 24 new matrix incomplete or uncertified')
+    if any(row['scientific_config']!=data.CONFIG_V05.scientific_mapping() for row in old+new):
+        raise AssertionError('scientific model changed')
+    if any(row.get('max_per_iteration_attempts',192)>192 for row in new):
+        raise AssertionError('M192 exceeded')
+    if any(row['search_config']['original_lns_attempts']!=40 or row['search_config']['crrr_attempts']!=8 for row in new):
+        raise AssertionError('40+8 LNS partition changed')
+    for instance in {row['instance'] for row in new}:
+        old_initial={row['initial_cmax'] for row in old if row['instance']==instance}
+        new_initial={row['initial_cmax'] for row in new if row['instance']==instance}
+        if len(old_initial)!=1 or new_initial!=old_initial:raise AssertionError('REGION initialization changed')
+    result={'smoke_rows':len(smoke),'old_reused':len(old),'new_runs':len(new),
+        'all_certified':True,'max_attempts':max(row['max_per_iteration_attempts'] for row in new),
+        'crrr_funnel':summary['funnel']}
+    print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -1474,4 +1674,8 @@ if __name__=='__main__':
     elif args.action=='region-init-zero':run_region_initialization_zero(args.root,args.workers)
     elif args.action=='region-init-online':run_region_initialization_online(args.root,args.workers)
     elif args.action=='region-init-summary':print(json.dumps(summarize_region_initialization(args.root),ensure_ascii=False,indent=2))
-    else:validate_region_initialization(args.root)
+    elif args.action=='region-init-validate':validate_region_initialization(args.root)
+    elif args.action=='crrr-smoke':run_crrr_smoke(args.root,args.workers)
+    elif args.action=='crrr-online':run_crrr_online(args.root,args.workers)
+    elif args.action=='crrr-summary':print(json.dumps(summarize_crrr(args.root),ensure_ascii=False,indent=2))
+    else:validate_crrr(args.root)

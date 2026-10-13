@@ -81,6 +81,26 @@ class SearchStats:
     repair_insertion_evaluations: int = 0
     repair_reference_calls: int = 0
     repair_full_direction_dp_calls: int = 0
+    crrr_attempted: int = 0
+    crrr_constructed: int = 0
+    crrr_valid_unique: int = 0
+    crrr_c2_selected: int = 0
+    crrr_direction_feasible: int = 0
+    crrr_c4_selected: int = 0
+    crrr_reference_evaluated: int = 0
+    crrr_reference_status: Counter[str] = field(default_factory=Counter)
+    crrr_accepted: int = 0
+    crrr_strict_cmax_improvements: int = 0
+    crrr_generation_time: float = 0.0
+    crrr_rejection_reasons: Counter[str] = field(default_factory=Counter)
+    original_lns_attempted: int = 0
+    original_lns_constructed: int = 0
+    original_lns_valid_unique: int = 0
+    original_lns_c2_selected: int = 0
+    original_lns_direction_feasible: int = 0
+    original_lns_c4_selected: int = 0
+    original_lns_reference_evaluated: int = 0
+    original_lns_reference_status: Counter[str] = field(default_factory=Counter)
 
     attempted_by_family: dict[str, int] = field(default_factory=_family_counter)
     constructed_by_family: dict[str, int] = field(default_factory=_family_counter)

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import pytest
 
 from mrta_exact import solve_exact_micro
-from mrta_reference.model import ParentWeld, ScientificConfig, SplitKind
-from mrta_reference.solution import canonicalize
+from mrta_reference.geometry import robot_is_eligible
+from mrta_reference.model import Operation, OperationKind, ParentWeld, ScientificConfig, SplitKind
+from mrta_reference.solution import block_map, canonicalize
 from mrta_search import (
     AdaptiveOperatorState,
     CandidateSourceKind,
@@ -18,6 +20,12 @@ from mrta_search import (
     run_bounded_sa_oi,
 )
 from mrta_search.pipeline import evaluate_iteration
+from mrta_search.lns import (
+    CRRRBottleneck,
+    build_crrr_candidate,
+    identify_crrr_region,
+    lns_pair,
+)
 from mrta_search.stats import SearchStats
 
 
@@ -278,6 +286,131 @@ def test_atomic_and_lns_share_complete_candidate_pipeline() -> None:
     assert stats.per_iteration_attempts[-1] == 32
     assert stats.repair_reference_calls == 0
     assert stats.repair_full_direction_dp_calls == 0
+
+
+def test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal() -> None:
+    initial = _initial()
+    weld = next(
+        operation for operation in initial.best_schedule.operations
+        if operation.kind is OperationKind.WELD and operation.block_id is not None
+    )
+    wait = Operation(
+        "crrr-test-wait", weld.robot_id, OperationKind.WAIT,
+        max(0.0, weld.start_time - 0.5), weld.start_time,
+        weld.start, weld.start, weld.sequence_index,
+    )
+    schedule = replace(
+        initial.best_schedule,
+        operations=initial.best_schedule.operations + (wait,),
+    )
+    region = identify_crrr_region(
+        initial.best_solution, schedule, FAST, attempt_index=0
+    )
+    assert region is not None
+    assert region.bottleneck_type is CRRRBottleneck.WAIT_BOUNDARY
+    assert weld.block_id.split("::", 1)[0] in region.affected_parent_ids
+    assert 2 <= len(region.affected_parent_ids) <= 6
+
+    repairs = [
+        build_crrr_candidate(
+            initial.best_solution, initial.best_directions, schedule, FAST,
+            attempt_index=index,
+        )
+        for index in range(8)
+    ]
+    candidate = next(row.candidate for row in repairs if row.candidate is not None)
+    provenance = dict(candidate.provenance)
+    assert provenance["operator"] == "CRRR"
+    assert provenance["changed_parent_count"] >= 2
+    assert lns_pair(candidate) is None
+    assert tuple(pattern.pattern_id for pattern in candidate.solution.patterns) == tuple(
+        pattern.pattern_id for pattern in initial.best_solution.patterns
+    )
+    blocks = block_map(candidate.solution, FAST)
+    actual = [item for route in candidate.solution.routes for item in route.block_ids]
+    assert len(actual) == len(set(actual)) == len(blocks)
+    assert all(
+        robot_is_eligible(blocks[item], route.robot_id, FAST)
+        for route in candidate.solution.routes for item in route.block_ids
+    )
+    from mrta_ranker.features import extract_c2_features
+    features = extract_c2_features(
+        initial.best_solution, initial.best_directions,
+        initial.best_schedule.cmax, candidate, FAST,
+    )
+    assert features["source_lns_repaired"] == 1.0
+    assert features["affected_parent_count"] >= 2.0
+
+
+def test_crrr_replaces_eight_original_lns_attempts_and_default_is_unchanged() -> None:
+    initial = _initial()
+    base = dict(
+        m=32, m_atomic=16, m_lns=16, kdp=8, kref=2,
+        kref_total=4, max_iterations=1,
+    )
+    disabled_stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 31)
+    evaluate_iteration(
+        initial.best_solution, initial.best_directions, FAST,
+        SearchConfig(**base), disabled_stats, seed=31,
+        current_schedule=initial.best_schedule,
+        adaptive_state=AdaptiveOperatorState(),
+    )
+    assert disabled_stats.per_iteration_attempts == [32]
+    assert disabled_stats.crrr_attempted == 0
+    assert len(disabled_stats.operator_sequence) == 0
+
+    enabled_stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 31)
+    adaptive = AdaptiveOperatorState()
+    iteration = evaluate_iteration(
+        initial.best_solution, initial.best_directions, FAST,
+        SearchConfig(**base, enable_crrr=True), enabled_stats, seed=31,
+        current_schedule=initial.best_schedule, adaptive_state=adaptive,
+    )
+    assert enabled_stats.per_iteration_attempts == [32]
+    assert enabled_stats.attempted_by_family == {
+        "ATOMIC": 16, "LNS_REPAIRED": 16, "DIRECTION_REFINEMENT": 0,
+    }
+    assert enabled_stats.crrr_attempted == 8
+    assert len(adaptive.selection_history) == 8
+    assert enabled_stats.crrr_valid_unique > 0
+    assert any(dict(candidate.provenance).get("operator") == "CRRR"
+               for candidate in iteration.complete_candidates)
+    assert enabled_stats.repair_reference_calls == 0
+    assert enabled_stats.repair_full_direction_dp_calls == 0
+
+
+def test_crrr_preserves_x_split_child_robot_identity() -> None:
+    from mrta_reference.geometry import finite_x_split_validator, generate_x_split_patterns
+    from mrta_reference.model import Rail, Route, ScheduleResult, ScheduleStatus
+    parents = (
+        ParentWeld("x1", (2.0, 9.0), (18.0, 9.0)),
+        ParentWeld("x2", (2.5, 10.0), (17.5, 10.0)),
+    )
+    patterns = tuple(
+        next(pattern for pattern in generate_x_split_patterns(
+            parent, 10.0, FAST, rail=Rail.UPPER
+        ) if pattern.point_id == "BX_CENTER")
+        for parent in parents
+    )
+    current = canonicalize(
+        parents, patterns,
+        (Route(0, ("x1::0", "x2::0")), Route(1, ("x1::1", "x2::1")),
+         Route(2, ()), Route(3, ())),
+        FAST, x_split_validator=finite_x_split_validator(parents, FAST),
+    )
+    schedule = ScheduleResult(
+        ScheduleStatus.FEASIBLE, cmax=20.0,
+        robot_completion=(20.0, 19.0, 0.0, 0.0),
+    )
+    repaired = build_crrr_candidate(
+        current, ((0, 0), (0, 0), (), ()), schedule, FAST, attempt_index=0
+    )
+    assert repaired.candidate is not None
+    routes = repaired.candidate.solution.routes
+    assert set(routes[0].block_ids) == {"x1::0", "x2::0"}
+    assert set(routes[1].block_ids) == {"x1::1", "x2::1"}
+    assert not routes[2].block_ids and not routes[3].block_ids
+    assert repaired.candidate.solution.patterns == patterns
 
 
 def test_q6_destroy_repair_crosses_a_basin_atomic_short_budget_cannot() -> None:

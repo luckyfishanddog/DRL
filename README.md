@@ -73,7 +73,15 @@ Production therefore remains baseline initialization + `BASELINE_C2` + heuristic
 
 All **10/10 zero-search** and **48/48 real 60-second** consumed-development runs certified. Region+HEURISTIC versus baseline+HEURISTIC is **9/3/0 wins/ties/losses**, median Cmax change **−4.56%**. Region+GAT versus Region+HEURISTIC is **6/2/4**, median **−0.07%** and mean **+0.14%**; frozen GAT V05 has no stable independent gain on the stronger seed. I3 is repaired, S2 improves instead of regressing, S1 still falls back, and the roughly 50% initial improvements on N55-I6/N85-I9 are followed by little or no further search improvement.
 
-Because the upgraded method was developed only on consumed-development workbooks, production remains `BASELINE` until new independent workbooks are available. The frozen region method is the candidate for that test; the next structural research question is Critical-Rail Region Reallocation, not further initialization/GAT tuning. Results: [region-cooperative initialization report](docs/REGION_COOPERATIVE_INITIALIZATION_RESULTS.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
+Because the upgraded method was developed only on consumed-development workbooks, production remains `BASELINE` until new independent workbooks are available. The frozen region method is the candidate for that test. Results: [region-cooperative initialization report](docs/REGION_COOPERATIVE_INITIALIZATION_RESULTS.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`.
+
+## CRRR structural-neighborhood result (0.50 m)
+
+`Critical-Rail Region Reallocation` is implemented as an explicit, default-off structural LNS source. It uses certified WAIT/WELD timelines or critical same-rail load boundaries to jointly reassign/reorder 2–6 spatially related parents. Enabling it preserves **M192 = 144 atomic + 40 original LNS + 8 CRRR** and does not change REGION initialization, GAT V05, C2/C4, SA, direction DP, B32, certifier or the split model.
+
+All 24 new consumed-development 60-second runs certified. CRRR+HEURISTIC versus original REGION+HEURISTIC is **2/8/2**, median 0.00%, mean **+1.60%**, including a **+20.95%** S1 regression. CRRR+GAT versus original REGION+GAT is **1/7/4**, median 0.00%, mean -0.62%; its only win is I5 seed 20261702 (-22.81%), while the other I5 seed worsens +7.20%. Across 2272 CRRR attempts, 1855 are unique, 88 reach C2, 44 reach C4/B32, 27 are accepted, but only **3 strictly reduce Cmax**, all on I5. Four-state offline replay confirms useful S1/I5 candidates exist but the frozen online funnel often misses them.
+
+Decision: **CRRR is not a default neighborhood** and the enhanced search is not frozen as a new paper method. The code remains an optional ablation; no further GAT training or neighborhood stacking follows from this development result. Complete evidence: [CRRR search results](docs/CRRR_SEARCH_RESULTS.md). Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
 
 ## First runnable GRC-ALNS (0.50 m)
 
