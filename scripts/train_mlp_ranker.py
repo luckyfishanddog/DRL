@@ -934,6 +934,7 @@ def rank_finish():
 # First runnable 0.5 m GRC-ALNS. Kept here to reuse the established runner and
 # avoid another phase-specific framework or result file.
 GRC_SEEDS=(20261301,20261302)
+GRC_V2_SEEDS=(20261401,20261402)
 
 
 def load_v05_states(role):
@@ -1052,6 +1053,275 @@ def _gat_score_states(model,states,stage,scalers,*,include_weld_edges=True,gradi
             _,material=model.score_candidates(stage,graph,embedding,state['current'],candidates,[r[stage+'_features'] for r in rows],scalers[stage+'_mean'],scalers[stage+'_std'],d.CONFIG_V05)
             for row,score in zip(rows,torch.sigmoid(material).detach().cpu().numpy()):row['GAT_'+stage]=float(score)
     return {'seconds':time.perf_counter()-started,'static_forward_calls':forward_calls}
+
+
+def grc_v2_equivalence():
+    """Prove the batched V05 route encoder preserves scores and Top-K identities."""
+    from mrta_ranker.model import build_static_graph,load_graph_model
+    states,_=load_v05_states('MLP_DEV');model,meta=load_graph_model(MODELS/'gat_v05.pt');torch.set_num_threads(1)
+    result={'states':len(states),'C2':{'max_abs_error':0.,'topk_mismatches':0,'legacy_seconds':0.,'batched_seconds':0.},
+        'C4':{'max_abs_error':0.,'topk_mismatches':0,'legacy_seconds':0.,'batched_seconds':0.}}
+    with torch.inference_mode():
+        for state in states:
+            graph=build_static_graph(state['current'].parents,d.CONFIG_V05);embedding=model.encode_static(graph)
+            scored={}
+            for stage in ('C2','C4'):
+                rows=[r for r in state['pool'] if r[stage+'_features'] is not None]
+                candidates=[r['candidate'] for r in rows];features=[r[stage+'_features'] for r in rows]
+                args=(stage,graph,embedding,state['current'],candidates,features,meta['scalers'][stage+'_mean'],meta['scalers'][stage+'_std'],d.CONFIG_V05)
+                start=time.perf_counter();old=torch.sigmoid(model.score_candidates_legacy(*args)[1]);result[stage]['legacy_seconds']+=time.perf_counter()-start
+                start=time.perf_counter();new=torch.sigmoid(model.score_candidates(*args)[1]);result[stage]['batched_seconds']+=time.perf_counter()-start
+                result[stage]['max_abs_error']=max(result[stage]['max_abs_error'],float((old-new).abs().max()))
+                scored[stage]=(rows,old.tolist(),new.tolist())
+            c2_rows,old,new=scored['C2']
+            def choose_c2(scores):
+                values={id(r):v for r,v in zip(c2_rows,scores)}
+                return family_c2(c2_rows,lambda r:(-values[id(r)],r['candidate_id']),lambda r:r['family'],k=8,seed=state['seed'],iteration=state['iteration'])
+            old_c2,new_c2=choose_c2(old),choose_c2(new)
+            if tuple(r['candidate_id'] for r in old_c2)!=tuple(r['candidate_id'] for r in new_c2):result['C2']['topk_mismatches']+=1
+            c4_rows,old4,new4=scored['C4'];lookup_old={r['candidate_id']:v for r,v in zip(c4_rows,old4)};lookup_new={r['candidate_id']:v for r,v in zip(c4_rows,new4)}
+            def choose_c4(c2,values):
+                eligible=[r for r in c2 if r['candidate_id'] in values]
+                return family_c4(eligible,lambda r:(-values[r['candidate_id']],r['projected'],r['dp_travel'],r['split_delta'],r['candidate_id']),lambda r:r['family'],k=2,seed=state['seed'],iteration=state['iteration'])
+            if tuple(r['candidate_id'] for r in choose_c4(old_c2,lookup_old))!=tuple(r['candidate_id'] for r in choose_c4(new_c2,lookup_new)):result['C4']['topk_mismatches']+=1
+    if result['C2']['topk_mismatches'] or result['C4']['topk_mismatches']:raise AssertionError('V05 batched scoring changed Top-K selection')
+    db=d.connect(d.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_v2_equivalence','summary',d.dumps(result)))
+    db.close();print(d.dumps(result),flush=True)
+
+
+def _gat_score_states_v2(model,states,stage,scalers,prefix,*,include_weld_edges=True):
+    from mrta_ranker.model import build_static_graph
+    graphs={};embeddings={};started=time.perf_counter();calls=0
+    model.eval()
+    with torch.inference_mode():
+        for state in states:
+            key=state['instance_id']
+            if key not in graphs:graphs[key]=build_static_graph(state['current'].parents,d.CONFIG_V05,include_weld_edges=include_weld_edges)
+            if key not in embeddings:embeddings[key]=model.encode_static(graphs[key]);calls+=1
+            rows=[r for r in state['pool'] if r[stage+'_features'] is not None]
+            _,material=model.score_candidates(stage,graphs[key],embeddings[key],state['current'],[r['candidate'] for r in rows],
+                [r[stage+'_features'] for r in rows],scalers[stage+'_mean'],scalers[stage+'_std'],d.CONFIG_V05,
+                directions=None if stage=='C2' else [r['direction'] for r in rows],current_direction=state['directions'] if stage=='C4' else None)
+            for row,score in zip(rows,torch.sigmoid(material).cpu().numpy()):row[prefix+'_'+stage]=float(score)
+    return {'seconds':time.perf_counter()-started,'static_forward_calls':calls}
+
+
+def _train_v06_stage(model,stage,train_states,dev_states,scalers,prefix,*,include_weld_edges,train_rows_by_state=None):
+    from mrta_ranker.model import build_static_graph
+    started=time.perf_counter();torch.manual_seed(20261420+(stage=='C4'))
+    if stage=='C4':
+        allowed=('transition.C4','route.C4','fusion.C4','numeric.C4','feasibility.C4','material.C4')
+        for name,p in model.named_parameters():p.requires_grad=any(name.startswith(value) for value in allowed)
+    else:
+        for p in model.parameters():p.requires_grad=True
+    opt=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=.001,weight_decay=.0001)
+    all_rows=[r for s in train_states for r in (train_rows_by_state or {}).get(s['state_id'],s['pool']) if r[stage+'_features'] is not None]
+    positives=sum(r['material'] for r in all_rows);pos_weight=torch.tensor((len(all_rows)-positives)/max(1,positives))
+    graphs={s['instance_id']:build_static_graph(s['current'].parents,d.CONFIG_V05,include_weld_edges=include_weld_edges) for s in train_states}
+    best=None;best_state=None;history=[];gradient_norm=0.;epochs=4
+    for epoch in range(1,epochs+1):
+        model.train();losses=[]
+        for state in train_states:
+            rows=[r for r in (train_rows_by_state or {}).get(state['state_id'],state['pool']) if r[stage+'_features'] is not None]
+            if not rows:continue
+            graph=graphs[state['instance_id']];opt.zero_grad(set_to_none=True);embedding=model.encode_static(graph)
+            feas,material=model.score_candidates(stage,graph,embedding,state['current'],[r['candidate'] for r in rows],[r[stage+'_features'] for r in rows],
+                scalers[stage+'_mean'],scalers[stage+'_std'],d.CONFIG_V05,directions=None if stage=='C2' else [r['direction'] for r in rows],
+                current_direction=state['directions'] if stage=='C4' else None)
+            yf=torch.tensor([r['y_feasible'] for r in rows],dtype=torch.float32);ym=torch.tensor([r['material'] for r in rows],dtype=torch.float32)
+            loss=nn.functional.binary_cross_entropy_with_logits(feas,yf)+nn.functional.binary_cross_entropy_with_logits(material,ym,pos_weight=pos_weight)
+            loss.backward()
+            target=model.encoder.layer1.linear.weight if stage=='C2' else model.transition['C4'][0].weight
+            if target.grad is not None:gradient_norm=max(gradient_norm,float(target.grad.abs().sum()))
+            opt.step();losses.append(float(loss.detach()))
+        timing=_gat_score_states_v2(model,dev_states,stage,scalers,prefix,include_weld_edges=include_weld_edges)
+        metric=_v05_metrics(dev_states,prefix)[stage]['ALL'];key=((metric['material_candidate_capture'] or 0),-(metric['material_zero_capture'] if metric['material_zero_capture'] is not None else 1),-statistics.fmean(losses))
+        history.append({'epoch':epoch,'loss':statistics.fmean(losses),'dev':metric,'inference':timing})
+        if best is None or key>best:best=key;best_state=deepcopy(model.state_dict());best_epoch=epoch
+    model.load_state_dict(best_state)
+    if gradient_norm<=0:raise AssertionError(stage+' route/GAT parameters received no gradient')
+    return {'rows':len(all_rows),'positives':positives,'epochs':epochs,'selected_epoch':best_epoch,'gradient_l1':gradient_norm,'training_seconds':time.perf_counter()-started,'history':history}
+
+
+def grc_v2_train():
+    """Train full-edge and independently initialized no-weld-edge V06 models."""
+    from mrta_ranker.model import GraphCandidateRankerV2,fit_scaler,save_graph_model
+    torch.set_num_threads(1);torch.use_deterministic_algorithms(True);train,names=load_v05_states('MLP_TRAIN');dev,_=load_v05_states('MLP_DEV')
+    scalers={}
+    for stage in ('C2','C4'):
+        values=[r[stage+'_features'] for s in train for r in s['pool'] if r[stage+'_features'] is not None]
+        scalers[stage+'_mean'],scalers[stage+'_std']=fit_scaler(values)
+    models={};training={}
+    for prefix,include_edges in (('GAT_V06',True),('GAT_V06_NO_WELD_EDGES',False)):
+        torch.manual_seed(20261419);model=GraphCandidateRankerV2();models[prefix]=model
+        training[prefix]={'C2':_train_v06_stage(model,'C2',train,dev,scalers,prefix,include_weld_edges=include_edges)}
+        _gat_score_states_v2(model,train,'C2',scalers,prefix,include_weld_edges=include_edges)
+        _gat_score_states_v2(model,dev,'C2',scalers,prefix,include_weld_edges=include_edges)
+    hard={}
+    for state in train:
+        ids={r['candidate_id'] for method in ('HEURISTIC','GAT_V06','GAT_V06_NO_WELD_EDGES') for r in _v05_c2(state,method)}
+        eligible=[r for r in state['pool'] if r['C4_features'] is not None]
+        ids.update(r['candidate_id'] for r in eligible if r['material']);ids.update(r['candidate_id'] for r in eligible[:8])
+        hard[state['state_id']]=[r for r in eligible if r['candidate_id'] in ids]
+    for prefix,include_edges in (('GAT_V06',True),('GAT_V06_NO_WELD_EDGES',False)):
+        model=models[prefix];model.initialize_c4_adapter()
+        _gat_score_states_v2(model,dev,'C2',scalers,prefix,include_weld_edges=include_edges)
+        before=tuple(tuple(r[prefix+'_C2'] for r in s['pool']) for s in dev)
+        training[prefix]['C4']=_train_v06_stage(model,'C4',train,dev,scalers,prefix,include_weld_edges=include_edges,train_rows_by_state=hard)
+        _gat_score_states_v2(model,dev,'C2',scalers,prefix,include_weld_edges=include_edges)
+        after=tuple(tuple(r[prefix+'_C2'] for r in s['pool']) for s in dev)
+        if before!=after:raise AssertionError('C4 training changed frozen C2 output')
+        training[prefix]['c2_frozen_after_c4']=True;training[prefix]['C4_hard_rows']=sum(map(len,hard.values()))
+        path=MODELS/('gat_v06.pt' if include_edges else 'gat_v06_no_weld_edges.pt')
+        save_graph_model(path,model,names['C2'],names['C4'],scalers,training[prefix],include_weld_edges=include_edges)
+    summary={'seed':20261419,'same_initialization':True,'same_C4_hard_rows':sum(map(len,hard.values())),'models':training}
+    db=d.connect(d.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_v2_training','summary',d.dumps(summary)))
+    db.close();print(d.dumps(summary),flush=True)
+
+
+def _c4_drop_summary(states,method):
+    rows=[]
+    for state in states:
+        c2=_v05_c2(state,method);c4=_v05_c4(state,c2,method);valuable=sum(r['material'] for r in c2);kept=sum(r['material'] for r in c4)
+        if valuable:rows.append({'tier':state['tier'],'valuable':valuable,'kept':kept,'dropped_all':kept==0})
+    result={}
+    for group,items in {'ALL':rows,**{tier:[r for r in rows if r['tier']==tier] for tier in d.TIERS}}.items():
+        result[group]={'states':len(items),'valuable_candidates':sum(r['valuable'] for r in items),'kept_candidates':sum(r['kept'] for r in items),
+            'candidate_drop_rate':None if not items else 1-sum(r['kept'] for r in items)/sum(r['valuable'] for r in items),
+            'dropped_all_state_rate':None if not items else statistics.fmean(r['dropped_all'] for r in items)}
+    return result
+
+
+def grc_v2_offline():
+    """Evaluate every method on its own true C2 Top8 then corresponding C4 Top2."""
+    from mrta_ranker.model import load_model,load_graph_model
+    states,_=load_v05_states('MLP_DEV');timing={}
+    for stage in ('C2','C4'):
+        model,meta=load_model(MODELS/f'mlp_{stage.lower()}_v05.pt');start=time.perf_counter();_set_mlp_scores(states,stage,model,meta['mean'],meta['std']);timing['MLP_'+stage]=time.perf_counter()-start
+    models=(('GAT_V05','gat_v05.pt',True),('GAT_V06','gat_v06.pt',True),('GAT_V06_NO_WELD_EDGES','gat_v06_no_weld_edges.pt',False))
+    for prefix,path,edges in models:
+        model,meta=load_graph_model(MODELS/path)
+        for stage in ('C2','C4'):timing[prefix+'_'+stage]=_gat_score_states_v2(model,states,stage,meta['scalers'],prefix,include_weld_edges=edges)
+    methods=('HEURISTIC','MLP','GAT_V05','GAT_V06','GAT_V06_NO_WELD_EDGES')
+    result={method:{'metrics':_v05_metrics(states,method),'c4_drop':_c4_drop_summary(states,method)} for method in methods};result['timing']=timing
+    differences={}
+    for stage in ('C2','C4'):
+        pairs=[(r['GAT_V06_'+stage],r['GAT_V06_NO_WELD_EDGES_'+stage]) for s in states for r in s['pool'] if stage+'_features' in r and r[stage+'_features'] is not None]
+        differences[stage]={'mean_abs_score_difference':statistics.fmean(abs(a-b) for a,b in pairs),'max_abs_score_difference':max(abs(a-b) for a,b in pairs),
+            'states_with_topk_difference':sum(tuple(r['candidate_id'] for r in (_v05_c2(s,'GAT_V06') if stage=='C2' else _v05_c4(s,_v05_c2(s,'GAT_V06'),'GAT_V06')))!=
+                tuple(r['candidate_id'] for r in (_v05_c2(s,'GAT_V06_NO_WELD_EDGES') if stage=='C2' else _v05_c4(s,_v05_c2(s,'GAT_V06_NO_WELD_EDGES'),'GAT_V06_NO_WELD_EDGES'))) for s in states)}
+    result['full_vs_no_weld_edges']=differences
+    db=d.connect(d.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_v2_offline','summary',d.dumps(result)))
+    db.close();print(d.dumps(result),flush=True)
+
+
+def _grc_v2_worker(job):
+    if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
+    from run_ppo_smoke import _range_parents
+    from mrta_ranker.ranking import V05MLPRanker,GATRanker
+    entry,seed,method=job;parents=_range_parents(entry,d.PPO)
+    if method=='HEURISTIC':ranker=None
+    elif method=='MLP_V05':ranker=V05MLPRanker(ROOT)
+    elif method=='GAT_V05':ranker=GATRanker(ROOT,model_version='v05')
+    elif method=='GAT_V06':ranker=GATRanker(ROOT,model_version='v06')
+    else:raise ValueError(method)
+    record,_=d.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=d.CONFIG_V05)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],'relative_path':entry['relative_path'],
+        'actual_N':len(parents),'total_weld_length':sum(p.length for p in parents),'seed':seed,'method':method,**record}
+
+
+def grc_v2_run(workers=4,*,pilot=False):
+    if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
+    from run_ppo_smoke import _c2_entries
+    entries=_c2_entries(ROOT);roles={r['relative_path']:r['new_v2_role'] for r in d.read(ROOT/'data/manifests/PPO_V2_DATA_ROLES_V1.json')['workbooks']}
+    if len(entries)!=6 or any(roles.get(e['relative_path'])!='V2_MODEL_DEVELOPMENT_CONSUMED' for e in entries):raise PermissionError('Online V2 matrix must use six consumed-development workbooks only')
+    selected=(entries[0],entries[4]) if pilot else entries;methods=('HEURISTIC','MLP_V05','GAT_V05','GAT_V06')
+    db=d.connect(d.DATABASE_V05);done={r[0] for r in db.execute("SELECT item_id FROM experiments WHERE experiment='grc_v2_runs'")};db.close();jobs=[]
+    for ei,entry in enumerate(selected):
+        seeds=(GRC_V2_SEEDS[:1] if pilot else GRC_V2_SEEDS)
+        for si,seed in enumerate(seeds):
+            order=methods[(ei+si)%len(methods):]+methods[:(ei+si)%len(methods)]
+            for method in order:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,seed,method)))
+    masks=d.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=workers,mp_context=mp.get_context('spawn'),initializer=_grc_smoke_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_grc_v2_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            row=future.result();db=d.connect(d.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_v2_runs',futures[future],d.dumps(row)))
+            db.close();print(f"v2 {futures[future]} Cmax@60={row['Cmax_at_60']} iterations={row['iterations']}",flush=True)
+    print(f'grc_v2_run complete: submitted={len(jobs)} pilot={pilot}',flush=True)
+
+
+def grc_v2_report():
+    db=d.connect(d.DATABASE_V05,readonly=True)
+    def payload(name):return json.loads(db.execute('SELECT payload FROM experiments WHERE experiment=? AND item_id=?',(name,'summary')).fetchone()[0])
+    equivalent=payload('grc_v2_equivalence');training=payload('grc_v2_training');offline=payload('grc_v2_offline')
+    runs=[json.loads(row[0]) for row in db.execute("SELECT payload FROM experiments WHERE experiment='grc_v2_runs' ORDER BY item_id")];db.close()
+    methods=('HEURISTIC','MLP_V05','GAT_V05','GAT_V06');tiers=('N35','N55','N85')
+    if len(runs)!=48 or any(not r['valid_60s_outcome'] for r in runs):raise AssertionError('Expected 48 valid certified V2 runs')
+    groups={}
+    for instance in sorted({r['instance'] for r in runs}):
+        for seed in GRC_V2_SEEDS:
+            rows={r['method']:r for r in runs if r['instance']==instance and r['seed']==seed}
+            if set(rows)!=set(methods):raise AssertionError('Incomplete paired matrix')
+            initials={round(r['initial_cmax'],8) for r in rows.values()}
+            if len(initials)!=1:raise AssertionError('Paired initial Cmax mismatch')
+            groups[(instance,seed)]=rows
+    def paired(method,tier=None):
+        values=[]
+        for rows in groups.values():
+            if tier is None or rows['HEURISTIC']['tier']==tier:values.append(rows[method]['Cmax_at_60']/rows['HEURISTIC']['Cmax_at_60']-1)
+        eps=1e-10
+        return {'pairs':len(values),'wins':sum(v < -eps for v in values),'ties':sum(abs(v)<=eps for v in values),'losses':sum(v>eps for v in values),
+            'median_delta':statistics.median(values),'mean_delta':statistics.fmean(values)}
+    online={m:{'ALL':paired(m),**{tier:paired(m,tier) for tier in tiers}} for m in methods[1:]}
+    def pc(v):return '—' if v is None else f'{100*v:.2f}%'
+    lines=['# GRC-ALNS V2 结果','',
+        '**结论：V06 保留为开发候选，但暂不替换 HEURISTIC production，也不进入最终 ID_TEST。** V05 等价加速明确成立；真实相邻编码和 C4 adapter 可训练且在线总体略有收益，但 DEV 捕获不优于 V05、跨实例方差仍大。','',
+        '## V05 等价加速','',
+        '| stage | 最大分数误差 | Top-K不一致状态 | 原耗时 | 批量耗时 | 加速 |','|---|---:|---:|---:|---:|---:|']
+    for stage in ('C2','C4'):
+        row=equivalent[stage];lines.append(f"| {stage} | {row['max_abs_error']:.3g} | {row['topk_mismatches']}/34 | {row['legacy_seconds']:.3f}s | {row['batched_seconds']:.3f}s | {row['legacy_seconds']/row['batched_seconds']:.2f}× |")
+    lines+=['','缓存按有序route、真实子段端点、u区间、拆分类型/点和机器人身份区分；未改变候选身份、family或tie-break。训练每次参数更新后重算embedding，不使用detach缓存。','',
+        '## DEV：真实 C2→direction→C4','',
+        '| method | tier | C2 capture | C2 zero | C2 feasible | C4 capture | C4 zero | C4 feasible | C4 material drop |','|---|---|---:|---:|---:|---:|---:|---:|---:|']
+    for method in ('HEURISTIC','MLP','GAT_V05','GAT_V06','GAT_V06_NO_WELD_EDGES'):
+        for tier,label in (('SMALL','N35'),('MEDIUM','N55'),('LARGE','N85'),('ALL','ALL')):
+            c2=offline[method]['metrics']['C2'][tier];c4=offline[method]['metrics']['C4'][tier];drop=offline[method]['c4_drop'][tier]['candidate_drop_rate']
+            lines.append(f"| {method} | {label} | {pc(c2['material_candidate_capture'])} | {pc(c2['material_zero_capture'])} | {pc(c2['selected_candidate_feasibility_rate'])} | {pc(c4['material_candidate_capture'])} | {pc(c4['material_zero_capture'])} | {pc(c4['selected_candidate_feasibility_rate'])} | {pc(drop)} |")
+    diff=offline['full_vs_no_weld_edges'];full=training['models']['GAT_V06'];noedge=training['models']['GAT_V06_NO_WELD_EDGES']
+    lines+=['',f"C4 adapter真实梯度L1：完整图 {full['C4']['gradient_l1']:.6g}、无焊缝边 {noedge['C4']['gradient_l1']:.6g}；两者均在C4训练后保持C2逐值不变。",
+        f"完整图与独立训练无焊缝边模型：C2/C4平均分数差 {diff['C2']['mean_abs_score_difference']:.6f}/{diff['C4']['mean_abs_score_difference']:.6f}，Top-K不同状态 {diff['C2']['states_with_topk_difference']}/34、{diff['C4']['states_with_topk_difference']}/34。完整图C4 capture仅比无边高 {pc(offline['GAT_V06']['metrics']['C4']['ALL']['material_candidate_capture']-offline['GAT_V06_NO_WELD_EDGES']['metrics']['C4']['ALL']['material_candidate_capture'])}，图关系增量很小，尚无强支持。",'',
+        '## 48次真实60秒配对','',
+        '| instance | actual N | length(m) | seed | HEURISTIC | MLP V05 Δ | GAT V05 Δ | GAT V06 Δ |','|---|---:|---:|---:|---:|---:|---:|---:|']
+    for (instance,seed),rows in sorted(groups.items()):
+        base=rows['HEURISTIC']['Cmax_at_60'];meta=rows['HEURISTIC']
+        lines.append(f"| {instance} | {meta['actual_N']} | {meta['total_weld_length']:.3f} | {seed} | {base:.6f} | {pc(rows['MLP_V05']['Cmax_at_60']/base-1)} | {pc(rows['GAT_V05']['Cmax_at_60']/base-1)} | {pc(rows['GAT_V06']['Cmax_at_60']/base-1)} |")
+    lines+=['','| method | tier | 胜/平/负 | median Δ | mean Δ |','|---|---|---:|---:|---:|']
+    for method in methods[1:]:
+        for tier in ('ALL',*tiers):
+            row=online[method][tier];lines.append(f"| {method} | {tier} | {row['wins']}/{row['ties']}/{row['losses']} | {pc(row['median_delta'])} | {pc(row['mean_delta'])} |")
+    lines+=['','| method | iterations | direction calls | reference calls | accepted | strict best@60 | ranker | graph/forward/score | status F/D/I/N |','|---|---:|---:|---:|---:|---:|---:|---|---|']
+    for method in methods:
+        rows=[r for r in runs if r['method']==method];status={k:sum(r['reference_status'][k] for r in rows) for k in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE')}
+        lines.append(f"| {method} | {sum(r['iterations'] for r in rows)} | {sum(r['direction_calls'] for r in rows)} | {sum(r['reference_calls'] for r in rows)} | {sum(r['accepted_moves'] for r in rows)} | {sum(r['strict_best_improvements_at60'] for r in rows)} | {sum(r['ranker_inference_seconds'] for r in rows):.3f}s | {sum(r['graph_build_seconds'] for r in rows):.3f}/{sum(r['static_graph_forward_seconds'] for r in rows):.3f}/{sum(r['candidate_scoring_seconds'] for r in rows):.3f}s | {status['FEASIBLE']}/{status['DEADLOCK']}/{status['INFEASIBLE']}/{status['NUMERIC_FAILURE']} |")
+    lines+=['',f"分阶段ranker耗时（C2/C4）：MLP {sum(r['c2_ranker_seconds'] for r in runs if r['method']=='MLP_V05'):.3f}/{sum(r['c4_ranker_seconds'] for r in runs if r['method']=='MLP_V05'):.3f}s，GAT V05 {sum(r['c2_ranker_seconds'] for r in runs if r['method']=='GAT_V05'):.3f}/{sum(r['c4_ranker_seconds'] for r in runs if r['method']=='GAT_V05'):.3f}s，GAT V06 {sum(r['c2_ranker_seconds'] for r in runs if r['method']=='GAT_V06'):.3f}/{sum(r['c4_ranker_seconds'] for r in runs if r['method']=='GAT_V06'):.3f}s。"]
+    v06=online['GAT_V06'];lines+=['','## 决策','',
+        f"- V06 对 heuristic：ALL {v06['ALL']['wins']}/{v06['ALL']['ties']}/{v06['ALL']['losses']}，median {pc(v06['ALL']['median_delta'])}；N35 {v06['N35']['wins']}/{v06['N35']['ties']}/{v06['N35']['losses']}，N55 {v06['N55']['wins']}/{v06['N55']['ties']}/{v06['N55']['losses']}，N85 {v06['N85']['wins']}/{v06['N85']['ties']}/{v06['N85']['losses']}。没有N35或N85全体系统性恶化，但各自都有大幅反向个例。",
+        '- V06 C4认证率提高，但其material capture和Top8→Top2保留率没有超过V05；当前主要阻碍是C4目标与在线轨迹收益仍不一致，而不是功能、认证或缓存错误。',
+        '- V05批量实现的评分加速值得保留。V06可进入下一轮更大development对比，但不应设为production或宣称图关系已被证明。下一步最小工作应聚焦C4监督/校准，而非扩大网络或打开ID_TEST。','',
+        '固定条件：0.5m、M192=144+48、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/B32/certifier、TWO_OPT_STAR OFF；48/48均有截止前独立认证结果，NUMERIC_FAILURE=0。','',
+        '完整回归：`pytest -q -p no:cacheprovider`，326 passed。','']
+    (ROOT/'docs/GRC_ALNS_V2_RESULTS.md').write_text('\n'.join(lines),encoding='utf-8')
+    summary={'runs':len(runs),'online':online,'numeric_failures':sum(r['numeric_failure'] for r in runs),'certified':sum(r['certified'] for r in runs)}
+    db=d.connect(d.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',('grc_v2_report','summary',d.dumps(summary)))
+    db.close();print(d.dumps(summary),flush=True)
 
 
 def _train_v05_gat_stage(model,stage,train_states,dev_states,scalers,train_rows_by_state=None):
@@ -1221,9 +1491,14 @@ def grc_report():
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action',choices=('train','offline','smoke','diagnose','finish','rank','audit','rank-finish','grc-train','grc-offline','grc-smoke','grc-report'));parser.add_argument('--workers',type=int,default=3)
+    parser.add_argument('action',choices=('train','offline','smoke','diagnose','finish','rank','audit','rank-finish','grc-train','grc-offline','grc-smoke','grc-report','grc-v2-equivalence','grc-v2-train','grc-v2-offline','grc-v2-run','grc-v2-report'));parser.add_argument('--workers',type=int,default=3);parser.add_argument('--pilot',action='store_true')
     args=parser.parse_args()
-    if args.action=='grc-train':grc_train()
+    if args.action=='grc-v2-equivalence':grc_v2_equivalence()
+    elif args.action=='grc-v2-train':grc_v2_train()
+    elif args.action=='grc-v2-offline':grc_v2_offline()
+    elif args.action=='grc-v2-run':grc_v2_run(args.workers,pilot=args.pilot)
+    elif args.action=='grc-v2-report':grc_v2_report()
+    elif args.action=='grc-train':grc_train()
     elif args.action=='grc-offline':grc_offline()
     elif args.action=='grc-smoke':grc_smoke(args.workers)
     elif args.action=='grc-report':grc_report()

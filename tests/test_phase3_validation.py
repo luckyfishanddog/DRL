@@ -425,3 +425,72 @@ def test_gat_ranker_static_attention_is_cached_per_instance():
     first=ranker._static(_base().parents,FAST);second=ranker._static(_base().parents,FAST)
     assert first[0] is second[0] and first[1] is second[1]
     assert ranker.static_forward_calls==ranker.model.calls==1
+
+
+def test_gat_v06_true_transitions_direction_boundary_and_c4_gradient():
+    torch=pytest.importorskip('torch');import numpy as np
+    from dataclasses import replace
+    from test_search_sa import _base,_family_candidates,FAST
+    from mrta_ranker.model import build_static_graph,GraphCandidateRankerV2
+    from mrta_reference.solution import canonicalize
+    from mrta_search.direction import ConstrainedDirectionResult,DirectionStatus
+    from mrta_search.lns import atomic_complete_candidate
+    current=_base();graph=build_static_graph(current.parents,FAST);model=GraphCandidateRankerV2();embedding=model.encode_static(graph)
+    # Same first/last welds, but distinct middle execution connections.
+    abcd=canonicalize(current.parents,current.patterns,{2:('a::whole','b::whole','c::whole','d::whole')},FAST)
+    acbd=canonicalize(current.parents,current.patterns,{2:('a::whole','c::whole','b::whole','d::whole')},FAST)
+    first=model._solution_routes(abcd,embedding,graph.parent_index,FAST)
+    second=model._solution_routes(acbd,embedding,graph.parent_index,FAST)
+    assert first.shape==second.shape==(640,) and not torch.allclose(first,second)
+    # Empty/singleton/two-block routes are finite and do not need padding tricks.
+    short=canonicalize(current.parents,current.patterns,{2:('a::whole',),3:('b::whole','c::whole','d::whole')},FAST)
+    assert torch.isfinite(model._solution_routes(short,embedding,graph.parent_index,FAST)).all()
+    candidate=atomic_complete_candidate(current,((),(),(0,0),(0,0)),_family_candidates()[0],FAST)
+    reverse=replace(candidate,canonical_solution=canonicalize(current.parents,current.patterns,{2:tuple(reversed(current.routes[2].block_ids)),3:current.routes[3].block_ids},FAST))
+    d0=ConstrainedDirectionResult(DirectionStatus.FEASIBLE,((),(),(0,0),(0,0)),1.)
+    d1=ConstrainedDirectionResult(DirectionStatus.FEASIBLE,((),(),(1,1),(1,1)),1.)
+    # C2 ignores future candidate direction; C4 consumes it.
+    c2a=model._encode_solutions('C2',[candidate.solution],embedding,graph.parent_index,FAST,[d0])[0]
+    c2b=model._encode_solutions('C2',[candidate.solution],embedding,graph.parent_index,FAST,[d1])[0]
+    assert torch.equal(c2a,c2b)
+    c4a=model._encode_solutions('C4',[candidate.solution],embedding,graph.parent_index,FAST,[d0])[0]
+    c4b=model._encode_solutions('C4',[candidate.solution],embedding,graph.parent_index,FAST,[d1])[0]
+    assert not torch.allclose(c4a,c4b)
+    model.initialize_c4_adapter();feas,material=model.score_candidates('C4',graph,embedding,current,[candidate,reverse],
+        [np.zeros(130),np.zeros(130)],np.zeros(130),np.ones(130),FAST,directions=[d0,d1],current_direction=d0)
+    (feas.sum()+material.sum()).backward()
+    assert model.transition['C4'][0].weight.grad is not None
+    assert float(model.transition['C4'][0].weight.grad.abs().sum())>0
+
+
+def test_v05_batched_route_scoring_matches_legacy_topology():
+    torch=pytest.importorskip('torch');import numpy as np
+    from test_search_sa import _base,_family_candidates,FAST
+    from mrta_ranker.model import build_static_graph,GraphCandidateRanker
+    from mrta_search.lns import atomic_complete_candidate
+    current=_base();candidate=atomic_complete_candidate(current,((),(),(0,0),(0,0)),_family_candidates()[0],FAST)
+    graph=build_static_graph(current.parents,FAST);model=GraphCandidateRanker();embedding=model.encode_static(graph)
+    args=('C2',graph,embedding,current,[candidate],[np.zeros(87)],np.zeros(87),np.ones(87),FAST)
+    old=model.score_candidates_legacy(*args);new=model.score_candidates(*args)
+    assert all(torch.allclose(a,b,atol=2e-7,rtol=0) for a,b in zip(old,new))
+
+
+def test_gat_v06_route_cache_distinguishes_whole_y_x_and_split_points():
+    pytest.importorskip('torch')
+    from mrta_ranker.dataset import CONFIG_V05
+    from mrta_ranker.model import GraphCandidateRankerV2
+    from mrta_reference.geometry import build_legal_pattern_catalog,finite_x_split_validator
+    from mrta_reference.model import ParentWeld,SplitKind,SplitPattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import canonicalize
+    xparents=(ParentWeld('x',(8.,2.),(12.,2.)),);xcatalog=build_legal_pattern_catalog(xparents,CONFIG_V05,FORMAL_SCOPE_V2)['x']
+    xpatterns=[p for p in xcatalog if p.kind is SplitKind.X_SPLIT]
+    xsolutions=[canonicalize(xparents,(p,),{2:('x::0',),3:('x::1',)},CONFIG_V05,
+        x_split_validator=finite_x_split_validator(xparents,CONFIG_V05)) for p in (xpatterns[0],xpatterns[-1])]
+    xkeys=[tuple(row[0] for row in GraphCandidateRankerV2._route_data(solution,CONFIG_V05)) for solution in xsolutions]
+    assert xkeys[0]!=xkeys[1]  # same child IDs, different real u/geometry/split point
+    whole=canonicalize(xparents,(SplitPattern('x',SplitKind.WHOLE),),{2:('x::whole',)},CONFIG_V05)
+    yparents=(ParentWeld('y',(2.,4.),(2.,8.)),);ypattern=build_legal_pattern_catalog(yparents,CONFIG_V05,FORMAL_SCOPE_V2)['y'][0]
+    ysplit=canonicalize(yparents,(ypattern,),{2:('y::0',),0:('y::1',)},CONFIG_V05)
+    kinds=lambda solution:{value[6] for key,route,blocks,patterns in GraphCandidateRankerV2._route_data(solution,CONFIG_V05) for value in key[1]}
+    assert kinds(whole)=={'WHOLE'} and kinds(ysplit)=={'Y_SPLIT'} and kinds(xsolutions[0])=={'X_SPLIT'}

@@ -78,7 +78,7 @@ class V05MLPRanker:
         from .model import load_model
         import torch
         torch.set_num_threads(1);root=Path(__file__).resolve().parents[2] if root is None else Path(root)
-        self.models={};self.inference_seconds=0.;self.ranking_seconds=0.
+        self.models={};self.inference_seconds=0.;self.ranking_seconds=0.;self.c2_seconds=0.;self.c4_seconds=0.
         for stage in ('C2','C4'):
             model,meta=load_model(root/f'models/mlp_{stage.lower()}_v05.pt')
             self.models[stage]=(model,meta)
@@ -95,7 +95,8 @@ class V05MLPRanker:
             scores={id(c):float(v) for c,v in zip(pool,self._scores('C2',features))};rank=time.perf_counter()
             result=family_c2(pool,lambda c:(-scores[id(c)],c.cheap_score),decision_family,k=k,seed=seed,iteration=iteration)
             self.ranking_seconds+=time.perf_counter()-rank;return result
-        finally:self.inference_seconds+=time.perf_counter()-start
+        finally:
+            elapsed=time.perf_counter()-start;self.inference_seconds+=elapsed;self.c2_seconds+=elapsed
     def select_c4(self,current,directions,cs,pool,config,*,seed,iteration,k=2):
         start=time.perf_counter()
         try:
@@ -104,17 +105,22 @@ class V05MLPRanker:
             scores={id(c):float(v) for c,v in zip(pool,self._scores('C4',features))};rank=time.perf_counter()
             result=family_c4(pool,lambda c:(-scores[id(c)],c.rerank_key),lambda c:decision_family(c.screened),k=k,seed=seed,iteration=iteration)
             self.ranking_seconds+=time.perf_counter()-rank;return result
-        finally:self.inference_seconds+=time.perf_counter()-start
+        finally:
+            elapsed=time.perf_counter()-start;self.inference_seconds+=elapsed;self.c4_seconds+=elapsed
 
 
 class GATRanker:
     """Cache one static graph forward per instance and score only dynamic candidates."""
-    def __init__(self,root=None,*,include_weld_edges=True):
+    def __init__(self,root=None,*,include_weld_edges=None,model_version='v05',legacy_scoring=False):
         from .model import load_graph_model
         import torch
         torch.set_num_threads(1);root=Path(__file__).resolve().parents[2] if root is None else Path(root)
-        self.model,self.meta=load_graph_model(root/'models/gat_v05.pt');self.include_weld_edges=include_weld_edges
-        self.inference_seconds=0.;self.graph_build_seconds=0.;self.static_forward_seconds=0.;self.candidate_scoring_seconds=0.;self.ranking_seconds=0.;self.static_forward_calls=0
+        names={'v05':'gat_v05.pt','v06':'gat_v06.pt','v06_no_weld_edges':'gat_v06_no_weld_edges.pt'}
+        if model_version not in names:raise ValueError('Unknown GAT model version')
+        self.model,self.meta=load_graph_model(root/'models'/names[model_version]);arch=self.meta.get('architecture',{})
+        self.include_weld_edges=arch.get('include_weld_edges',True) if include_weld_edges is None else include_weld_edges
+        self.model_version=model_version;self.legacy_scoring=legacy_scoring
+        self.inference_seconds=0.;self.graph_build_seconds=0.;self.static_forward_seconds=0.;self.candidate_scoring_seconds=0.;self.ranking_seconds=0.;self.c2_seconds=0.;self.c4_seconds=0.;self.static_forward_calls=0
         self._key=None;self._graph=None;self._embeddings=None
     def _static(self,parents,config):
         import torch
@@ -126,13 +132,15 @@ class GATRanker:
         with torch.inference_mode(): embeddings=self.model.encode_static(graph)
         self.static_forward_seconds+=time.perf_counter()-start;self.static_forward_calls+=1
         self._key=key;self._graph=graph;self._embeddings=embeddings;return graph,embeddings
-    def _scores(self,stage,current,candidates,features,config):
+    def _scores(self,stage,current,candidates,features,config,*,directions=None,current_direction=None):
         import torch
         graph,embeddings=self._static(current.parents,config);mean=self.meta['scalers'][stage+'_mean'];std=self.meta['scalers'][stage+'_std']
         names=self.meta['c2_names' if stage=='C2' else 'c4_names']
         if any(list(row)!=names for row in features):raise ValueError('GAT feature columns differ')
         start=time.perf_counter()
-        with torch.inference_mode(): _,material=self.model.score_candidates(stage,graph,embeddings,current,candidates,[list(r.values()) for r in features],mean,std,config)
+        scorer=self.model.score_candidates_legacy if self.legacy_scoring else self.model.score_candidates
+        with torch.inference_mode(): _,material=scorer(stage,graph,embeddings,current,candidates,[list(r.values()) for r in features],mean,std,config,
+            directions=directions,current_direction=current_direction)
         self.candidate_scoring_seconds+=time.perf_counter()-start;return torch.sigmoid(material).numpy()
     def select_c2(self,current,directions,cs,pool,config,*,seed,iteration,k=8):
         start=time.perf_counter()
@@ -142,14 +150,17 @@ class GATRanker:
             scores={id(c):float(v) for c,v in zip(pool,self._scores('C2',current,pool,features,config))};rank=time.perf_counter()
             result=family_c2(pool,lambda c:(-scores[id(c)],c.cheap_score),decision_family,k=k,seed=seed,iteration=iteration)
             self.ranking_seconds+=time.perf_counter()-rank;return result
-        finally:self.inference_seconds+=time.perf_counter()-start
+        finally:
+            elapsed=time.perf_counter()-start;self.inference_seconds+=elapsed;self.c2_seconds+=elapsed
     def select_c4(self,current,directions,cs,pool,config,*,seed,iteration,k=2):
         start=time.perf_counter()
         try:
             candidates=[c.screened for c in pool]
             features=[extract_c4_features(current,directions,cs,c.screened,config,direction=c.direction,cheap_rank=c.cheap_rank) for c in pool]
             if not pool:return ()
-            scores={id(c):float(v) for c,v in zip(pool,self._scores('C4',current,candidates,features,config))};rank=time.perf_counter()
+            scores={id(c):float(v) for c,v in zip(pool,self._scores('C4',current,candidates,features,config,
+                directions=[c.direction for c in pool],current_direction=directions))};rank=time.perf_counter()
             result=family_c4(pool,lambda c:(-scores[id(c)],c.rerank_key),lambda c:decision_family(c.screened),k=k,seed=seed,iteration=iteration)
             self.ranking_seconds+=time.perf_counter()-rank;return result
-        finally:self.inference_seconds+=time.perf_counter()-start
+        finally:
+            elapsed=time.perf_counter()-start;self.inference_seconds+=elapsed;self.c4_seconds+=elapsed

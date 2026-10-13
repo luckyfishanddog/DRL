@@ -133,7 +133,46 @@ class GraphCandidateRanker(nn.Module):
             summaries.append(torch.cat((seq.mean(0),(seq*weights).sum(0)/weights.sum(),seq[0],seq[-1],adjacent)))
         return torch.cat(summaries)
 
-    def score_candidates(self,stage,graph,node_embeddings,current,candidates,features,mean,std,config):
+    @staticmethod
+    def _route_data(solution,config):
+        """Return collision-safe route cache keys and their real block geometry."""
+        from mrta_reference.solution import block_map
+        blocks=block_map(solution,config);patterns={p.parent_id:p for p in solution.patterns};rows=[]
+        for route in solution.routes:
+            values=tuple((blocks[item].parent_id,blocks[item].block_id,blocks[item].u_start,blocks[item].u_end,
+                blocks[item].start,blocks[item].end,patterns[blocks[item].parent_id].kind.value,
+                patterns[blocks[item].parent_id].point_id,patterns[blocks[item].parent_id].t) for item in route.block_ids)
+            rows.append(((route.robot_id,values),route,tuple(blocks[item] for item in route.block_ids),patterns))
+        return rows
+
+    def _batched_solution_routes(self,solutions,node_embeddings,parent_index,config):
+        """Encode every unique ordered route once and batch all block projections."""
+        route_rows=[];unique={}
+        for solution in solutions:
+            keys=[]
+            for key,route,blocks,patterns in self._route_data(solution,config):
+                keys.append(key);unique.setdefault(key,(route,blocks,patterns))
+            route_rows.append(tuple(keys))
+        inputs=[];spans={}
+        for key,(route,blocks,patterns) in unique.items():
+            begin=len(inputs);count=len(blocks)
+            for position,b in enumerate(blocks):
+                kind=patterns[b.parent_id].kind
+                extra=node_embeddings.new_tensor([b.start[0]/20,b.start[1]/12,b.end[0]/20,b.end[1]/12,b.u_start,b.u_end,b.length/24,
+                    route.robot_id/3,position/max(1,count-1),float(kind.value=='WHOLE'),float(kind.value=='Y_SPLIT'),float(kind.value=='X_SPLIT')])
+                inputs.append(torch.cat((node_embeddings[parent_index[b.parent_id]],extra)))
+            spans[key]=(begin,len(inputs))
+        tokens=self.block(torch.stack(inputs)) if inputs else node_embeddings.new_zeros((0,32));summaries={}
+        for key in unique:
+            begin,end=spans[key];seq=tokens[begin:end]
+            if not len(seq):summaries[key]=node_embeddings.new_zeros(5*32);continue
+            weights=torch.linspace(1/len(seq),1.,len(seq),device=seq.device).unsqueeze(1)
+            adjacent=(seq[1:]-seq[:-1]).mean(0) if len(seq)>1 else seq.new_zeros(32)
+            summaries[key]=torch.cat((seq.mean(0),(seq*weights).sum(0)/weights.sum(),seq[0],seq[-1],adjacent))
+        return [torch.cat(tuple(summaries[key] for key in keys)) for keys in route_rows]
+
+    def score_candidates_legacy(self,stage,graph,node_embeddings,current,candidates,features,mean,std,config,**_):
+        """Original V05 implementation retained for numerical equivalence checks."""
         before=self._solution_routes(current,node_embeddings,graph.parent_index,config)
         route_rows=[torch.cat((before,self._solution_routes(c.solution,node_embeddings,graph.parent_index,config))) for c in candidates]
         route_hidden=self.route(torch.stack(route_rows))
@@ -141,15 +180,103 @@ class GraphCandidateRanker(nn.Module):
         h=self.fusion(torch.cat((route_hidden,self.numeric[stage](x)),dim=1))
         return self.feasibility[stage](h).squeeze(-1),self.material[stage](h).squeeze(-1)
 
+    def score_candidates(self,stage,graph,node_embeddings,current,candidates,features,mean,std,config,**_):
+        encoded=self._batched_solution_routes((current,*(c.solution for c in candidates)),node_embeddings,graph.parent_index,config)
+        before=encoded[0];route_rows=[torch.cat((before,after)) for after in encoded[1:]]
+        route_hidden=self.route(torch.stack(route_rows))
+        x=torch.as_tensor(transform(features,mean,std),dtype=torch.float32,device=node_embeddings.device)
+        h=self.fusion(torch.cat((route_hidden,self.numeric[stage](x)),dim=1))
+        return self.feasibility[stage](h).squeeze(-1),self.material[stage](h).squeeze(-1)
 
-def save_graph_model(path,model,c2_names,c4_names,scalers,metrics):
+
+class GraphCandidateRankerV2(nn.Module):
+    """V06: true route transitions and an independently trainable C4 adapter."""
+    architecture_version='v06'
+    def __init__(self,c2_width=87,c4_width=130,hidden_dim=64,heads=4):
+        super().__init__();self.encoder=StaticGATEncoder(18,hidden_dim,heads)
+        self.block=nn.Sequential(nn.Linear(hidden_dim+12,32),nn.ReLU())
+        self.transition=nn.ModuleDict({s:nn.Sequential(nn.Linear(86,64),nn.ReLU(),nn.Linear(64,32),nn.ReLU()) for s in ('C2','C4')})
+        self.route=nn.ModuleDict({s:nn.Sequential(nn.Linear(4*2*5*32,128),nn.ReLU(),nn.Linear(128,64),nn.ReLU()) for s in ('C2','C4')})
+        self.numeric=nn.ModuleDict({'C2':nn.Sequential(nn.Linear(c2_width,128),nn.ReLU(),nn.Linear(128,64),nn.ReLU()),
+                                    'C4':nn.Sequential(nn.Linear(c4_width,128),nn.ReLU(),nn.Linear(128,64),nn.ReLU())})
+        self.fusion=nn.ModuleDict({s:nn.Sequential(nn.Linear(128,64),nn.ReLU()) for s in ('C2','C4')})
+        self.feasibility=nn.ModuleDict({s:nn.Linear(64,1) for s in ('C2','C4')})
+        self.material=nn.ModuleDict({s:nn.Linear(64,1) for s in ('C2','C4')})
+
+    def encode_static(self,graph):return self.encoder(graph)
+
+    @staticmethod
+    def _route_data(solution,config):return GraphCandidateRanker._route_data(solution,config)
+
+    def initialize_c4_adapter(self):
+        self.transition['C4'].load_state_dict(self.transition['C2'].state_dict())
+        self.route['C4'].load_state_dict(self.route['C2'].state_dict())
+        self.fusion['C4'].load_state_dict(self.fusion['C2'].state_dict())
+
+    def _encode_solutions(self,stage,solutions,node_embeddings,parent_index,config,directions=None):
+        """Batch block tokens; route keys include exact split geometry and C4 directions."""
+        directions=[None]*len(solutions) if directions is None else list(directions)
+        route_rows=[];unique={}
+        for solution,direction in zip(solutions,directions):
+            keys=[]
+            vectors=None if direction is None else getattr(direction,'directions',direction)
+            for key,route,blocks,patterns in self._route_data(solution,config):
+                vector=None if vectors is None else tuple(vectors[route.robot_id])
+                full=(key,vector if stage=='C4' else None);keys.append(full);unique.setdefault(full,(route,blocks,patterns,vector))
+            route_rows.append(tuple(keys))
+        block_inputs=[];spans={}
+        for key,(route,blocks,patterns,vector) in unique.items():
+            begin=len(block_inputs);count=len(blocks)
+            for position,b in enumerate(blocks):
+                kind=patterns[b.parent_id].kind.value
+                extra=node_embeddings.new_tensor([b.start[0]/20,b.start[1]/12,b.end[0]/20,b.end[1]/12,b.u_start,b.u_end,b.length/24,
+                    route.robot_id/3,position/max(1,count-1),float(kind=='WHOLE'),float(kind=='Y_SPLIT'),float(kind=='X_SPLIT')])
+                block_inputs.append(torch.cat((node_embeddings[parent_index[b.parent_id]],extra)))
+            spans[key]=(begin,len(block_inputs))
+        token_rows=self.block(torch.stack(block_inputs)) if block_inputs else node_embeddings.new_zeros((0,32));summaries={}
+        for key,(route,blocks,patterns,vector) in unique.items():
+            begin,end=spans[key];seq=token_rows[begin:end]
+            if not len(seq):summaries[key]=node_embeddings.new_zeros(160);continue
+            transitions=[]
+            for index,(a,b) in enumerate(zip(blocks,blocks[1:])):
+                if stage=='C4' and vector is not None and len(vector)==len(blocks):
+                    ao,bo=int(vector[index]),int(vector[index+1]);a_exit=a.end if ao==0 else a.start;b_entry=b.start if bo==0 else b.end
+                else:
+                    pairs=((a.end,b.start),(a.end,b.end),(a.start,b.start),(a.start,b.end));a_exit,b_entry=min(pairs,key=lambda p:(math.dist(*p),p))
+                dx=b_entry[0]-a_exit[0];dy=b_entry[1]-a_exit[1]
+                geom=[a.start[0]/20,a.start[1]/12,a.end[0]/20,a.end[1]/12,b.start[0]/20,b.start[1]/12,b.end[0]/20,b.end[1]/12,
+                    dx/20,dy/12,math.hypot(dx,dy)/24,((b.start[0]+b.end[0]-a.start[0]-a.end[0])/2)/20,
+                    ((b.start[1]+b.end[1]-a.start[1]-a.end[1])/2)/12,*[float(route.robot_id==r) for r in range(4)],
+                    index/max(1,len(blocks)-2),a.u_start,a.u_end,b.u_start,b.u_end]
+                transitions.append(torch.cat((seq[index],seq[index+1],node_embeddings.new_tensor(geom))))
+            adjacent=self.transition[stage](torch.stack(transitions)).mean(0) if transitions else seq.new_zeros(32)
+            weights=torch.linspace(1/len(seq),1.,len(seq),device=seq.device).unsqueeze(1)
+            summaries[key]=torch.cat((seq.mean(0),(seq*weights).sum(0)/weights.sum(),seq[0],seq[-1],adjacent))
+        return [torch.cat(tuple(summaries[key] for key in keys)) for keys in route_rows]
+
+    def _solution_routes(self,solution,node_embeddings,parent_index,config,stage='C2',direction=None):
+        return self._encode_solutions(stage,[solution],node_embeddings,parent_index,config,[direction])[0]
+
+    def score_candidates(self,stage,graph,node_embeddings,current,candidates,features,mean,std,config,*,directions=None,current_direction=None):
+        candidate_directions=[None]*len(candidates) if directions is None else list(directions)
+        encoded=self._encode_solutions(stage,(current,*(c.solution for c in candidates)),node_embeddings,graph.parent_index,config,
+            (current_direction,*candidate_directions))
+        rows=torch.stack([torch.cat((encoded[0],after)) for after in encoded[1:]])
+        route_hidden=self.route[stage](rows);x=torch.as_tensor(transform(features,mean,std),dtype=torch.float32,device=node_embeddings.device)
+        h=self.fusion[stage](torch.cat((route_hidden,self.numeric[stage](x)),dim=1))
+        return self.feasibility[stage](h).squeeze(-1),self.material[stage](h).squeeze(-1)
+
+
+def save_graph_model(path,model,c2_names,c4_names,scalers,metrics,*,include_weld_edges=True):
     torch.save({'state_dict':model.state_dict(),'c2_names':list(c2_names),'c4_names':list(c4_names),
-        'scalers':{k:np.asarray(v).tolist() for k,v in scalers.items()},'metrics':metrics,'architecture':{'layers':2,'heads':4,'hidden':64}},path)
+        'scalers':{k:np.asarray(v).tolist() for k,v in scalers.items()},'metrics':metrics,
+        'architecture':{'version':getattr(model,'architecture_version','v05'),'layers':2,'heads':4,'hidden':64,'include_weld_edges':include_weld_edges}},path)
 
 
 def load_graph_model(path):
     checkpoint=torch.load(path,map_location='cpu',weights_only=True)
-    model=GraphCandidateRanker(len(checkpoint['c2_names']),len(checkpoint['c4_names']));model.load_state_dict(checkpoint['state_dict']);model.eval()
+    cls=GraphCandidateRankerV2 if checkpoint.get('architecture',{}).get('version')=='v06' else GraphCandidateRanker
+    model=cls(len(checkpoint['c2_names']),len(checkpoint['c4_names']));model.load_state_dict(checkpoint['state_dict']);model.eval()
     return model,checkpoint
 
 

@@ -78,3 +78,11 @@ On DEV, heuristic→GAT C2 material capture is **8.99%→14.61%**, certified rat
 The required 18 native 60-second development runs all have certified Cmax@60 and zero numeric failures. Relative to heuristic, MLP is **1/0/5** and GAT **3/0/3** wins/ties/losses: GAT loses both N35 pairs, wins both N55 pairs, and splits N85. GAT ranking consumes 30.896 s across its six 60-second runs (8.58% of their wall-clock budgets). Therefore GAT is retained as a runnable development/paper method, but is **not recommended as production default**. Full evidence and per-tier tables: [GRC-ALNS first results](docs/GRC_ALNS_GAT_FIRST_RESULTS.md); raw candidates, labels, offline metrics and run records: `data/development/graph_ranker_dataset_v05.sqlite`.
 
 Final regression after GRC integration: **323 passed** with `pytest -q -p no:cacheprovider`.
+
+## GRC-ALNS V2 (0.50 m)
+
+V05 inference now batches block projection and reuses exact ordered-route summaries. Across all 34 saved DEV states, scores agree within `1.19e-7`, C2 Top8/C4 Top2 identities and order are unchanged, and candidate scoring is **3.04× faster** overall.
+
+`gat_v06.pt` replaces the telescoping adjacency mean with real consecutive-weld transition tokens and gives C4 its own trainable transition/route/fusion adapter. C4 adapter gradient is nonzero and C4 training leaves C2 outputs unchanged. The independently trained `gat_v06_no_weld_edges.pt` differs on 24/34 C2 and 10/34 C4 Top-K selections, but full-graph DEV C4 material capture exceeds the ablation by only **0.28 percentage points**; graph-relation benefit remains weak.
+
+In the complete 48-run consumed-development matrix, all runs certify with zero numeric failures. V06 versus heuristic is **6/2/4 wins/ties/losses**, median Cmax change **−0.01%** (N35 **2/1/1**, N55 **2/0/2**, N85 **2/1/1**). V06 performs 144 iterations and 606 reference calls versus heuristic 133/488, but DEV material capture is below V05 at both C2 (13.48% vs 14.61%) and C4 (3.65% vs 4.78%), and large opposite-direction instance effects persist. Production therefore remains heuristic; V05 acceleration is retained, while V06 is development-only. Full evidence: [GRC-ALNS V2 results](docs/GRC_ALNS_V2_RESULTS.md). Final regression: **326 passed**.
