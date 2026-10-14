@@ -164,6 +164,8 @@ class SearchStats:
     requested_budget: float | None = None
     actual_runtime: float | None = None
     overshoot: float | None = None
+    reference_worker_startup_time: float = 0.0
+    hard_deadline_terminations: int = 0
     last_reference_start: float | None = None
     last_reference_end: float | None = None
     reference_status_sequence: list[str] = field(default_factory=list)

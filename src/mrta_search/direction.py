@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from mrta_reference.geometry import oriented_endpoints
 from mrta_reference.model import CanonicalSolution, ScheduleResult, ScheduleStatus, ScientificConfig, FormalScope
-from mrta_reference.scheduler import resolve_reference_evaluator
+from mrta_reference.scheduler import ReferenceDeadlineExceeded, resolve_reference_evaluator
 from mrta_reference.solution import block_map, official_metrics
 
 
@@ -223,6 +223,8 @@ def refine_directions_bounded(
                 config,
                 orientations={index: directions[index] for index in range(4)},
             )
+        except ReferenceDeadlineExceeded:
+            break
         except (ArithmeticError, OverflowError, ValueError) as error:
             schedule = ScheduleResult(
                 ScheduleStatus.NUMERIC_FAILURE,

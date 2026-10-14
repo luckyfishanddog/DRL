@@ -3,6 +3,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+import multiprocessing as mp
 import math
 import time
 
@@ -1847,6 +1848,146 @@ class FormalReferenceEvaluator:
         return result
 
 
+class ReferenceDeadlineExceeded(TimeoutError):
+    """Raised after the dedicated reference worker reaches the run deadline."""
+
+
+class ReferenceWorkerFailure(ValueError):
+    """Raised when the isolated reference worker cannot return a result."""
+
+
+def _hard_deadline_reference_worker(connection, evaluator) -> None:
+    """Serve every B32 call for one solver run in one spawned process."""
+    try:
+        connection.send(("READY", None))
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            solution, config, orientations = request
+            try:
+                result = evaluator(solution, config, orientations=orientations)
+            except BaseException as error:  # returned to the parent as data
+                connection.send(("ERROR", f"{type(error).__name__}: {error}"))
+            else:
+                connection.send(("RESULT", result))
+    except (EOFError, BrokenPipeError, OSError):
+        return
+    finally:
+        connection.close()
+
+
+class HardDeadlineReferenceEvaluator:
+    """One Windows-spawned B32 worker shared by all calls in a solver run.
+
+    Process start-up and IPC consume the same absolute wall-clock budget.  A
+    timed-out result is never reclassified as DEADLOCK or FEASIBLE; the parent
+    terminates the worker and retains only an already certified incumbent.
+    """
+
+    def __init__(self, evaluator, absolute_deadline: float, *, context: str = "spawn"):
+        self.evaluator = evaluator
+        self.scope = getattr(evaluator, "scope", None)
+        self.absolute_deadline = absolute_deadline
+        self.started_at = time.perf_counter()
+        self.ready_at: float | None = None
+        self.deadline_terminations = 0
+        self._ready = False
+        self._closed = False
+        ctx = mp.get_context(context)
+        parent, child = ctx.Pipe(duplex=True)
+        self._connection = parent
+        self._process = ctx.Process(
+            target=_hard_deadline_reference_worker,
+            args=(child, evaluator),
+            name="grc-b32-reference",
+            daemon=True,
+        )
+        self._process.start()
+        child.close()
+
+    @property
+    def startup_seconds(self) -> float:
+        end = self.ready_at if self.ready_at is not None else time.perf_counter()
+        return max(0.0, end - self.started_at)
+
+    @property
+    def expired(self) -> bool:
+        return self.deadline_terminations > 0
+
+    def _remaining(self) -> float:
+        return self.absolute_deadline - time.perf_counter()
+
+    def _terminate_for_deadline(self) -> None:
+        if self.deadline_terminations == 0:
+            self.deadline_terminations = 1
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=0.05)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=0.05)
+        self._closed = True
+        self._connection.close()
+
+    def _receive_before_deadline(self):
+        remaining = self._remaining()
+        if remaining <= 0.0 or not self._connection.poll(remaining):
+            self._terminate_for_deadline()
+            raise ReferenceDeadlineExceeded("B32 reference evaluation exceeded run deadline")
+        try:
+            return self._connection.recv()
+        except (EOFError, BrokenPipeError, OSError) as error:
+            self.close()
+            raise ReferenceWorkerFailure(f"B32 reference worker failed: {error}") from error
+
+    def _ensure_ready(self) -> None:
+        if self._ready:
+            return
+        kind, payload = self._receive_before_deadline()
+        if kind != "READY":
+            self.close()
+            raise ReferenceWorkerFailure(
+                f"B32 reference worker did not initialize: {kind}: {payload}"
+            )
+        self._ready = True
+        self.ready_at = time.perf_counter()
+
+    def __call__(self, solution, config, *, orientations=None):
+        if self._closed or self._remaining() <= 0.0:
+            self._terminate_for_deadline()
+            raise ReferenceDeadlineExceeded("B32 reference evaluation started after run deadline")
+        self._ensure_ready()
+        try:
+            self._connection.send((solution, config, orientations))
+        except (BrokenPipeError, EOFError, OSError) as error:
+            self.close()
+            raise ReferenceWorkerFailure(f"B32 reference worker send failed: {error}") from error
+        kind, payload = self._receive_before_deadline()
+        if kind == "RESULT":
+            return payload
+        self.close()
+        raise ReferenceWorkerFailure(f"B32 reference worker error: {payload}")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            if self._process.is_alive():
+                self._connection.send(None)
+                self._process.join(timeout=0.05)
+                if self._process.is_alive():
+                    self._process.terminate()
+                    self._process.join(timeout=0.05)
+        except (BrokenPipeError, EOFError, OSError):
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=0.05)
+        finally:
+            self._closed = True
+            self._connection.close()
+
+
 def resolve_reference_evaluator(scope: FormalScope | None, evaluator=None):
     if scope is None:
         if isinstance(evaluator, FormalReferenceEvaluator) or evaluator is reference_schedule_formal:
@@ -1856,5 +1997,7 @@ def resolve_reference_evaluator(scope: FormalScope | None, evaluator=None):
     if evaluator is None or evaluator is reference_schedule_formal:
         return FormalReferenceEvaluator(scope)
     if isinstance(evaluator, FormalReferenceEvaluator) and evaluator.scope == scope:
+        return evaluator
+    if isinstance(evaluator, HardDeadlineReferenceEvaluator) and evaluator.scope == scope:
         return evaluator
     raise ValueError("formal run requires the matching formal evaluator; development callbacks are unsupported")

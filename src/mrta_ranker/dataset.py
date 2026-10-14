@@ -38,7 +38,7 @@ def dumps(value): return json.dumps(value,ensure_ascii=False,separators=(',',':'
 def read(path): return json.loads(Path(path).read_text(encoding='utf-8'))
 def provenance(): return SourceProvenance(REPOSITORY_ID,'LOCAL_DRL_USER_AUTHORIZED',compute_source_tree_hash(ROOT),True,False)
 def search_config():
-    return pipeline.SearchConfig(m=192,m_lns=48,construction_budget=5,kinit_ref=5,max_iterations=100000,time_limit=60.0,checkpoints=(5.0,30.0,60.0),enable_two_opt_star=False)
+    return pipeline.SearchConfig(m=192,m_lns=48,construction_budget=5,kinit_ref=5,max_iterations=100000,time_limit=60.0,hard_reference_deadline=True,checkpoints=(5.0,30.0,60.0),enable_two_opt_star=False)
 
 def encode(value, parents=None):
     """Explicit typed JSON, with shared instance geometry instead of pickle."""
@@ -236,12 +236,13 @@ def generation_timers():
         for name,fn in originals.items(): setattr(pipeline,name,fn)
 
 
-def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None,search=None):
+def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None,search=None,
+                   budget_started_at=None):
     config=CONFIG if config is None else config
     parents=load_parents(entry) if parents is None else parents
     cap=Capture()
     with generation_timers() as timings:
-        result=pipeline.run_sa_oi_alns_v2(parents,config,search or search_config(),seed=seed,source_provenance=source or provenance(),observer=cap,**({'ranker':ranker} if ranker is not None else {}))
+        result=pipeline.run_sa_oi_alns_v2(parents,config,search or search_config(),seed=seed,source_provenance=source or provenance(),observer=cap,budget_started_at=budget_started_at,**({'ranker':ranker} if ranker is not None else {}))
     st=result.stats
     from mrta_reference.solution import block_map
     best=cap.best60;blocks=None if best is None else block_map(best['solution'],config)
@@ -303,6 +304,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'certifier_seconds':st.certifier_time,
         'direction_calls':sum(st.per_iteration_kdp)+st.repair_full_direction_dp_calls+st.jrrb_direction_evaluated,'direction_seconds':st.direction_dp_time,
         'reference_status':{'FEASIBLE':st.n_feasible,'DEADLOCK':st.n_deadlock,'INFEASIBLE':st.n_infeasible,'NUMERIC_FAILURE':st.n_numeric_failure},
+        'reference_records':list(st.reference_records),
         'direction_feasible':sum(st.decision_family_funnel[f]['direction_feasible'] for f in pipeline.DECISION_FAMILIES),
         'c2_selected':st.kdp_count,'best60_process_loads':loads,
         'c2_selection_seconds':st.c2_selection_time,
@@ -314,6 +316,8 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'best60_split_counts':split_counts,
         'numeric_failure':st.n_numeric_failure+st.init_status_counts.get('NUMERIC_FAILURE',0),
         'actual_runtime':result.runtime,'overshoot':st.overshoot,**timings,
+        'reference_worker_startup_seconds':st.reference_worker_startup_time,
+        'hard_deadline_terminations':st.hard_deadline_terminations,
         'ranker_inference_seconds':0.0 if ranker is None else ranker.inference_seconds,
         'graph_build_seconds':0.0 if ranker is None else getattr(ranker,'graph_build_seconds',0.0),
         'static_graph_forward_seconds':0.0 if ranker is None else getattr(ranker,'static_forward_seconds',0.0),

@@ -431,11 +431,13 @@ def _final_worker_init(masks):
 def _final_online_worker(job):
     from . import dataset as data
     entry,seed,method,root=job;smoke=_final_smoke_module(root);parents=smoke._range_parents(entry,data.PPO)
+    budget_started_at=time.perf_counter()
     if method=='HEURISTIC':ranker=None
     elif method=='GAT_V05':ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05')
     elif method=='GAT_V05_C4_RANKED':ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05_C4_RANKED')
     else:raise ValueError(method)
-    record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=data.CONFIG_V05)
+    record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=data.CONFIG_V05,
+        budget_started_at=budget_started_at)
     return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],'relative_path':entry['relative_path'],
         'actual_N':len(parents),'total_weld_length':sum(p.length for p in parents),'seed':seed,'method':method,**record}
 
@@ -754,8 +756,10 @@ def _sci_formal_worker(job):
     common={'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],'relative_path':entry['relative_path'],
         'actual_N':len(parents),'total_weld_length':sum(parent.length for parent in parents),'seed':seed,'method':method}
     if method in ('HEURISTIC','MLP_V05','GAT_V05'):
+        budget_started_at=time.perf_counter()
         ranker=None if method=='HEURISTIC' else V05MLPRanker(root) if method=='MLP_V05' else GATRanker(root,model_version='v05')
-        record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=data.CONFIG_V05)
+        record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=data.CONFIG_V05,
+            budget_started_at=budget_started_at)
         record['certified_at_60']=record['Cmax_at_60'] is not None and record['numeric_failure']==0
         record['independent_certification']=record['certified_at_60']
         return {**common,**record}
@@ -1354,10 +1358,11 @@ def _region_initialization_online_worker(job):
     entry,seed,method,root=job;smoke=_final_smoke_module(root)
     parents=smoke._range_parents(entry,data.PPO)
     region=method.startswith('REGION_');gat=method.endswith('GAT_V05')
+    budget_started_at=time.perf_counter()
     search=replace(data.search_config(),initialization_region_cooperative=region)
     ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05') if gat else None
     record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,
-        config=data.CONFIG_V05,search=search)
+        config=data.CONFIG_V05,search=search,budget_started_at=budget_started_at)
     return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
         'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],
         'actual_N':len(parents),'seed':seed,'method':method,
@@ -1539,9 +1544,10 @@ def _crrr_online_worker(job):
     entry,seed,method,root=job;smoke=_final_smoke_module(root)
     parents=smoke._range_parents(entry,data.PPO)
     search=replace(data.search_config(),initialization_region_cooperative=True,enable_crrr=True)
+    budget_started_at=time.perf_counter()
     ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05') if method.endswith('GAT_V05') else None
     record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,
-        config=data.CONFIG_V05,search=search)
+        config=data.CONFIG_V05,search=search,budget_started_at=budget_started_at)
     return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
         'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],
         'actual_N':len(parents),'seed':seed,'method':method,
@@ -2229,11 +2235,12 @@ def _upgraded_independent_worker(job):
         'total_weld_length':sum(parent.length for parent in parents),'solver_seed':seed,'seed':seed,'method':method,
         'scientific_config':data.CONFIG_V05.scientific_mapping(),'method_spec':upgraded_method_spec(method)}
     if method in ('BASELINE_HEURISTIC','REGION_FAST_HEURISTIC','REGION_FAST_GAT_V05'):
+        budget_started_at=time.perf_counter()
         search=upgraded_search_config(method)
         ranker=(HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05')
             if method=='REGION_FAST_GAT_V05' else None)
         record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,
-            config=data.CONFIG_V05,search=search)
+            config=data.CONFIG_V05,search=search,budget_started_at=budget_started_at)
         return {**common,**record}
     baseline_method='HGA_V2' if method=='ADAPTED_HGA_V2' else 'WAG_VNS_V2'
     result,checkpoint,initial,statuses=_sci_run_baseline(parents,baseline_method,seed,data.CONFIG_V05)

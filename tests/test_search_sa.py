@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import time
 
 import pytest
 from pathlib import Path
@@ -24,6 +25,17 @@ from mrta_search.pipeline import phase3_alns_config
 
 # Historical Q1-Q5 quality fixtures retain their original 0.2 feasible domain.
 FAST = ScientificConfig(delta_x=.20, delta_y=.20, weld_speed=1.0, empty_speed=1.0, t_pre=1.0, t_post=1.0)
+
+
+class _DelayedReferenceEvaluator:
+    """Picklable Windows-spawn fixture for the hard-deadline path."""
+
+    def __init__(self, delay: float):
+        self.delay = delay
+
+    def __call__(self, solution, config, *, orientations=None):
+        time.sleep(self.delay)
+        return reference_schedule(solution, config, orientations=orientations)
 
 
 def _base():
@@ -259,6 +271,102 @@ def test_time_limited_run_completes_one_real_iteration_after_initialization() ->
     assert result.stats.actual_runtime is not None
     assert result.stats.overshoot == pytest.approx(result.stats.actual_runtime)
     assert result.final_certification.certified
+
+
+def test_hard_reference_deadline_preserves_only_certified_incumbent() -> None:
+    from mrta_search.initialization import build_initial_solution
+
+    parents = _jrrb_parents()
+    initial = build_initial_solution(
+        parents,
+        FAST,
+        SearchStats("deadline-fixture", 91),
+        construction_budget=5,
+        kinit_ref=5,
+        portfolio=True,
+        region_cooperative=True,
+    )
+    started = time.perf_counter()
+    result = run_bounded_sa_oi(
+        parents,
+        FAST,
+        SearchConfig(
+            m=64,
+            m_lns=16,
+            construction_budget=5,
+            kinit_ref=5,
+            initialization_region_cooperative=True,
+            max_iterations=100,
+            time_limit=0.35,
+            hard_reference_deadline=True,
+            checkpoints=(0.35,),
+        ),
+        seed=91,
+        reference_evaluator=_DelayedReferenceEvaluator(3.0),
+        initialization_override=initial,
+    )
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.5
+    assert result.status is SearchStatus.COMPLETED
+    assert result.termination_reason == "TIME_LIMIT"
+    assert result.best_solution.canonical_hash == initial.solution.canonical_hash
+    assert result.best_schedule.canonical_json() == initial.schedule.canonical_json()
+    assert result.final_certification is not None and result.final_certification.certified
+    assert result.stats.hard_deadline_terminations == 1
+    assert result.stats.n_numeric_failure == 0
+    assert result.anytime[0.35]["cmax"] == pytest.approx(initial.schedule.cmax)
+
+
+def test_hard_reference_deadline_without_certified_seed_returns_failure() -> None:
+    parents = (ParentWeld("one", (1.0, 2.0), (2.0, 2.0)),)
+    started = time.perf_counter()
+    result = run_bounded_sa_oi(
+        parents,
+        FAST,
+        SearchConfig(
+            construction_budget=1,
+            kinit_ref=1,
+            feasibility_bootstrap_budget=0,
+            max_iterations=0,
+            time_limit=0.25,
+            hard_reference_deadline=True,
+            checkpoints=(0.25,),
+        ),
+        seed=92,
+        reference_evaluator=_DelayedReferenceEvaluator(3.0),
+    )
+    assert time.perf_counter() - started < 1.5
+    assert result.status is SearchStatus.INITIALIZATION_FAILED
+    assert result.termination_reason == "TIME_LIMIT"
+    assert result.best_solution is result.best_schedule is result.best_metrics is None
+    assert result.anytime[0.25]["cmax"] is None
+    assert result.stats.hard_deadline_terminations == 1
+    assert result.stats.init_reference_calls == 0
+
+
+def test_hard_reference_worker_matches_direct_unexpired_schedule() -> None:
+    from dataclasses import replace
+
+    parents = (ParentWeld("one", (1.0, 2.0), (2.0, 2.0)),)
+    direct_config = SearchConfig(
+        construction_budget=1,
+        kinit_ref=1,
+        max_iterations=0,
+        time_limit=5.0,
+        checkpoints=(),
+    )
+    direct = run_bounded_sa_oi(parents, FAST, direct_config, seed=93)
+    isolated = run_bounded_sa_oi(
+        parents,
+        FAST,
+        replace(direct_config, hard_reference_deadline=True),
+        seed=93,
+    )
+    assert direct.status is isolated.status is SearchStatus.COMPLETED
+    assert direct.best_solution.canonical_hash == isolated.best_solution.canonical_hash
+    assert direct.best_schedule.canonical_json() == isolated.best_schedule.canonical_json()
+    assert isolated.final_certification is not None and isolated.final_certification.certified
+    assert isolated.stats.hard_deadline_terminations == 0
 
 
 def _jrrb_parents():

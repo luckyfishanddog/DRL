@@ -9,7 +9,7 @@ import time
 
 from mrta_reference.certifier import CertificationReport, certify_schedule
 from mrta_reference.model import FormalScope
-from mrta_reference.scheduler import resolve_reference_evaluator
+from mrta_reference.scheduler import ReferenceDeadlineExceeded, resolve_reference_evaluator
 from mrta_reference.geometry import (
     blocks_for_pattern,
     finite_x_split_validator,
@@ -1536,6 +1536,7 @@ def build_initial_solution(
         )
 
     feasible = []
+    deadline_exceeded = False
     for attempt_index, solution, direction, _ in sorted(
         constructed, key=(lambda item: item[3]) if portfolio else (lambda item: item[0])
     )[:kinit_ref]:
@@ -1547,6 +1548,14 @@ def build_initial_solution(
                 config,
                 orientations=orientation_map,
             )
+        except ReferenceDeadlineExceeded as error:
+            old_attempt = attempts[attempt_index]
+            attempts[attempt_index] = replace(
+                old_attempt,
+                diagnostics=old_attempt.diagnostics + (str(error),),
+            )
+            deadline_exceeded = True
+            break
         except (ArithmeticError, OverflowError, ValueError) as error:
             schedule = ScheduleResult(
                 ScheduleStatus.NUMERIC_FAILURE, diagnostics=(str(error),)
@@ -1599,6 +1608,9 @@ def build_initial_solution(
                             for robot in range(4)
                         },
                     )
+                except ReferenceDeadlineExceeded:
+                    deadline_exceeded = True
+                    break
                 except (ArithmeticError, OverflowError, ValueError) as error:
                     fallback_schedule = ScheduleResult(
                         ScheduleStatus.NUMERIC_FAILURE,
@@ -1662,6 +1674,13 @@ def build_initial_solution(
                     break
                 if schedule.status is ScheduleStatus.NUMERIC_FAILURE:
                     break
+            if deadline_exceeded:
+                attempts[attempt_index] = replace(
+                    old_attempt,
+                    diagnostics=old_attempt.diagnostics
+                    + ("B32 reference evaluation exceeded run deadline",),
+                )
+                break
         attempt = InitializationAttempt(
             old_attempt.construction_index,
             solution,
@@ -1714,6 +1733,17 @@ def build_initial_solution(
             best_attempt.certification,
             tuple(attempts),
             best_attempt.strategy,
+        )
+
+    if deadline_exceeded:
+        stats.init_time += time.perf_counter() - started
+        return InitializationResult(
+            InitializationStatus.INITIALIZATION_FAILED,
+            None,
+            None,
+            None,
+            None,
+            tuple(attempts),
         )
 
     if feasibility_bootstrap_budget:
@@ -1780,6 +1810,28 @@ def build_initial_solution(
                             solution,
                             config,
                             orientations=orientation_map,
+                        )
+                    except ReferenceDeadlineExceeded as error:
+                        attempts.append(
+                            InitializationAttempt(
+                                construction_index,
+                                solution,
+                                direction,
+                                None,
+                                None,
+                                direction.diagnostics + (str(error),),
+                                False,
+                                RAIL_SERIAL_BOOTSTRAP,
+                            )
+                        )
+                        stats.init_time += time.perf_counter() - started
+                        return InitializationResult(
+                            InitializationStatus.INITIALIZATION_FAILED,
+                            None,
+                            None,
+                            None,
+                            None,
+                            tuple(attempts),
                         )
                     except (ArithmeticError, OverflowError, ValueError) as error:
                         schedule = ScheduleResult(

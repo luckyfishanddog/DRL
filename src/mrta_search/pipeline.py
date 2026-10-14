@@ -22,8 +22,13 @@ from mrta_reference.model import (
     ScientificConfig,
     SplitKind,
 )
-from mrta_reference.scheduler import reference_schedule
-from mrta_reference.scheduler import resolve_reference_evaluator
+from mrta_reference.scheduler import (
+    FormalReferenceEvaluator,
+    HardDeadlineReferenceEvaluator,
+    ReferenceDeadlineExceeded,
+    reference_schedule,
+    resolve_reference_evaluator,
+)
 from mrta_reference.model import FormalScope, RunScientificIdentity, DEVELOPMENT_NO_REPAIR_V1
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.provenance import (
@@ -122,6 +127,7 @@ class SearchConfig:
     tmin: float = 1.0e-6
     max_iterations: int = 100
     time_limit: float | None = None
+    hard_reference_deadline: bool = False
     checkpoints: tuple[float, ...] = (1.0, 5.0, 30.0)
     enable_two_opt_star: bool = False
     enable_crrr: bool = False
@@ -1042,6 +1048,8 @@ def evaluate_iteration(
                 config,
                 orientations=orientation_map,
             )
+        except ReferenceDeadlineExceeded:
+            break
         except (ArithmeticError, OverflowError, ValueError) as error:
             schedule = ScheduleResult(
                 ScheduleStatus.NUMERIC_FAILURE,
@@ -1262,6 +1270,8 @@ def evaluate_jrrb_step(
                 config,
                 orientations=orientations,
             )
+        except ReferenceDeadlineExceeded:
+            break
         except (ArithmeticError, OverflowError, ValueError) as error:
             schedule = ScheduleResult(
                 ScheduleStatus.NUMERIC_FAILURE,
@@ -1324,7 +1334,7 @@ def evaluate_jrrb_step(
     return best
 
 
-def run_bounded_sa_oi(
+def _run_bounded_sa_oi_inner(
     parents: Sequence[ParentWeld],
     config: ScientificConfig = ScientificConfig(),
     search_config: SearchConfig = SearchConfig(),
@@ -1341,8 +1351,9 @@ def run_bounded_sa_oi(
     family_access_policy: bool | None = None,
     observer=None,
     ranker=None,
+    _run_started: float | None = None,
 ) -> SearchResult:
-    started = time.perf_counter()
+    started = time.perf_counter() if _run_started is None else _run_started
     if enable_x_split and (
         scope is None or scope.optional_x_split_policy != "FINITE_GEOMETRIC_X_SPLIT_V1"
     ):
@@ -1723,6 +1734,78 @@ def run_bounded_sa_oi(
     )
 
 
+def run_bounded_sa_oi(
+    parents: Sequence[ParentWeld],
+    config: ScientificConfig = ScientificConfig(),
+    search_config: SearchConfig = SearchConfig(),
+    *,
+    seed: int = 0,
+    reference_evaluator: ReferenceEvaluator | None = None,
+    scope: FormalScope | None = None,
+    source_provenance: SourceProvenance | None = None,
+    source_commit: str | None = None,
+    allow_unverified_source: bool = False,
+    formal_result: bool = False,
+    initialization_override: InitializationResult | None = None,
+    enable_x_split: bool = False,
+    family_access_policy: bool | None = None,
+    observer=None,
+    ranker=None,
+    budget_started_at: float | None = None,
+) -> SearchResult:
+    """Run ALNS, optionally isolating all B32 calls behind one hard deadline."""
+    started = time.perf_counter() if budget_started_at is None else budget_started_at
+    evaluator = resolve_reference_evaluator(scope, reference_evaluator)
+    worker = None
+    if search_config.hard_reference_deadline and search_config.time_limit is not None:
+        worker = HardDeadlineReferenceEvaluator(
+            evaluator,
+            started + search_config.time_limit,
+        )
+        evaluator = worker
+    try:
+        result = _run_bounded_sa_oi_inner(
+            parents,
+            config,
+            search_config,
+            seed=seed,
+            reference_evaluator=evaluator,
+            scope=scope,
+            source_provenance=source_provenance,
+            source_commit=source_commit,
+            allow_unverified_source=allow_unverified_source,
+            formal_result=formal_result,
+            initialization_override=initialization_override,
+            enable_x_split=enable_x_split,
+            family_access_policy=family_access_policy,
+            observer=observer,
+            ranker=ranker,
+            _run_started=started,
+        )
+    finally:
+        if worker is not None:
+            worker.close()
+    runtime = time.perf_counter() - started
+    result.stats.actual_runtime = runtime
+    result.stats.overshoot = (
+        None
+        if search_config.time_limit is None
+        else max(0.0, runtime - search_config.time_limit)
+    )
+    if worker is not None:
+        result.stats.reference_worker_startup_time = worker.startup_seconds
+        result.stats.hard_deadline_terminations = worker.deadline_terminations
+    termination_reason = (
+        "TIME_LIMIT" if worker is not None and worker.expired else result.termination_reason
+    )
+    return replace(
+        result,
+        runtime=runtime,
+        termination_reason=termination_reason,
+        anytime=result.stats.anytime(search_config.checkpoints),
+    )
+
+
 def run_sa_oi_alns_v2(
     parents: Sequence[ParentWeld],
     config: ScientificConfig = ScientificConfig(),
@@ -1735,6 +1818,7 @@ def run_sa_oi_alns_v2(
     formal_result: bool = False,
     observer=None,
     ranker=None,
+    budget_started_at: float | None = None,
 ) -> SearchResult:
     # Explicit historical configs are honored unchanged. Only this V2 default
     # adopts the measured production pool; expensive evaluation budgets stay fixed.
@@ -1756,6 +1840,7 @@ def run_sa_oi_alns_v2(
         enable_x_split=True,
         observer=observer,
         ranker=ranker,
+        budget_started_at=budget_started_at,
     )
 
 
