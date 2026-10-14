@@ -328,6 +328,27 @@ def test_atomic_and_lns_share_complete_candidate_pipeline() -> None:
     assert accelerated_stats.repair_insertion_evaluations == stats.repair_insertion_evaluations
 
 
+def test_upgraded_frozen_alns_profiles_change_only_authorized_switches() -> None:
+    from mrta_ranker.ranking import upgraded_method_spec, upgraded_search_config
+
+    baseline = upgraded_search_config("BASELINE_HEURISTIC")
+    heuristic = upgraded_search_config("REGION_FAST_HEURISTIC")
+    gat = upgraded_search_config("REGION_FAST_GAT_V05")
+    assert not baseline.initialization_region_cooperative
+    assert not baseline.lns_incremental_scoring
+    assert heuristic == gat
+    assert heuristic.initialization_region_cooperative
+    assert heuristic.lns_incremental_scoring
+    for search in (baseline, heuristic, gat):
+        assert (search.m, search.m_atomic, search.m_lns) == (192, 144, 48)
+        assert (search.kdp, search.kref, search.kref_total) == (8, 2, 4)
+        assert not search.enable_crrr
+        assert search.c2_mode == "BASELINE_C2"
+        assert not search.enable_two_opt_star
+    assert upgraded_method_spec("REGION_FAST_HEURISTIC")["ranker"] is None
+    assert upgraded_method_spec("REGION_FAST_GAT_V05")["ranker"] == "GAT_V05"
+
+
 def test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal() -> None:
     initial = _initial()
     weld = next(

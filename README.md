@@ -97,6 +97,14 @@ WHOLE/Y/X unit replay and native fixed-iteration N35/N55/N85 replay match candid
 
 Decision: retain the equivalent acceleration as a default-off candidate for new independent validation. It improves real search opportunity without changing decisions, but does not close the historical HGA/WAG gap and is not a new search-method contribution. Evidence: [LNS equivalent acceleration report](docs/LNS_EQUIVALENT_ACCELERATION_RESULTS.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
 
+## Upgraded independent five-method comparison (0.50 m)
+
+The frozen independent-test methods are `BASELINE_HEURISTIC`, `REGION_FAST_HEURISTIC`, `REGION_FAST_GAT_V05`, `ADAPTED_HGA_V2`, and `ADAPTED_WAG_VNS_V2`. Fifteen new geometries were produced by the verified original `generate_welds.py` and PPO source workbook using previously unused geometry seeds 20262001--20262015. Exact geometry identities have zero overlap with 2,942 indexed historical geometries. Static selection produced five N35, five N55, and LARGE N85/N83/N77/N85/N85 without trimming or solver-result selection.
+
+All **375/375 real 60-second runs** completed. BASELINE, REGION_FAST_HEURISTIC, REGION_FAST_GAT and WAG certified 75/75; HGA certified 73/75, with two unretried `TIME_LIMIT_NO_FEASIBLE` runs on the hardest LARGE workbook. At workbook-level five-seed medians, REGION_FAST_HEURISTIC versus BASELINE is **11/4/0**, median **-2.25%**, mean **-8.86%**. Frozen GAT versus the identical REGION+FAST skeleton is **8/2/5**, median **-0.23%**, mean **-4.28%**; its workbook bootstrap median interval crosses zero, so it is not a stable independent gain.
+
+Against WAG, REGION_FAST_HEURISTIC is **7/0/8** (median +0.10%, mean +13.68%) and REGION_FAST_GAT is **8/0/7** (median -0.29%, mean +7.82%). MEDIUM and the high-work-content LARGE_04 remain serious weaknesses; on LARGE_04, WAG median Cmax is 6663.3 s versus 10562.3 s for REGION_FAST_HEURISTIC and 10355.4 s for GAT. The enhanced deterministic configuration is therefore frozen as the principal GRC-ALNS method, while GAT V05 remains a learning ablation rather than the claimed source of stable superiority. The evidence supports robust improvement over original ALNS, not uniform superiority over HGA/WAG. Full results: [upgraded independent comparison](docs/UPGRADED_GRC_INDEPENDENT_COMPARISON.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. DRL regression: **335 passed**; project-root plus DRL discovery: **707 passed, 1 skipped, 3 subtests passed**.
+
 ## First runnable GRC-ALNS (0.50 m)
 
 The new workbook-isolated dataset contains **98 TRAIN states / 11,924 candidates** and **34 DEV states / 4,184 candidates**, with **590/356 material positives** and zero numeric failures. It keeps the existing 17 TRAIN / 6 DEV workbook split; missing EARLY states are not backfilled. The historical 0.20 dataset and checkpoints are unchanged.

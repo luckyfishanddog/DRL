@@ -264,6 +264,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
             empty_by_robot.append(sum(math.dist(left.end,right.start)/config.empty_speed for left,right in zip(welds,welds[1:])))
             waiting_by_robot.append(sum(op.duration for op in best['schedule'].operations if op.robot_id==robot and op.kind is OperationKind.WAIT))
     split_counts=None if best is None else dict(Counter(pattern.kind.value for pattern in best['solution'].patterns))
+    robot_completion=None if best is None else list(best['schedule'].robot_completion)
     strict_improvements=strict_cmax_improvement_count(st.best_events)
     record={'initial_cmax':None if cap.initial is None else cap.initial['metrics'].cmax,
         'initial_process_loads':initial_loads,
@@ -285,6 +286,7 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'best60_empty_travel':None if best is None else best['metrics'].total_empty_travel,
         'best60_waiting':None if best is None else best['metrics'].total_waiting,
         'best60_empty_travel_by_robot':empty_by_robot,'best60_waiting_by_robot':waiting_by_robot,
+        'best60_robot_completion':robot_completion,
         'best60_split_counts':split_counts,
         'numeric_failure':st.n_numeric_failure+st.init_status_counts.get('NUMERIC_FAILURE',0),
         'actual_runtime':result.runtime,'overshoot':st.overshoot,**timings,

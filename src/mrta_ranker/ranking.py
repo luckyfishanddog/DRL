@@ -514,7 +514,8 @@ def _sci_solution_record(candidate,config):
     from mrta_reference.solution import block_map
     if candidate is None or candidate.metrics is None or candidate.schedule is None:
         return {'certified_at_60':False,'robot_loads':None,'empty_travel_by_robot':None,
-            'waiting_by_robot':None,'split_counts':None,'independent_certification':False}
+            'waiting_by_robot':None,'robot_completion':None,'split_counts':None,
+            'independent_certification':False}
     blocks=block_map(candidate.solution,config);loads=[];empty=[];waiting=[]
     for robot,route in enumerate(candidate.solution.routes):
         loads.append(sum(config.process_time(blocks[item].length) for item in route.block_ids))
@@ -522,7 +523,8 @@ def _sci_solution_record(candidate,config):
         empty.append(sum(math.dist(left.end,right.start)/config.empty_speed for left,right in zip(welds,welds[1:])))
         waiting.append(sum(op.duration for op in candidate.schedule.operations if op.robot_id==robot and op.kind is OperationKind.WAIT))
     return {'certified_at_60':True,'robot_loads':loads,'empty_travel_by_robot':empty,
-        'waiting_by_robot':waiting,'total_empty_travel':candidate.metrics.total_empty_travel,
+        'waiting_by_robot':waiting,'robot_completion':list(candidate.schedule.robot_completion),
+        'total_empty_travel':candidate.metrics.total_empty_travel,
         'total_waiting':candidate.metrics.total_waiting,
         'split_counts':dict(Counter(pattern.kind.value for pattern in candidate.solution.patterns)),
         'independent_certification':bool(candidate.certification and candidate.certification.certified)}
@@ -2005,10 +2007,394 @@ def validate_lns_acceleration(root=None):
     print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
 
 
+# The upgraded comparison freezes existing components; these profiles are data,
+# not a new solver.  Keeping construction in one helper makes the two ALNS
+# methods differ only in their explicitly recorded switches and ranker.
+UPGRADED_INDEPENDENT_GEOMETRY_SEEDS=tuple(range(20262001,20262016))
+UPGRADED_INDEPENDENT_SOLVER_SEEDS=(20261901,20261902,20261903,20261904,20261905)
+UPGRADED_INDEPENDENT_METHODS=(
+    'BASELINE_HEURISTIC',
+    'REGION_FAST_HEURISTIC',
+    'REGION_FAST_GAT_V05',
+    'ADAPTED_HGA_V2',
+    'ADAPTED_WAG_VNS_V2',
+)
+UPGRADED_INDEPENDENT_EXPERIMENT='sci_upgraded_independent_runs'
+UPGRADED_INDEPENDENT_MATRIX='sci_upgraded_independent_matrix'
+
+
+def upgraded_method_spec(method):
+    """Return the frozen, inspectable method switches without loading a model."""
+    if method not in UPGRADED_INDEPENDENT_METHODS:raise ValueError(method)
+    baseline=method=='BASELINE_HEURISTIC'
+    learned=method=='REGION_FAST_GAT_V05'
+    traditional=method in ('ADAPTED_HGA_V2','ADAPTED_WAG_VNS_V2')
+    return {'method':method,'algorithm_family':('BASELINE' if traditional else 'ALNS'),
+        'initialization_region_cooperative':False if baseline or traditional else True,
+        'lns_incremental_scoring':False if baseline or traditional else True,
+        'enable_crrr':False,'c2_mode':'BASELINE_C2','ranker':('GAT_V05' if learned else None),
+        'm':None if traditional else 192,'m_atomic':None if traditional else 144,
+        'm_lns':None if traditional else 48,'kdp':None if traditional else 8,
+        'kref':None if traditional else 2,'kref_total':None if traditional else 4,
+        'two_opt_star':False if not traditional else None,'wall_clock_seconds':60.0}
+
+
+def upgraded_search_config(method):
+    """Construct one frozen ALNS profile; external rankers still own C2/C4."""
+    from dataclasses import replace
+    from . import dataset as data
+    spec=upgraded_method_spec(method)
+    if spec['algorithm_family']!='ALNS':raise ValueError(f'{method} is not an ALNS method')
+    return replace(data.search_config(),
+        initialization_region_cooperative=spec['initialization_region_cooperative'],
+        lns_incremental_scoring=spec['lns_incremental_scoring'],enable_crrr=False,
+        c2_mode='BASELINE_C2',enable_two_opt_star=False,m_atomic=144)
+
+
+def _ppo_dataset_module(root):
+    import sys
+    ppo_src=Path(root).resolve().parent/'ppo'/'src'
+    if str(ppo_src) not in sys.path:sys.path.insert(0,str(ppo_src))
+    from laces_weld_slim import dataset as ppo_dataset
+    return ppo_dataset
+
+
+def _upgraded_static_geometry_choices(root):
+    """Select 5/5/5 scales using only generated geometry counts, before solving."""
+    ppo_dataset=_ppo_dataset_module(root);generator=ppo_dataset._load_allowed_generator_module()
+    source=Path(generator.DEFAULT_SOURCE_EXCEL).resolve()
+    groups,_,_=generator.read_and_prepare_groups(str(source),None,'mm',0.01,min_weld_length_m=0.5)
+    targets=(35,55,85);choices={}
+    for seed in UPGRADED_INDEPENDENT_GEOMETRY_SEEDS:
+        placed,_=generator.layout_packing(groups,45,0.03,platform_w=20.0,platform_h=12.0,
+            allow_rotate=True,seed=seed,max_attempts_per_instance=2000)
+        if len(placed)!=45:raise RuntimeError(f'geometry seed {seed} did not place the frozen 45-group range')
+        count=0;natural=[]
+        for item in placed:
+            count+=len(groups[item['group_id']]);group_count=int(item['instance_index'])+1
+            if group_count>=15:natural.append((group_count,count))
+        choices[seed]=tuple(min(natural,key=lambda row,target=target:(abs(row[1]-target),row[0])) for target in targets)
+    dp={(0,0,0):(0,())}
+    for seed in UPGRADED_INDEPENDENT_GEOMETRY_SEEDS:
+        nxt={}
+        for used,(cost,assignment) in dp.items():
+            for tier,(group_count,actual_n) in enumerate(choices[seed]):
+                if used[tier]>=5:continue
+                capacity=tuple(value+int(index==tier) for index,value in enumerate(used))
+                proposal=(cost+abs(actual_n-targets[tier]),assignment+(tier,))
+                if capacity not in nxt or proposal<nxt[capacity]:nxt[capacity]=proposal
+        dp=nxt
+    assignment=dp[(5,5,5)][1];labels=('SMALL','MEDIUM','LARGE');ordinals=[0,0,0];rows=[]
+    for seed,tier_index in zip(UPGRADED_INDEPENDENT_GEOMETRY_SEEDS,assignment):
+        ordinals[tier_index]+=1;group_count,actual_n=choices[seed][tier_index]
+        rows.append({'geometry_seed':seed,'tier':labels[tier_index],'target_N':targets[tier_index],
+            'requested_group_count':group_count,'actual_N':actual_n,
+            'label':f'{labels[tier_index]}_{ordinals[tier_index]:02d}'})
+    return rows,source,dp[(5,5,5)][0]
+
+
+def prepare_upgraded_independent_matrix(root=None,*,node_executable=None,artifact_node_modules=None):
+    """Generate exactly 15 selected XLSX files and freeze their identities in SQLite."""
+    import hashlib
+    from . import dataset as data
+    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
+    db=data.connect(data.DATABASE_V05,readonly=True);existing=db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
+        (UPGRADED_INDEPENDENT_MATRIX,'summary')).fetchone();db.close()
+    if existing is not None:
+        matrix=json.loads(existing[0])
+        if tuple(matrix['seeds'])!=UPGRADED_INDEPENDENT_SOLVER_SEEDS or tuple(matrix['methods'])!=UPGRADED_INDEPENDENT_METHODS:
+            raise RuntimeError('upgraded independent matrix was frozen differently')
+        return matrix
+    if node_executable is None or artifact_node_modules is None:
+        raise ValueError('node_executable and artifact_node_modules are required for verified XLSX writing')
+    selections,source,total_distance=_upgraded_static_geometry_choices(root)
+    ppo_dataset=_ppo_dataset_module(root);project_root=root.parent
+    config_path=project_root/'ppo'/'config'/'scientific_model_v9.json'
+    historical=data.read(data.DATASET);historical_hashes={row['instance_geometry_hash'] for row in historical['instances']}
+    serialized_history=json.dumps(historical,ensure_ascii=False)
+    if any(str(seed) in serialized_history for seed in UPGRADED_INDEPENDENT_GEOMETRY_SEEDS):
+        raise RuntimeError('a proposed upgraded geometry seed already appears in the historical dataset manifest')
+    historical_book=next((project_root/'ppo'/'data'/'PPO_TRAIN').glob('*.xlsx'))
+    historical_family=ppo_dataset.load_seed_family_workbook(historical_book).manifest
+    output_dir=root/'data'/'independent'/'upgraded_grc';entries=[];new_hashes=set()
+    for selected in selections:
+        seed=selected['geometry_seed'];destination=output_dir/f'seed_{seed:010d}.xlsx'
+        if destination.exists():
+            loaded_family=ppo_dataset.load_seed_family_workbook(destination)
+            manifest=loaded_family.manifest
+        else:
+            build=ppo_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+                requested_group_counts=(selected['requested_group_count'],),source_excel=source,
+                scientific_config_path=config_path)
+            ppo_dataset._write_workbook_with_artifact_tool(build,destination,
+                node_executable=node_executable,artifact_node_modules=artifact_node_modules,preview_directory=None)
+            manifest=build.manifest
+        if manifest.dataset_generation_seed!=seed or len(manifest.sheets)!=1:
+            raise RuntimeError(f'unexpected generated family identity for {destination}')
+        sheet=manifest.sheets[0]
+        if sheet.requested_group_count!=selected['requested_group_count'] or sheet.actual_N!=selected['actual_N']:
+            raise RuntimeError(f'static selection changed during generation for seed {seed}')
+        relative=destination.relative_to(root).as_posix();instance_id=f"{destination.with_suffix('').relative_to(root).as_posix()}::{sheet.sheet_name}"
+        instance=load_ppo_platform_instance(destination,sheet.sheet_name,ppo_root=root,instance_id=instance_id)
+        parents=to_parent_welds(instance);geometry_hash=instance_geometry_hash(instance)
+        if len(parents)!=selected['actual_N'] or geometry_hash in historical_hashes or geometry_hash in new_hashes:
+            raise RuntimeError(f'generated geometry is invalid, historical, or duplicated: {seed}')
+        new_hashes.add(geometry_hash)
+        entries.append({**selected,'instance_id':instance_id,'relative_path':relative,'sheet_name':sheet.sheet_name,
+            'raw_file_sha256':instance.raw_file_sha256,'instance_geometry_hash':geometry_hash,
+            'generator_geometry_hash':sheet.geometry_hash,'geometry_content_hash':sheet.geometry_content_hash,
+            'family_hash':manifest.family_hash,'total_weld_length':sum(parent.length for parent in parents)})
+    if historical_family.generator_source_sha256!=manifest.generator_source_sha256 or historical_family.source_excel_sha256!=manifest.source_excel_sha256:
+        raise RuntimeError('current generator/source is not the one recorded by historical PPO families')
+    sha=lambda path:hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    matrix={'selection_frozen_before_solver_access':True,
+        'selection_rule':'seeds 20262001..20262015; group counts 15..45; one sheet per seed; exact 5/5/5 assignment minimizing total |actual_N-target| for targets 35/55/85; ties by group count then tier tuple; geometry only',
+        'entries':entries,'geometry_seeds':list(UPGRADED_INDEPENDENT_GEOMETRY_SEEDS),
+        'seeds':list(UPGRADED_INDEPENDENT_SOLVER_SEEDS),'methods':list(UPGRADED_INDEPENDENT_METHODS),
+        'time_limit_seconds':60.0,'static_total_target_distance':total_distance,
+        'method_order':'cyclic rotation by (instance ordinal + solver-seed ordinal) mod 5',
+        'workers':4,'resource_policy':'spawned workers bound to distinct physical cores; torch threads=1',
+        'source_excel':str(source),'source_excel_sha256':sha(source),
+        'generator_source':str(project_root/'src'/'generate_welds.py'),
+        'generator_source_sha256':sha(project_root/'src'/'generate_welds.py'),
+        'generator_matches_historical_ppo':True,'historical_geometry_overlap':False,
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'search':{'M':192,'atomic':144,'LNS':48,'Kdp':8,'Kref':2,'Kref_total':4,
+            'TWO_OPT_STAR':False,'CRRR':False,'CRRR_ACCESS_C2':False},
+        'checkpoints':{'GAT_V05':'models/gat_v05.pt'},
+        'primary_metric':'independently certified Cmax at or before 60 seconds',
+        'statistics_unit':'workbook; five solver seeds are repeated runs'}
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT INTO experiments VALUES (?,?,?)',
+        (UPGRADED_INDEPENDENT_MATRIX,'summary',data.dumps(matrix)))
+    db.close();print(data.dumps(matrix),flush=True);return matrix
+
+
+def _load_upgraded_independent_parents(root,matrix):
+    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    loaded={}
+    for entry in matrix['entries']:
+        instance=load_ppo_platform_instance(root/entry['relative_path'],entry['sheet_name'],
+            ppo_root=root,instance_id=entry['instance_id'])
+        if instance.raw_file_sha256!=entry['raw_file_sha256'] or instance_geometry_hash(instance)!=entry['instance_geometry_hash']:
+            raise ValueError('upgraded independent workbook differs from frozen SQLite identity')
+        parents=to_parent_welds(instance)
+        if len(parents)!=entry['actual_N']:raise ValueError('upgraded independent weld count changed')
+        loaded[entry['instance_id']]=parents
+    return loaded
+
+
+def run_upgraded_gat_compatibility(root=None):
+    """One native fixed-iteration GAT check of legacy versus incremental LNS."""
+    from dataclasses import replace
+    from . import dataset as data
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);_,entries=_region_initialization_entries(root)
+    entry=next(row for row in entries if row['label']=='N35_S1');parents=_final_smoke_module(root)._range_parents(entry,data.PPO)
+    rows=[]
+    for accelerated in (False,True):
+        trace={'c2':[],'c4':[]}
+        inner=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05')
+        class CaptureRanker:
+            def select_c2(self,*args,**kwargs):
+                out=inner.select_c2(*args,**kwargs);trace['c2'].append([row.solution.canonical_hash for row in out]);return out
+            def select_c4(self,*args,**kwargs):
+                out=inner.select_c4(*args,**kwargs);trace['c4'].append([row.screened.solution.canonical_hash for row in out]);return out
+        search=replace(upgraded_search_config('REGION_FAST_GAT_V05'),lns_incremental_scoring=accelerated,
+            max_iterations=1,time_limit=None,checkpoints=())
+        result=run_sa_oi_alns_v2(parents,data.CONFIG_V05,search,seed=20261811,
+            source_provenance=data.provenance(),ranker=CaptureRanker())
+        rows.append({'accelerated':accelerated,'c2':trace['c2'],'c4':trace['c4'],
+            'best_hash':result.best_solution.canonical_hash,'best_cmax':result.best_metrics.cmax,
+            'reference_status':list(result.stats.reference_status_sequence),
+            'candidate_attempts':list(result.stats.per_iteration_attempts),
+            'certified':bool(result.final_certification and result.final_certification.certified)})
+    equivalent=all(rows[0][key]==rows[1][key] for key in ('c2','c4','best_hash','best_cmax','reference_status','candidate_attempts'))
+    if not equivalent or not all(row['certified'] for row in rows):raise AssertionError('GAT fixed-iteration LNS compatibility failed')
+    summary={'instance':entry['label'],'seed':20261811,'fixed_iterations':1,'equivalent':True,'rows':rows,
+        'gat_checkpoint':'models/gat_v05.pt','crrr':False,'crrr_access':False}
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+        ('sci_upgraded_gat_compatibility','summary',data.dumps(summary)))
+    db.close();print(data.dumps(summary),flush=True);return summary
+
+
+def _upgraded_independent_worker(job):
+    from . import dataset as data
+    entry,parents,seed,method,root=job
+    common={'instance':entry['label'],'workbook':entry['relative_path'],'tier':entry['tier'],
+        'instance_id':entry['instance_id'],'actual_N':len(parents),'geometry_seed':entry['geometry_seed'],
+        'total_weld_length':sum(parent.length for parent in parents),'solver_seed':seed,'seed':seed,'method':method,
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),'method_spec':upgraded_method_spec(method)}
+    if method in ('BASELINE_HEURISTIC','REGION_FAST_HEURISTIC','REGION_FAST_GAT_V05'):
+        search=upgraded_search_config(method)
+        ranker=(HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05')
+            if method=='REGION_FAST_GAT_V05' else None)
+        record,_=data.run_trajectory(entry,seed,parents=parents,ranker=ranker,
+            config=data.CONFIG_V05,search=search)
+        return {**common,**record}
+    baseline_method='HGA_V2' if method=='ADAPTED_HGA_V2' else 'WAG_VNS_V2'
+    result,checkpoint,initial,statuses=_sci_run_baseline(parents,baseline_method,seed,data.CONFIG_V05)
+    events=[(event.elapsed,event.cmax) for event in result.best_events]
+    return {**common,'status':result.status.value,'termination_reason':result.termination_reason,
+        'initial_cmax':None if initial is None or initial.metrics is None else initial.metrics.cmax,
+        'Cmax_at_60':result.checkpoints[60.0],'time_to_first_certified':result.time_to_first_certified,
+        'initialization_seconds':result.initialization_time,'iterations':result.iterations,
+        'candidate_count':result.candidate_count,'reference_calls':result.reference_calls,
+        'initial_reference_calls':result.initial_reference_calls,
+        'search_reference_calls':result.reference_calls-result.initial_reference_calls,
+        'reference_status':statuses,'certifier_calls':result.certifier_calls,
+        'accepted_moves':None,'strict_best_improvements_at60':data.strict_cmax_improvement_count(events),
+        'actual_runtime':result.actual_runtime,'overshoot':result.overshoot,'scope_id':result.scope_id,
+        'accounting':result.accounting,'diagnostics':result.diagnostics,'best_events':events,
+        'candidate_generation_seconds':None,'search_repair_seconds':None,
+        'direction_seconds':result.accounting.get('direction_time'),'reference_seconds':result.accounting.get('scheduler_time'),
+        'certifier_seconds':result.accounting.get('certifier_time'),'ranker_inference_seconds':0.0,
+        **_sci_solution_record(checkpoint,data.CONFIG_V05)}
+
+
+def run_upgraded_independent(root=None,workers=4):
+    """Run/resume the frozen 15x5x5 comparison; every terminal record is retained."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);db=data.connect(data.DATABASE_V05,readonly=True)
+    matrix_row=db.execute('SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
+        (UPGRADED_INDEPENDENT_MATRIX,'summary')).fetchone()
+    compatibility=db.execute("SELECT count(*) FROM experiments WHERE experiment='sci_upgraded_gat_compatibility' AND item_id='summary'").fetchone()[0]
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(UPGRADED_INDEPENDENT_EXPERIMENT,))};db.close()
+    if matrix_row is None or not compatibility:raise RuntimeError('prepare matrix and complete GAT compatibility smoke first')
+    if not (root/'models'/'gat_v05.pt').is_file():raise FileNotFoundError('models/gat_v05.pt')
+    matrix=json.loads(matrix_row[0]);parents_by_id=_load_upgraded_independent_parents(root,matrix);jobs=[]
+    for entry_index,entry in enumerate(matrix['entries']):
+        for seed_index,seed in enumerate(UPGRADED_INDEPENDENT_SOLVER_SEEDS):
+            offset=(entry_index+seed_index)%len(UPGRADED_INDEPENDENT_METHODS)
+            order=UPGRADED_INDEPENDENT_METHODS[offset:]+UPGRADED_INDEPENDENT_METHODS[:offset]
+            for method in order:
+                key=f"{entry['instance_id']}|{seed}|{method}"
+                if key not in done:jobs.append((key,(entry,parents_by_id[entry['instance_id']],seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),
+            initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_upgraded_independent_worker,job):key for key,job in jobs}
+        job_by_key={key:job for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future];entry,_,seed,method,_=job_by_key[key]
+            try:row=future.result()
+            except Exception as error:
+                row={'instance':entry['label'],'workbook':entry['relative_path'],'tier':entry['tier'],
+                    'instance_id':entry['instance_id'],'actual_N':entry['actual_N'],'geometry_seed':entry['geometry_seed'],
+                    'solver_seed':seed,'seed':seed,'method':method,'status':'EXECUTION_ERROR',
+                    'Cmax_at_60':None,'certified_at_60':False,'independent_certification':False,
+                    'diagnostics':[repr(error)],'method_spec':upgraded_method_spec(method)}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+                (UPGRADED_INDEPENDENT_EXPERIMENT,key,data.dumps(row)))
+            db.close();print(f"upgraded independent {entry['label']}:{seed}:{method} status={row['status']} Cmax@60={row.get('Cmax_at_60')}",flush=True)
+    return len(jobs)
+
+
+def _paired_workbook_summary(instance_rows,method,baseline):
+    import statistics
+    pairs=[]
+    index={(row['instance_id'],row['method']):row for row in instance_rows}
+    for (instance_id,row_method),row in index.items():
+        if row_method!=method:continue
+        other=index.get((instance_id,baseline))
+        if other and row['median_cmax_complete'] is not None and other['median_cmax_complete'] is not None:
+            pairs.append({'instance':row['instance'],'instance_id':instance_id,'tier':row['tier'],
+                'actual_N':row['actual_N'],'method_cmax':row['median_cmax_complete'],
+                'baseline_cmax':other['median_cmax_complete'],
+                'delta_percent':100*(row['median_cmax_complete']/other['median_cmax_complete']-1)})
+    tiers={}
+    for tier in ('SMALL','MEDIUM','LARGE','ALL'):
+        subset=[row for row in pairs if tier=='ALL' or row['tier']==tier];values=[row['delta_percent'] for row in subset]
+        tiers[tier]={'workbooks':len(values),'wins':sum(value<-1e-10 for value in values),
+            'ties':sum(abs(value)<=1e-10 for value in values),'losses':sum(value>1e-10 for value in values),
+            'median_delta_percent':None if not values else statistics.median(values),
+            'mean_delta_percent':None if not values else statistics.fmean(values),
+            'worst_delta_percent':None if not values else max(values)}
+    return {'method':method,'baseline':baseline,'workbooks':sorted(pairs,key=lambda row:row['instance']),'tiers':tiers}
+
+
+def summarize_upgraded_independent(root=None):
+    import statistics
+    from . import dataset as data
+    db=data.connect(data.DATABASE_V05,readonly=True)
+    matrix_row=db.execute('SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
+        (UPGRADED_INDEPENDENT_MATRIX,'summary')).fetchone()
+    rows=[json.loads(row[0]) for row in db.execute('SELECT payload FROM experiments WHERE experiment=? ORDER BY item_id',
+        (UPGRADED_INDEPENDENT_EXPERIMENT,))];db.close()
+    matrix=None if matrix_row is None else json.loads(matrix_row[0]);success=lambda row:(row.get('Cmax_at_60') is not None
+        and row.get('status')!='EXECUTION_ERROR' and row.get('independent_certification',row.get('certified_at_60',False)))
+    instance_rows=[]
+    if matrix is not None:
+        for entry in matrix['entries']:
+            for method in UPGRADED_INDEPENDENT_METHODS:
+                selected=[row for row in rows if row.get('instance_id')==entry['instance_id'] and row.get('method')==method]
+                values=[row['Cmax_at_60'] for row in selected if success(row)]
+                instance_rows.append({'instance':entry['label'],'instance_id':entry['instance_id'],'workbook':entry['relative_path'],
+                    'tier':entry['tier'],'actual_N':entry['actual_N'],'method':method,'completed_runs':len(selected),
+                    'certified_runs':len(values),'seed_values':{str(seed):next((row.get('Cmax_at_60') for row in selected if row.get('seed')==seed),None)
+                        for seed in UPGRADED_INDEPENDENT_SOLVER_SEEDS},
+                    'median_cmax_complete':statistics.median(values) if len(values)==5 else None,
+                    'conditional_median_cmax':None if not values else statistics.median(values)})
+    comparisons={f'{method}_vs_{baseline}':_paired_workbook_summary(instance_rows,method,baseline)
+        for method,baseline in (
+            ('REGION_FAST_HEURISTIC','BASELINE_HEURISTIC'),
+            ('REGION_FAST_GAT_V05','REGION_FAST_HEURISTIC'),
+            ('REGION_FAST_HEURISTIC','ADAPTED_HGA_V2'),
+            ('REGION_FAST_HEURISTIC','ADAPTED_WAG_VNS_V2'),
+            ('REGION_FAST_GAT_V05','ADAPTED_HGA_V2'),
+            ('REGION_FAST_GAT_V05','ADAPTED_WAG_VNS_V2'))}
+    success_summary={method:{'scheduled':75,'completed':sum(row.get('method')==method for row in rows),
+        'certified':sum(row.get('method')==method and success(row) for row in rows)} for method in UPGRADED_INDEPENDENT_METHODS}
+    telemetry={}
+    for method in UPGRADED_INDEPENDENT_METHODS:
+        selected=[row for row in rows if row.get('method')==method]
+        def values(key):return [row[key] for row in selected if row.get(key) is not None]
+        telemetry[method]={'runtime_median':None if not values('actual_runtime') else statistics.median(values('actual_runtime')),
+            'overshoot_max':None if not values('overshoot') else max(values('overshoot')),
+            'iterations_median':None if not values('iterations') else statistics.median(values('iterations')),
+            'reference_calls_median':None if not values('reference_calls') else statistics.median(values('reference_calls')),
+            'strict_improvements_total':sum(values('strict_best_improvements_at60')),
+            'ranker_inference_seconds_total':sum(values('ranker_inference_seconds'))}
+    summary={'matrix':matrix,'completed_runs':len(rows),'scheduled_runs':375,'success':success_summary,
+        'instances':instance_rows,'comparisons':comparisons,'telemetry':telemetry}
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+        ('sci_upgraded_independent_summary','summary',data.dumps(summary)))
+    db.close();return summary
+
+
+def validate_upgraded_independent(root=None):
+    from . import dataset as data
+    summary=summarize_upgraded_independent(root);matrix=summary['matrix'];rows=summary['completed_runs']
+    if matrix is None or len(matrix['entries'])!=15:raise AssertionError('15 frozen independent workbooks required')
+    if [sum(entry['tier']==tier for entry in matrix['entries']) for tier in ('SMALL','MEDIUM','LARGE')]!=[5,5,5]:
+        raise AssertionError('independent scale balance changed')
+    if len({entry['geometry_seed'] for entry in matrix['entries']})!=15 or matrix['historical_geometry_overlap']:
+        raise AssertionError('new geometry independence check failed')
+    if rows!=375:raise AssertionError(f'upgraded matrix incomplete: {rows}/375')
+    db=data.connect(data.DATABASE_V05,readonly=True);payloads=[json.loads(row[0]) for row in db.execute(
+        'SELECT payload FROM experiments WHERE experiment=?',(UPGRADED_INDEPENDENT_EXPERIMENT,))];db.close()
+    if any(row.get('scientific_config')!=data.CONFIG_V05.scientific_mapping() for row in payloads if row.get('status')!='EXECUTION_ERROR'):
+        raise AssertionError('scientific config changed')
+    for row in payloads:
+        spec=row['method_spec']
+        if spec['enable_crrr'] or spec['c2_mode']!='BASELINE_C2':raise AssertionError('CRRR/C2 mode changed')
+        if spec['algorithm_family']=='ALNS' and (spec['m'],spec['m_atomic'],spec['m_lns'],spec['kdp'],spec['kref'],spec['kref_total'])!=(192,144,48,8,2,4):
+            raise AssertionError('ALNS budget changed')
+    result={'completed_runs':rows,'success':summary['success'],'comparisons':summary['comparisons']}
+    print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -2039,4 +2425,12 @@ if __name__=='__main__':
     elif args.action=='crrr-access-validate':validate_crrr_access(args.root)
     elif args.action=='lns-acceleration-online':run_lns_acceleration_online(args.root,args.workers)
     elif args.action=='lns-acceleration-summary':print(json.dumps(summarize_lns_acceleration(args.root),ensure_ascii=False,indent=2))
-    else:validate_lns_acceleration(args.root)
+    elif args.action=='lns-acceleration-validate':validate_lns_acceleration(args.root)
+    elif args.action=='upgraded-gat-smoke':run_upgraded_gat_compatibility(args.root)
+    elif args.action=='upgraded-prepare':
+        prepare_upgraded_independent_matrix(args.root,
+            node_executable=r'C:\Users\Renjl\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe',
+            artifact_node_modules=r'C:\Users\Renjl\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules')
+    elif args.action=='upgraded-run':run_upgraded_independent(args.root,args.workers)
+    elif args.action=='upgraded-summary':print(json.dumps(summarize_upgraded_independent(args.root),ensure_ascii=False,indent=2))
+    else:validate_upgraded_independent(args.root)
