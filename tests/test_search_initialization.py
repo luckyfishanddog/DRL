@@ -13,6 +13,7 @@ from mrta_search.initialization import (
     InitializationStatus,
     _construct_region_cooperative_initialization,
     _construct_rail_monotone_balanced_bootstrap,
+    _construct_same_rail_boundary_rebalanced_initialization,
     _patterns,
     bounded_insertion_positions,
     build_joint_rail_region_rebuild_candidates,
@@ -405,6 +406,132 @@ def test_region_cooperative_preserves_x_split_child_robot_ownership():
     assert not solution.routes[2].block_ids and not solution.routes[3].block_ids
     blocks=block_map(solution,FAST)
     assert all(block.length>=FAST.min_child_length-FAST.numeric_epsilon for block in blocks.values())
+
+
+def test_same_rail_rebalance_default_off_replaces_only_x_order_slot():
+    parents = _v3_fixture()
+    default = build_initial_solution(
+        parents, FAST, _stats(), construction_budget=5, kinit_ref=5,
+        portfolio=True, region_cooperative=True,
+    )
+    explicit_off = build_initial_solution(
+        parents, FAST, _stats(), construction_budget=5, kinit_ref=5,
+        portfolio=True, region_cooperative=True,
+        same_rail_boundary_rebalance=False,
+    )
+    enabled = build_initial_solution(
+        parents, FAST, _stats(), construction_budget=5, kinit_ref=5,
+        portfolio=True, region_cooperative=True,
+        same_rail_boundary_rebalance=True,
+    )
+    assert default.solution == explicit_off.solution
+    assert default.directions == explicit_off.directions
+    assert [row.strategy for row in default.attempts] == [
+        row.strategy for row in explicit_off.attempts
+    ]
+    assert [row.strategy for row in enabled.attempts[:5]] == [
+        "LOAD_FIRST",
+        "RAIL_BALANCED",
+        "SAME_RAIL_BOUNDARY_REBALANCED_INITIALIZATION",
+        "REGION_COOPERATIVE_INITIALIZATION",
+        "RAIL_MONOTONE_BALANCED_BOOTSTRAP",
+    ]
+    assert sum(row.schedule is not None for row in enabled.attempts[:5]) <= 5
+
+
+def test_same_rail_rebalance_is_joint_legal_and_preserves_split_ownership():
+    from mrta_reference.geometry import generate_x_split_patterns
+    from mrta_reference.model import Rail
+
+    upper = tuple(
+        ParentWeld(f"u{i}", (1.0 + i, 9.0), (15.0 + i, 9.0))
+        for i in range(4)
+    )
+    lower = tuple(
+        ParentWeld(f"l{i}", (1.0 + i, 3.0), (15.0 + i, 3.0))
+        for i in range(4)
+    )
+    mandatory = ParentWeld("mandatory", (10.0, 5.0), (10.0, 7.0))
+    x_parent = ParentWeld("x", (2.0, 9.0), (18.0, 9.0))
+    parents = upper + lower + (mandatory, x_parent)
+    patterns = list(_patterns(parents, FAST))
+    x_pattern = next(
+        row for row in generate_x_split_patterns(x_parent, 10.0, FAST, rail=Rail.UPPER)
+        if row.point_id == "BX_CENTER"
+    )
+    patterns = tuple(x_pattern if row.parent_id == "x" else row for row in patterns)
+    base = _construct_region_cooperative_initialization(parents, patterns, FAST)
+    candidate = _construct_same_rail_boundary_rebalanced_initialization(
+        parents, patterns, FAST
+    )
+    assert candidate.canonical_hash != base.canonical_hash
+    base_robot = {
+        item: route.robot_id for route in base.routes for item in route.block_ids
+    }
+    candidate_robot = {
+        item: route.robot_id for route in candidate.routes for item in route.block_ids
+    }
+    assert all(base_robot[item] // 2 == candidate_robot[item] // 2 for item in base_robot)
+    assert any(
+        base_robot[item] != candidate_robot[item]
+        for item in base_robot if base_robot[item] // 2 == 1
+    )
+    assert candidate_robot["x::0"] == 0 and candidate_robot["x::1"] == 1
+    assert tuple(row.pattern_id for row in candidate.patterns) == tuple(
+        row.pattern_id for row in patterns
+    )
+    blocks = block_map(candidate, FAST)
+    assigned = [item for route in candidate.routes for item in route.block_ids]
+    assert len(assigned) == len(set(assigned)) == len(blocks)
+    assert all(
+        robot_is_eligible(blocks[item], route.robot_id, FAST)
+        for route in candidate.routes for item in route.block_ids
+    )
+    mandatory_pattern = next(row for row in candidate.patterns if row.parent_id == "mandatory")
+    assert mandatory_pattern.kind is SplitKind.Y_SPLIT and mandatory_pattern.mandatory
+
+
+def test_same_rail_rebalance_can_jointly_change_both_rail_boundaries():
+    parents = tuple(
+        ParentWeld(f"u{i}", (1.0 + i, 9.0), (15.0 + i, 9.0))
+        for i in range(4)
+    ) + tuple(
+        ParentWeld(f"l{i}", (1.0 + i, 3.0), (15.0 + i, 3.0))
+        for i in range(4)
+    )
+    patterns = _patterns(parents, FAST)
+    base = _construct_region_cooperative_initialization(parents, patterns, FAST)
+    candidate = _construct_same_rail_boundary_rebalanced_initialization(
+        parents, patterns, FAST
+    )
+    base_robot = {item: route.robot_id for route in base.routes for item in route.block_ids}
+    candidate_robot = {
+        item: route.robot_id for route in candidate.routes for item in route.block_ids
+    }
+    for rail in (0, 1):
+        assert any(
+            base_robot[item] != candidate_robot[item]
+            for item in base_robot if base_robot[item] // 2 == rail
+        )
+    assert all(base_robot[item] // 2 == candidate_robot[item] // 2 for item in base_robot)
+
+
+def test_same_rail_rebalance_can_change_only_one_rail():
+    parents = tuple(
+        ParentWeld(f"u{i}", (1.0 + i, 9.0), (15.0 + i, 9.0))
+        for i in range(4)
+    ) + (ParentWeld("lower", (2.0, 3.0), (3.0, 3.0)),)
+    patterns = _patterns(parents, FAST)
+    base = _construct_region_cooperative_initialization(parents, patterns, FAST)
+    candidate = _construct_same_rail_boundary_rebalanced_initialization(
+        parents, patterns, FAST
+    )
+    base_robot = {item: route.robot_id for route in base.routes for item in route.block_ids}
+    candidate_robot = {
+        item: route.robot_id for route in candidate.routes for item in route.block_ids
+    }
+    assert any(base_robot[item] != candidate_robot[item] for item in base_robot if item != "lower::whole")
+    assert base_robot["lower::whole"] == candidate_robot["lower::whole"]
 
 
 def _jrrb_state():

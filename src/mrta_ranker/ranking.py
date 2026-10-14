@@ -2529,10 +2529,266 @@ def summarize_jrrb_development(root=None):
     db.close();return summary
 
 
+SAME_RAIL_DIAGNOSTIC_EXPERIMENT='same_rail_load_rebalance_diagnostic'
+SAME_RAIL_ONLINE_EXPERIMENT='same_rail_load_rebalance_online'
+SAME_RAIL_SUMMARY_EXPERIMENT='same_rail_load_rebalance_summary'
+SAME_RAIL_HIGH_WORKLOAD_SEEDS=tuple(range(20262231,20262237))
+SAME_RAIL_SOLVER_SEEDS=(20262221,20262222)
+SAME_RAIL_STRATEGY='SAME_RAIL_BOUNDARY_REBALANCED_INITIALIZATION'
+
+
+def _same_rail_high_workload_states(root):
+    """Build six fixed development geometries in memory, without solver selection."""
+    from . import dataset as data
+    from mrta_reference.model import ParentWeld
+    ppo_data=_ppo_dataset_module(root);generator=ppo_data._load_allowed_generator_module()
+    source=Path(generator.DEFAULT_SOURCE_EXCEL).resolve()
+    config_path=Path(root).resolve().parent/'ppo'/'config'/'scientific_model_v9.json'
+    result=[]
+    for seed in SAME_RAIL_HIGH_WORKLOAD_SEEDS:
+        build=ppo_data.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+            requested_group_counts=(45,),source_excel=source,scientific_config_path=config_path)
+        sheet=build.manifest.sheets[0];rows=build.rows_by_sheet[sheet.sheet_name]
+        parents=tuple(ParentWeld(row.weld_id,(row.x1,row.y1),(row.x2,row.y2)) for row in rows)
+        result.append(({'label':f'HW_{seed}','tier':'HIGH_WORKLOAD',
+            'instance_id':f'in_memory_ppo_seed_{seed}::{sheet.sheet_name}',
+            'relative_path':None,'sheet_name':sheet.sheet_name,'actual_N':len(parents),
+            'geometry_seed':seed,'total_weld_length':sum(parent.length for parent in parents),
+            'development_only':True,'generated_in_memory':True},parents))
+    return result
+
+
+def _same_rail_development_states(root):
+    from . import dataset as data
+    smoke=_final_smoke_module(root);_,entries=_region_initialization_entries(root)
+    result=[(entry,smoke._range_parents(entry,data.PPO)) for entry in entries]
+    return result+_same_rail_high_workload_states(root)
+
+
+def _same_rail_transfer_space(solution,config):
+    """Task-layer same-rail alternatives; no direction or schedule label is used."""
+    from collections import Counter
+    from mrta_reference.geometry import robot_is_eligible
+    from mrta_reference.model import SplitKind
+    from mrta_reference.solution import block_map
+    blocks=block_map(solution,config);patterns={row.parent_id:row for row in solution.patterns}
+    robot_by={item:route.robot_id for route in solution.routes for item in route.block_ids}
+    loads=[sum(config.process_time(blocks[item].length) for item in route.block_ids)
+        for route in solution.routes]
+    movable_count=[0,0,0,0];movable_seconds=[0.0,0.0,0.0,0.0];fixed=Counter()
+    for item,robot in robot_by.items():
+        kind=patterns[blocks[item].parent_id].kind
+        if kind is SplitKind.X_SPLIT:
+            fixed['X_SPLIT_FIXED_CHILD']+=1;continue
+        partner=robot^1
+        if robot_is_eligible(blocks[item],partner,config):
+            movable_count[robot]+=1;movable_seconds[robot]+=config.process_time(blocks[item].length)
+        else:fixed[f'{kind.value}_PARTNER_INELIGIBLE']+=1
+    rails=[]
+    for pair in ((0,1),(2,3)):
+        fixed_ids={pair[0]:[],pair[1]:[]};movable=[]
+        for robot in pair:
+            for item in solution.routes[robot].block_ids:
+                if patterns[blocks[item].parent_id].kind is SplitKind.X_SPLIT:
+                    fixed_ids[robot].append(item)
+                else:movable.append(item)
+        ordered=tuple(sorted(movable,key=lambda item:(min(blocks[item].start[0],blocks[item].end[0]),
+            (blocks[item].start[0]+blocks[item].end[0])/2,item)))
+        options=[]
+        for boundary in range(len(ordered)+1):
+            routes=(tuple(fixed_ids[pair[0]])+ordered[:boundary],
+                ordered[boundary:]+tuple(fixed_ids[pair[1]]))
+            if any(not robot_is_eligible(blocks[item],robot,config)
+                    for robot,route in zip(pair,routes) for item in route):continue
+            option_loads=tuple(sum(config.process_time(blocks[item].length) for item in route)
+                for route in routes)
+            options.append({'boundary_index':boundary,'loads':option_loads,
+                'max_load':max(option_loads,default=0.0),'changed_blocks':sum(
+                    robot_by[item]!=robot for robot,route in zip(pair,routes) for item in route)})
+        best=min(options,key=lambda row:(row['max_load'],abs(row['loads'][0]-row['loads'][1]),row['boundary_index']))
+        rails.append({'pair':pair,'feasible_boundaries':len(options),'best':best,
+            'current_max_load':max(loads[pair[0]],loads[pair[1]])})
+    return {'process_loads':loads,'movable_block_count_by_robot':movable_count,
+        'movable_process_seconds_by_robot':movable_seconds,
+        'movable_block_count':sum(movable_count),'movable_process_seconds':sum(movable_seconds),
+        'fixed_reasons':dict(fixed),'rails':rails,
+        'current_max_process_load':max(loads,default=0.0),
+        'task_layer_best_max_process_load':max(row['best']['max_load'] for row in rails)}
+
+
+def _same_rail_attempt_record(initialization,config):
+    from mrta_reference.geometry import robot_is_eligible
+    from mrta_reference.solution import block_map
+    candidate=next((row for row in initialization.attempts if row.strategy==SAME_RAIL_STRATEGY),None)
+    region=next((row for row in initialization.attempts
+        if row.strategy=='REGION_COOPERATIVE_INITIALIZATION'),None)
+    if candidate is None:return {'attempted':False}
+    row={'attempted':True,'constructed':candidate.solution is not None,'duplicate':candidate.duplicate,
+        'direction_status':None if candidate.directions is None else candidate.directions.status.value,
+        'reference_status':None if candidate.schedule is None else candidate.schedule.status.value,
+        'reference_cmax':None if candidate.schedule is None else candidate.schedule.cmax,
+        'certified':bool(candidate.certification and candidate.certification.certified)}
+    if candidate.solution is None:return row
+    blocks=block_map(candidate.solution,config);assigned={item:route.robot_id
+        for route in candidate.solution.routes for item in route.block_ids}
+    row.update({'canonical_hash':candidate.solution.canonical_hash,
+        'process_loads':[sum(config.process_time(blocks[item].length) for item in route.block_ids)
+            for route in candidate.solution.routes],
+        'complete_unique':len(assigned)==len(blocks) and set(assigned)==set(blocks),
+        'robot_eligible':all(robot_is_eligible(blocks[item],robot,config)
+            for item,robot in assigned.items()),'patterns_preserved':(
+                tuple(pattern.pattern_id for pattern in candidate.solution.patterns)==
+                tuple(pattern.pattern_id for pattern in initialization.solution.patterns))})
+    if region is not None and region.solution is not None:
+        old={item:route.robot_id for route in region.solution.routes for item in route.block_ids}
+        row.update({'same_rail_changes':sum(old[item]!=assigned[item] and old[item]//2==assigned[item]//2 for item in old),
+            'cross_rail_changes':sum(old[item]//2!=assigned[item]//2 for item in old),
+            'reordered_routes':sum(region.solution.routes[i].block_ids!=candidate.solution.routes[i].block_ids for i in range(4))})
+    return row
+
+
+def _same_rail_diagnostic_worker(job):
+    from dataclasses import replace
+    from . import dataset as data
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    entry,parents=job
+    common=replace(data.search_config(),initialization_region_cooperative=True,
+        max_iterations=0,time_limit=None,checkpoints=(),enable_jrrb=False,enable_crrr=False)
+    before=run_sa_oi_alns_v2(parents,data.CONFIG_V05,common,seed=SAME_RAIL_SOLVER_SEEDS[0],
+        source_provenance=data.provenance())
+    after=run_sa_oi_alns_v2(parents,data.CONFIG_V05,replace(common,
+        initialization_same_rail_boundary_rebalance=True),seed=SAME_RAIL_SOLVER_SEEDS[0],
+        source_provenance=data.provenance())
+    attempt=_same_rail_attempt_record(after.initialization,data.CONFIG_V05)
+    old_cmax=before.initialization.schedule.cmax;candidate_cmax=attempt.get('reference_cmax')
+    return {**{key:entry.get(key) for key in ('label','tier','instance_id','relative_path','sheet_name','actual_N','geometry_seed','total_weld_length')},
+        'instance':entry['label'],'development_only':True,
+        'before':{'strategy':before.initialization.winning_strategy,'cmax':old_cmax,
+            'initialization_seconds':before.stats.init_time,'reference_calls':before.stats.init_reference_calls,
+            'reference_status':dict(before.stats.init_status_counts),
+            'transfer_space':_same_rail_transfer_space(before.initialization.solution,data.CONFIG_V05)},
+        'after':{'strategy':after.initialization.winning_strategy,'cmax':after.initialization.schedule.cmax,
+            'initialization_seconds':after.stats.init_time,'reference_calls':after.stats.init_reference_calls,
+            'reference_status':dict(after.stats.init_status_counts)},
+        'candidate':attempt,'candidate_strict_improvement':bool(attempt.get('certified') and
+            candidate_cmax<old_cmax-1e-9*max(1.0,abs(old_cmax))),
+        'candidate_improvement_seconds':None if candidate_cmax is None else old_cmax-candidate_cmax,
+        'candidate_improvement_percent':None if candidate_cmax is None else 100*(candidate_cmax/old_cmax-1),
+        'incremental_initialization_seconds':after.stats.init_time-before.stats.init_time,
+        'scientific_config':data.CONFIG_V05.scientific_mapping()}
+
+
+def run_same_rail_diagnostic(root=None):
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
+    states=_same_rail_development_states(root);db=data.connect(data.DATABASE_V05)
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',
+        (SAME_RAIL_DIAGNOSTIC_EXPERIMENT,))};db.close()
+    for entry,parents in states:
+        key=entry['label']
+        if key in done:continue
+        row=_same_rail_diagnostic_worker((entry,parents));db=data.connect(data.DATABASE_V05)
+        with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+            (SAME_RAIL_DIAGNOSTIC_EXPERIMENT,key,data.dumps(row)))
+        db.close();print(f"same-rail diagnostic {key} old={row['before']['cmax']:.3f} candidate={row['candidate'].get('reference_cmax')}",flush=True)
+    return summarize_same_rail(root)
+
+
+def _same_rail_online_worker(job):
+    from dataclasses import replace
+    from . import dataset as data
+    entry,parents,seed,method=job
+    enabled=method=='REGION_FAST_SAME_RAIL'
+    search=replace(data.search_config(),initialization_region_cooperative=True,
+        initialization_same_rail_boundary_rebalance=enabled,enable_crrr=False,enable_jrrb=False,
+        lns_incremental_scoring=True,c2_mode='BASELINE_C2',enable_two_opt_star=False,m_atomic=144)
+    record,_=data.run_trajectory(entry,seed,parents=parents,config=data.CONFIG_V05,search=search)
+    return {**{key:entry.get(key) for key in ('label','tier','instance_id','relative_path','sheet_name','actual_N','geometry_seed','total_weld_length')},
+        'instance':entry['label'],'seed':seed,'solver_seed':seed,'method':method,
+        'development_only':True,'scientific_config':data.CONFIG_V05.scientific_mapping(),**record}
+
+
+def run_same_rail_online(root=None,workers=4):
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
+    summary=summarize_same_rail(root)
+    if not summary['quality_gate_passed']:
+        raise RuntimeError('same-rail candidate quality gate did not pass')
+    states=_same_rail_development_states(root);db=data.connect(data.DATABASE_V05)
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',
+        (SAME_RAIL_ONLINE_EXPERIMENT,))};db.close();jobs=[];methods=('REGION_FAST_HEURISTIC','REGION_FAST_SAME_RAIL')
+    for index,(entry,parents) in enumerate(states):
+        for seed_index,seed in enumerate(SAME_RAIL_SOLVER_SEEDS):
+            order=methods if (index+seed_index)%2==0 else tuple(reversed(methods))
+            for method in order:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,parents,seed,method)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),
+            initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_same_rail_online_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future];row=future.result();db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+                (SAME_RAIL_ONLINE_EXPERIMENT,key,data.dumps(row)))
+            db.close();print(f"same-rail online {key} Cmax={row.get('Cmax_at_60')}",flush=True)
+    return summarize_same_rail(root)
+
+
+def summarize_same_rail(root=None):
+    import statistics
+    from . import dataset as data
+    db=data.connect(data.DATABASE_V05,readonly=True)
+    diagnostics=[json.loads(row[0]) for row in db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? ORDER BY item_id',(SAME_RAIL_DIAGNOSTIC_EXPERIMENT,))]
+    online=[json.loads(row[0]) for row in db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? ORDER BY item_id',(SAME_RAIL_ONLINE_EXPERIMENT,))]
+    db.close();improved=[row for row in diagnostics if row['candidate_strict_improvement']]
+    index={(row['instance'],row['seed'],row['method']):row for row in online};pairs=[]
+    for key,row in index.items():
+        instance,seed,method=key
+        if method!='REGION_FAST_SAME_RAIL':continue
+        base=index.get((instance,seed,'REGION_FAST_HEURISTIC'))
+        if base is None or row.get('Cmax_at_60') is None or base.get('Cmax_at_60') is None:continue
+        pairs.append({'instance':instance,'tier':row['tier'],'seed':seed,
+            'base_cmax':base['Cmax_at_60'],'method_cmax':row['Cmax_at_60'],
+            'delta_seconds':row['Cmax_at_60']-base['Cmax_at_60'],
+            'delta_percent':100*(row['Cmax_at_60']/base['Cmax_at_60']-1),
+            'base_initial_cmax':base['initial_cmax'],'method_initial_cmax':row['initial_cmax'],
+            'base_alns_improvement':base['initial_cmax']-base['Cmax_at_60'],
+            'method_alns_improvement':row['initial_cmax']-row['Cmax_at_60'],
+            'iteration_delta':row['iterations']-base['iterations'],
+            'reference_delta':row['reference_calls']-base['reference_calls'],
+            'initialization_seconds_delta':row['initialization_seconds']-base['initialization_seconds']})
+    def group(rows):
+        values=[row['delta_percent'] for row in rows]
+        return {'pairs':len(rows),'wins':sum(value<-1e-10 for value in values),
+            'ties':sum(abs(value)<=1e-10 for value in values),'losses':sum(value>1e-10 for value in values),
+            'median_delta_percent':None if not values else statistics.median(values),
+            'mean_delta_percent':None if not values else statistics.fmean(values),
+            'worst_delta_percent':None if not values else max(values)}
+    tiers={tier:group([row for row in pairs if row['tier']==tier])
+        for tier in sorted({row['tier'] for row in pairs})};tiers['ALL']=group(pairs)
+    summary={'diagnostic_rows':len(diagnostics),'geometries_with_certified_candidate_improvement':len(improved),
+        'quality_gate_passed':len(improved)>1,'online_rows':len(online),'online_pairs':len(pairs),
+        'online_complete':len(pairs)==24,'paired':group(pairs),'tiers':tiers,'pairs':pairs,
+        'diagnostics':diagnostics,'online':online,
+        'high_workload_selection':{'seeds':SAME_RAIL_HIGH_WORKLOAD_SEEDS,
+            'requested_group_count':45,'selection_used_solver_outputs':False,'workbooks_written':False}}
+    if diagnostics:
+        db=data.connect(data.DATABASE_V05)
+        with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+            (SAME_RAIL_SUMMARY_EXPERIMENT,'summary',data.dumps(summary)))
+        db.close()
+    return summary
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate','jrrb-development-diagnostic','jrrb-development-summary'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate','jrrb-development-diagnostic','jrrb-development-summary','same-rail-diagnostic','same-rail-online','same-rail-summary'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -2573,4 +2829,7 @@ if __name__=='__main__':
     elif args.action=='upgraded-summary':print(json.dumps(summarize_upgraded_independent(args.root),ensure_ascii=False,indent=2))
     elif args.action=='upgraded-validate':validate_upgraded_independent(args.root)
     elif args.action=='jrrb-development-diagnostic':print(json.dumps(run_jrrb_development_diagnostic(args.root),ensure_ascii=False,indent=2))
-    else:print(json.dumps(summarize_jrrb_development(args.root),ensure_ascii=False,indent=2))
+    elif args.action=='jrrb-development-summary':print(json.dumps(summarize_jrrb_development(args.root),ensure_ascii=False,indent=2))
+    elif args.action=='same-rail-diagnostic':print(json.dumps(run_same_rail_diagnostic(args.root),ensure_ascii=False,indent=2))
+    elif args.action=='same-rail-online':print(json.dumps(run_same_rail_online(args.root,args.workers),ensure_ascii=False,indent=2))
+    else:print(json.dumps(summarize_same_rail(args.root),ensure_ascii=False,indent=2))

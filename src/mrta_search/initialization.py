@@ -57,6 +57,7 @@ class InitializationStrategy(str, Enum):
     SPATIAL_SPREAD = "SPATIAL_SPREAD"
     RAIL_MONOTONE_BALANCED = "RAIL_MONOTONE_BALANCED_BOOTSTRAP"
     REGION_COOPERATIVE_INITIALIZATION = "REGION_COOPERATIVE_INITIALIZATION"
+    SAME_RAIL_BOUNDARY_REBALANCED = "SAME_RAIL_BOUNDARY_REBALANCED_INITIALIZATION"
 
 
 RAIL_SERIAL_BOOTSTRAP = "RAIL_SERIAL_BOOTSTRAP"
@@ -1149,6 +1150,105 @@ def _construct_region_cooperative_initialization(
     )
 
 
+def _construct_same_rail_boundary_rebalanced_initialization(
+    parents: Sequence[ParentWeld],
+    patterns: tuple[SplitPattern, ...],
+    config: ScientificConfig,
+) -> CanonicalSolution:
+    """Re-cut both same-rail boundaries without changing rail ownership.
+
+    REGION first fixes the upper/lower rail assignment. This candidate keeps
+    that assignment and every split pattern, then evaluates the Cartesian
+    product of the two rail-boundary choices. Its fixed proxy gives equal
+    status to normalized peak process load and same-rail X-envelope overlap.
+    """
+    base = _construct_region_cooperative_initialization(parents, patterns, config)
+    blocks = block_map(base, config)
+    pattern_by_parent = {pattern.parent_id: pattern for pattern in patterns}
+    fixed: dict[int, list[str]] = {robot: [] for robot in range(4)}
+    movable_by_rail: list[list[str]] = [[], []]
+    for route in base.routes:
+        for block_id in route.block_ids:
+            block = blocks[block_id]
+            if pattern_by_parent[block.parent_id].kind is SplitKind.X_SPLIT:
+                fixed[route.robot_id].append(block_id)
+            else:
+                movable_by_rail[route.robot_id // 2].append(block_id)
+
+    boundary_rows = []
+    for rail, pair in enumerate(((0, 1), (2, 3))):
+        ordered = tuple(
+            sorted(movable_by_rail[rail], key=lambda item: _block_x_key(blocks[item]))
+        )
+        rows = []
+        rail_total = sum(
+            config.process_time(blocks[item].length)
+            for item in ordered + tuple(fixed[pair[0]]) + tuple(fixed[pair[1]])
+        )
+        for boundary in range(len(ordered) + 1):
+            left = tuple(fixed[pair[0]]) + ordered[:boundary]
+            right = ordered[boundary:] + tuple(fixed[pair[1]])
+            left = tuple(sorted(left, key=lambda item: _block_x_key(blocks[item])))
+            right = tuple(
+                sorted(right, key=lambda item: _block_x_key(blocks[item]), reverse=True)
+            )
+            loads = tuple(
+                sum(config.process_time(blocks[item].length) for item in route)
+                for route in (left, right)
+            )
+            overlap = _jrrb_same_rail_overlap((left, right), blocks, config)
+            rows.append((left, right, (
+                max(loads, default=0.0) / max(rail_total, 1.0),
+                overlap / max(config.workspace_x[1] - config.workspace_x[0], 1.0),
+            )))
+        boundary_rows.append(tuple(rows))
+
+    best = None
+    for up in boundary_rows[0]:
+        for low in boundary_rows[1]:
+            routes = (up[0], up[1], low[0], low[1])
+            loads = tuple(
+                sum(config.process_time(blocks[item].length) for item in route)
+                for route in routes
+            )
+            empty = tuple(_route_empty_proxy(route, blocks, config) for route in routes)
+            score = (
+                up[2][0] + up[2][1] + low[2][0] + low[2][1],
+                max(loads, default=0.0),
+                max(abs(loads[0] - loads[1]), abs(loads[2] - loads[3])),
+                sum(empty),
+                routes,
+            )
+            if best is None or score < best[0]:
+                best = (score, routes)
+    assert best is not None
+    routes = tuple(
+        _improve_region_route(route, robot, blocks, config)
+        for robot, route in enumerate(best[1])
+    )
+    solution = canonicalize(
+        parents,
+        patterns,
+        tuple(Route(robot, routes[robot]) for robot in range(4)),
+        config,
+        revision=0,
+        x_split_validator=(
+            finite_x_split_validator(parents, config)
+            if any(pattern.kind is SplitKind.X_SPLIT for pattern in patterns)
+            else None
+        ),
+    )
+    base_rail = {
+        item: route.robot_id // 2 for route in base.routes for item in route.block_ids
+    }
+    result_rail = {
+        item: route.robot_id // 2 for route in solution.routes for item in route.block_ids
+    }
+    if base_rail != result_rail:
+        raise ValueError("same-rail initialization changed rail ownership")
+    return solution
+
+
 def _construct_rail_monotone_balanced_bootstrap(
     parents: Sequence[ParentWeld],
     patterns: tuple[SplitPattern, ...],
@@ -1298,6 +1398,7 @@ def build_initial_solution(
     portfolio: bool = False,
     clearance_aware: bool = False,
     region_cooperative: bool = False,
+    same_rail_boundary_rebalance: bool = False,
     reference_evaluator: ReferenceEvaluator | None = None,
     certifier: Certifier = certify_schedule,
     scope: FormalScope | None = None,
@@ -1315,7 +1416,11 @@ def build_initial_solution(
     cooperative_strategies = (
         InitializationStrategy.LOAD_FIRST,
         InitializationStrategy.RAIL_BALANCED,
-        InitializationStrategy.X_ORDER_AWARE,
+        (
+            InitializationStrategy.SAME_RAIL_BOUNDARY_REBALANCED
+            if same_rail_boundary_rebalance
+            else InitializationStrategy.X_ORDER_AWARE
+        ),
         InitializationStrategy.REGION_COOPERATIVE_INITIALIZATION,
         InitializationStrategy.RAIL_MONOTONE_BALANCED,
     )
@@ -1349,15 +1454,20 @@ def build_initial_solution(
     for construction_index, strategy in enumerate(strategies):
         stats.construction_attempts += 1
         try:
-            solution = _construct(
-                parents,
-                selected_patterns,
-                config,
-                insertion_limit=insertion_limit,
-                strategy=strategy,
-                legacy_robot_tie_first=(not portfolio and construction_index == 1),
-                clearance_aware=clearance_aware,
-            )
+            if strategy is InitializationStrategy.SAME_RAIL_BOUNDARY_REBALANCED:
+                solution = _construct_same_rail_boundary_rebalanced_initialization(
+                    parents, selected_patterns, config
+                )
+            else:
+                solution = _construct(
+                    parents,
+                    selected_patterns,
+                    config,
+                    insertion_limit=insertion_limit,
+                    strategy=strategy,
+                    legacy_robot_tie_first=(not portfolio and construction_index == 1),
+                    clearance_aware=clearance_aware,
+                )
         except (ValueError, ArithmeticError, OverflowError) as error:
             attempts.append(
                 InitializationAttempt(

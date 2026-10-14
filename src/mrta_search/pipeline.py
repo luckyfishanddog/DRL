@@ -99,6 +99,7 @@ class SearchConfig:
     feasibility_bootstrap_budget: int = 1
     initialization_clearance_aware: bool = False
     initialization_region_cooperative: bool = False
+    initialization_same_rail_boundary_rebalance: bool = False
     c2_mode: str = BASELINE_C2
     m_atomic: int | None = None
     m_lns: int = 16
@@ -177,6 +178,11 @@ class SearchConfig:
             raise ValueError("require 0 <= JRRB Kref <= Kdp <= 8")
         if self.enable_jrrb and not self.initialization_region_cooperative:
             raise ValueError("JRRB requires REGION cooperative initialization")
+        if (
+            self.initialization_same_rail_boundary_rebalance
+            and not self.initialization_region_cooperative
+        ):
+            raise ValueError("same-rail initialization requires REGION cooperative initialization")
 
 
 @dataclass(frozen=True)
@@ -1379,6 +1385,9 @@ def run_bounded_sa_oi(
             portfolio=True,
             clearance_aware=search_config.initialization_clearance_aware,
             region_cooperative=search_config.initialization_region_cooperative,
+            same_rail_boundary_rebalance=(
+                search_config.initialization_same_rail_boundary_rebalance
+            ),
             reference_evaluator=reference_evaluator,
             scope=scope,
         )

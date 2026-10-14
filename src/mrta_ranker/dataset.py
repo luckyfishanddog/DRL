@@ -272,6 +272,30 @@ def run_trajectory(entry,seed,*,parents=None,source=None,ranker=None,config=None
         'initial_waiting':None if cap.initial is None else cap.initial['metrics'].total_waiting,
         'initialization_seconds':st.init_time,
         'initialization_strategy':result.initialization.winning_strategy,
+        'initialization_attempts':[
+            {
+                'index':attempt.construction_index,
+                'strategy':attempt.strategy,
+                'constructed':attempt.solution is not None,
+                'canonical_hash':(
+                    None if attempt.solution is None else attempt.solution.canonical_hash
+                ),
+                'duplicate':attempt.duplicate,
+                'direction_status':(
+                    None if attempt.directions is None else attempt.directions.status.value
+                ),
+                'reference_status':(
+                    None if attempt.schedule is None else attempt.schedule.status.value
+                ),
+                'reference_cmax':(
+                    None if attempt.schedule is None else attempt.schedule.cmax
+                ),
+                'certified':bool(
+                    attempt.certification and attempt.certification.certified
+                ),
+            }
+            for attempt in result.initialization.attempts
+        ],
         'Cmax_at_60':checkpoint_cmax(result),'final_cmax':None if result.best_metrics is None else result.best_metrics.cmax,
         'certified':bool(result.final_certification and result.final_certification.certified),'iterations':st.iterations,
         'accepted_moves':sum(st.accepted_by_family.values()),'global_best_updates':len(st.best_improvement_cmax),
