@@ -15,6 +15,7 @@ from mrta_search.initialization import (
     _construct_rail_monotone_balanced_bootstrap,
     _patterns,
     bounded_insertion_positions,
+    build_joint_rail_region_rebuild_candidates,
     build_initial_solution,
 )
 from mrta_search.stats import SearchStats
@@ -404,3 +405,62 @@ def test_region_cooperative_preserves_x_split_child_robot_ownership():
     assert not solution.routes[2].block_ids and not solution.routes[3].block_ids
     blocks=block_map(solution,FAST)
     assert all(block.length>=FAST.min_child_length-FAST.numeric_epsilon for block in blocks.values())
+
+
+def _jrrb_state():
+    parents=tuple(ParentWeld(f'j{i}',(1.+2*i,6.),(2.+2*i,6.)) for i in range(8))
+    result=build_initial_solution(parents,FAST,_stats(),construction_budget=5,kinit_ref=5,
+        portfolio=True,region_cooperative=True)
+    assert result.status is InitializationStatus.SUCCESS
+    return parents,result
+
+
+def test_jrrb_joint_boundary_pool_is_bounded_structural_and_legal():
+    parents,initial=_jrrb_state()
+    pool=build_joint_rail_region_rebuild_candidates(
+        initial.solution,initial.directions,initial.schedule,FAST)
+    assert 0<pool.attempted<=16
+    assert pool.constructed<=pool.attempted and pool.valid_unique<=pool.constructed
+    assert len(pool.candidates)==pool.valid_unique
+    assert len({row.solution.canonical_hash for row in pool.candidates})==pool.valid_unique
+    assert any(row.b_up_changed and row.b_low_changed for row in pool.candidates)
+    assert any(row.reordered_routes==4 for row in pool.candidates)
+    for candidate in pool.candidates:
+        assert candidate.cross_rail_parent_changes>0
+        assert candidate.solution.canonical_hash!=initial.solution.canonical_hash
+        assert candidate.solution.parents==tuple(sorted(parents,key=lambda row:row.parent_id))
+        assert tuple(p.pattern_id for p in candidate.solution.patterns)==tuple(
+            p.pattern_id for p in initial.solution.patterns)
+        blocks=block_map(candidate.solution,FAST)
+        assigned=[item for route in candidate.solution.routes for item in route.block_ids]
+        assert len(assigned)==len(set(assigned))==len(blocks)
+        assert all(robot_is_eligible(blocks[item],route.robot_id,FAST)
+                   for route in candidate.solution.routes for item in route.block_ids)
+
+
+def test_jrrb_preserves_mandatory_y_x_children_and_scientific_split_limits():
+    from mrta_reference.geometry import generate_x_split_patterns
+    from mrta_reference.model import Rail
+    flexible=tuple(ParentWeld(f'f{i}',(1.+2*i,6.),(2.+2*i,6.)) for i in range(8))
+    x_parent=ParentWeld('x',(2.,9.),(18.,9.))
+    mandatory=ParentWeld('mandatory',(9.,5.),(9.,7.))
+    parents=flexible+(x_parent,mandatory)
+    patterns=list(_patterns(parents,FAST))
+    x_pattern=next(row for row in generate_x_split_patterns(x_parent,10.,FAST,rail=Rail.UPPER)
+                   if row.point_id=='BX_CENTER')
+    patterns=tuple(x_pattern if row.parent_id=='x' else row for row in patterns)
+    current=_construct_region_cooperative_initialization(parents,patterns,FAST)
+    pool=build_joint_rail_region_rebuild_candidates(
+        current,tuple(tuple(0 for _ in route.block_ids) for route in current.routes),
+        ScheduleResult(ScheduleStatus.FEASIBLE),FAST)
+    assert pool.valid_unique>0
+    for candidate in pool.candidates:
+        by_robot={item:route.robot_id for route in candidate.solution.routes for item in route.block_ids}
+        assert by_robot['x::0']==0 and by_robot['x::1']==1
+        mandatory_pattern=next(row for row in candidate.solution.patterns if row.parent_id=='mandatory')
+        assert mandatory_pattern.kind is SplitKind.Y_SPLIT and mandatory_pattern.mandatory
+        assert tuple(row.pattern_id for row in candidate.solution.patterns)==tuple(row.pattern_id for row in patterns)
+        assert all(block.length>=FAST.min_child_length-FAST.numeric_epsilon
+                   for block in block_map(candidate.solution,FAST).values())
+    assert FAST.delta_x==pytest.approx(.5) and FAST.delta_y==pytest.approx(.5)
+    assert FAST.min_child_length==pytest.approx(.2)

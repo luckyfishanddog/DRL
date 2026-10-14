@@ -44,11 +44,15 @@ from .initialization import (
     InitializationResult,
     InitializationStatus,
     InitializationStrategy,
+    JRRBCandidate,
+    JRRBConstruction,
+    build_joint_rail_region_rebuild_candidates,
     build_initial_solution,
 )
 from .lns import (
     AdaptiveOperatorState,
     CandidateSourceKind,
+    CompleteCandidateIdentity,
     CompleteSearchCandidate,
     DestroyOperator,
     RepairOperator,
@@ -80,6 +84,7 @@ V2_C4_FAMILY_EXPLORE_EXPLOIT_V1 = "V2_C4_FAMILY_EXPLORE_EXPLOIT_V1"
 BASELINE_C2 = "BASELINE_C2"
 COORDINATION_AWARE_C2 = "COORDINATION_AWARE_C2"
 CRRR_ACCESS_C2 = "CRRR_ACCESS_C2"
+JRRB_OPERATOR = "JRRB"
 DECISION_FAMILIES = ("STRUCTURAL", "TARGET_WHOLE", "TARGET_Y", "TARGET_X")
 
 
@@ -121,6 +126,10 @@ class SearchConfig:
     enable_crrr: bool = False
     crrr_attempts: int = 8
     lns_incremental_scoring: bool = False
+    enable_jrrb: bool = False
+    jrrb_max_candidates: int = 16
+    jrrb_kdp: int = 8
+    jrrb_kref: int = 2
 
     def __post_init__(self) -> None:
         if not (1 <= self.kref <= self.kdp <= self.m):
@@ -162,6 +171,12 @@ class SearchConfig:
             raise ValueError("CRRR attempts must be in 0..8")
         if self.enable_crrr and self.crrr_attempts > self.m_lns:
             raise ValueError("CRRR attempts must replace existing LNS attempts")
+        if not 0 <= self.jrrb_max_candidates <= 16:
+            raise ValueError("JRRB complete-candidate cap must be in 0..16")
+        if not 0 <= self.jrrb_kref <= self.jrrb_kdp <= 8:
+            raise ValueError("require 0 <= JRRB Kref <= Kdp <= 8")
+        if self.enable_jrrb and not self.initialization_region_cooperative:
+            raise ValueError("JRRB requires REGION cooperative initialization")
 
 
 @dataclass(frozen=True)
@@ -1085,6 +1100,224 @@ def evaluate_iteration(
     )
 
 
+def _jrrb_complete_candidate(
+    candidate: JRRBCandidate,
+    current: CanonicalSolution,
+    config: ScientificConfig,
+) -> CompleteSearchCandidate:
+    current_blocks = block_map(current, config)
+    current_routes = tuple(route.block_ids for route in current.routes)
+    current_loads = tuple(
+        sum(config.process_time(current_blocks[item].length) for item in route)
+        for route in current_routes
+    )
+    provenance = (
+        ("operator", JRRB_OPERATOR),
+        ("window", candidate.window),
+        ("scheme", candidate.scheme),
+        ("b_up", candidate.b_up),
+        ("b_low", candidate.b_low),
+        ("b_up_changed", candidate.b_up_changed),
+        ("b_low_changed", candidate.b_low_changed),
+        ("changed_parent_ids", candidate.changed_parent_ids),
+        ("cross_rail_parent_changes", candidate.cross_rail_parent_changes),
+        ("same_rail_robot_changes", candidate.same_rail_robot_changes),
+        ("reordered_routes", candidate.reordered_routes),
+        ("cheap_components", candidate.components),
+    )
+    identity = CompleteCandidateIdentity(
+        current.revision,
+        CandidateSourceKind.LNS_REPAIRED.value,
+        (
+            JRRB_OPERATOR,
+            candidate.window,
+            candidate.scheme,
+            candidate.b_up,
+            candidate.b_low,
+            candidate.solution.canonical_hash,
+        ),
+    )
+    return CompleteSearchCandidate(
+        CandidateSourceKind.LNS_REPAIRED,
+        candidate.solution,
+        identity,
+        candidate.components[1],
+        candidate.components[4],
+        0,
+        candidate.components[2] - (max(current_loads) - min(current_loads)),
+        provenance,
+    )
+
+
+def _jrrb_direction_shortlist(
+    rows: Sequence[tuple[JRRBCandidate, DirectionEvaluatedCandidate]],
+    limit: int,
+) -> tuple[tuple[JRRBCandidate, DirectionEvaluatedCandidate], ...]:
+    if not rows or limit <= 0:
+        return ()
+    rankings = (
+        lambda row: (
+            row[0].components[0],
+            math.inf if row[1].direction.total_empty_travel is None else row[1].direction.total_empty_travel,
+            row[0].solution.canonical_hash,
+        ),
+        lambda row: (
+            row[0].components[1], row[0].components[3], row[0].components[5],
+            row[0].solution.canonical_hash,
+        ),
+    )
+    ordered = [sorted(rows, key=key) for key in rankings]
+    selected = []
+    seen = set()
+    for rank in range(max(len(items) for items in ordered)):
+        for items in ordered:
+            if rank >= len(items):
+                continue
+            row = items[rank]
+            identity = row[0].solution.canonical_hash
+            if identity in seen:
+                continue
+            seen.add(identity)
+            selected.append(row)
+            if len(selected) == limit:
+                return tuple(selected)
+    return tuple(selected)
+
+
+def evaluate_jrrb_step(
+    current: CanonicalSolution,
+    current_directions: DirectionVectors,
+    current_schedule: ScheduleResult,
+    current_metrics: OfficialMetrics,
+    config: ScientificConfig,
+    search_config: SearchConfig,
+    stats: SearchStats,
+    *,
+    run_started: float,
+    reference_evaluator: ReferenceEvaluator,
+    scope: FormalScope | None,
+    observer=None,
+) -> ReferenceEvaluatedCandidate | None:
+    """Run the one-shot bounded JRRB funnel under the common wall clock."""
+    stats.jrrb_initial_cmax = current_metrics.cmax
+    construction_started = time.perf_counter()
+    construction = build_joint_rail_region_rebuild_candidates(
+        current,
+        current_directions,
+        current_schedule,
+        config,
+        max_candidates=search_config.jrrb_max_candidates,
+    )
+    construction_elapsed = time.perf_counter() - construction_started
+    stats.jrrb_construction_time += construction_elapsed
+    stats.jrrb_attempted += construction.attempted
+    stats.jrrb_constructed += construction.constructed
+    stats.jrrb_valid_unique += construction.valid_unique
+    for reason, count in construction.rejection_reasons:
+        stats.jrrb_rejection_reasons[reason] += count
+    stats.jrrb_cross_rail_candidates += sum(
+        candidate.cross_rail_parent_changes > 0 for candidate in construction.candidates
+    )
+    stats.jrrb_both_boundaries_changed += sum(
+        candidate.b_up_changed and candidate.b_low_changed
+        for candidate in construction.candidates
+    )
+    stats.jrrb_reordered_four_routes += sum(
+        candidate.reordered_routes == 4 for candidate in construction.candidates
+    )
+    if observer is not None:
+        observer("jrrb_pool", construction)
+    deadline = search_config.time_limit
+    direction_rows = []
+    for rank, candidate in enumerate(construction.candidates[: search_config.jrrb_kdp]):
+        if deadline is not None and time.perf_counter() - run_started >= deadline:
+            break
+        complete = _jrrb_complete_candidate(candidate, current, config)
+        dp_started = time.perf_counter()
+        direction = optimize_directions_with_initial_feasibility(candidate.solution, config)
+        elapsed = time.perf_counter() - dp_started
+        stats.direction_dp_time += elapsed
+        stats.jrrb_direction_time += elapsed
+        stats.jrrb_direction_evaluated += 1
+        if direction.total_empty_travel is None:
+            continue
+        stats.jrrb_direction_feasible += 1
+        direction_rows.append((candidate, DirectionEvaluatedCandidate(complete, rank, direction)))
+    shortlist = _jrrb_direction_shortlist(direction_rows, search_config.jrrb_kref)
+    best = None
+    for candidate, item in shortlist:
+        if deadline is not None and time.perf_counter() - run_started >= deadline:
+            break
+        orientations = {robot: item.direction.directions[robot] for robot in range(4)}
+        reference_started = time.perf_counter()
+        try:
+            schedule = reference_evaluator(
+                candidate.solution,
+                config,
+                orientations=orientations,
+            )
+        except (ArithmeticError, OverflowError, ValueError) as error:
+            schedule = ScheduleResult(
+                ScheduleStatus.NUMERIC_FAILURE,
+                diagnostics=(str(error),),
+                directions=item.direction.directions,
+            )
+        reference_elapsed = time.perf_counter() - reference_started
+        reference_ended = time.perf_counter()
+        stats.jrrb_reference_time += reference_elapsed
+        stats.jrrb_reference_evaluated += 1
+        certification = None
+        metrics = None
+        effective_status = schedule.status
+        if schedule.status is ScheduleStatus.FEASIBLE:
+            cert_started = time.perf_counter()
+            certification = certify_schedule(candidate.solution, schedule, config, scope=scope)
+            stats.certifier_time += time.perf_counter() - cert_started
+            if certification.certified:
+                stats.jrrb_certified += 1
+                metrics = official_metrics(candidate.solution, schedule, config)
+            else:
+                effective_status = ScheduleStatus.NUMERIC_FAILURE
+                schedule = replace(
+                    schedule,
+                    status=ScheduleStatus.NUMERIC_FAILURE,
+                    cmax=None,
+                    diagnostics=(
+                        "JRRB FEASIBLE schedule failed certification: "
+                        + "; ".join(certification.errors),
+                    ),
+                    directions=item.direction.directions,
+                )
+        stats.record_reference(
+            effective_status,
+            reference_elapsed,
+            initialization=False,
+            schedule=schedule,
+            reference_start=reference_started - run_started,
+            reference_end=reference_ended - run_started,
+        )
+        stats.jrrb_reference_status[effective_status.value] += 1
+        evaluated = ReferenceEvaluatedCandidate(item, schedule, certification, metrics, False)
+        within_deadline = deadline is None or reference_ended - run_started <= deadline
+        if metrics is not None and certification is not None and certification.certified and not within_deadline:
+            stats.jrrb_late_certified += 1
+        if not within_deadline or metrics is None or certification is None or not certification.certified:
+            continue
+        eps = 1.0e-9 * max(1.0, abs(current_metrics.cmax), abs(metrics.cmax))
+        if metrics.cmax >= current_metrics.cmax - eps:
+            continue
+        if best is None or metrics.compare(best.metrics) < 0:
+            best = evaluated
+    if best is not None:
+        stats.jrrb_strict_cmax_improvements = 1
+        stats.jrrb_post_cmax = best.metrics.cmax
+    else:
+        stats.jrrb_post_cmax = current_metrics.cmax
+    if observer is not None:
+        observer("jrrb_evaluation", (construction, tuple(row[1] for row in direction_rows), shortlist, best))
+    return best
+
+
 def run_bounded_sa_oi(
     parents: Sequence[ParentWeld],
     config: ScientificConfig = ScientificConfig(),
@@ -1244,10 +1477,36 @@ def run_bounded_sa_oi(
             })
 
     observe_boundary()
+    if search_config.enable_jrrb:
+        jrrb_best = evaluate_jrrb_step(
+            current_solution,
+            current_directions,
+            current_schedule,
+            current_metrics,
+            config,
+            search_config,
+            stats,
+            run_started=started,
+            reference_evaluator=reference_evaluator,
+            scope=scope,
+            observer=observer,
+        )
+        if jrrb_best is not None:
+            current_solution = jrrb_best.direction_candidate.screened.solution
+            current_directions = jrrb_best.direction_candidate.direction.directions
+            current_schedule = jrrb_best.schedule
+            current_metrics = jrrb_best.metrics
+            best_solution = current_solution
+            best_directions = current_directions
+            best_schedule = current_schedule
+            best_metrics = current_metrics
+            stats.best_improvement_cmax.append(best_metrics.cmax)
+            stats.record_best(time.perf_counter() - started, best_metrics.cmax)
+        observe_boundary()
     termination_reason = "ITERATION_LIMIT"
     for iteration in range(search_config.max_iterations):
         if (
-            iteration > 0
+            (iteration > 0 or search_config.enable_jrrb)
             and
             search_config.time_limit is not None
             and time.perf_counter() - started >= search_config.time_limit

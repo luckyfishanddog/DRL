@@ -261,6 +261,99 @@ def test_time_limited_run_completes_one_real_iteration_after_initialization() ->
     assert result.final_certification.certified
 
 
+def _jrrb_parents():
+    return tuple(ParentWeld(f'j{i}',(1.+2*i,6.),(2.+2*i,6.)) for i in range(8))
+
+
+def test_jrrb_default_off_preserves_old_path_and_fixed_alns_budgets():
+    from dataclasses import replace
+    base=SearchConfig(m=192,m_atomic=144,m_lns=48,kdp=8,kref=2,kref_total=4,
+        construction_budget=5,kinit_ref=5,initialization_region_cooperative=True,
+        max_iterations=0,time_limit=None,checkpoints=())
+    explicit=replace(base,enable_jrrb=False)
+    first=run_bounded_sa_oi(_jrrb_parents(),FAST,base,seed=19)
+    second=run_bounded_sa_oi(_jrrb_parents(),FAST,explicit,seed=19)
+    assert first.best_solution.canonical_hash==second.best_solution.canonical_hash
+    assert first.best_schedule.canonical_json()==second.best_schedule.canonical_json()
+    assert first.stats.jrrb_attempted==second.stats.jrrb_attempted==0
+    assert (base.m,base.m_atomic,base.m_lns,base.kdp,base.kref,base.kref_total)==(192,144,48,8,2,4)
+    assert not base.enable_crrr and not base.enable_two_opt_star
+    with pytest.raises(ValueError,match='requires REGION'):
+        SearchConfig(enable_jrrb=True)
+    with pytest.raises(ValueError,match='0..16'):
+        replace(base,enable_jrrb=True,jrrb_max_candidates=17)
+    with pytest.raises(ValueError,match='Kref'):
+        replace(base,enable_jrrb=True,jrrb_kdp=9)
+
+
+def test_jrrb_macro_caps_certifies_and_does_not_consume_normal_iteration_slots():
+    config=SearchConfig(m=192,m_atomic=144,m_lns=48,kdp=8,kref=2,kref_total=4,
+        construction_budget=5,kinit_ref=5,initialization_region_cooperative=True,
+        enable_jrrb=True,max_iterations=0,time_limit=None,checkpoints=())
+    result=run_bounded_sa_oi(_jrrb_parents(),FAST,config,seed=23)
+    stats=result.stats
+    assert result.status is SearchStatus.COMPLETED
+    assert result.final_certification.certified
+    assert stats.iterations==0
+    assert 0<stats.jrrb_attempted<=16
+    assert stats.jrrb_valid_unique<=16
+    assert stats.jrrb_direction_evaluated<=8
+    assert stats.jrrb_reference_evaluated<=2
+    assert stats.jrrb_certified<=stats.jrrb_reference_evaluated
+    assert stats.nref==stats.jrrb_reference_evaluated
+    assert stats.jrrb_cross_rail_candidates==stats.jrrb_valid_unique
+    assert stats.jrrb_both_boundaries_changed>0
+
+
+def test_jrrb_certifier_failure_cannot_replace_certified_current(monkeypatch):
+    from mrta_reference.certifier import CertificationReport
+    from mrta_reference.solution import official_metrics
+    from mrta_search import pipeline
+    from mrta_search.initialization import build_initial_solution
+    parents=_jrrb_parents();stats0=SearchStats('EXACT_Y_SCOPE_CURRENT_SEMANTICS',31)
+    initial=build_initial_solution(parents,FAST,stats0,construction_budget=5,kinit_ref=5,
+        portfolio=True,region_cooperative=True)
+    current_metrics=official_metrics(initial.solution,initial.schedule,FAST)
+    monkeypatch.setattr(pipeline,'certify_schedule',lambda *args,**kwargs:
+        CertificationReport(False,('deliberate JRRB rejection',),None))
+    stats=SearchStats('EXACT_Y_SCOPE_CURRENT_SEMANTICS',31)
+    import time
+    started=time.perf_counter();stats.run_started=started
+    outcome=pipeline.evaluate_jrrb_step(initial.solution,initial.directions,initial.schedule,
+        current_metrics,FAST,SearchConfig(initialization_region_cooperative=True,
+            enable_jrrb=True,max_iterations=0,time_limit=None),stats,
+        run_started=started,reference_evaluator=reference_schedule,scope=None)
+    assert outcome is None
+    assert stats.jrrb_reference_evaluated<=2
+    assert stats.jrrb_certified==stats.jrrb_strict_cmax_improvements==0
+    assert stats.jrrb_reference_status[ScheduleStatus.NUMERIC_FAILURE.value]>0
+
+
+def test_jrrb_late_certification_is_counted_but_never_backfilled(monkeypatch):
+    import time
+    from mrta_reference.solution import official_metrics
+    from mrta_search import pipeline
+    from mrta_search.initialization import build_initial_solution,build_joint_rail_region_rebuild_candidates
+    parents=_jrrb_parents();initial=build_initial_solution(parents,FAST,SearchStats('x',1),
+        construction_budget=5,kinit_ref=5,portfolio=True,region_cooperative=True)
+    pool=build_joint_rail_region_rebuild_candidates(initial.solution,initial.directions,
+        initial.schedule,FAST,max_candidates=1)
+    monkeypatch.setattr(pipeline,'build_joint_rail_region_rebuild_candidates',lambda *args,**kwargs:pool)
+    def delayed(solution,config,*,orientations):
+        time.sleep(.25)
+        return reference_schedule(solution,config,orientations=orientations)
+    stats=SearchStats('EXACT_Y_SCOPE_CURRENT_SEMANTICS',1);started=time.perf_counter();stats.run_started=started
+    outcome=pipeline.evaluate_jrrb_step(initial.solution,initial.directions,initial.schedule,
+        official_metrics(initial.solution,initial.schedule,FAST),FAST,
+        SearchConfig(initialization_region_cooperative=True,enable_jrrb=True,
+            jrrb_max_candidates=1,jrrb_kdp=1,jrrb_kref=1,max_iterations=0,time_limit=.2),
+        stats,run_started=started,reference_evaluator=delayed,scope=None)
+    assert outcome is None
+    assert stats.jrrb_reference_evaluated==1
+    assert stats.jrrb_certified==stats.jrrb_late_certified==1
+    assert stats.jrrb_strict_cmax_improvements==0
+
+
 @pytest.mark.parametrize("count", (1, 2, 3, 4))
 def test_micro_exact_reference_gap_decomposition_and_certified_best(count: int) -> None:
     specs = (

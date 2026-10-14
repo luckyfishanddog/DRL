@@ -20,6 +20,7 @@ from mrta_reference.geometry import (
 )
 from mrta_reference.model import (
     CanonicalSolution,
+    OperationKind,
     ParentWeld,
     Route,
     ScheduleResult,
@@ -84,6 +85,34 @@ class InitializationResult:
     certification: CertificationReport | None
     attempts: tuple[InitializationAttempt, ...]
     winning_strategy: str | None = None
+
+
+@dataclass(frozen=True)
+class JRRBCandidate:
+    """One complete, cheap-only joint rail/region/route reconstruction."""
+
+    solution: CanonicalSolution
+    cheap_score: tuple[float, ...]
+    components: tuple[float, ...]
+    b_up: float
+    b_low: float
+    window: tuple[float, float]
+    scheme: str
+    changed_parent_ids: tuple[str, ...]
+    cross_rail_parent_changes: int
+    same_rail_robot_changes: int
+    reordered_routes: int
+    b_up_changed: bool
+    b_low_changed: bool
+
+
+@dataclass(frozen=True)
+class JRRBConstruction:
+    attempted: int
+    constructed: int
+    valid_unique: int
+    candidates: tuple[JRRBCandidate, ...]
+    rejection_reasons: tuple[tuple[str, int], ...] = ()
 
 
 ReferenceEvaluator = Callable[..., ScheduleResult]
@@ -512,6 +541,422 @@ def _improve_region_route(
             _route_order_risk(route, robot, blocks, config),
             route,
         ),
+    )
+
+
+def _jrrb_robot_by_block(solution: CanonicalSolution) -> dict[str, int]:
+    return {
+        block_id: route.robot_id
+        for route in solution.routes
+        for block_id in route.block_ids
+    }
+
+
+def _jrrb_boundary_value(
+    routes: Sequence[Sequence[str]],
+    pair: tuple[int, int],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> float:
+    left = routes[pair[0]]
+    right = routes[pair[1]]
+    if not left:
+        return config.workspace_x[0]
+    if not right:
+        return config.workspace_x[1]
+    left_x = max((blocks[item].start[0] + blocks[item].end[0]) / 2.0 for item in left)
+    right_x = min((blocks[item].start[0] + blocks[item].end[0]) / 2.0 for item in right)
+    return 0.5 * (left_x + right_x)
+
+
+def _jrrb_same_rail_overlap(
+    routes: Sequence[Sequence[str]],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+) -> float:
+    total = 0.0
+    pairs = ((0, 1),) if len(routes) == 2 else ((0, 1), (2, 3))
+    for left, right in pairs:
+        if not routes[left] or not routes[right]:
+            continue
+        left_max = max(
+            max(blocks[item].start[0], blocks[item].end[0]) for item in routes[left]
+        )
+        right_min = min(
+            min(blocks[item].start[0], blocks[item].end[0]) for item in routes[right]
+        )
+        total += max(0.0, left_max + config.interference_dx - right_min)
+    return total
+
+
+def _jrrb_boundary_options(
+    block_ids: Sequence[str],
+    pair: tuple[int, int],
+    fixed: Mapping[int, Sequence[str]],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+    *,
+    limit: int = 3,
+) -> tuple[tuple[tuple[str, ...], tuple[str, ...], float], ...]:
+    """Return a fixed small set of boundary choices for one rail."""
+    ordered = tuple(sorted(block_ids, key=lambda item: _block_x_key(blocks[item])))
+    ranked = []
+    for boundary in range(len(ordered) + 1):
+        left = tuple(fixed.get(pair[0], ())) + ordered[:boundary]
+        right = ordered[boundary:] + tuple(fixed.get(pair[1], ()))
+        left = tuple(sorted(left, key=lambda item: _block_x_key(blocks[item])))
+        right = tuple(sorted(right, key=lambda item: _block_x_key(blocks[item]), reverse=True))
+        routes = (left, right)
+        loads = tuple(
+            sum(config.process_time(blocks[item].length) for item in route)
+            for route in routes
+        )
+        empty = tuple(_route_empty_proxy(route, blocks, config) for route in routes)
+        overlap = _jrrb_same_rail_overlap(routes, blocks, config)
+        boundary_x = _jrrb_boundary_value(routes, (0, 1), blocks, config)
+        ranked.append((
+            (
+                max(loads, default=0.0) + 0.10 * max(empty, default=0.0)
+                + 0.02 * overlap / config.empty_speed,
+                abs(loads[0] - loads[1]),
+                sum(empty),
+                overlap,
+                boundary,
+            ),
+            left,
+            right,
+            boundary_x,
+        ))
+    return tuple((left, right, boundary_x) for _, left, right, boundary_x in sorted(ranked)[:limit])
+
+
+def _jrrb_route_components(
+    routes: Sequence[Sequence[str]],
+    blocks: Mapping[str, WeldingBlock],
+    config: ScientificConfig,
+    *,
+    current_max_load: float,
+    current_empty: float,
+    wait_scale: float,
+) -> tuple[float, ...]:
+    loads = tuple(
+        sum(config.process_time(blocks[item].length) for item in route)
+        for route in routes
+    )
+    rail_totals = (loads[0] + loads[1], loads[2] + loads[3])
+    empty = sum(_route_empty_proxy(route, blocks, config) for route in routes)
+    overlap = _jrrb_same_rail_overlap(routes, blocks, config)
+    order_risk = sum(
+        _route_order_risk(route, robot, blocks, config)
+        for robot, route in enumerate(routes)
+    )
+    load_scale = max(current_max_load, 1.0)
+    rail_scale = max(sum(loads), 1.0)
+    empty_scale = max(current_empty, 1.0)
+    workspace_width = max(config.workspace_x[1] - config.workspace_x[0], 1.0)
+    normalized = (
+        0.45 * max(loads, default=0.0) / load_scale
+        + 0.15 * (max(loads) - min(loads)) / load_scale
+        + 0.12 * abs(rail_totals[0] - rail_totals[1]) / rail_scale
+        + 0.18 * empty / empty_scale
+        + 0.05 * overlap / workspace_width * (1.0 + wait_scale)
+        + 0.05 * order_risk / empty_scale
+    )
+    return (
+        normalized,
+        max(loads, default=0.0),
+        max(loads) - min(loads),
+        abs(rail_totals[0] - rail_totals[1]),
+        empty,
+        overlap,
+        order_risk,
+    )
+
+
+def _jrrb_representatives(rows: Sequence[dict[str, object]], limit: int) -> tuple[dict[str, object], ...]:
+    """Round-robin fixed proxy views so the cap is not a single-weight Top-K."""
+    rankings = (
+        lambda row: (row["components"][0], row["identity"]),
+        lambda row: (row["components"][1], row["components"][3], row["identity"]),
+        lambda row: (row["components"][4], row["components"][6], row["identity"]),
+        lambda row: (row["components"][5], row["components"][6], row["identity"]),
+    )
+    ordered = [sorted(rows, key=key) for key in rankings]
+    selected = []
+    seen = set()
+    for rank in range(max((len(items) for items in ordered), default=0)):
+        for items in ordered:
+            if rank >= len(items):
+                continue
+            row = items[rank]
+            identity = row["identity"]
+            if identity in seen:
+                continue
+            seen.add(identity)
+            selected.append(row)
+            if len(selected) == limit:
+                return tuple(selected)
+    return tuple(selected)
+
+
+def build_joint_rail_region_rebuild_candidates(
+    current: CanonicalSolution,
+    current_directions: DirectionVectors,
+    schedule: ScheduleResult,
+    config: ScientificConfig,
+    *,
+    max_candidates: int = 16,
+) -> JRRBConstruction:
+    """Build one bounded JRRB pool without direction DP or reference access.
+
+    Cross-rail parent assignment and the two rail boundaries are proposed as
+    one state.  Boundary pairs are scored together; neither rail is committed
+    before the other.  Split patterns, including fixed X children, are frozen.
+    """
+    del current_directions  # directions are deliberately unavailable to the cheap pool
+    if not 0 <= max_candidates <= 16:
+        raise ValueError("JRRB complete-candidate cap must be in 0..16")
+    if max_candidates == 0:
+        return JRRBConstruction(0, 0, 0, ())
+    blocks = block_map(current, config)
+    patterns = {pattern.parent_id: pattern for pattern in current.patterns}
+    current_routes = tuple(route.block_ids for route in current.routes)
+    robot_by_block = _jrrb_robot_by_block(current)
+    fixed: dict[int, list[str]] = {robot: [] for robot in range(4)}
+    rail_blocks: list[list[str]] = [[], []]
+    blocks_by_parent: dict[str, list[str]] = {}
+    for block_id, block in blocks.items():
+        blocks_by_parent.setdefault(block.parent_id, []).append(block_id)
+        if patterns[block.parent_id].kind is SplitKind.X_SPLIT:
+            fixed[robot_by_block[block_id]].append(block_id)
+        else:
+            rail_blocks[robot_by_block[block_id] // 2].append(block_id)
+    movable = []
+    for parent_id, parent_blocks in sorted(blocks_by_parent.items()):
+        if patterns[parent_id].kind is SplitKind.X_SPLIT:
+            continue
+        current_rails = {robot_by_block[item] // 2 for item in parent_blocks}
+        if len(current_rails) != 1:
+            continue
+        if all(
+            any(robot_is_eligible(blocks[item], robot, config) for robot in pair)
+            for item in parent_blocks
+            for pair in ((0, 1), (2, 3))
+        ):
+            x = sum(
+                (blocks[item].start[0] + blocks[item].end[0]) / 2.0
+                for item in parent_blocks
+            ) / len(parent_blocks)
+            duration = sum(config.process_time(blocks[item].length) for item in parent_blocks)
+            movable.append((parent_id, x, duration, next(iter(current_rails))))
+    if len(movable) < 2:
+        return JRRBConstruction(0, 0, 0, (), (("NO_MULTI_PARENT_CROSS_RAIL_REGION", 1),))
+
+    loads = tuple(
+        sum(config.process_time(blocks[item].length) for item in route)
+        for route in current_routes
+    )
+    current_empty = sum(_route_empty_proxy(route, blocks, config) for route in current_routes)
+    waits = [0.0, 0.0, 0.0, 0.0]
+    wait_x = []
+    for operation in schedule.operations:
+        if operation.kind is OperationKind.WAIT:
+            waits[operation.robot_id] += operation.duration
+            wait_x.append(0.5 * (operation.start[0] + operation.end[0]))
+    critical_robot = max(range(4), key=lambda robot: (loads[robot], waits[robot], -robot))
+    critical_x = [
+        (blocks[item].start[0] + blocks[item].end[0]) / 2.0
+        for item in current_routes[critical_robot]
+    ]
+    lo = min(row[1] for row in movable)
+    hi = max(row[1] for row in movable)
+    span = max(hi - lo, config.delta_x)
+    anchor = (
+        sum(wait_x) / len(wait_x)
+        if wait_x
+        else sum(critical_x) / len(critical_x)
+        if critical_x
+        else 0.5 * (lo + hi)
+    )
+    windows = (
+        (lo, hi),
+        (lo, min(hi, lo + 0.55 * span)),
+        (max(lo, hi - 0.55 * span), hi),
+        (max(lo, anchor - 0.28 * span), min(hi, anchor + 0.28 * span)),
+        (
+            max(lo, min(critical_x, default=anchor) - 0.08 * span),
+            min(hi, max(critical_x, default=anchor) + 0.08 * span),
+        ),
+    )
+    unique_windows = []
+    seen_windows = set()
+    for a, b in windows:
+        key = (round(a, 12), round(b, 12))
+        if a <= b and key not in seen_windows:
+            seen_windows.add(key)
+            unique_windows.append((a, b))
+    windows = tuple(unique_windows)
+    current_rail_by_parent = {parent_id: rail for parent_id, _, _, rail in movable}
+    current_rail_totals = [loads[0] + loads[1], loads[2] + loads[3]]
+    raw: list[dict[str, object]] = []
+    raw_seen = set()
+    for window in windows:
+        selected = [row for row in movable if window[0] <= row[1] <= window[1]]
+        if len(selected) < 2:
+            continue
+        selected_ids = {row[0] for row in selected}
+        base_totals = list(current_rail_totals)
+        for parent_id, _, duration, rail in selected:
+            base_totals[rail] -= duration
+        schemes: dict[str, dict[str, int]] = {}
+        schemes["WINDOW_FLIP"] = {
+            parent_id: 1 - rail for parent_id, _, _, rail in selected
+        }
+        greedy = {}
+        totals = list(base_totals)
+        for parent_id, _, duration, _ in sorted(selected, key=lambda row: (-row[2], row[1], row[0])):
+            rail = min((0, 1), key=lambda item: (totals[item], item))
+            greedy[parent_id] = rail
+            totals[rail] += duration
+        schemes["JOINT_LOAD_BALANCE"] = greedy
+        overloaded = int(current_rail_totals[1] > current_rail_totals[0])
+        underloaded = 1 - overloaded
+        schemes["OVERLOAD_REGION_TRANSFER"] = {
+            parent_id: (underloaded if rail == overloaded else rail)
+            for parent_id, _, _, rail in selected
+        }
+        alternating = {}
+        first = int(base_totals[1] < base_totals[0])
+        for index, (parent_id, _, _, _) in enumerate(sorted(selected, key=lambda row: (row[1], row[0]))):
+            alternating[parent_id] = (first + index) % 2
+        schemes["X_BAND_ALTERNATE"] = alternating
+        for scheme, changed in schemes.items():
+            assignment = dict(current_rail_by_parent)
+            assignment.update(changed)
+            if not any(assignment[parent_id] != current_rail_by_parent[parent_id] for parent_id in selected_ids):
+                continue
+            proposed = [[], []]
+            for block_id in rail_blocks[0] + rail_blocks[1]:
+                parent_id = blocks[block_id].parent_id
+                rail = assignment.get(parent_id, robot_by_block[block_id] // 2)
+                proposed[rail].append(block_id)
+            up_options = _jrrb_boundary_options(proposed[0], (0, 1), fixed, blocks, config)
+            low_options = _jrrb_boundary_options(proposed[1], (2, 3), fixed, blocks, config)
+            for up in up_options:
+                for low in low_options:
+                    routes = (up[0], up[1], low[0], low[1])
+                    identity = tuple(tuple(route) for route in routes)
+                    if identity in raw_seen or identity == current_routes:
+                        continue
+                    raw_seen.add(identity)
+                    components = _jrrb_route_components(
+                        routes, blocks, config,
+                        current_max_load=max(loads), current_empty=current_empty,
+                        wait_scale=min(sum(waits) / max(max(loads), 1.0), 1.0),
+                    )
+                    raw.append({
+                        "routes": routes,
+                        "components": components,
+                        "identity": identity,
+                        "b_up": up[2],
+                        "b_low": low[2],
+                        "window": window,
+                        "scheme": scheme,
+                    })
+    selected_raw = _jrrb_representatives(raw, max_candidates)
+    current_b_up = _jrrb_boundary_value(current_routes, (0, 1), blocks, config)
+    current_b_low = _jrrb_boundary_value(current_routes, (2, 3), blocks, config)
+    candidates = []
+    seen_hashes = set()
+    rejections: dict[str, int] = {}
+    constructed_count = 0
+    for row in selected_raw:
+        routes = tuple(
+            _improve_region_route(route, robot, blocks, config)
+            for robot, route in enumerate(row["routes"])
+        )
+        try:
+            solution = canonicalize(
+                current.parents,
+                current.patterns,
+                tuple(Route(robot, routes[robot]) for robot in range(4)),
+                config,
+                revision=current.revision + 1,
+                x_split_validator=(
+                    finite_x_split_validator(current.parents, config)
+                    if any(pattern.kind is SplitKind.X_SPLIT for pattern in current.patterns)
+                    else None
+                ),
+            )
+            if tuple(pattern.pattern_id for pattern in solution.patterns) != tuple(
+                pattern.pattern_id for pattern in current.patterns
+            ):
+                raise ValueError("JRRB changed split pattern")
+            solution_blocks = block_map(solution, config)
+            if any(
+                not robot_is_eligible(solution_blocks[item], route.robot_id, config)
+                for route in solution.routes
+                for item in route.block_ids
+            ):
+                raise ValueError("JRRB robot eligibility failure")
+        except (ValueError, KeyError, IndexError) as error:
+            key = str(error)
+            rejections[key] = rejections.get(key, 0) + 1
+            continue
+        constructed_count += 1
+        if solution.canonical_hash == current.canonical_hash or solution.canonical_hash in seen_hashes:
+            rejections["IDENTITY_OR_DUPLICATE"] = rejections.get("IDENTITY_OR_DUPLICATE", 0) + 1
+            continue
+        seen_hashes.add(solution.canonical_hash)
+        new_robot_by_block = _jrrb_robot_by_block(solution)
+        cross_rail_parents = {
+            blocks[item].parent_id
+            for item in blocks
+            if new_robot_by_block[item] // 2 != robot_by_block[item] // 2
+        }
+        if not cross_rail_parents:
+            rejections["NO_CROSS_RAIL_CHANGE"] = rejections.get("NO_CROSS_RAIL_CHANGE", 0) + 1
+            continue
+        same_rail_changes = sum(
+            new_robot_by_block[item] != robot_by_block[item]
+            and new_robot_by_block[item] // 2 == robot_by_block[item] // 2
+            for item in blocks
+        )
+        changed_parents = tuple(sorted({
+            blocks[item].parent_id
+            for item in blocks
+            if new_robot_by_block[item] != robot_by_block[item]
+        }))
+        reordered = sum(
+            tuple(current_routes[robot]) != tuple(solution.routes[robot].block_ids)
+            for robot in range(4)
+        )
+        components = _jrrb_route_components(
+            tuple(route.block_ids for route in solution.routes), solution_blocks, config,
+            current_max_load=max(loads), current_empty=current_empty,
+            wait_scale=min(sum(waits) / max(max(loads), 1.0), 1.0),
+        )
+        candidates.append(JRRBCandidate(
+            solution=solution,
+            cheap_score=components,
+            components=components,
+            b_up=float(row["b_up"]),
+            b_low=float(row["b_low"]),
+            window=tuple(row["window"]),
+            scheme=str(row["scheme"]),
+            changed_parent_ids=changed_parents,
+            cross_rail_parent_changes=len(cross_rail_parents),
+            same_rail_robot_changes=same_rail_changes,
+            reordered_routes=reordered,
+            b_up_changed=abs(float(row["b_up"]) - current_b_up) > config.numeric_epsilon,
+            b_low_changed=abs(float(row["b_low"]) - current_b_low) > config.numeric_epsilon,
+        ))
+    return JRRBConstruction(
+        attempted=len(selected_raw),
+        constructed=constructed_count,
+        valid_unique=len(candidates),
+        candidates=tuple(candidates),
+        rejection_reasons=tuple(sorted(rejections.items())),
     )
 
 

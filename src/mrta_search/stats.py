@@ -97,6 +97,25 @@ class SearchStats:
     crrr_access_competitive: int = 0
     crrr_access_rejected: int = 0
     crrr_access_injected: int = 0
+    jrrb_attempted: int = 0
+    jrrb_constructed: int = 0
+    jrrb_valid_unique: int = 0
+    jrrb_direction_evaluated: int = 0
+    jrrb_direction_feasible: int = 0
+    jrrb_reference_evaluated: int = 0
+    jrrb_reference_status: Counter[str] = field(default_factory=Counter)
+    jrrb_certified: int = 0
+    jrrb_strict_cmax_improvements: int = 0
+    jrrb_late_certified: int = 0
+    jrrb_cross_rail_candidates: int = 0
+    jrrb_both_boundaries_changed: int = 0
+    jrrb_reordered_four_routes: int = 0
+    jrrb_construction_time: float = 0.0
+    jrrb_direction_time: float = 0.0
+    jrrb_reference_time: float = 0.0
+    jrrb_initial_cmax: float | None = None
+    jrrb_post_cmax: float | None = None
+    jrrb_rejection_reasons: Counter[str] = field(default_factory=Counter)
     original_lns_attempted: int = 0
     original_lns_constructed: int = 0
     original_lns_valid_unique: int = 0

@@ -2391,10 +2391,148 @@ def validate_upgraded_independent(root=None):
     print(json.dumps(result,ensure_ascii=False,indent=2),flush=True);return result
 
 
+JRRB_DEVELOPMENT_SEED=20262121
+JRRB_DIAGNOSTIC_EXPERIMENT='jrrb_development_diagnostic'
+
+
+def _jrrb_development_diagnostic_worker(job):
+    """Evaluate the online Top2 and all cheap candidates on one consumed DEV state."""
+    from collections import Counter
+    from dataclasses import replace
+    from . import dataset as data
+    from mrta_reference.certifier import certify_schedule
+    from mrta_reference.geometry import robot_is_eligible
+    from mrta_reference.model import ScheduleStatus,SplitKind
+    from mrta_reference.scheduler import resolve_reference_evaluator
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import block_map,official_metrics
+    from mrta_search.direction import optimize_directions_with_initial_feasibility
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    entry,root=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO);captured={}
+    def observer(event,value):
+        if event in ('jrrb_pool','jrrb_evaluation'):captured[event]=value
+    search=replace(data.search_config(),initialization_region_cooperative=True,
+        enable_jrrb=True,max_iterations=0,time_limit=None,checkpoints=())
+    result=run_sa_oi_alns_v2(parents,data.CONFIG_V05,search,seed=JRRB_DEVELOPMENT_SEED,
+        source_provenance=data.provenance(),observer=observer)
+    initial=result.initialization;pool=captured.get('jrrb_pool')
+    initial_cmax=None if initial.schedule is None else initial.schedule.cmax
+    current_robot={item:route.robot_id for route in initial.solution.routes for item in route.block_ids}
+    patterns={pattern.parent_id:pattern for pattern in initial.solution.patterns}
+    evaluator=resolve_reference_evaluator(FORMAL_SCOPE_V2,None);offline=[]
+    online_evaluation=captured.get('jrrb_evaluation');online_hashes=set();online_best_hash=None
+    if online_evaluation is not None:
+        online_hashes={row[0].solution.canonical_hash for row in online_evaluation[2]}
+        if online_evaluation[3] is not None:
+            online_best_hash=online_evaluation[3].direction_candidate.screened.solution.canonical_hash
+    for index,candidate in enumerate(() if pool is None else pool.candidates):
+        blocks=block_map(candidate.solution,data.CONFIG_V05)
+        assigned={item:route.robot_id for route in candidate.solution.routes for item in route.block_ids}
+        pattern_preserved=tuple(pattern.pattern_id for pattern in candidate.solution.patterns)==tuple(
+            pattern.pattern_id for pattern in initial.solution.patterns)
+        x_fixed=all(
+            patterns[blocks[item].parent_id].kind is not SplitKind.X_SPLIT
+            or assigned[item]==current_robot[item] for item in blocks)
+        eligible=all(robot_is_eligible(blocks[item],robot,data.CONFIG_V05)
+            for item,robot in assigned.items())
+        dp_started=time.perf_counter();direction=optimize_directions_with_initial_feasibility(candidate.solution,data.CONFIG_V05)
+        dp_seconds=time.perf_counter()-dp_started
+        row={'index':index,'canonical_hash':candidate.solution.canonical_hash,
+            'online_top2':candidate.solution.canonical_hash in online_hashes,
+            'online_accepted':candidate.solution.canonical_hash==online_best_hash,
+            'window':candidate.window,'scheme':candidate.scheme,
+            'b_up':candidate.b_up,'b_low':candidate.b_low,
+            'b_up_changed':candidate.b_up_changed,'b_low_changed':candidate.b_low_changed,
+            'changed_parent_ids':candidate.changed_parent_ids,
+            'cross_rail_parent_changes':candidate.cross_rail_parent_changes,
+            'same_rail_robot_changes':candidate.same_rail_robot_changes,
+            'reordered_routes':candidate.reordered_routes,
+            'pattern_preserved':pattern_preserved,'x_children_fixed':x_fixed,
+            'robot_eligible':eligible,'complete_coverage':set(assigned)==set(blocks),
+            'direction_seconds':dp_seconds,'direction_feasible':direction.total_empty_travel is not None,
+            'reference_status':None,'reference_seconds':0.0,'certified':False,'cmax':None,
+            'strict_initial_improvement':False}
+        if direction.total_empty_travel is not None:
+            ref_started=time.perf_counter();schedule=evaluator(candidate.solution,data.CONFIG_V05,
+                orientations={robot:direction.directions[robot] for robot in range(4)})
+            row['reference_seconds']=time.perf_counter()-ref_started;row['reference_status']=schedule.status.value
+            if schedule.status is ScheduleStatus.FEASIBLE:
+                certification=certify_schedule(candidate.solution,schedule,data.CONFIG_V05,scope=FORMAL_SCOPE_V2)
+                row['certified']=certification.certified
+                if certification.certified:
+                    row['cmax']=official_metrics(candidate.solution,schedule,data.CONFIG_V05).cmax
+                    row['strict_initial_improvement']=row['cmax']<initial_cmax-1e-9*max(1.0,abs(initial_cmax))
+        offline.append(row)
+    st=result.stats;valid=() if pool is None else pool.candidates
+    best_offline=min((row['cmax'] for row in offline if row['strict_initial_improvement']),default=None)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],'actual_N':len(parents),
+        'seed':JRRB_DEVELOPMENT_SEED,'development_only':True,'status':result.status.value,
+        'initialization_strategy':initial.winning_strategy,'initial_cmax':initial_cmax,
+        'online_jrrb_cmax':st.jrrb_post_cmax,'online_direct_improvement':(
+            None if st.jrrb_post_cmax is None else initial_cmax-st.jrrb_post_cmax),
+        'funnel':{'attempted':st.jrrb_attempted,'constructed':st.jrrb_constructed,
+            'valid_unique':st.jrrb_valid_unique,'direction_evaluated':st.jrrb_direction_evaluated,
+            'direction_feasible':st.jrrb_direction_feasible,'reference_evaluated':st.jrrb_reference_evaluated,
+            'reference_status':dict(st.jrrb_reference_status),'certified':st.jrrb_certified,
+            'strict_cmax_improvements':st.jrrb_strict_cmax_improvements},
+        'structure':{'cross_rail_candidates':sum(c.cross_rail_parent_changes>0 for c in valid),
+            'both_boundaries_changed':sum(c.b_up_changed and c.b_low_changed for c in valid),
+            'four_routes_reordered':sum(c.reordered_routes==4 for c in valid)},
+        'timing':{'construction_seconds':st.jrrb_construction_time,
+            'online_direction_seconds':st.jrrb_direction_time,'online_reference_seconds':st.jrrb_reference_time,
+            'offline_direction_seconds':sum(row['direction_seconds'] for row in offline),
+            'offline_reference_seconds':sum(row['reference_seconds'] for row in offline)},
+        'offline_candidates':offline,'offline_certified':sum(row['certified'] for row in offline),
+        'offline_strict_improvements':sum(row['strict_initial_improvement'] for row in offline),
+        'offline_best_cmax':best_offline,
+        'split_counts':dict(Counter(pattern.kind.value for pattern in initial.solution.patterns)),
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'search_config':{'m':192,'m_atomic':144,'m_lns':48,'kdp':8,'kref':2,'kref_total':4,
+            'jrrb_max_candidates':16,'jrrb_kdp':8,'jrrb_kref':2,'crrr':False,
+            'crrr_access':False,'two_opt_star':False}}
+
+
+def run_jrrb_development_diagnostic(root=None):
+    """Run/resume the fixed six-state DEV quality gate; this is not the 60s matrix."""
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
+    _,entries=_region_initialization_entries(root);db=data.connect(data.DATABASE_V05)
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',(JRRB_DIAGNOSTIC_EXPERIMENT,))};db.close()
+    for entry in entries:
+        if entry['label'] in done:continue
+        row=_jrrb_development_diagnostic_worker((entry,root));db=data.connect(data.DATABASE_V05)
+        with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+            (JRRB_DIAGNOSTIC_EXPERIMENT,entry['label'],data.dumps(row)))
+        db.close();print(f"JRRB diagnostic {entry['label']} valid={row['funnel']['valid_unique']} offline_improved={row['offline_strict_improvements']}",flush=True)
+    return summarize_jrrb_development(root)
+
+
+def summarize_jrrb_development(root=None):
+    from . import dataset as data
+    db=data.connect(data.DATABASE_V05,readonly=True);rows=[json.loads(row[0]) for row in db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? ORDER BY item_id',(JRRB_DIAGNOSTIC_EXPERIMENT,))];db.close()
+    improved=[row for row in rows if row['offline_strict_improvements']>0]
+    summary={'diagnostic_runs':len(rows),'development_only':True,
+        'geometries_with_valid_candidates':sum(row['funnel']['valid_unique']>0 for row in rows),
+        'geometries_with_offline_certified_improvement':len(improved),
+        'online_top2_geometries_with_direct_improvement':sum(row['funnel']['strict_cmax_improvements']>0 for row in rows),
+        'quality_gate_passed':len(improved)>1,
+        'online_60s_matrix_executed':False,
+        'stop_reason':('candidate quality gate passed' if len(improved)>1 else
+            'only one development geometry has any offline certified improvement; per protocol, do not run the 24x60s matrix'),
+        'rows':rows}
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+        ('jrrb_development_summary','summary',data.dumps(summary)))
+    db.close();return summary
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate','jrrb-development-diagnostic','jrrb-development-summary'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -2433,4 +2571,6 @@ if __name__=='__main__':
             artifact_node_modules=r'C:\Users\Renjl\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules')
     elif args.action=='upgraded-run':run_upgraded_independent(args.root,args.workers)
     elif args.action=='upgraded-summary':print(json.dumps(summarize_upgraded_independent(args.root),ensure_ascii=False,indent=2))
-    else:validate_upgraded_independent(args.root)
+    elif args.action=='upgraded-validate':validate_upgraded_independent(args.root)
+    elif args.action=='jrrb-development-diagnostic':print(json.dumps(run_jrrb_development_diagnostic(args.root),ensure_ascii=False,indent=2))
+    else:print(json.dumps(summarize_jrrb_development(args.root),ensure_ascii=False,indent=2))
