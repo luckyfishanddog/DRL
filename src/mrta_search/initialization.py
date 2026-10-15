@@ -58,6 +58,7 @@ class InitializationStrategy(str, Enum):
     RAIL_MONOTONE_BALANCED = "RAIL_MONOTONE_BALANCED_BOOTSTRAP"
     REGION_COOPERATIVE_INITIALIZATION = "REGION_COOPERATIVE_INITIALIZATION"
     SAME_RAIL_BOUNDARY_REBALANCED = "SAME_RAIL_BOUNDARY_REBALANCED_INITIALIZATION"
+    REGION_COORDINATION_ROUTE_REORDERED = "REGION_COORDINATION_ROUTE_REORDERED"
 
 
 RAIL_SERIAL_BOOTSTRAP = "RAIL_SERIAL_BOOTSTRAP"
@@ -1150,6 +1151,55 @@ def _construct_region_cooperative_initialization(
     )
 
 
+def _construct_region_coordination_route_reordered_initialization(
+    parents: Sequence[ParentWeld],
+    patterns: tuple[SplitPattern, ...],
+    config: ScientificConfig,
+) -> CanonicalSolution:
+    """Keep REGION ownership and replace only its four route orders.
+
+    The deterministic farthest-insertion plus bounded 2-opt ordering is already
+    used by REGION's route toolkit. This construction exposes that alternative
+    in one existing initialization slot; it does not add a reference call or
+    change a split pattern, rail assignment, or robot assignment.
+    """
+    base = _construct_region_cooperative_initialization(parents, patterns, config)
+    blocks = block_map(base, config)
+    routes = tuple(
+        _bounded_two_opt(
+            _farthest_insertion_route(route.block_ids, blocks, config),
+            blocks,
+            config,
+        )
+        for route in base.routes
+    )
+    solution = canonicalize(
+        parents,
+        patterns,
+        tuple(Route(robot, routes[robot]) for robot in range(4)),
+        config,
+        revision=0,
+        x_split_validator=(
+            finite_x_split_validator(parents, config)
+            if any(pattern.kind is SplitKind.X_SPLIT for pattern in patterns)
+            else None
+        ),
+    )
+    base_owner = {
+        block_id: route.robot_id
+        for route in base.routes
+        for block_id in route.block_ids
+    }
+    reordered_owner = {
+        block_id: route.robot_id
+        for route in solution.routes
+        for block_id in route.block_ids
+    }
+    if reordered_owner != base_owner:
+        raise ValueError("coordination route reorder changed robot ownership")
+    return solution
+
+
 def _construct_same_rail_boundary_rebalanced_initialization(
     parents: Sequence[ParentWeld],
     patterns: tuple[SplitPattern, ...],
@@ -1399,6 +1449,7 @@ def build_initial_solution(
     clearance_aware: bool = False,
     region_cooperative: bool = False,
     same_rail_boundary_rebalance: bool = False,
+    coordination_route_reorder: bool = False,
     reference_evaluator: ReferenceEvaluator | None = None,
     certifier: Certifier = certify_schedule,
     scope: FormalScope | None = None,
@@ -1413,14 +1464,21 @@ def build_initial_solution(
         InitializationStrategy.SPATIAL_SPREAD,
         InitializationStrategy.RAIL_MONOTONE_BALANCED,
     )
-    cooperative_strategies = (
-        InitializationStrategy.LOAD_FIRST,
-        InitializationStrategy.RAIL_BALANCED,
-        (
+    if same_rail_boundary_rebalance and coordination_route_reorder:
+        raise ValueError("same-rail and coordination-route initializations share one slot")
+    replacement_strategy = (
+        InitializationStrategy.REGION_COORDINATION_ROUTE_REORDERED
+        if coordination_route_reorder
+        else (
             InitializationStrategy.SAME_RAIL_BOUNDARY_REBALANCED
             if same_rail_boundary_rebalance
             else InitializationStrategy.X_ORDER_AWARE
-        ),
+        )
+    )
+    cooperative_strategies = (
+        InitializationStrategy.LOAD_FIRST,
+        InitializationStrategy.RAIL_BALANCED,
+        replacement_strategy,
         InitializationStrategy.REGION_COOPERATIVE_INITIALIZATION,
         InitializationStrategy.RAIL_MONOTONE_BALANCED,
     )
@@ -1456,6 +1514,10 @@ def build_initial_solution(
         try:
             if strategy is InitializationStrategy.SAME_RAIL_BOUNDARY_REBALANCED:
                 solution = _construct_same_rail_boundary_rebalanced_initialization(
+                    parents, selected_patterns, config
+                )
+            elif strategy is InitializationStrategy.REGION_COORDINATION_ROUTE_REORDERED:
+                solution = _construct_region_coordination_route_reordered_initialization(
                     parents, selected_patterns, config
                 )
             else:

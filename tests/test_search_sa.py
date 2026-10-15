@@ -385,9 +385,16 @@ def test_jrrb_default_off_preserves_old_path_and_fixed_alns_budgets():
     assert first.best_schedule.canonical_json()==second.best_schedule.canonical_json()
     assert first.stats.jrrb_attempted==second.stats.jrrb_attempted==0
     assert base.initialization_same_rail_boundary_rebalance is False
+    assert base.initialization_coordination_route_reorder is False
     with pytest.raises(ValueError,match="same-rail initialization requires REGION"):
         replace(base,initialization_region_cooperative=False,
             initialization_same_rail_boundary_rebalance=True)
+    with pytest.raises(ValueError,match="coordination-route initialization requires REGION"):
+        replace(base,initialization_region_cooperative=False,
+            initialization_coordination_route_reorder=True)
+    with pytest.raises(ValueError,match="share one slot"):
+        replace(base,initialization_same_rail_boundary_rebalance=True,
+            initialization_coordination_route_reorder=True)
     assert (base.m,base.m_atomic,base.m_lns,base.kdp,base.kref,base.kref_total)==(192,144,48,8,2,4)
     assert not base.enable_crrr and not base.enable_two_opt_star
     with pytest.raises(ValueError,match='requires REGION'):

@@ -105,6 +105,7 @@ class SearchConfig:
     initialization_clearance_aware: bool = False
     initialization_region_cooperative: bool = False
     initialization_same_rail_boundary_rebalance: bool = False
+    initialization_coordination_route_reorder: bool = False
     c2_mode: str = BASELINE_C2
     m_atomic: int | None = None
     m_lns: int = 16
@@ -189,6 +190,16 @@ class SearchConfig:
             and not self.initialization_region_cooperative
         ):
             raise ValueError("same-rail initialization requires REGION cooperative initialization")
+        if (
+            self.initialization_coordination_route_reorder
+            and not self.initialization_region_cooperative
+        ):
+            raise ValueError("coordination-route initialization requires REGION cooperative initialization")
+        if (
+            self.initialization_coordination_route_reorder
+            and self.initialization_same_rail_boundary_rebalance
+        ):
+            raise ValueError("same-rail and coordination-route initializations share one slot")
 
 
 @dataclass(frozen=True)
@@ -1398,6 +1409,9 @@ def _run_bounded_sa_oi_inner(
             region_cooperative=search_config.initialization_region_cooperative,
             same_rail_boundary_rebalance=(
                 search_config.initialization_same_rail_boundary_rebalance
+            ),
+            coordination_route_reorder=(
+                search_config.initialization_coordination_route_reorder
             ),
             reference_evaluator=reference_evaluator,
             scope=scope,

@@ -2543,6 +2543,62 @@ SAME_RAIL_HIGH_WORKLOAD_SEEDS=tuple(range(20262231,20262237))
 SAME_RAIL_SOLVER_SEEDS=(20262221,20262222)
 SAME_RAIL_STRATEGY='SAME_RAIL_BOUNDARY_REBALANCED_INITIALIZATION'
 
+COORDINATION_ROUTE_ONLINE_EXPERIMENT='coordination_feasibility_route_online'
+COORDINATION_ROUTE_SOLVER_SEEDS=(20262321,20262322)
+COORDINATION_ROUTE_METHODS=('REGION_FAST_HEURISTIC','REGION_ROUTE_REORDER_HEURISTIC')
+
+
+def _coordination_route_online_worker(job):
+    """One paired 60-second run; only the initialization route slot differs."""
+    from dataclasses import replace
+    from . import dataset as data
+    entry,seed,method,root=job;smoke=_final_smoke_module(root)
+    parents=smoke._range_parents(entry,data.PPO)
+    budget_started_at=time.perf_counter()
+    search=replace(data.search_config(),initialization_region_cooperative=True,
+        initialization_same_rail_boundary_rebalance=False,
+        initialization_coordination_route_reorder=(method=='REGION_ROUTE_REORDER_HEURISTIC'),
+        lns_incremental_scoring=True,m_atomic=144,enable_crrr=False,enable_jrrb=False,
+        enable_two_opt_star=False)
+    record,_=data.run_trajectory(entry,seed,parents=parents,config=data.CONFIG_V05,
+        search=search,budget_started_at=budget_started_at)
+    return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],
+        'relative_path':entry['relative_path'],'sheet_name':entry['sheet_name'],
+        'actual_N':len(parents),'seed':seed,'method':method,
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),**record}
+
+
+def run_coordination_route_online(root=None,workers=4):
+    """Run/resume the fixed 6x2x2 consumed-development paired matrix."""
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    _,entries=_region_initialization_entries(root)
+    db=data.connect(data.DATABASE_V05)
+    done={row[0] for row in db.execute(
+        'SELECT item_id FROM experiments WHERE experiment=?',
+        (COORDINATION_ROUTE_ONLINE_EXPERIMENT,))};db.close()
+    jobs=[]
+    for entry_index,entry in enumerate(entries):
+        for seed_index,seed in enumerate(COORDINATION_ROUTE_SOLVER_SEEDS):
+            order=(COORDINATION_ROUTE_METHODS if (entry_index+seed_index)%2==0
+                else tuple(reversed(COORDINATION_ROUTE_METHODS)))
+            for method in order:
+                key=f"{entry['label']}:{seed}:{method}"
+                if key not in done:jobs.append((key,(entry,seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),
+            mp_context=mp.get_context('spawn'),initializer=_final_worker_init,
+            initargs=(masks,)) as pool:
+        futures={pool.submit(_coordination_route_online_worker,job):key for key,job in jobs}
+        for future in as_completed(futures):
+            key=futures[future];row=future.result();db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+                (COORDINATION_ROUTE_ONLINE_EXPERIMENT,key,data.dumps(row)))
+            db.close();print(f"coordination route {key} Cmax60={row['Cmax_at_60']}",flush=True)
+    return len(jobs)
+
 
 def _same_rail_high_workload_states(root):
     """Build six fixed development geometries in memory, without solver selection."""
@@ -2795,7 +2851,7 @@ def summarize_same_rail(root=None):
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate','jrrb-development-diagnostic','jrrb-development-summary','same-rail-diagnostic','same-rail-online','same-rail-summary'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate','jrrb-development-diagnostic','jrrb-development-summary','same-rail-diagnostic','same-rail-online','same-rail-summary','coordination-route-online'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -2839,4 +2895,5 @@ if __name__=='__main__':
     elif args.action=='jrrb-development-summary':print(json.dumps(summarize_jrrb_development(args.root),ensure_ascii=False,indent=2))
     elif args.action=='same-rail-diagnostic':print(json.dumps(run_same_rail_diagnostic(args.root),ensure_ascii=False,indent=2))
     elif args.action=='same-rail-online':print(json.dumps(run_same_rail_online(args.root,args.workers),ensure_ascii=False,indent=2))
-    else:print(json.dumps(summarize_same_rail(args.root),ensure_ascii=False,indent=2))
+    elif args.action=='same-rail-summary':print(json.dumps(summarize_same_rail(args.root),ensure_ascii=False,indent=2))
+    else:run_coordination_route_online(args.root,args.workers)

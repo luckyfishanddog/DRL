@@ -12,6 +12,7 @@ from mrta_search.initialization import (
     RAIL_SERIAL_BOOTSTRAP,
     InitializationStatus,
     _construct_region_cooperative_initialization,
+    _construct_region_coordination_route_reordered_initialization,
     _construct_rail_monotone_balanced_bootstrap,
     _construct_same_rail_boundary_rebalanced_initialization,
     _patterns,
@@ -437,6 +438,61 @@ def test_same_rail_rebalance_default_off_replaces_only_x_order_slot():
         "RAIL_MONOTONE_BALANCED_BOOTSTRAP",
     ]
     assert sum(row.schedule is not None for row in enabled.attempts[:5]) <= 5
+
+
+def test_coordination_route_reorder_is_default_off_and_replaces_only_x_order_slot():
+    parents = _v3_fixture()
+    default = build_initial_solution(
+        parents, FAST, _stats(), construction_budget=5, kinit_ref=5,
+        portfolio=True, region_cooperative=True,
+    )
+    explicit_off = build_initial_solution(
+        parents, FAST, _stats(), construction_budget=5, kinit_ref=5,
+        portfolio=True, region_cooperative=True, coordination_route_reorder=False,
+    )
+    enabled = build_initial_solution(
+        parents, FAST, _stats(), construction_budget=5, kinit_ref=5,
+        portfolio=True, region_cooperative=True, coordination_route_reorder=True,
+    )
+    assert default.solution == explicit_off.solution
+    assert default.directions == explicit_off.directions
+    assert [row.strategy for row in enabled.attempts[:5]] == [
+        "LOAD_FIRST",
+        "RAIL_BALANCED",
+        "REGION_COORDINATION_ROUTE_REORDERED",
+        "REGION_COOPERATIVE_INITIALIZATION",
+        "RAIL_MONOTONE_BALANCED_BOOTSTRAP",
+    ]
+    assert sum(row.schedule is not None for row in enabled.attempts[:5]) <= 5
+
+
+def test_coordination_route_reorder_changes_only_order_and_preserves_legality():
+    parents = _v3_fixture() + (
+        ParentWeld("mandatory", (10.0, 5.0), (10.0, 7.0)),
+    )
+    patterns = _patterns(parents, FAST)
+    base = _construct_region_cooperative_initialization(parents, patterns, FAST)
+    candidate = _construct_region_coordination_route_reordered_initialization(
+        parents, patterns, FAST
+    )
+    assert candidate.patterns == base.patterns
+    assert {
+        block_id: route.robot_id
+        for route in candidate.routes
+        for block_id in route.block_ids
+    } == {
+        block_id: route.robot_id
+        for route in base.routes
+        for block_id in route.block_ids
+    }
+    blocks = block_map(candidate, FAST)
+    assigned = [block_id for route in candidate.routes for block_id in route.block_ids]
+    assert len(assigned) == len(set(assigned)) == len(blocks)
+    assert all(
+        robot_is_eligible(blocks[block_id], route.robot_id, FAST)
+        for route in candidate.routes
+        for block_id in route.block_ids
+    )
 
 
 def test_same_rail_rebalance_is_joint_legal_and_preserves_split_ownership():
