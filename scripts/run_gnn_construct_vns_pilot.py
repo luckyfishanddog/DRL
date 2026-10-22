@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from copy import deepcopy
+import json
 import math
 from pathlib import Path
 import random
@@ -36,6 +37,8 @@ from mrta_search.gnn_constructor import (
     rule_assignment,
 )
 from mrta_search.vns import (
+    GLOBAL_BALANCED,
+    LEGACY_LOCAL_ABSOLUTE,
     NEIGHBORHOODS,
     VNSResult,
     VNSStats,
@@ -382,6 +385,131 @@ def run_method(entry, method, seed, config, budget):
     }
 
 
+def _solution_changes(initial, final):
+    initial_owner = {
+        block_id: route.robot_id
+        for route in initial.solution.routes
+        for block_id in route.block_ids
+    }
+    final_owner = {
+        block_id: route.robot_id
+        for route in final.solution.routes
+        for block_id in route.block_ids
+    }
+    assignment_changes = sum(
+        initial_owner[block_id] != final_owner[block_id] for block_id in initial_owner
+    )
+    changed_routes = sum(
+        left.block_ids != right.block_ids
+        for left, right in zip(initial.solution.routes, final.solution.routes)
+    )
+    return assignment_changes, changed_routes
+
+
+def run_paired_vns_fix(entry, construction_kind, seed, config, budget, model=None):
+    """Compare legacy/new selection from one already-certified fixed-split initial."""
+    parents = ranker_dataset.load_parents(entry)
+    constructed = construct_solution(
+        parents,
+        config,
+        model=model if construction_kind == "GNN" else None,
+    )
+    initial_evaluator = CommonBaselineEvaluator(
+        parents,
+        config,
+        FORMAL_SCOPE_V2,
+        time_limit=max(5.0, budget),
+        checkpoints=(max(5.0, budget),),
+    )
+    initial, attempts, initial_failures = evaluate_initial_with_shared_repair(
+        constructed.solution, initial_evaluator, config
+    )
+    if initial is None:
+        return [{
+            "instance": entry["instance_id"],
+            "N": entry["N"],
+            "construction": construction_kind,
+            "seed": seed,
+            "status": "INITIALIZATION_FAILED",
+            "initial_attempts": attempts,
+            "initial_failures": initial_failures,
+        }]
+
+    rows = []
+    for policy in (LEGACY_LOCAL_ABSOLUTE, GLOBAL_BALANCED):
+        evaluator = CommonBaselineEvaluator(
+            parents,
+            config,
+            FORMAL_SCOPE_V2,
+            time_limit=budget,
+            checkpoints=(budget,),
+        )
+        outcome = run_vns(
+            initial.solution,
+            evaluator,
+            config,
+            seed=seed,
+            per_neighborhood_budget=12,
+            selection_policy=policy,
+            certified_initial=initial,
+        )
+        assert outcome.initial is not None and outcome.best is not None
+        assignment_changes, changed_routes = _solution_changes(
+            outcome.initial, outcome.best
+        )
+        initial_metrics = _solution_metrics(outcome.initial, config)
+        final_metrics = _solution_metrics(outcome.best, config)
+        rows.append({
+            "instance": entry["instance_id"],
+            "N": entry["N"],
+            "construction": construction_kind,
+            "policy": policy,
+            "seed": seed,
+            "status": "CERTIFIED",
+            "initial": initial_metrics,
+            "final": final_metrics,
+            "improvement_percent": 100.0 * (
+                initial_metrics["cmax"] - final_metrics["cmax"]
+            ) / initial_metrics["cmax"],
+            "solve_seconds": outcome.elapsed,
+            "iterations": outcome.stats.iterations,
+            "generated": dict(outcome.stats.generated),
+            "attempted": dict(outcome.stats.attempted),
+            "certified": dict(outcome.stats.certified),
+            "improvements": dict(outcome.stats.improvements),
+            "failures": dict(outcome.stats.failures),
+            "explored_types": outcome.stats.explored_types,
+            "assignment_changes": assignment_changes,
+            "changed_routes": changed_routes,
+        })
+    return rows
+
+
+def run_vns_fix_mode(dev_entries, config, budget, all_dev, seeds):
+    entries = dev_entries if all_dev else _select_pilot_entries(dev_entries)
+    model, _ = load_model()
+    rows = []
+    for entry in entries:
+        for seed in seeds:
+            for construction_kind in ("RULE", "GNN"):
+                print(
+                    f"paired-vns {_entry_label(entry)} seed={seed} {construction_kind}",
+                    flush=True,
+                )
+                produced = run_paired_vns_fix(
+                    entry,
+                    construction_kind,
+                    seed,
+                    config,
+                    budget,
+                    model,
+                )
+                rows.extend(produced)
+                for row in produced:
+                    print("VNS_FIX_ROW " + json.dumps(row, ensure_ascii=False), flush=True)
+    return rows
+
+
 def run_wag_reference(entry, seed, config, budget):
     parents = ranker_dataset.load_parents(entry)
     started = time.perf_counter()
@@ -627,6 +755,14 @@ def main():
     parser.add_argument("--pilot-budget", type=float, default=20.0)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--skip-wag", action="store_true")
+    parser.add_argument(
+        "--vns-fix-mode",
+        action="store_true",
+        help="skip training and compare legacy/new VNS selection from paired initials",
+    )
+    parser.add_argument("--vns-fix-budget", type=float, default=20.0)
+    parser.add_argument("--vns-fix-all-dev", action="store_true")
+    parser.add_argument("--vns-fix-seeds", type=int, nargs="+", default=[20261022])
     args = parser.parse_args()
     config = ScientificConfig()
     representatives = ranker_dataset.representatives_v05()
@@ -634,6 +770,15 @@ def main():
     dev_entries = [entry for entry in representatives if entry["split"] == "MLP_DEV"]
     if (len(train_entries), len(dev_entries)) != (17, 6):
         raise ValueError("expected existing 17 TRAIN / 6 DEV workbook split")
+    if args.vns_fix_mode:
+        run_vns_fix_mode(
+            dev_entries,
+            config,
+            args.vns_fix_budget,
+            args.vns_fix_all_dev,
+            tuple(args.vns_fix_seeds),
+        )
+        return
     train_records, train_diag = build_experts(train_entries, config, args.expert_budget)
     dev_records, dev_diag = build_experts(dev_entries, config, args.expert_budget)
     if not train_records or not dev_records:

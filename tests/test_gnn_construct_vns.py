@@ -25,6 +25,8 @@ from mrta_search.gnn_constructor import (
     solution_from_assignment,
 )
 from mrta_search.vns import (
+    GLOBAL_BALANCED,
+    LEGACY_LOCAL_ABSOLUTE,
     n1_relocate_candidates,
     n2_swap_candidates,
     n3_route_candidates,
@@ -47,6 +49,35 @@ def _parents():
 
 def _solution():
     return construct_solution(_parents(), CONFIG).solution
+
+
+def _imbalanced_solution():
+    parents = (
+        ParentWeld("a", (1.0, 6.0), (4.5, 6.0)),
+        ParentWeld("b", (5.0, 6.0), (8.5, 6.0)),
+        ParentWeld("c", (9.0, 6.0), (12.5, 6.0)),
+        ParentWeld("d", (13.0, 6.0), (16.5, 6.0)),
+        ParentWeld("e", (2.0, 6.0), (2.5, 6.0)),
+        ParentWeld("f", (3.0, 6.0), (3.5, 6.0)),
+        ParentWeld("g", (10.0, 6.0), (10.5, 6.0)),
+        ParentWeld("h", (15.0, 6.0), (15.5, 6.0)),
+    )
+    patterns = tuple(
+        SplitPattern(parent.parent_id, SplitKind.WHOLE) for parent in parents
+    )
+    solution = canonicalize(
+        parents,
+        patterns,
+        {
+            0: ("a::whole", "c::whole", "b::whole", "d::whole"),
+            1: ("e::whole", "f::whole"),
+            2: ("g::whole",),
+            3: ("h::whole",),
+        },
+        CONFIG,
+        scope=FORMAL_SCOPE_V2,
+    )
+    return parents, solution
 
 
 def _assert_assignment_legal(solution):
@@ -107,8 +138,8 @@ def test_solution_constructor_rejects_an_illegal_robot_before_canonicalization()
 
 def test_vns_relocate_and_swap_keep_assignment_legal():
     solution = _solution()
-    relocate = n1_relocate_candidates(solution, CONFIG, random.Random(7), cap=12)
-    swap = n2_swap_candidates(solution, CONFIG, random.Random(7), cap=12)
+    relocate = n1_relocate_candidates(solution, CONFIG, random.Random(7), cap=10_000)
+    swap = n2_swap_candidates(solution, CONFIG, random.Random(7), cap=10_000)
     assert relocate
     assert swap
     for candidate in (*relocate, *swap):
@@ -120,8 +151,60 @@ def test_route_neighborhood_preserves_each_robot_task_set():
     candidates = n3_route_candidates(solution, CONFIG, random.Random(9), cap=20)
     assert candidates
     expected = [set(route.block_ids) for route in solution.routes]
+    signatures = set()
     for candidate in candidates:
         assert [set(route.block_ids) for route in candidate.routes] == expected
+        signatures.add(candidate.canonical_json)
+    assert len(signatures) == len(candidates)
+
+
+def test_global_n1_and_n2_selection_reaches_the_critical_robot():
+    _, solution = _imbalanced_solution()
+    for builder in (n1_relocate_candidates, n2_swap_candidates):
+        candidate = builder(
+            solution,
+            CONFIG,
+            random.Random(4),
+            cap=1,
+            selection_policy=GLOBAL_BALANCED,
+        )[0]
+        changed = [
+            robot
+            for robot in range(4)
+            if candidate.routes[robot].block_ids != solution.routes[robot].block_ids
+        ]
+        assert 0 in changed
+        _assert_assignment_legal(candidate)
+
+
+def test_n3_global_selection_uses_critical_route_and_improvement_not_absolute_cost():
+    _, solution = _imbalanced_solution()
+    global_candidate = n3_route_candidates(
+        solution,
+        CONFIG,
+        random.Random(5),
+        cap=1,
+        selection_policy=GLOBAL_BALANCED,
+    )[0]
+    legacy_candidate = n3_route_candidates(
+        solution,
+        CONFIG,
+        random.Random(5),
+        cap=1,
+        selection_policy=LEGACY_LOCAL_ABSOLUTE,
+    )[0]
+    global_changed = [
+        robot
+        for robot in range(4)
+        if global_candidate.routes[robot].block_ids != solution.routes[robot].block_ids
+    ]
+    legacy_changed = [
+        robot
+        for robot in range(4)
+        if legacy_candidate.routes[robot].block_ids != solution.routes[robot].block_ids
+    ]
+    assert global_changed == [0]
+    assert legacy_changed == [1]
 
 
 def test_same_rail_passing_cannot_pass_independent_certification():
@@ -182,6 +265,10 @@ def test_same_seed_gnn_inference_and_vns_are_reproducible():
         )
         results.append(result)
     assert results[0].best is not None and results[1].best is not None
+    assert results[0].initial is not None and results[1].initial is not None
     assert results[0].best.solution.canonical_json == results[1].best.solution.canonical_json
     assert results[0].stats.improvements == results[1].stats.improvements
+    assert results[0].best.metrics.cmax <= results[0].initial.metrics.cmax
+    assert results[0].best.certification is not None
+    assert results[0].best.certification.certified
 

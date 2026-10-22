@@ -19,6 +19,8 @@ from mrta_reference.solution import block_map, canonicalize
 
 
 NEIGHBORHOODS = ("N1_RELOCATE", "N2_SWAP", "N3_ROUTE")
+GLOBAL_BALANCED = "GLOBAL_BALANCED"
+LEGACY_LOCAL_ABSOLUTE = "LEGACY_LOCAL_ABSOLUTE"
 
 
 @dataclass
@@ -32,6 +34,12 @@ class VNSStats:
     )
     improvements: dict[str, int] = field(
         default_factory=lambda: {name: 0 for name in NEIGHBORHOODS}
+    )
+    generated: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in NEIGHBORHOODS}
+    )
+    explored_types: dict[str, dict[str, int]] = field(
+        default_factory=lambda: {name: {} for name in NEIGHBORHOODS}
     )
     failures: dict[str, int] = field(
         default_factory=lambda: {
@@ -51,6 +59,13 @@ class VNSResult:
     initialization_attempts: int
     initialization_failures: tuple[str, ...]
     elapsed: float
+
+
+@dataclass(frozen=True)
+class _CandidateBatch:
+    candidates: tuple[CanonicalSolution, ...]
+    move_types: tuple[str, ...]
+    generated_count: int
 
 
 def _replace_routes(
@@ -163,20 +178,121 @@ def _ranked_insertions(
     return tuple(position for _, position in sorted(ranked)[:limit])
 
 
-def n1_relocate_candidates(
+@dataclass(frozen=True)
+class _Proposal:
+    key: tuple[object, ...]
+    group: str
+    move_type: str
+    routes: tuple[tuple[str, ...], ...]
+
+
+def _route_signature(routes: Sequence[Sequence[str]]) -> tuple[tuple[str, ...], ...]:
+    return tuple(tuple(route) for route in routes)
+
+
+def _processing_loads_from_routes(routes, blocks, config: ScientificConfig) -> tuple[float, ...]:
+    return tuple(
+        sum(config.process_time(blocks[block_id].length) for block_id in route)
+        for route in routes
+    )
+
+
+def _route_costs_from_routes(routes, blocks, config: ScientificConfig) -> tuple[float, ...]:
+    return tuple(_route_cost(route, blocks, config) for route in routes)
+
+
+def _same_rail_inversions(routes, blocks) -> int:
+    """Cheap coordination proxy; it is never treated as a feasibility rule."""
+    total = 0
+    for left, right in ((0, 1), (2, 3)):
+        left_x = [
+            (blocks[block_id].start[0] + blocks[block_id].end[0]) / 2.0
+            for block_id in routes[left]
+        ]
+        right_x = [
+            (blocks[block_id].start[0] + blocks[block_id].end[0]) / 2.0
+            for block_id in routes[right]
+        ]
+        total += sum(left_value > right_value for left_value in left_x for right_value in right_x)
+    return total
+
+
+def _select_proposals(
+    proposals: Sequence[_Proposal],
+    cap: int,
+    *,
+    diverse: bool,
+) -> tuple[_Proposal, ...]:
+    """Select strong global candidates while reserving four slots for move diversity."""
+    if cap <= 0:
+        return ()
+    unique: dict[tuple[tuple[str, ...], ...], _Proposal] = {}
+    for proposal in proposals:
+        previous = unique.get(proposal.routes)
+        if previous is None or proposal.key < previous.key:
+            unique[proposal.routes] = proposal
+    ranked = sorted(unique.values(), key=lambda proposal: proposal.key)
+    if not diverse or len(ranked) <= cap:
+        return tuple(ranked[:cap])
+
+    reserve = min(4, max(1, cap // 3))
+    selected = list(ranked[: max(0, cap - reserve)])
+    selected_signatures = {proposal.routes for proposal in selected}
+    represented_groups = {proposal.group for proposal in selected}
+
+    group_best: dict[str, _Proposal] = {}
+    for proposal in ranked:
+        group_best.setdefault(proposal.group, proposal)
+    for proposal in sorted(group_best.values(), key=lambda item: item.key):
+        if len(selected) >= cap:
+            break
+        if proposal.group in represented_groups or proposal.routes in selected_signatures:
+            continue
+        selected.append(proposal)
+        selected_signatures.add(proposal.routes)
+        represented_groups.add(proposal.group)
+    for proposal in ranked:
+        if len(selected) >= cap:
+            break
+        if proposal.routes not in selected_signatures:
+            selected.append(proposal)
+            selected_signatures.add(proposal.routes)
+    return tuple(selected)
+
+
+def _materialize_batch(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    proposals: Sequence[_Proposal],
+    cap: int,
+    *,
+    diverse: bool,
+) -> _CandidateBatch:
+    selected = _select_proposals(proposals, cap, diverse=diverse)
+    return _CandidateBatch(
+        tuple(_replace_routes(solution, proposal.routes, config) for proposal in selected),
+        tuple(proposal.move_type for proposal in selected),
+        len({proposal.routes for proposal in proposals}),
+    )
+
+
+def _n1_relocate_batch(
     solution: CanonicalSolution,
     config: ScientificConfig,
     rng: random.Random,
     *,
     cap: int,
-) -> tuple[CanonicalSolution, ...]:
+    selection_policy: str,
+) -> _CandidateBatch:
     blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
     routes = _route_lists(solution)
-    loads = _loads(solution, config)
+    loads = _processing_loads_from_routes(routes, blocks, config)
+    route_costs = _route_costs_from_routes(routes, blocks, config)
+    critical = {max(range(4), key=loads.__getitem__), max(range(4), key=route_costs.__getitem__)}
     sources = list(range(4))
     rng.shuffle(sources)
     sources.sort(key=lambda robot: -loads[robot])
-    proposals: list[tuple[float, int, int, str, int]] = []
+    proposals: list[_Proposal] = []
     for source in sources:
         block_ids = list(routes[source])
         rng.shuffle(block_ids)
@@ -186,38 +302,98 @@ def n1_relocate_candidates(
                     blocks[block_id], destination, config
                 ):
                     continue
-                source_route = [item for item in routes[source] if item != block_id]
-                for position in _ranked_insertions(
-                    block_id, routes[destination], blocks, config
-                ):
-                    destination_route = list(routes[destination])
-                    destination_route.insert(position, block_id)
-                    cheap = max(
-                        _route_cost(source_route, blocks, config),
-                        _route_cost(destination_route, blocks, config),
+                positions: Iterable[int]
+                if selection_policy == LEGACY_LOCAL_ABSOLUTE:
+                    positions = _ranked_insertions(
+                        block_id, routes[destination], blocks, config
                     )
+                else:
+                    positions = range(len(routes[destination]) + 1)
+                for position in positions:
+                    candidate_routes = [list(route) for route in routes]
+                    candidate_routes[source].remove(block_id)
+                    candidate_routes[destination].insert(position, block_id)
+                    candidate_costs = list(route_costs)
+                    candidate_costs[source] = _route_cost(
+                        candidate_routes[source], blocks, config
+                    )
+                    candidate_costs[destination] = _route_cost(
+                        candidate_routes[destination], blocks, config
+                    )
+                    if selection_policy == LEGACY_LOCAL_ABSOLUTE:
+                        key = (
+                            max(candidate_costs[source], candidate_costs[destination]),
+                            source,
+                            destination,
+                            block_id,
+                            position,
+                        )
+                    else:
+                        candidate_loads = list(loads)
+                        duration = config.process_time(blocks[block_id].length)
+                        candidate_loads[source] -= duration
+                        candidate_loads[destination] += duration
+                        key = (
+                            max(candidate_loads),
+                            max(candidate_costs),
+                            max(candidate_loads) - max(loads),
+                            max(candidate_costs) - max(route_costs),
+                            0 if source in critical else 1,
+                            _same_rail_inversions(candidate_routes, blocks),
+                            sum(candidate_costs) - sum(route_costs),
+                            source,
+                            destination,
+                            block_id,
+                            position,
+                        )
                     proposals.append(
-                        (cheap, source, destination, block_id, position)
+                        _Proposal(
+                            key,
+                            f"R{source}->R{destination}",
+                            f"R{source}->R{destination}",
+                            _route_signature(candidate_routes),
+                        )
                     )
-    result = []
-    for _, source, destination, block_id, position in sorted(proposals)[:cap]:
-        candidate_routes = [list(route) for route in routes]
-        candidate_routes[source].remove(block_id)
-        candidate_routes[destination].insert(position, block_id)
-        result.append(_replace_routes(solution, candidate_routes, config))
-    return tuple(result)
+    return _materialize_batch(
+        solution,
+        config,
+        proposals,
+        cap,
+        diverse=selection_policy != LEGACY_LOCAL_ABSOLUTE,
+    )
 
 
-def n2_swap_candidates(
+def n1_relocate_candidates(
     solution: CanonicalSolution,
     config: ScientificConfig,
     rng: random.Random,
     *,
     cap: int,
+    selection_policy: str = GLOBAL_BALANCED,
 ) -> tuple[CanonicalSolution, ...]:
+    return _n1_relocate_batch(
+        solution,
+        config,
+        rng,
+        cap=cap,
+        selection_policy=selection_policy,
+    ).candidates
+
+
+def _n2_swap_batch(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    rng: random.Random,
+    *,
+    cap: int,
+    selection_policy: str,
+) -> _CandidateBatch:
     blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
     routes = _route_lists(solution)
-    proposals: list[tuple[float, int, int, int, int]] = []
+    loads = _processing_loads_from_routes(routes, blocks, config)
+    route_costs = _route_costs_from_routes(routes, blocks, config)
+    critical = {max(range(4), key=loads.__getitem__), max(range(4), key=route_costs.__getitem__)}
+    proposals: list[_Proposal] = []
     pairs = [(left, right) for left in range(4) for right in range(left + 1, 4)]
     rng.shuffle(pairs)
     for left, right in pairs:
@@ -227,28 +403,149 @@ def n2_swap_candidates(
                     continue
                 if not robot_is_eligible(blocks[right_id], left, config):
                     continue
-                left_route = list(routes[left])
-                right_route = list(routes[right])
-                left_route[left_position], right_route[right_position] = (
+                candidate_routes = [list(route) for route in routes]
+                candidate_routes[left][left_position], candidate_routes[right][right_position] = (
                     right_id,
                     left_id,
                 )
-                cheap = max(
-                    _route_cost(left_route, blocks, config),
-                    _route_cost(right_route, blocks, config),
-                )
+                candidate_costs = list(route_costs)
+                candidate_costs[left] = _route_cost(candidate_routes[left], blocks, config)
+                candidate_costs[right] = _route_cost(candidate_routes[right], blocks, config)
+                if selection_policy == LEGACY_LOCAL_ABSOLUTE:
+                    key = (
+                        max(candidate_costs[left], candidate_costs[right]),
+                        left,
+                        right,
+                        left_position,
+                        right_position,
+                    )
+                else:
+                    candidate_loads = list(loads)
+                    left_duration = config.process_time(blocks[left_id].length)
+                    right_duration = config.process_time(blocks[right_id].length)
+                    candidate_loads[left] += right_duration - left_duration
+                    candidate_loads[right] += left_duration - right_duration
+                    key = (
+                        max(candidate_loads),
+                        max(candidate_costs),
+                        max(candidate_loads) - max(loads),
+                        max(candidate_costs) - max(route_costs),
+                        0 if left in critical or right in critical else 1,
+                        _same_rail_inversions(candidate_routes, blocks),
+                        sum(candidate_costs) - sum(route_costs),
+                        left,
+                        right,
+                        left_position,
+                        right_position,
+                    )
                 proposals.append(
-                    (cheap, left, right, left_position, right_position)
+                    _Proposal(
+                        key,
+                        f"R{left}<->R{right}",
+                        f"R{left}<->R{right}",
+                        _route_signature(candidate_routes),
+                    )
                 )
-    result = []
-    for _, left, right, left_position, right_position in sorted(proposals)[:cap]:
+    return _materialize_batch(
+        solution,
+        config,
+        proposals,
+        cap,
+        diverse=selection_policy != LEGACY_LOCAL_ABSOLUTE,
+    )
+
+
+def n2_swap_candidates(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    rng: random.Random,
+    *,
+    cap: int,
+    selection_policy: str = GLOBAL_BALANCED,
+) -> tuple[CanonicalSolution, ...]:
+    return _n2_swap_batch(
+        solution,
+        config,
+        rng,
+        cap=cap,
+        selection_policy=selection_policy,
+    ).candidates
+
+
+def _n3_route_batch(
+    solution: CanonicalSolution,
+    config: ScientificConfig,
+    rng: random.Random,
+    *,
+    cap: int,
+    selection_policy: str,
+) -> _CandidateBatch:
+    blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
+    routes = _route_lists(solution)
+    route_costs = _route_costs_from_routes(routes, blocks, config)
+    critical = {max(range(4), key=route_costs.__getitem__)}
+    proposals: list[_Proposal] = []
+    robot_order = list(range(4))
+    rng.shuffle(robot_order)
+
+    def append_proposal(robot: int, candidate: tuple[str, ...], operation: str) -> None:
+        if candidate == tuple(routes[robot]):
+            return
         candidate_routes = [list(route) for route in routes]
-        candidate_routes[left][left_position], candidate_routes[right][right_position] = (
-            candidate_routes[right][right_position],
-            candidate_routes[left][left_position],
+        candidate_routes[robot] = list(candidate)
+        new_cost = _route_cost(candidate, blocks, config)
+        candidate_costs = list(route_costs)
+        candidate_costs[robot] = new_cost
+        if selection_policy == LEGACY_LOCAL_ABSOLUTE:
+            key = (new_cost, robot, candidate)
+        else:
+            key = (
+                max(candidate_costs),
+                new_cost - route_costs[robot],
+                0 if robot in critical else 1,
+                _same_rail_inversions(candidate_routes, blocks),
+                sum(candidate_costs) - sum(route_costs),
+                robot,
+                operation,
+                candidate,
+            )
+        proposals.append(
+            _Proposal(
+                key,
+                f"R{robot}:{operation}",
+                f"R{robot}:{operation}",
+                _route_signature(candidate_routes),
+            )
         )
-        result.append(_replace_routes(solution, candidate_routes, config))
-    return tuple(result)
+
+    for robot in robot_order:
+        route = routes[robot]
+        for left in range(len(route) - 1):
+            for right in range(left + 1, min(len(route), left + 6)):
+                candidate = tuple(route[:left]) + tuple(
+                    reversed(route[left : right + 1])
+                ) + tuple(route[right + 1 :])
+                append_proposal(robot, candidate, "2OPT")
+        for source in range(len(route)):
+            removed = route[source]
+            remainder = route[:source] + route[source + 1 :]
+            if selection_policy == LEGACY_LOCAL_ABSOLUTE:
+                destinations: Iterable[int] = _ranked_insertions(
+                    removed, remainder, blocks, config
+                )
+            else:
+                destinations = range(len(remainder) + 1)
+            for destination in destinations:
+                candidate_list = list(remainder)
+                candidate_list.insert(destination, removed)
+                append_proposal(robot, tuple(candidate_list), "REINSERT")
+    return _materialize_batch(
+        solution,
+        config,
+        proposals,
+        cap,
+        diverse=selection_policy != LEGACY_LOCAL_ABSOLUTE,
+    )
 
 
 def n3_route_candidates(
@@ -257,44 +554,15 @@ def n3_route_candidates(
     rng: random.Random,
     *,
     cap: int,
+    selection_policy: str = GLOBAL_BALANCED,
 ) -> tuple[CanonicalSolution, ...]:
-    blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
-    routes = _route_lists(solution)
-    proposals: list[tuple[float, int, tuple[str, ...]]] = []
-    robot_order = list(range(4))
-    rng.shuffle(robot_order)
-    for robot in robot_order:
-        route = routes[robot]
-        for left in range(len(route) - 1):
-            for right in range(left + 1, min(len(route), left + 6)):
-                candidate = tuple(route[:left]) + tuple(
-                    reversed(route[left : right + 1])
-                ) + tuple(route[right + 1 :])
-                proposals.append((_route_cost(candidate, blocks, config), robot, candidate))
-        for source in range(len(route)):
-            removed = route[source]
-            remainder = route[:source] + route[source + 1 :]
-            for destination in _ranked_insertions(removed, remainder, blocks, config):
-                candidate_list = list(remainder)
-                candidate_list.insert(destination, removed)
-                candidate = tuple(candidate_list)
-                if candidate != tuple(route):
-                    proposals.append(
-                        (_route_cost(candidate, blocks, config), robot, candidate)
-                    )
-    result = []
-    seen = set()
-    for _, robot, route in sorted(proposals):
-        key = (robot, route)
-        if key in seen:
-            continue
-        seen.add(key)
-        candidate_routes = [list(items) for items in routes]
-        candidate_routes[robot] = list(route)
-        result.append(_replace_routes(solution, candidate_routes, config))
-        if len(result) >= cap:
-            break
-    return tuple(result)
+    return _n3_route_batch(
+        solution,
+        config,
+        rng,
+        cap=cap,
+        selection_policy=selection_policy,
+    ).candidates
 
 
 def _record_failure(stats: VNSStats, result: EvaluatedCandidate) -> None:
@@ -310,13 +578,24 @@ def run_vns(
     *,
     seed: int,
     per_neighborhood_budget: int = 12,
+    selection_policy: str = GLOBAL_BALANCED,
+    certified_initial: EvaluatedCandidate | None = None,
 ) -> VNSResult:
     """Run deterministic-seed VND and accept only strictly better certified Cmax."""
+    if selection_policy not in (GLOBAL_BALANCED, LEGACY_LOCAL_ABSOLUTE):
+        raise ValueError(f"unknown VNS selection policy: {selection_policy}")
     started = time.perf_counter()
     stats = VNSStats()
-    initial, attempts, init_failures = evaluate_initial_with_shared_repair(
-        initial_solution, evaluator, config
-    )
+    if certified_initial is None:
+        initial, attempts, init_failures = evaluate_initial_with_shared_repair(
+            initial_solution, evaluator, config
+        )
+    else:
+        initial = evaluator.inject_certified(
+            certified_initial, source="PAIRED_CERTIFIED_INITIAL"
+        )
+        attempts = 0
+        init_failures = ()
     if initial is None:
         return VNSResult(
             None,
@@ -329,21 +608,25 @@ def run_vns(
     current = initial
     rng = random.Random(seed)
     neighborhood = 0
-    builders = (n1_relocate_candidates, n2_swap_candidates, n3_route_candidates)
+    builders = (_n1_relocate_batch, _n2_swap_batch, _n3_route_batch)
     while not evaluator.expired and neighborhood < len(NEIGHBORHOODS):
         stats.iterations += 1
         name = NEIGHBORHOODS[neighborhood]
-        candidates = builders[neighborhood](
+        batch = builders[neighborhood](
             current.solution,
             config,
             rng,
             cap=per_neighborhood_budget,
+            selection_policy=selection_policy,
         )
+        stats.generated[name] += batch.generated_count
         best_neighbor: EvaluatedCandidate | None = None
-        for candidate in candidates:
+        for candidate, move_type in zip(batch.candidates, batch.move_types):
             if evaluator.expired:
                 break
             stats.attempted[name] += 1
+            type_counts = stats.explored_types[name]
+            type_counts[move_type] = type_counts.get(move_type, 0) + 1
             evaluated = evaluator.evaluate(candidate, source=name)
             if evaluated.status is not BaselineStatus.COMPLETED:
                 _record_failure(stats, evaluated)
