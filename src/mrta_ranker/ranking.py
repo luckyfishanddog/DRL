@@ -2848,10 +2848,377 @@ def summarize_same_rail(root=None):
     return summary
 
 
+# Frozen final comparison.  This reuses the established generator, solvers and
+# SQLite experiment table; it adds no search decision and does not alter the
+# previous 375-run experiment.
+FINAL_COORDINATION_GEOMETRY_SEEDS=tuple(range(20262501,20262516))
+FINAL_COORDINATION_HIGH_WORKLOAD_SEEDS=tuple(range(20262516,20262536))
+FINAL_COORDINATION_SOLVER_SEEDS=(20262581,20262582,20262583)
+FINAL_COORDINATION_METHODS=(
+    'REGION_FAST_HEURISTIC','REGION_FAST_ROUTE_REORDER','REGION_FAST_SAME_RAIL',
+    'ADAPTED_HGA_V2','ADAPTED_WAG_VNS_V2')
+FINAL_COORDINATION_MATRIX='sci_coordination_final_matrix'
+FINAL_COORDINATION_EXPERIMENT='sci_coordination_final_comparison'
+FINAL_COORDINATION_SUMMARY='sci_coordination_final_summary'
+
+
+def final_coordination_method_spec(method):
+    if method not in FINAL_COORDINATION_METHODS:raise ValueError(method)
+    traditional=method.startswith('ADAPTED_')
+    return {'method':method,'algorithm_family':'BASELINE' if traditional else 'ALNS',
+        'initialization_region_cooperative':None if traditional else True,
+        'initialization_same_rail_boundary_rebalance':(
+            None if traditional else method=='REGION_FAST_SAME_RAIL'),
+        'initialization_coordination_route_reorder':(
+            None if traditional else method=='REGION_FAST_ROUTE_REORDER'),
+        'lns_incremental_scoring':None if traditional else True,
+        'enable_crrr':False if not traditional else None,
+        'enable_jrrb':False if not traditional else None,
+        'c2_mode':'BASELINE_C2' if not traditional else None,'ranker':None,
+        'm':None if traditional else 192,'m_atomic':None if traditional else 144,
+        'm_lns':None if traditional else 48,'kdp':None if traditional else 8,
+        'kref':None if traditional else 2,'kref_total':None if traditional else 4,
+        'construction_budget':None if traditional else 5,
+        'kinit_ref':None if traditional else 5,
+        'two_opt_star':False if not traditional else None,
+        'reference_recovery_rollouts':32,'wall_clock_seconds':60.0,
+        'deadline_semantics':('certified-60s-soft-return' if traditional else 'hard-reference-deadline')}
+
+
+def final_coordination_search_config(method):
+    from dataclasses import replace
+    from . import dataset as data
+    spec=final_coordination_method_spec(method)
+    if spec['algorithm_family']!='ALNS':raise ValueError(f'{method} is not an ALNS method')
+    return replace(data.search_config(),initialization_region_cooperative=True,
+        initialization_same_rail_boundary_rebalance=spec['initialization_same_rail_boundary_rebalance'],
+        initialization_coordination_route_reorder=spec['initialization_coordination_route_reorder'],
+        lns_incremental_scoring=True,m_atomic=144,c2_mode='BASELINE_C2',
+        enable_crrr=False,enable_jrrb=False,enable_two_opt_star=False)
+
+
+def _final_coordination_static_geometry_choices(root):
+    """Apply the prior 5/5/5 count-only rule to the new fixed 15-seed pool."""
+    ppo_dataset=_ppo_dataset_module(root);generator=ppo_dataset._load_allowed_generator_module()
+    source=Path(generator.DEFAULT_SOURCE_EXCEL).resolve()
+    groups,_,_=generator.read_and_prepare_groups(str(source),None,'mm',0.01,min_weld_length_m=0.5)
+    targets=(35,55,85);choices={}
+    for seed in FINAL_COORDINATION_GEOMETRY_SEEDS:
+        placed,_=generator.layout_packing(groups,45,0.03,platform_w=20.0,platform_h=12.0,
+            allow_rotate=True,seed=seed,max_attempts_per_instance=2000)
+        if len(placed)!=45:raise RuntimeError(f'geometry seed {seed} did not place 45 groups')
+        count=0;natural=[]
+        for item in placed:
+            count+=len(groups[item['group_id']]);group_count=int(item['instance_index'])+1
+            if group_count>=15:natural.append((group_count,count))
+        choices[seed]=tuple(min(natural,key=lambda row,target=target:(abs(row[1]-target),row[0]))
+            for target in targets)
+    dp={(0,0,0):(0,())}
+    for seed in FINAL_COORDINATION_GEOMETRY_SEEDS:
+        nxt={}
+        for used,(cost,assignment) in dp.items():
+            for tier,(group_count,actual_n) in enumerate(choices[seed]):
+                if used[tier]>=5:continue
+                capacity=tuple(value+int(index==tier) for index,value in enumerate(used))
+                proposal=(cost+abs(actual_n-targets[tier]),assignment+(tier,))
+                if capacity not in nxt or proposal<nxt[capacity]:nxt[capacity]=proposal
+        dp=nxt
+    labels=('SMALL','MEDIUM','LARGE');ordinals=[0,0,0];rows=[]
+    for seed,tier_index in zip(FINAL_COORDINATION_GEOMETRY_SEEDS,dp[(5,5,5)][1]):
+        ordinals[tier_index]+=1;group_count,actual_n=choices[seed][tier_index]
+        rows.append({'geometry_seed':seed,'tier':labels[tier_index],'target_N':targets[tier_index],
+            'requested_group_count':group_count,'actual_N':actual_n,
+            'label':f'{labels[tier_index]}_{ordinals[tier_index]:02d}'})
+    return rows,source,dp[(5,5,5)][0]
+
+
+def prepare_final_coordination_matrix(root=None,*,node_executable=None,artifact_node_modules=None):
+    """Create 20 solver-unseen workbooks using geometry-only selection and save the matrix."""
+    from . import dataset as data
+    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
+    db=data.connect(data.DATABASE_V05,readonly=True);existing=db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
+        (FINAL_COORDINATION_MATRIX,'summary')).fetchone();db.close()
+    if existing is not None:
+        matrix=json.loads(existing[0])
+        if tuple(matrix['seeds'])!=FINAL_COORDINATION_SOLVER_SEEDS or tuple(matrix['methods'])!=FINAL_COORDINATION_METHODS:
+            raise RuntimeError('final coordination matrix was frozen differently')
+        return matrix
+    if node_executable is None or artifact_node_modules is None:
+        raise ValueError('node_executable and artifact_node_modules are required')
+    selections,source,total_distance=_final_coordination_static_geometry_choices(root)
+    ppo_dataset=_ppo_dataset_module(root);config_path=root.parent/'ppo'/'config'/'scientific_model_v9.json'
+    high_builds=[]
+    for seed in FINAL_COORDINATION_HIGH_WORKLOAD_SEEDS:
+        build=ppo_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+            requested_group_counts=(45,),source_excel=source,scientific_config_path=config_path)
+        sheet=build.manifest.sheets[0];rows=build.rows_by_sheet[sheet.sheet_name]
+        if sheet.generation_status!='SUCCESS':raise RuntimeError(f'high-workload seed {seed} is not legal')
+        length=sum(math.dist((row.x1,row.y1),(row.x2,row.y2)) for row in rows)
+        high_builds.append((length,seed,build))
+    high_selected=sorted(high_builds,key=lambda row:(-row[0],row[1]))[:5]
+    for ordinal,(length,seed,build) in enumerate(high_selected,1):
+        sheet=build.manifest.sheets[0]
+        selections.append({'geometry_seed':seed,'tier':'HIGH_WORKLOAD','target_N':None,
+            'requested_group_count':45,'actual_N':sheet.actual_N,'total_weld_length':length,
+            'label':f'HIGH_WORKLOAD_{ordinal:02d}','_build':build})
+    historical=data.read(data.DATASET);known={row['instance_geometry_hash'] for row in historical['instances']}
+    db=data.connect(data.DATABASE_V05,readonly=True);prior=db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
+        (UPGRADED_INDEPENDENT_MATRIX,'summary')).fetchone();db.close()
+    if prior is not None:known.update(row['instance_geometry_hash'] for row in json.loads(prior[0])['entries'])
+    output_dir=root/'data'/'independent'/'final_coordination';entries=[];new_hashes=set()
+    for selected in selections:
+        seed=selected['geometry_seed'];destination=output_dir/f'seed_{seed:010d}.xlsx'
+        build=selected.pop('_build',None)
+        if destination.exists():manifest=ppo_dataset.load_seed_family_workbook(destination).manifest
+        else:
+            if build is None:
+                build=ppo_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+                    requested_group_counts=(selected['requested_group_count'],),source_excel=source,
+                    scientific_config_path=config_path)
+            ppo_dataset._write_workbook_with_artifact_tool(build,destination,
+                node_executable=node_executable,artifact_node_modules=artifact_node_modules,preview_directory=None)
+            manifest=build.manifest
+        if manifest.dataset_generation_seed!=seed or len(manifest.sheets)!=1:
+            raise RuntimeError(f'unexpected generated family identity for {destination}')
+        sheet=manifest.sheets[0]
+        if sheet.generation_status!='SUCCESS' or sheet.requested_group_count!=selected['requested_group_count']:
+            raise RuntimeError(f'generated workbook failed static contract for seed {seed}')
+        relative=destination.relative_to(root).as_posix()
+        instance_id=f"{destination.with_suffix('').relative_to(root).as_posix()}::{sheet.sheet_name}"
+        instance=load_ppo_platform_instance(destination,sheet.sheet_name,ppo_root=root,instance_id=instance_id)
+        parents=to_parent_welds(instance);geometry_hash=instance_geometry_hash(instance)
+        if len(parents)!=selected['actual_N'] or geometry_hash in known or geometry_hash in new_hashes:
+            raise RuntimeError(f'geometry is historical, duplicated, or changed for seed {seed}')
+        new_hashes.add(geometry_hash);actual_length=sum(parent.length for parent in parents)
+        if 'total_weld_length' in selected and abs(actual_length-selected['total_weld_length'])>1e-9:
+            raise RuntimeError(f'high-workload length changed for seed {seed}')
+        entries.append({**selected,'instance_id':instance_id,'relative_path':relative,
+            'sheet_name':sheet.sheet_name,'raw_file_sha256':instance.raw_file_sha256,
+            'instance_geometry_hash':geometry_hash,
+            'total_weld_length':actual_length,'source_workbook':relative})
+    matrix={'selection_frozen_before_solver_access':True,'entries':entries,
+        'geometry_seeds':list(FINAL_COORDINATION_GEOMETRY_SEEDS),
+        'high_workload_candidate_seeds':list(FINAL_COORDINATION_HIGH_WORKLOAD_SEEDS),
+        'high_workload_selected_seeds':[row[1] for row in high_selected],
+        'selection_rule':'SMALL/MEDIUM/LARGE: existing count-only 5/5/5 assignment for targets 35/55/85; HIGH_WORKLOAD: top five total weld lengths among legal 45-group seeds; no solver output used',
+        'static_total_target_distance':total_distance,'seeds':list(FINAL_COORDINATION_SOLVER_SEEDS),
+        'methods':list(FINAL_COORDINATION_METHODS),'time_limit_seconds':60.0,
+        'method_order':'cyclic rotation by (workbook ordinal + solver-seed ordinal) mod 5',
+        'workers':4,'resource_policy':'spawned workers bound to distinct physical cores; one thread per worker',
+        'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'primary_metric':'independently certified Cmax completed at or before 60 seconds',
+        'statistics_unit':'workbook; three solver seeds are repeated runs',
+        'deadline_note':'ALNS hard-interrupts reference work; frozen HGA/WAG retain soft return but their checkpoint excludes certifications completed after 60 seconds'}
+    db=data.connect(data.DATABASE_V05)
+    with db:db.execute('INSERT INTO experiments VALUES (?,?,?)',
+        (FINAL_COORDINATION_MATRIX,'summary',data.dumps(matrix)))
+    db.close();return matrix
+
+
+def _final_coordination_worker(job):
+    from . import dataset as data
+    entry,parents,seed,method,root=job
+    common={'instance':entry['label'],'workbook':entry['relative_path'],'tier':entry['tier'],
+        'instance_id':entry['instance_id'],'actual_N':len(parents),'geometry_seed':entry['geometry_seed'],
+        'total_weld_length':sum(parent.length for parent in parents),'solver_seed':seed,'seed':seed,
+        'method':method,'scientific_config':data.CONFIG_V05.scientific_mapping(),
+        'method_spec':final_coordination_method_spec(method)}
+    if method.startswith('REGION_FAST_'):
+        started=time.perf_counter();record,_=data.run_trajectory(entry,seed,parents=parents,
+            config=data.CONFIG_V05,search=final_coordination_search_config(method),budget_started_at=started)
+        return {**common,**record,'independent_certification':record['certified_at_60'],
+            'termination_status':record['termination_reason']}
+    baseline_method='HGA_V2' if method=='ADAPTED_HGA_V2' else 'WAG_VNS_V2'
+    result,checkpoint,initial,statuses=_sci_run_baseline(parents,baseline_method,seed,data.CONFIG_V05)
+    final_record=_sci_solution_record(checkpoint,data.CONFIG_V05)
+    initial_record=_sci_solution_record(initial,data.CONFIG_V05)
+    events=[(event.elapsed,event.cmax) for event in result.best_events]
+    return {**common,'status':result.status.value,'termination_reason':result.termination_reason,
+        'termination_status':result.termination_reason,'initialization_strategy':baseline_method,
+        'initialization_attempts':None,'initial_cmax':None if initial is None or initial.metrics is None else initial.metrics.cmax,
+        'initial_process_loads':initial_record['robot_loads'],
+        'initial_empty_travel':None if initial is None or initial.metrics is None else initial.metrics.total_empty_travel,
+        'initial_waiting':None if initial is None or initial.metrics is None else initial.metrics.total_waiting,
+        'initialization_seconds':result.initialization_time,'Cmax_at_60':result.checkpoints[60.0],
+        'time_to_first_certified':result.time_to_first_certified,'iterations':result.iterations,
+        'candidate_count':result.candidate_count,'reference_calls':result.reference_calls,
+        'initial_reference_calls':result.initial_reference_calls,
+        'search_reference_calls':result.reference_calls-result.initial_reference_calls,
+        'reference_status':statuses,'certifier_calls':result.certifier_calls,
+        'strict_best_improvements_at60':data.strict_cmax_improvement_count(events),
+        'actual_runtime':result.actual_runtime,'overshoot':result.overshoot,
+        'accounting':result.accounting,'diagnostics':result.diagnostics,'best_events':events,
+        'best60_process_loads':final_record['robot_loads'],
+        'best60_empty_travel':final_record.get('total_empty_travel'),
+        'best60_waiting':final_record.get('total_waiting'),
+        'best60_empty_travel_by_robot':final_record['empty_travel_by_robot'],
+        'best60_waiting_by_robot':final_record['waiting_by_robot'],
+        'best60_robot_completion':final_record['robot_completion'],
+        'best60_split_counts':final_record['split_counts'],**final_record}
+
+
+def run_final_coordination_comparison(root=None,workers=4):
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing as mp
+    from . import dataset as data
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
+    db=data.connect(data.DATABASE_V05,readonly=True);matrix_row=db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
+        (FINAL_COORDINATION_MATRIX,'summary')).fetchone()
+    done={row[0] for row in db.execute('SELECT item_id FROM experiments WHERE experiment=?',
+        (FINAL_COORDINATION_EXPERIMENT,))};db.close()
+    if matrix_row is None:raise RuntimeError('prepare final coordination matrix first')
+    matrix=json.loads(matrix_row[0]);parents_by_id=_load_upgraded_independent_parents(root,matrix);jobs=[]
+    for entry_index,entry in enumerate(matrix['entries']):
+        for seed_index,seed in enumerate(FINAL_COORDINATION_SOLVER_SEEDS):
+            offset=(entry_index+seed_index)%len(FINAL_COORDINATION_METHODS)
+            order=FINAL_COORDINATION_METHODS[offset:]+FINAL_COORDINATION_METHODS[:offset]
+            for method in order:
+                key=f"{entry['instance_id']}|{seed}|{method}"
+                if key not in done:jobs.append((key,(entry,parents_by_id[entry['instance_id']],seed,method,root)))
+    masks=data.physical_core_affinities()[:workers]
+    with ProcessPoolExecutor(max_workers=min(workers,len(jobs) or 1),mp_context=mp.get_context('spawn'),
+            initializer=_final_worker_init,initargs=(masks,)) as pool:
+        futures={pool.submit(_final_coordination_worker,job):key for key,job in jobs};by_key=dict(jobs)
+        for future in as_completed(futures):
+            key=futures[future];entry,_,seed,method,_=by_key[key]
+            try:row=future.result()
+            except Exception as error:
+                row={'instance':entry['label'],'workbook':entry['relative_path'],'tier':entry['tier'],
+                    'instance_id':entry['instance_id'],'actual_N':entry['actual_N'],
+                    'total_weld_length':entry['total_weld_length'],'geometry_seed':entry['geometry_seed'],
+                    'solver_seed':seed,'seed':seed,'method':method,'status':'EXECUTION_ERROR',
+                    'termination_status':'EXECUTION_ERROR','Cmax_at_60':None,'certified_at_60':False,
+                    'independent_certification':False,'diagnostics':[repr(error)],
+                    'method_spec':final_coordination_method_spec(method)}
+            db=data.connect(data.DATABASE_V05)
+            with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+                (FINAL_COORDINATION_EXPERIMENT,key,data.dumps(row)))
+            db.close();print(f"final coordination {entry['label']}:{seed}:{method} status={row['status']} Cmax60={row.get('Cmax_at_60')}",flush=True)
+    return len(jobs)
+
+
+def _final_coordination_pair(instance_rows,method,baseline):
+    import statistics
+    index={(row['instance_id'],row['method']):row for row in instance_rows};pairs=[]
+    for entry in instance_rows:
+        if entry['method']!=method:continue
+        other=index.get((entry['instance_id'],baseline))
+        if other and entry['median_cmax_complete'] is not None and other['median_cmax_complete'] is not None:
+            pairs.append({'instance':entry['instance'],'instance_id':entry['instance_id'],'tier':entry['tier'],
+                'method_cmax':entry['median_cmax_complete'],'baseline_cmax':other['median_cmax_complete'],
+                'delta_percent':100*(entry['median_cmax_complete']/other['median_cmax_complete']-1)})
+    def group(selected):
+        values=[row['delta_percent'] for row in selected]
+        return {'workbooks':len(values),'wins':sum(v<-1e-10 for v in values),
+            'ties':sum(abs(v)<=1e-10 for v in values),'losses':sum(v>1e-10 for v in values),
+            'median_delta_percent':None if not values else statistics.median(values),
+            'mean_delta_percent':None if not values else statistics.fmean(values),
+            'worst_delta_percent':None if not values else max(values)}
+    tiers={tier:group([row for row in pairs if row['tier']==tier])
+        for tier in ('SMALL','MEDIUM','LARGE','HIGH_WORKLOAD')};tiers['ALL']=group(pairs)
+    return {'tiers':tiers,'pairs':pairs}
+
+
+def summarize_final_coordination(root=None):
+    import statistics
+    from . import dataset as data
+    db=data.connect(data.DATABASE_V05,readonly=True);matrix_row=db.execute(
+        'SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
+        (FINAL_COORDINATION_MATRIX,'summary')).fetchone()
+    rows=[json.loads(row[0]) for row in db.execute('SELECT payload FROM experiments WHERE experiment=?',
+        (FINAL_COORDINATION_EXPERIMENT,))];db.close()
+    matrix=None if matrix_row is None else json.loads(matrix_row[0])
+    success=lambda row:(row.get('Cmax_at_60') is not None and row.get('status')!='EXECUTION_ERROR'
+        and row.get('independent_certification',row.get('certified_at_60',False)))
+    instances=[]
+    if matrix is not None:
+        for entry in matrix['entries']:
+            for method in FINAL_COORDINATION_METHODS:
+                selected=[row for row in rows if row.get('instance_id')==entry['instance_id'] and row.get('method')==method]
+                values=[row['Cmax_at_60'] for row in selected if success(row)]
+                instances.append({'instance':entry['label'],'instance_id':entry['instance_id'],
+                    'workbook':entry['relative_path'],'tier':entry['tier'],'actual_N':entry['actual_N'],
+                    'total_weld_length':entry['total_weld_length'],'method':method,
+                    'completed_runs':len(selected),'certified_runs':len(values),
+                    'seed_values':{str(seed):next((row.get('Cmax_at_60') for row in selected
+                        if row.get('seed')==seed and success(row)),None) for seed in FINAL_COORDINATION_SOLVER_SEEDS},
+                    'median_cmax_complete':statistics.median(values) if len(values)==3 else None,
+                    'conditional_median_cmax':None if not values else statistics.median(values)})
+    comparisons={f'{method}_vs_{baseline}':_final_coordination_pair(instances,method,baseline)
+        for method,baseline in (
+            ('REGION_FAST_ROUTE_REORDER','REGION_FAST_HEURISTIC'),
+            ('REGION_FAST_SAME_RAIL','REGION_FAST_HEURISTIC'),
+            ('REGION_FAST_HEURISTIC','ADAPTED_WAG_VNS_V2'),
+            ('REGION_FAST_ROUTE_REORDER','ADAPTED_WAG_VNS_V2'),
+            ('REGION_FAST_SAME_RAIL','ADAPTED_WAG_VNS_V2'),
+            ('REGION_FAST_HEURISTIC','ADAPTED_HGA_V2'),
+            ('REGION_FAST_ROUTE_REORDER','ADAPTED_HGA_V2'),
+            ('REGION_FAST_SAME_RAIL','ADAPTED_HGA_V2'))}
+    methods={}
+    for method in FINAL_COORDINATION_METHODS:
+        selected=[row for row in rows if row.get('method')==method]
+        values=lambda key:[row[key] for row in selected if row.get(key) is not None]
+        alns=not method.startswith('ADAPTED_');attempts=[attempt for row in selected
+            for attempt in (row.get('initialization_attempts') or [])]
+        methods[method]={'scheduled':60,'completed':len(selected),'certified':sum(success(row) for row in selected),
+            'certification_rate':sum(success(row) for row in selected)/60,
+            'runtime_median':None if not values('actual_runtime') else statistics.median(values('actual_runtime')),
+            'runtime_max':None if not values('actual_runtime') else max(values('actual_runtime')),
+            'overshoot_max':None if not values('overshoot') else max(values('overshoot')),
+            'iterations_median':None if not values('iterations') else statistics.median(values('iterations')),
+            'reference_calls_median':None if not values('reference_calls') else statistics.median(values('reference_calls')),
+            'serial_fallback_runs':sum(row.get('initialization_strategy')=='RAIL_SERIAL_BOOTSTRAP' for row in selected) if alns else None,
+            'initial_deadlock_attempts':sum(attempt.get('reference_status')=='DEADLOCK' for attempt in attempts) if alns else None,
+            'initial_reference_attempts':sum(attempt.get('reference_status') is not None for attempt in attempts) if alns else None,
+            'mean_max_process_load':(None if not values('best60_process_loads') else statistics.fmean(
+                max(loads) for loads in values('best60_process_loads'))),
+            'mean_empty_travel':None if not values('best60_empty_travel') else statistics.fmean(values('best60_empty_travel')),
+            'mean_waiting':None if not values('best60_waiting') else statistics.fmean(values('best60_waiting'))}
+    summary={'matrix':matrix,'completed_runs':len(rows),'scheduled_runs':300,'methods':methods,
+        'instances':instances,'comparisons':comparisons}
+    if matrix is not None:
+        db=data.connect(data.DATABASE_V05)
+        with db:db.execute('INSERT OR REPLACE INTO experiments VALUES (?,?,?)',
+            (FINAL_COORDINATION_SUMMARY,'summary',data.dumps(summary)))
+        db.close()
+    return summary
+
+
+def validate_final_coordination(root=None):
+    from . import dataset as data
+    summary=summarize_final_coordination(root);matrix=summary['matrix']
+    if matrix is None or len(matrix['entries'])!=20:raise AssertionError('20 independent workbooks required')
+    if [sum(row['tier']==tier for row in matrix['entries']) for tier in ('SMALL','MEDIUM','LARGE','HIGH_WORKLOAD')]!=[5,5,5,5]:
+        raise AssertionError('tier balance changed')
+    if summary['completed_runs']!=300:raise AssertionError(f"final matrix incomplete: {summary['completed_runs']}/300")
+    db=data.connect(data.DATABASE_V05,readonly=True);rows=[json.loads(row[0]) for row in db.execute(
+        'SELECT payload FROM experiments WHERE experiment=?',(FINAL_COORDINATION_EXPERIMENT,))]
+    old_count=db.execute('SELECT count(*) FROM experiments WHERE experiment=?',
+        (UPGRADED_INDEPENDENT_EXPERIMENT,)).fetchone()[0];db.close()
+    if old_count!=375:raise AssertionError('previous 375-run experiment changed')
+    keys={(row['instance_id'],row['seed'],row['method']) for row in rows}
+    if len(keys)!=300:raise AssertionError('missing or duplicate combinations')
+    if any(row.get('scientific_config')!=data.CONFIG_V05.scientific_mapping()
+            for row in rows if row.get('status')!='EXECUTION_ERROR'):
+        raise AssertionError('scientific configuration changed')
+    for row in rows:
+        spec=row['method_spec']
+        if spec['algorithm_family']=='ALNS' and (spec['m'],spec['m_atomic'],spec['m_lns'],spec['kdp'],
+                spec['kref'],spec['kref_total'],spec['construction_budget'],spec['kinit_ref'])!=(192,144,48,8,2,4,5,5):
+            raise AssertionError('ALNS budget changed')
+        if spec['algorithm_family']=='ALNS' and (spec['enable_crrr'] or spec['enable_jrrb'] or spec['two_opt_star']):
+            raise AssertionError('disabled enhancement was enabled')
+    return {'completed_runs':300,'methods':summary['methods'],'comparisons':summary['comparisons']}
+
+
 if __name__=='__main__':
     import argparse
     parser=argparse.ArgumentParser(description='Final C4 development utilities')
-    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate','jrrb-development-diagnostic','jrrb-development-summary','same-rail-diagnostic','same-rail-online','same-rail-summary','coordination-route-online'))
+    parser.add_argument('action',choices=('final-offline','final-train','final-online','baseline-smoke','sci-dev-baselines','sci-edge-ablation','sci-freeze-matrix','sci-formal','sci-summary','sci-report','sci-validate','final-summary','final-validate','final-report','region-init-zero','region-init-online','region-init-summary','region-init-validate','crrr-smoke','crrr-online','crrr-summary','crrr-validate','crrr-access-offline','crrr-access-online','crrr-access-summary','crrr-access-validate','lns-acceleration-online','lns-acceleration-summary','lns-acceleration-validate','upgraded-gat-smoke','upgraded-prepare','upgraded-run','upgraded-summary','upgraded-validate','jrrb-development-diagnostic','jrrb-development-summary','same-rail-diagnostic','same-rail-online','same-rail-summary','coordination-route-online','final-coordination-prepare','final-coordination-run','final-coordination-summary','final-coordination-validate'))
     parser.add_argument('--root',default=str(Path(__file__).resolve().parents[2]));parser.add_argument('--workers',type=int,default=4)
     args=parser.parse_args()
     if args.action=='final-offline':run_final_c4_offline(args.root)
@@ -2896,4 +3263,11 @@ if __name__=='__main__':
     elif args.action=='same-rail-diagnostic':print(json.dumps(run_same_rail_diagnostic(args.root),ensure_ascii=False,indent=2))
     elif args.action=='same-rail-online':print(json.dumps(run_same_rail_online(args.root,args.workers),ensure_ascii=False,indent=2))
     elif args.action=='same-rail-summary':print(json.dumps(summarize_same_rail(args.root),ensure_ascii=False,indent=2))
-    else:run_coordination_route_online(args.root,args.workers)
+    elif args.action=='coordination-route-online':run_coordination_route_online(args.root,args.workers)
+    elif args.action=='final-coordination-prepare':
+        prepare_final_coordination_matrix(args.root,
+            node_executable=r'C:\Users\Renjl\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe',
+            artifact_node_modules=r'C:\Users\Renjl\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules')
+    elif args.action=='final-coordination-run':run_final_coordination_comparison(args.root,args.workers)
+    elif args.action=='final-coordination-summary':print(json.dumps(summarize_final_coordination(args.root),ensure_ascii=False,indent=2))
+    else:print(json.dumps(validate_final_coordination(args.root),ensure_ascii=False,indent=2))

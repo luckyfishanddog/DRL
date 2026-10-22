@@ -349,6 +349,38 @@ def test_upgraded_frozen_alns_profiles_change_only_authorized_switches() -> None
     assert upgraded_method_spec("REGION_FAST_GAT_V05")["ranker"] == "GAT_V05"
 
 
+def test_final_coordination_profiles_are_frozen_and_mutually_exclusive() -> None:
+    from mrta_ranker.ranking import (
+        FINAL_COORDINATION_METHODS,
+        final_coordination_method_spec,
+        final_coordination_search_config,
+    )
+
+    base = final_coordination_search_config("REGION_FAST_HEURISTIC")
+    route = final_coordination_search_config("REGION_FAST_ROUTE_REORDER")
+    same = final_coordination_search_config("REGION_FAST_SAME_RAIL")
+    assert FINAL_COORDINATION_METHODS == (
+        "REGION_FAST_HEURISTIC", "REGION_FAST_ROUTE_REORDER",
+        "REGION_FAST_SAME_RAIL", "ADAPTED_HGA_V2", "ADAPTED_WAG_VNS_V2",
+    )
+    for search in (base, route, same):
+        assert (search.m, search.m_atomic, search.m_lns) == (192, 144, 48)
+        assert (search.kdp, search.kref, search.kref_total) == (8, 2, 4)
+        assert (search.construction_budget, search.kinit_ref) == (5, 5)
+        assert search.initialization_region_cooperative
+        assert search.lns_incremental_scoring and search.hard_reference_deadline
+        assert not search.enable_crrr and not search.enable_jrrb
+        assert not search.enable_two_opt_star and search.c2_mode == "BASELINE_C2"
+    assert not base.initialization_same_rail_boundary_rebalance
+    assert not base.initialization_coordination_route_reorder
+    assert route.initialization_coordination_route_reorder
+    assert not route.initialization_same_rail_boundary_rebalance
+    assert same.initialization_same_rail_boundary_rebalance
+    assert not same.initialization_coordination_route_reorder
+    for method in FINAL_COORDINATION_METHODS:
+        assert final_coordination_method_spec(method)["reference_recovery_rollouts"] == 32
+
+
 def test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal() -> None:
     initial = _initial()
     weld = next(
