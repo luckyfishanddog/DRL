@@ -1,6 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
 import random
+import sys
+import time
+
+SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import run_gnn_construct_vns_pilot as pilot_script
 
 from mrta_baselines.common import CommonBaselineEvaluator
 from mrta_reference.certifier import certify_schedule
@@ -30,6 +40,7 @@ from mrta_search.vns import (
     n1_relocate_candidates,
     n2_swap_candidates,
     n3_route_candidates,
+    evaluate_initial_with_shared_repair,
     run_vns,
 )
 
@@ -271,4 +282,97 @@ def test_same_seed_gnn_inference_and_vns_are_reproducible():
     assert results[0].best.metrics.cmax <= results[0].initial.metrics.cmax
     assert results[0].best.certification is not None
     assert results[0].best.certification.certified
+
+
+def test_late_initial_certification_is_not_accepted_at_hard_deadline():
+    evaluator = CommonBaselineEvaluator(
+        _parents(), CONFIG, FORMAL_SCOPE_V2, time_limit=5.0, checkpoints=(5.0,)
+    )
+    completed = evaluator.evaluate(_solution(), source="ON_TIME_REFERENCE")
+    assert completed.status.value == "COMPLETED"
+
+    class LateEvaluator:
+        expired = True
+
+        def evaluate(self, solution, *, source):
+            return replace(completed, solution=solution, source=source, completed_at=1.01)
+
+    initial, attempts, failures = evaluate_initial_with_shared_repair(
+        _solution(), LateEvaluator(), CONFIG, accept_completed_by=1.0
+    )
+    assert initial is None
+    assert attempts == 1
+    assert failures == ("LATE_CERTIFIED",)
+
+
+def test_end_to_end_budget_charges_model_load_construction_and_uses_remaining_time(monkeypatch):
+    entry = {
+        "instance_id": "unit:tiny",
+        "N": 5,
+        "split": "MLP_DEV",
+    }
+    original_construct = pilot_script.construct_solution
+    captured = {}
+
+    def delayed_load_model():
+        time.sleep(0.02)
+        return BlockAssignmentGNN(), {}
+
+    def delayed_construct(parents, config, *, model=None):
+        time.sleep(0.02)
+        return original_construct(parents, config, model=model)
+
+    def fake_run_vns(initial_solution, evaluator, config, **kwargs):
+        captured["time_limit"] = evaluator.time_limit
+        captured["accept_completed_by"] = kwargs["accept_completed_by"]
+        return pilot_script.VNSResult(
+            None, None, pilot_script.VNSStats(), 0, (), evaluator.elapsed
+        )
+
+    monkeypatch.setattr(pilot_script.ranker_dataset, "load_parents", lambda _: _parents())
+    monkeypatch.setattr(pilot_script, "load_model", delayed_load_model)
+    monkeypatch.setattr(pilot_script, "construct_solution", delayed_construct)
+    monkeypatch.setattr(pilot_script, "run_vns", fake_run_vns)
+    row = pilot_script.run_end_to_end(entry, "GNN", 7, CONFIG, 0.2)
+    assert row["timing_scope"] == "END_TO_END_EXCLUDING_INPUT_READ"
+    assert row["model_load_seconds"] >= 0.015
+    assert row["construction_seconds"] >= 0.015
+    assert captured["time_limit"] < 0.17
+    assert captured["accept_completed_by"] == captured["time_limit"]
+
+
+def test_assignment_change_diagnostic_ignores_route_order_only_changes():
+    evaluator = CommonBaselineEvaluator(
+        _parents(), CONFIG, FORMAL_SCOPE_V2, time_limit=5.0, checkpoints=(5.0,)
+    )
+    initial = evaluator.evaluate(_solution(), source="INITIAL")
+    assert initial.status.value == "COMPLETED"
+    reordered = canonicalize(
+        initial.solution.parents,
+        initial.solution.patterns,
+        {
+            route.robot_id: tuple(reversed(route.block_ids))
+            for route in initial.solution.routes
+        },
+        CONFIG,
+        scope=FORMAL_SCOPE_V2,
+    )
+    final = replace(initial, solution=reordered)
+    diagnostics = pilot_script._knowledge_diagnostics(initial, final, CONFIG)
+    assert diagnostics["assignment_changes"] == 0
+    assert diagnostics["changed_route_robots"] > 0
+    assert diagnostics["pure_order_changed_robots"] > 0
+
+
+def test_existing_role_manifest_keeps_train_and_dev_disjoint():
+    representatives = pilot_script.ranker_dataset.representatives_v05()
+    train = {
+        entry["instance_id"] for entry in representatives if entry["split"] == "MLP_TRAIN"
+    }
+    dev = {
+        entry["instance_id"] for entry in representatives if entry["split"] == "MLP_DEV"
+    }
+    assert len(train) == 17
+    assert len(dev) == 6
+    assert train.isdisjoint(dev)
 

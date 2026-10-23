@@ -35,6 +35,7 @@ from mrta_search.gnn_constructor import (
     fixed_blocks,
     fixed_split_patterns,
     rule_assignment,
+    solution_from_assignment,
 )
 from mrta_search.vns import (
     GLOBAL_BALANCED,
@@ -49,6 +50,7 @@ from mrta_search.vns import (
 
 MODEL_PATH = ROOT / "models" / "gnn_constructor_v1.pt"
 REPORT_PATH = ROOT / "docs" / "GNN_CONSTRUCT_VNS_PILOT.md"
+EXPERT_DATA_PATH = ROOT / "data" / "development" / "gnn_experts_fixed_split_v2.json"
 TRAINING_SEED = 20261022
 PILOT_SEEDS = (20261022, 20261023)
 
@@ -464,6 +466,7 @@ def run_paired_vns_fix(entry, construction_kind, seed, config, budget, model=Non
             "N": entry["N"],
             "construction": construction_kind,
             "policy": policy,
+            "timing_scope": "VNS_ONLY_FROM_CERTIFIED_INITIAL",
             "seed": seed,
             "status": "CERTIFIED",
             "initial": initial_metrics,
@@ -508,6 +511,358 @@ def run_vns_fix_mode(dev_entries, config, budget, all_dev, seeds):
                 for row in produced:
                     print("VNS_FIX_ROW " + json.dumps(row, ensure_ascii=False), flush=True)
     return rows
+
+
+def _public_run(row):
+    return {key: value for key, value in row.items() if not key.startswith("_")}
+
+
+def run_end_to_end(entry, construction_kind, seed, config, budget):
+    """Run one complete solver call under one wall-clock deadline.
+
+    Workbook loading is intentionally outside the measured region. Model loading,
+    construction, initial evaluation/repair, VNS, B32 and certification are inside.
+    """
+    parents = ranker_dataset.load_parents(entry)
+    started = time.perf_counter()
+    model = None
+    model_load_seconds = 0.0
+    if construction_kind == "GNN":
+        load_started = time.perf_counter()
+        model, _ = load_model()
+        model_load_seconds = time.perf_counter() - load_started
+    construction_started = time.perf_counter()
+    construction = construct_solution(parents, config, model=model)
+    construction_seconds = time.perf_counter() - construction_started
+    pre_evaluation_seconds = time.perf_counter() - started
+    remaining = budget - pre_evaluation_seconds
+    if remaining <= 0.0:
+        total = time.perf_counter() - started
+        return {
+            "instance": entry["instance_id"],
+            "N": entry["N"],
+            "data_role": entry["split"],
+            "construction": construction_kind,
+            "seed": seed,
+            "budget_seconds": budget,
+            "status": "TIMEOUT_BEFORE_INITIAL_EVALUATION",
+            "timing_scope": "END_TO_END_EXCLUDING_INPUT_READ",
+            "model_load_seconds": model_load_seconds,
+            "construction_seconds": construction_seconds,
+            "initial_certification_seconds": 0.0,
+            "vns_seconds": 0.0,
+            "total_seconds": total,
+            "overtime_seconds": max(0.0, total - budget),
+            "initial": _solution_metrics(None, config),
+            "final": _solution_metrics(None, config),
+            "time_to_best_seconds": None,
+            "attempted": {name: 0 for name in NEIGHBORHOODS},
+            "certified": {name: 0 for name in NEIGHBORHOODS},
+            "improvements": {name: 0 for name in NEIGHBORHOODS},
+            "failures": {},
+            "late_certified": 0,
+            "initial_failures": ("BUDGET_EXHAUSTED_BY_CONSTRUCTION",),
+            "_parents": parents,
+            "_construction": construction,
+            "_outcome": None,
+        }
+
+    evaluator = CommonBaselineEvaluator(
+        parents,
+        config,
+        FORMAL_SCOPE_V2,
+        time_limit=remaining,
+        checkpoints=(remaining,),
+    )
+    outcome = run_vns(
+        construction.solution,
+        evaluator,
+        config,
+        seed=seed,
+        per_neighborhood_budget=12,
+        selection_policy=GLOBAL_BALANCED,
+        accept_completed_by=remaining,
+    )
+    total = time.perf_counter() - started
+    initial_seconds = (
+        outcome.initial.completed_at if outcome.initial is not None else evaluator.elapsed
+    )
+    vns_seconds = max(0.0, evaluator.elapsed - initial_seconds)
+    status = "CERTIFIED" if outcome.best is not None else (
+        "TIMEOUT_NO_CERTIFIED" if total >= budget else "INITIALIZATION_FAILED"
+    )
+    return {
+        "instance": entry["instance_id"],
+        "N": entry["N"],
+        "data_role": entry["split"],
+        "construction": construction_kind,
+        "seed": seed,
+        "budget_seconds": budget,
+        "status": status,
+        "timing_scope": "END_TO_END_EXCLUDING_INPUT_READ",
+        "model_load_seconds": model_load_seconds,
+        "construction_seconds": construction_seconds,
+        "initial_certification_seconds": initial_seconds,
+        "vns_seconds": vns_seconds,
+        "total_seconds": total,
+        "overtime_seconds": max(0.0, total - budget),
+        "initial": _solution_metrics(outcome.initial, config),
+        "final": _solution_metrics(outcome.best, config),
+        "time_to_best_seconds": (
+            None
+            if outcome.best is None
+            else pre_evaluation_seconds + outcome.best.completed_at
+        ),
+        "attempted": dict(outcome.stats.attempted),
+        "certified": dict(outcome.stats.certified),
+        "improvements": dict(outcome.stats.improvements),
+        "failures": dict(outcome.stats.failures),
+        "late_certified": outcome.stats.late_certified,
+        "initial_failures": outcome.initialization_failures,
+        "_parents": parents,
+        "_construction": construction,
+        "_outcome": outcome,
+    }
+
+
+def run_end_to_end_mode(dev_entries, config, budget):
+    rows = []
+    for entry in _select_pilot_entries(dev_entries):
+        for construction_kind in ("RULE", "GNN"):
+            print(
+                f"end-to-end {_entry_label(entry)} {construction_kind} budget={budget}",
+                flush=True,
+            )
+            row = run_end_to_end(
+                entry, construction_kind, TRAINING_SEED, config, budget
+            )
+            rows.append(row)
+            print(
+                "END_TO_END_ROW "
+                + json.dumps(_public_run(row), ensure_ascii=False),
+                flush=True,
+            )
+    return rows
+
+
+def _owner_map(solution):
+    return {
+        block_id: route.robot_id
+        for route in solution.routes
+        for block_id in route.block_ids
+    }
+
+
+def _knowledge_diagnostics(initial, final, config):
+    blocks = block_map(initial.solution, config, scope=FORMAL_SCOPE_V2)
+    initial_owner = _owner_map(initial.solution)
+    final_owner = _owner_map(final.solution)
+    changed = [
+        block_id
+        for block_id in sorted(blocks)
+        if initial_owner[block_id] != final_owner[block_id]
+    ]
+    flexible = [
+        block_id
+        for block_id, block in blocks.items()
+        if sum(robot_is_eligible(block, robot, config) for robot in range(4)) > 1
+    ]
+    cross_rail_flexible = [
+        block_id
+        for block_id, block in blocks.items()
+        if any(robot_is_eligible(block, robot, config) for robot in (0, 1))
+        and any(robot_is_eligible(block, robot, config) for robot in (2, 3))
+    ]
+    same_rail_changes = sum(
+        initial_owner[block_id] // 2 == final_owner[block_id] // 2
+        for block_id in changed
+    )
+    cross_rail_changes = len(changed) - same_rail_changes
+    changed_route_robots = 0
+    pure_order_changed_robots = 0
+    for initial_route, final_route in zip(initial.solution.routes, final.solution.routes):
+        if initial_route.block_ids != final_route.block_ids:
+            changed_route_robots += 1
+        if (
+            set(initial_route.block_ids) == set(final_route.block_ids)
+            and initial_route.block_ids != final_route.block_ids
+        ):
+            pure_order_changed_robots += 1
+    initial_metrics = _solution_metrics(initial, config)
+    final_metrics = _solution_metrics(final, config)
+    initial_lb = max(initial_metrics["loads"])
+    final_lb = max(final_metrics["loads"])
+    return {
+        "assignment_changes": len(changed),
+        "changed_block_ids": changed,
+        "cross_rail_changes": cross_rail_changes,
+        "same_rail_changes": same_rail_changes,
+        "flexible_blocks": len(flexible),
+        "flexible_assignment_changes": sum(block_id in changed for block_id in flexible),
+        "cross_rail_flexible_blocks": len(cross_rail_flexible),
+        "cross_rail_flexible_changes": sum(
+            block_id in changed for block_id in cross_rail_flexible
+        ),
+        "changed_route_robots": changed_route_robots,
+        "pure_order_changed_robots": pure_order_changed_robots,
+        "initial_lb_load": initial_lb,
+        "final_lb_load": final_lb,
+        "initial_cmax_minus_lb_load": initial_metrics["cmax"] - initial_lb,
+        "final_cmax_minus_lb_load": final_metrics["cmax"] - final_lb,
+    }
+
+
+def _evaluate_x_sorted_ownership(candidate, config, *, time_limit=60.0):
+    solution = candidate.solution
+    blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
+    owner = _owner_map(solution)
+    assignment = tuple((block_id, owner[block_id]) for block_id in sorted(blocks))
+    x_sorted = solution_from_assignment(
+        solution.parents,
+        solution.patterns,
+        tuple(blocks.values()),
+        assignment,
+        config,
+    )
+    evaluator = CommonBaselineEvaluator(
+        solution.parents,
+        config,
+        FORMAL_SCOPE_V2,
+        time_limit=time_limit,
+        checkpoints=(time_limit,),
+    )
+    evaluated = evaluator.evaluate(x_sorted, source="OWNERSHIP_X_SORT_DIAGNOSTIC")
+    in_time = evaluated.completed_at <= time_limit
+    return {
+        "status": evaluated.status.value if in_time else "LATE_" + evaluated.status.value,
+        "cmax": (
+            evaluated.metrics.cmax
+            if in_time and evaluated.metrics is not None
+            else None
+        ),
+        "seconds": evaluator.elapsed,
+    }
+
+
+def _serialize_pattern(pattern):
+    return {
+        "parent_id": pattern.parent_id,
+        "kind": pattern.kind.value,
+        "t": pattern.t,
+        "point_id": pattern.point_id,
+        "mandatory": pattern.mandatory,
+        "rail": None if pattern.rail is None else pattern.rail.value,
+    }
+
+
+def _serialize_expert(entry, run, diagnostics, config):
+    outcome = run["_outcome"]
+    if outcome is None or outcome.best is None:
+        return None
+    best = outcome.best
+    return {
+        "instance_id": entry["instance_id"],
+        "relative_path": entry["relative_path"],
+        "sheet_name": entry["sheet_name"],
+        "data_role": entry["split"],
+        "N": entry["N"],
+        "fixed_split_patterns": [
+            _serialize_pattern(pattern) for pattern in best.solution.patterns
+        ],
+        "assignments": [
+            {"block_id": block_id, "robot_id": robot}
+            for block_id, robot in sorted(_owner_map(best.solution).items())
+        ],
+        "routes": [
+            {"robot_id": route.robot_id, "block_ids": list(route.block_ids)}
+            for route in best.solution.routes
+        ],
+        "certified_cmax": best.metrics.cmax,
+        "expert_source": f"{run['construction']}_GLOBAL_BALANCED_VNS",
+        "solver_budget_seconds": run["budget_seconds"],
+        "time_to_best_seconds": run["time_to_best_seconds"],
+        "scientific_config": config.scientific_mapping(),
+        "diagnostics": diagnostics,
+    }
+
+
+def run_train_expert(entry, config, budget, seed, construction_kind="RULE"):
+    run = run_end_to_end(entry, construction_kind, seed, config, budget)
+    outcome = run["_outcome"]
+    if outcome is None or outcome.initial is None or outcome.best is None:
+        return run, None, None
+    knowledge = _knowledge_diagnostics(outcome.initial, outcome.best, config)
+    diagnostics = {
+        **knowledge,
+        "initial": run["initial"],
+        "final": run["final"],
+        "improvements": run["improvements"],
+        "attempted": run["attempted"],
+        "certified": run["certified"],
+        "failures": run["failures"],
+        "late_certified": run["late_certified"],
+        "initial_x_sorted": _evaluate_x_sorted_ownership(outcome.initial, config),
+        "expert_x_sorted": _evaluate_x_sorted_ownership(outcome.best, config),
+    }
+    return run, _serialize_expert(entry, run, diagnostics, config), diagnostics
+
+
+def _select_scale_entries(entries):
+    small = min(entries, key=lambda entry: (entry["N"], entry["instance_id"]))
+    medium = min(entries, key=lambda entry: (abs(entry["N"] - 55), entry["instance_id"]))
+    large = max(entries, key=lambda entry: (entry["N"], entry["instance_id"]))
+    return [small, medium, large]
+
+
+def run_train_expert_mode(
+    train_entries,
+    config,
+    budget,
+    limit,
+    write_output,
+    construction_kind="RULE",
+):
+    entries = list(train_entries)
+    if limit == 3:
+        entries = _select_scale_entries(entries)
+    elif limit is not None:
+        entries = entries[:limit]
+    experts = []
+    public_rows = []
+    for index, entry in enumerate(entries):
+        print(
+            f"train-expert {index + 1}/{len(entries)} {_entry_label(entry)} budget={budget}",
+            flush=True,
+        )
+        run, expert, diagnostics = run_train_expert(
+            entry,
+            config,
+            budget,
+            TRAINING_SEED + index,
+            construction_kind=construction_kind,
+        )
+        row = _public_run(run)
+        row["knowledge"] = diagnostics
+        public_rows.append(row)
+        if expert is not None:
+            experts.append(expert)
+        print("TRAIN_EXPERT_ROW " + json.dumps(row, ensure_ascii=False), flush=True)
+    if write_output:
+        payload = {
+            "purpose": "fixed-split block-to-robot supervised expert data",
+            "data_role": "MLP_TRAIN",
+            "expert_source": f"{construction_kind}_GLOBAL_BALANCED_VNS",
+            "solver_budget_seconds_per_instance": budget,
+            "experts": experts,
+            "runs": public_rows,
+        }
+        EXPERT_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        EXPERT_DATA_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"expert-data: {EXPERT_DATA_PATH}", flush=True)
+    return public_rows, experts
 
 
 def run_wag_reference(entry, seed, config, budget):
@@ -763,6 +1118,17 @@ def main():
     parser.add_argument("--vns-fix-budget", type=float, default=20.0)
     parser.add_argument("--vns-fix-all-dev", action="store_true")
     parser.add_argument("--vns-fix-seeds", type=int, nargs="+", default=[20261022])
+    parser.add_argument("--end-to-end-mode", action="store_true")
+    parser.add_argument("--end-to-end-budget", type=float, default=20.0)
+    parser.add_argument("--train-expert-mode", action="store_true")
+    parser.add_argument("--train-expert-budget", type=float, default=60.0)
+    parser.add_argument("--train-expert-limit", type=int)
+    parser.add_argument(
+        "--train-expert-construction",
+        choices=("RULE", "GNN"),
+        default="RULE",
+    )
+    parser.add_argument("--write-expert-data", action="store_true")
     args = parser.parse_args()
     config = ScientificConfig()
     representatives = ranker_dataset.representatives_v05()
@@ -777,6 +1143,19 @@ def main():
             args.vns_fix_budget,
             args.vns_fix_all_dev,
             tuple(args.vns_fix_seeds),
+        )
+        return
+    if args.end_to_end_mode:
+        run_end_to_end_mode(dev_entries, config, args.end_to_end_budget)
+        return
+    if args.train_expert_mode:
+        run_train_expert_mode(
+            train_entries,
+            config,
+            args.train_expert_budget,
+            args.train_expert_limit,
+            args.write_expert_data,
+            args.train_expert_construction,
         )
         return
     train_records, train_diag = build_experts(train_entries, config, args.expert_budget)

@@ -41,6 +41,7 @@ class VNSStats:
     explored_types: dict[str, dict[str, int]] = field(
         default_factory=lambda: {name: {} for name in NEIGHBORHOODS}
     )
+    late_certified: int = 0
     failures: dict[str, int] = field(
         default_factory=lambda: {
             BaselineStatus.DEADLOCK.value: 0,
@@ -138,21 +139,35 @@ def evaluate_initial_with_shared_repair(
     solution: CanonicalSolution,
     evaluator: CommonBaselineEvaluator,
     config: ScientificConfig,
+    *,
+    accept_completed_by: float | None = None,
 ) -> tuple[EvaluatedCandidate | None, int, tuple[str, ...]]:
     attempts = 1
     failures: list[str] = []
     result = evaluator.evaluate(solution, source="INITIAL_COMMON_ROUTE")
-    if result.status is BaselineStatus.COMPLETED:
+    if result.status is BaselineStatus.COMPLETED and (
+        accept_completed_by is None or result.completed_at <= accept_completed_by
+    ):
         return result, attempts, ()
-    failures.append(result.status.value)
+    failures.append(
+        "LATE_CERTIFIED"
+        if result.status is BaselineStatus.COMPLETED
+        else result.status.value
+    )
     for index, repaired in enumerate(_route_repair_variants(solution, config)):
         if evaluator.expired:
             break
         attempts += 1
         result = evaluator.evaluate(repaired, source=f"INITIAL_COMMON_REPAIR_{index}")
-        if result.status is BaselineStatus.COMPLETED:
+        if result.status is BaselineStatus.COMPLETED and (
+            accept_completed_by is None or result.completed_at <= accept_completed_by
+        ):
             return result, attempts, tuple(failures)
-        failures.append(result.status.value)
+        failures.append(
+            "LATE_CERTIFIED"
+            if result.status is BaselineStatus.COMPLETED
+            else result.status.value
+        )
     return None, attempts, tuple(failures)
 
 
@@ -580,6 +595,7 @@ def run_vns(
     per_neighborhood_budget: int = 12,
     selection_policy: str = GLOBAL_BALANCED,
     certified_initial: EvaluatedCandidate | None = None,
+    accept_completed_by: float | None = None,
 ) -> VNSResult:
     """Run deterministic-seed VND and accept only strictly better certified Cmax."""
     if selection_policy not in (GLOBAL_BALANCED, LEGACY_LOCAL_ABSOLUTE):
@@ -588,7 +604,10 @@ def run_vns(
     stats = VNSStats()
     if certified_initial is None:
         initial, attempts, init_failures = evaluate_initial_with_shared_repair(
-            initial_solution, evaluator, config
+            initial_solution,
+            evaluator,
+            config,
+            accept_completed_by=accept_completed_by,
         )
     else:
         initial = evaluator.inject_certified(
@@ -630,6 +649,12 @@ def run_vns(
             evaluated = evaluator.evaluate(candidate, source=name)
             if evaluated.status is not BaselineStatus.COMPLETED:
                 _record_failure(stats, evaluated)
+                continue
+            if (
+                accept_completed_by is not None
+                and evaluated.completed_at > accept_completed_by
+            ):
+                stats.late_certified += 1
                 continue
             stats.certified[name] += 1
             assert evaluated.metrics is not None and current.metrics is not None
