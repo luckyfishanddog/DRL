@@ -110,6 +110,8 @@ def build_block_robot_graph(
     blocks: Sequence[WeldingBlock],
     patterns: Sequence[SplitPattern],
     config: ScientificConfig,
+    *,
+    include_weld_edges: bool = True,
 ) -> BlockRobotGraph:
     """Build block-nearness, same-rail-risk and block-to-eligible-robot edges."""
     ordered = tuple(blocks)
@@ -161,30 +163,31 @@ def build_block_robot_graph(
     node_count = len(ordered) + 4
     for node in range(node_count):
         add(node, node, 0)
-    for index, midpoint in enumerate(midpoints):
-        nearest = sorted(
-            (math.dist(midpoint, other), other_index)
-            for other_index, other in enumerate(midpoints)
-            if other_index != index
-        )[:4]
-        for _, other_index in nearest:
-            add(index, other_index, 1)
-    for left in range(len(ordered)):
-        left_x = sorted((ordered[left].start[0], ordered[left].end[0]))
-        left_rails = {0 if robot < 2 else 1 for robot in eligibilities[left]}
-        related: list[tuple[float, int]] = []
-        for right in range(len(ordered)):
-            if left == right:
-                continue
-            right_rails = {0 if robot < 2 else 1 for robot in eligibilities[right]}
-            if not left_rails.intersection(right_rails):
-                continue
-            right_x = sorted((ordered[right].start[0], ordered[right].end[0]))
-            gap = max(0.0, max(left_x[0], right_x[0]) - min(left_x[1], right_x[1]))
-            if gap <= config.interference_dx + config.numeric_epsilon:
-                related.append((math.dist(midpoints[left], midpoints[right]), right))
-        for _, right in sorted(related)[:4]:
-            add(left, right, 2)
+    if include_weld_edges:
+        for index, midpoint in enumerate(midpoints):
+            nearest = sorted(
+                (math.dist(midpoint, other), other_index)
+                for other_index, other in enumerate(midpoints)
+                if other_index != index
+            )[:4]
+            for _, other_index in nearest:
+                add(index, other_index, 1)
+        for left in range(len(ordered)):
+            left_x = sorted((ordered[left].start[0], ordered[left].end[0]))
+            left_rails = {0 if robot < 2 else 1 for robot in eligibilities[left]}
+            related: list[tuple[float, int]] = []
+            for right in range(len(ordered)):
+                if left == right:
+                    continue
+                right_rails = {0 if robot < 2 else 1 for robot in eligibilities[right]}
+                if not left_rails.intersection(right_rails):
+                    continue
+                right_x = sorted((ordered[right].start[0], ordered[right].end[0]))
+                gap = max(0.0, max(left_x[0], right_x[0]) - min(left_x[1], right_x[1]))
+                if gap <= config.interference_dx + config.numeric_epsilon:
+                    related.append((math.dist(midpoints[left], midpoints[right]), right))
+            for _, right in sorted(related)[:4]:
+                add(left, right, 2)
     robot_offset = len(ordered)
     for block_index, eligible in enumerate(eligibilities):
         for robot in eligible:
@@ -249,6 +252,96 @@ class BlockAssignmentGNN(nn.Module):
             ),
             dim=0,
         )
+
+
+class BlockAssignmentRankingModel(nn.Module):
+    """Small joint assignment/ranking model used by the initial-solution study.
+
+    ``encoder_kind='gnn'`` retains the frozen two-layer, four-head GAT.  The MLP
+    ablation consumes the identical node and dynamic features but performs no
+    message passing.  Weld-edge ablation is controlled when the graph is built,
+    so it is used consistently during both training and inference.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        heads: int = 4,
+        *,
+        encoder_kind: str = "gnn",
+    ) -> None:
+        super().__init__()
+        if encoder_kind not in {"gnn", "mlp"}:
+            raise ValueError("encoder_kind must be 'gnn' or 'mlp'")
+        self.hidden_dim = hidden_dim
+        self.heads = heads
+        self.encoder_kind = encoder_kind
+        if encoder_kind == "gnn":
+            self.layer1 = SparseGATLayer(NODE_DIM, hidden_dim, heads)
+            self.layer2 = SparseGATLayer(hidden_dim, hidden_dim, heads)
+        else:
+            self.node_mlp = nn.Sequential(
+                nn.Linear(NODE_DIM, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        fused_dim = 2 * hidden_dim + DYNAMIC_DIM
+        self.assignment_head = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.ranking_head = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def encode_static(self, graph: BlockRobotGraph) -> torch.Tensor:
+        if self.encoder_kind == "mlp":
+            return self.node_mlp(graph.node_features)
+        hidden = torch.nn.functional.elu(
+            self.layer1(graph.node_features, graph.edge_index, graph.edge_type)
+        )
+        return self.layer2(hidden, graph.edge_index, graph.edge_type)
+
+    def _rows(
+        self,
+        graph: BlockRobotGraph,
+        embeddings: torch.Tensor,
+        block_id: str,
+        dynamic_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        block_embedding = embeddings[graph.block_index[block_id]].expand(4, -1)
+        robot_embeddings = embeddings[graph.robot_offset : graph.robot_offset + 4]
+        return torch.cat((block_embedding, robot_embeddings, dynamic_rows), dim=1)
+
+    def action_logits(
+        self,
+        graph: BlockRobotGraph,
+        embeddings: torch.Tensor,
+        block_id: str,
+        dynamic_rows: torch.Tensor,
+        legal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = self.assignment_head(
+            self._rows(graph, embeddings, block_id, dynamic_rows)
+        ).squeeze(1)
+        return logits.masked_fill(~legal_mask, -torch.inf)
+
+    def ordering_score(
+        self,
+        graph: BlockRobotGraph,
+        embeddings: torch.Tensor,
+        block_id: str,
+        robot: int,
+        dynamic_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        if robot not in range(4):
+            raise ValueError("robot must be 0..3")
+        return self.ranking_head(
+            self._rows(graph, embeddings, block_id, dynamic_rows)[robot]
+        ).squeeze(0)
 
 
 def _home(robot: int, config: ScientificConfig) -> tuple[float, float]:
@@ -403,6 +496,186 @@ def solution_from_assignment(
         for robot in range(4)
     )
     return canonicalize(parents, patterns, routes, config, scope=FORMAL_SCOPE_V2)
+
+
+def solution_from_ordered_routes(
+    parents: Sequence[ParentWeld],
+    patterns: Sequence[SplitPattern],
+    blocks: Sequence[WeldingBlock],
+    routes: Sequence[Sequence[str]],
+    config: ScientificConfig,
+) -> CanonicalSolution:
+    """Validate ordered routes before passing them to the canonical model."""
+    if len(routes) != 4:
+        raise ValueError("exactly four robot routes are required")
+    by_id = {block.block_id: block for block in blocks}
+    actual = [block_id for route in routes for block_id in route]
+    if len(actual) != len(set(actual)):
+        raise ValueError("a ranked welding block is assigned more than once")
+    if set(actual) != set(by_id):
+        raise ValueError(
+            "ranked route coverage mismatch: "
+            f"missing={sorted(set(by_id) - set(actual))}, "
+            f"extra={sorted(set(actual) - set(by_id))}"
+        )
+    for robot, route in enumerate(routes):
+        for block_id in route:
+            if not robot_is_eligible(by_id[block_id], robot, config):
+                raise ValueError(f"illegal ranked assignment {block_id} -> R{robot}")
+    return canonicalize(
+        parents,
+        patterns,
+        tuple(Route(robot, tuple(route)) for robot, route in enumerate(routes)),
+        config,
+        scope=FORMAL_SCOPE_V2,
+    )
+
+
+def _validate_predecessors(
+    block_ids: set[str],
+    predecessors: Mapping[str, Sequence[str]] | None,
+) -> dict[str, set[str]]:
+    result = {block_id: set() for block_id in block_ids}
+    for block_id, required in (predecessors or {}).items():
+        if block_id not in block_ids:
+            raise ValueError(f"unknown precedence target: {block_id}")
+        result[block_id] = set(required)
+        unknown = result[block_id] - block_ids
+        if unknown:
+            raise ValueError(f"unknown predecessors for {block_id}: {sorted(unknown)}")
+        if block_id in result[block_id]:
+            raise ValueError(f"self precedence for {block_id}")
+    return result
+
+
+def dag_safe_ordered_routes(
+    model: BlockAssignmentRankingModel,
+    graph: BlockRobotGraph,
+    embeddings: torch.Tensor,
+    assignment: Sequence[tuple[str, int]],
+    config: ScientificConfig,
+    *,
+    predecessors: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[tuple[str, ...], ...]:
+    """Construct four routes through one global topological append sequence.
+
+    The fixed WHOLE/mandatory-Y representation has coverage children but no
+    parent-child temporal edge: the two mandatory-Y children are allowed to run
+    in parallel on different rails.  ``predecessors`` therefore defaults to the
+    empty relation, while keeping the constructor safe for any explicit frozen
+    precedence relation supplied by a caller.  Every route edge and every
+    supplied precedence edge follows the returned global append order, so their
+    union cannot contain a cross-robot cycle.
+    """
+    by_id = {block.block_id: block for block in graph.blocks}
+    owners: dict[str, int] = {}
+    for block_id, robot in assignment:
+        if block_id in owners or block_id not in by_id:
+            raise ValueError(f"duplicate or unknown assigned block: {block_id}")
+        if not robot_is_eligible(by_id[block_id], robot, config):
+            raise ValueError(f"illegal assignment {block_id} -> R{robot}")
+        owners[block_id] = robot
+    if set(owners) != set(by_id):
+        raise ValueError("assignment does not cover the graph blocks")
+    required = _validate_predecessors(set(by_id), predecessors)
+    remaining = set(by_id)
+    scheduled: set[str] = set()
+    routes: list[list[str]] = [[] for _ in range(4)]
+    step = 0
+    while remaining:
+        ready = {
+            block_id
+            for block_id in remaining
+            if required[block_id].issubset(scheduled)
+        }
+        if not ready:
+            unresolved = {key: sorted(required[key] - scheduled) for key in sorted(remaining)}
+            raise ValueError(f"precedence graph contains a cycle: {unresolved}")
+
+        chosen: str | None = None
+        # Rotate the robot turn so ranking comparisons remain within one robot;
+        # the expert data provide no meaningful cross-robot ordering labels.
+        for offset in range(4):
+            robot = (step + offset) % 4
+            candidates = sorted(block_id for block_id in ready if owners[block_id] == robot)
+            if not candidates:
+                continue
+            scored: list[tuple[float, str]] = []
+            for block_id in candidates:
+                rows = dynamic_features(
+                    by_id[block_id], routes, by_id, config, step, len(by_id)
+                )
+                score = model.ordering_score(
+                    graph, embeddings, block_id, robot, rows
+                )
+                scored.append((float(score.detach()), block_id))
+            chosen = min(scored, key=lambda item: (-item[0], item[1]))[1]
+            break
+        if chosen is None:
+            raise AssertionError("ready tasks have no assigned robot")
+        routes[owners[chosen]].append(chosen)
+        remaining.remove(chosen)
+        scheduled.add(chosen)
+        step += 1
+    return tuple(tuple(route) for route in routes)
+
+
+def construct_ranked_solution(
+    parents: Sequence[ParentWeld],
+    config: ScientificConfig,
+    model: BlockAssignmentRankingModel,
+    *,
+    assignment_kind: str,
+    include_weld_edges: bool = True,
+    predecessors: Mapping[str, Sequence[str]] | None = None,
+) -> ConstructionResult:
+    """Create a direct fixed-split solution with learned within-robot ordering."""
+    if assignment_kind not in {"RULE", "MODEL"}:
+        raise ValueError("assignment_kind must be RULE or MODEL")
+    started = time.perf_counter()
+    patterns = fixed_split_patterns(parents, config)
+    blocks = fixed_blocks(parents, patterns, config)
+    graph = build_block_robot_graph(
+        blocks, patterns, config, include_weld_edges=include_weld_edges
+    )
+    by_id = {block.block_id: block for block in blocks}
+    model.eval()
+    with torch.inference_mode():
+        embeddings = model.encode_static(graph)
+        if assignment_kind == "RULE":
+            assignment = rule_assignment(blocks, config)
+        else:
+            partial: list[list[str]] = [[] for _ in range(4)]
+            rows: list[tuple[str, int]] = []
+            for step, block in enumerate(blocks):
+                mask = torch.tensor(
+                    [robot_is_eligible(block, robot, config) for robot in range(4)],
+                    dtype=torch.bool,
+                )
+                logits = model.action_logits(
+                    graph,
+                    embeddings,
+                    block.block_id,
+                    dynamic_features(block, partial, by_id, config, step, len(blocks)),
+                    mask,
+                )
+                robot = int(torch.argmax(logits).item())
+                partial[robot].append(block.block_id)
+                rows.append((block.block_id, robot))
+            assignment = tuple(rows)
+        routes = dag_safe_ordered_routes(
+            model,
+            graph,
+            embeddings,
+            assignment,
+            config,
+            predecessors=predecessors,
+        )
+    solution = solution_from_ordered_routes(
+        parents, patterns, blocks, routes, config
+    )
+    elapsed = time.perf_counter() - started
+    return ConstructionResult(solution, elapsed, 1.0, tuple(assignment))
 
 
 def construct_solution(

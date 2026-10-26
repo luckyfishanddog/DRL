@@ -29,9 +29,15 @@ from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
 from mrta_search.gnn_constructor import (
     BlockAssignmentGNN,
+    BlockAssignmentRankingModel,
+    build_block_robot_graph,
+    construct_ranked_solution,
     construct_solution,
+    dag_safe_ordered_routes,
+    dynamic_features,
     fixed_blocks,
     fixed_split_patterns,
+    rule_assignment,
     solution_from_assignment,
 )
 from mrta_search.vns import (
@@ -127,6 +133,115 @@ def test_gnn_constructor_covers_every_block_once_with_only_legal_actions():
     result = construct_solution(_parents(), CONFIG, model=model)
     assert result.legal_action_fraction == 1.0
     _assert_assignment_legal(result.solution)
+
+
+def test_ranking_model_direct_constructor_is_deterministic_complete_and_legal():
+    import torch
+
+    torch.manual_seed(71)
+    model = BlockAssignmentRankingModel()
+    first = construct_ranked_solution(
+        _parents(), CONFIG, model, assignment_kind="MODEL"
+    )
+    second = construct_ranked_solution(
+        _parents(), CONFIG, model, assignment_kind="MODEL"
+    )
+    assert first.solution.canonical_json == second.solution.canonical_json
+    _assert_assignment_legal(first.solution)
+
+
+def test_weld_edge_ablation_removes_only_weld_relations():
+    patterns = fixed_split_patterns(_parents(), CONFIG)
+    blocks = fixed_blocks(_parents(), patterns, CONFIG)
+    full = build_block_robot_graph(blocks, patterns, CONFIG)
+    ablated = build_block_robot_graph(
+        blocks, patterns, CONFIG, include_weld_edges=False
+    )
+    assert any(int(kind) in (1, 2) for kind in full.edge_type)
+    assert not any(int(kind) in (1, 2) for kind in ablated.edge_type)
+    assert any(int(kind) == 3 for kind in ablated.edge_type)
+    assert ablated.node_features.equal(full.node_features)
+
+
+def test_joint_assignment_and_pairwise_ranking_heads_both_receive_gradients():
+    import torch
+
+    patterns = fixed_split_patterns(_parents(), CONFIG)
+    blocks = fixed_blocks(_parents(), patterns, CONFIG)
+    graph = build_block_robot_graph(blocks, patterns, CONFIG)
+    by_id = {block.block_id: block for block in blocks}
+    assignment = rule_assignment(blocks, CONFIG)
+    routes = [[] for _ in range(4)]
+    model = BlockAssignmentRankingModel()
+    embeddings = model.encode_static(graph)
+    first = blocks[0]
+    rows = dynamic_features(first, routes, by_id, CONFIG, 0, len(blocks))
+    mask = torch.tensor(
+        [robot_is_eligible(first, robot, CONFIG) for robot in range(4)],
+        dtype=torch.bool,
+    )
+    target = dict(assignment)[first.block_id]
+    assignment_loss = torch.nn.functional.cross_entropy(
+        model.action_logits(graph, embeddings, first.block_id, rows, mask).unsqueeze(0),
+        torch.tensor([target]),
+    )
+    same_robot = [block_id for block_id, robot in assignment if robot == target]
+    if len(same_robot) < 2:
+        same_robot = [block.block_id for block in blocks[:2]]
+        target = next(
+            robot
+            for robot in range(4)
+            if all(robot_is_eligible(by_id[item], robot, CONFIG) for item in same_robot)
+        )
+    score0 = model.ordering_score(
+        graph,
+        embeddings,
+        same_robot[0],
+        target,
+        dynamic_features(by_id[same_robot[0]], routes, by_id, CONFIG, 0, len(blocks)),
+    )
+    score1 = model.ordering_score(
+        graph,
+        embeddings,
+        same_robot[1],
+        target,
+        dynamic_features(by_id[same_robot[1]], routes, by_id, CONFIG, 0, len(blocks)),
+    )
+    (assignment_loss + torch.nn.functional.softplus(-(score0 - score1))).backward()
+    assert any(
+        parameter.grad is not None and bool(torch.any(parameter.grad != 0))
+        for parameter in model.assignment_head.parameters()
+    )
+    assert any(
+        parameter.grad is not None and bool(torch.any(parameter.grad != 0))
+        for parameter in model.ranking_head.parameters()
+    )
+
+
+def test_dag_safe_constructor_rejects_precedence_cycle():
+    import torch
+
+    patterns = fixed_split_patterns(_parents(), CONFIG)
+    blocks = fixed_blocks(_parents(), patterns, CONFIG)
+    graph = build_block_robot_graph(blocks, patterns, CONFIG)
+    model = BlockAssignmentRankingModel(encoder_kind="mlp")
+    with torch.inference_mode():
+        embeddings = model.encode_static(graph)
+        assignment = rule_assignment(blocks, CONFIG)
+        first, second = blocks[0].block_id, blocks[1].block_id
+        try:
+            dag_safe_ordered_routes(
+                model,
+                graph,
+                embeddings,
+                assignment,
+                CONFIG,
+                predecessors={first: (second,), second: (first,)},
+            )
+        except ValueError as error:
+            assert "cycle" in str(error)
+        else:
+            raise AssertionError("cyclic precedence was accepted")
 
 
 def test_solution_constructor_rejects_an_illegal_robot_before_canonicalization():

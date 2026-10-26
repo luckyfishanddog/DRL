@@ -1,5 +1,7 @@
 # Multi-Robot Weld Allocation and Sequencing
 
+Current research direction (2026-10-26): [joint graph-policy construction and conflict-related reconstruction](docs/多机器人焊缝分配与排序实验方案.md). The revised plan contains primary literature and official GitHub sources, a concrete joint-insertion/partial-reconstruction design, common-domain comparisons with HGA/WAG, and implementation mapping to existing files. It is a proposed method, not a trained replacement or a superiority claim. A fresh 18-evaluation replay of the existing six DEV instances reproduced the current weakness: RULE+GNN-order has 2 wins/4 losses versus RULE (median Cmax +0.51%); the existing joint model has 1 win/4 losses plus one DEADLOCK (median +2.96% on the five successful pairs). No new files or model weights were created, and solver defaults are unchanged. The historical stages below retain their original scope.
+
 FORMAL_SCOPE_V2 active: WHOLE / Y_SPLIT / X_SPLIT.
 
 Current split windows: **delta_x=delta_y=0.50 m**, child minimum **0.20 m**, interference_dx/dy **0.50 m**. Old ±0.2 cuts and legal MIDPOINT remain; new ±0.5 cuts use distinct OUTER identities. By=[5.5,6.5] is a task-layer rail coverage assumption; no URDF/IK reachability claim. Current development sensitivity: [Y/X range change](docs/YX_SPLIT_RANGE_05_CHANGE.md).
