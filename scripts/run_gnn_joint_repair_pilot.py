@@ -220,12 +220,19 @@ def action_diagnostics(model,graphs,grouped):
                 parent_accuracy=counts['parent_correct']/max(1,counts['parent_actions']))
 
 
-def fit_model(records,args,epochs,*,small=False):
+def fit_model(records,args,epochs,*,small=False,initial_checkpoint=None,prepared=None):
     started=time.perf_counter()
-    graphs,grouped=prepare_training(records)
+    graphs,grouped=prepare_training(records) if prepared is None else prepared
     torch.manual_seed(args.seed)
     model=JointInsertionGNN(64,4,normalize_inputs=True)
-    model.fit_input_scaling([s for steps in grouped.values() for s in steps])
+    if initial_checkpoint is None:
+        model.fit_input_scaling([s for steps in grouped.values() for s in steps])
+    else:
+        if not initial_checkpoint.get('normalize_inputs'):
+            raise ValueError('continued training expects the V2 input scaling')
+        model.load_state_dict(initial_checkpoint['state_dict'],strict=True)
+        # Preserve all four normalization buffers exactly. Re-estimating them
+        # under old weights would silently change the input interpretation.
     optimizer=torch.optim.AdamW(model.parameters(),lr=1e-3)
     history=[];gradient_norms=[]
     for epoch in range(epochs):

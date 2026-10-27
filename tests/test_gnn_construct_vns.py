@@ -126,6 +126,52 @@ def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder():
     assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
 
 
+def test_shared_raw_geometry_initial_has_no_routes_or_heuristic_input(monkeypatch):
+    import run_gnn_shared_construction as shared
+    from mrta_search.gnn_constructor import JointInsertionGNN,joint_geometry
+    from mrta_search import lns
+    def forbidden(*args,**kwargs):
+        raise AssertionError('pure neural construction must not call Beam/Regret')
+    monkeypatch.setattr(shared.pilot.oriented,'common_initial_beam',forbidden)
+    monkeypatch.setattr(lns,'repair_partial_state_oriented',forbidden)
+    reference=_joint_simple_reference()
+    geometry=joint_geometry(reference.parents,reference.patterns,CONFIG)
+    assert not hasattr(geometry,'routes')
+    model=JointInsertionGNN()
+    with torch.no_grad():
+        for parameter in model.parameters():parameter.zero_()
+    scheduled,info=shared.neural_initial(reference.parents,model)
+    assert info['constructed']==info['b32_calls']==1
+    assert info['actions']==len(reference.parents)
+    assert scheduled is not None and scheduled.schedule.status is ScheduleStatus.FEASIBLE
+
+
+def test_shared_replay_is_parent_atomic_and_every_prefix_can_continue():
+    import run_gnn_shared_construction as shared
+    from mrta_search.gnn_constructor import joint_geometry,prepare_joint_teacher_steps
+    parents=(ParentWeld('cross',(4,4),(4,8)),ParentWeld('u',(1,9),(2,9)),ParentWeld('l',(1,2),(2,2)))
+    patterns=fixed_split_patterns(parents,CONFIG)
+    target=canonicalize(parents,patterns,{0:('u::whole','cross::1'),2:('l::whole','cross::0')},CONFIG,scope=FORMAL_SCOPE_V2)
+    directions=((0,0),(),(0,0),())
+    result,info=shared.construction_replay(target,directions)
+    assert info['replay_status']=='REPLAYED'
+    state,actions,snapshots=result
+    cross=[i for i,a in enumerate(actions) if a.block_id.startswith('cross::')]
+    assert cross[1]==cross[0]+1
+    geometry=joint_geometry(parents,patterns,CONFIG)
+    from dataclasses import asdict
+    for prefix,pending,offset in snapshots:
+        _,_,final=prepare_joint_teacher_steps(geometry,prefix.routes,prefix.directions,pending,
+                                             [asdict(a) for a in actions[offset:]],CONFIG)
+        assert final.routes==state.routes and final.directions==directions
+
+
+def test_shared_replay_failure_is_bounded_and_does_not_inject_an_action():
+    import run_gnn_shared_construction as shared
+    result,info=shared.construction_replay(_joint_simple_reference(),((0,),(0,),(),()),max_nodes=0)
+    assert result is None and info['replay_status']=='BOUNDED_REPLAY_EXHAUSTED'
+
+
 def test_joint_data_preparation_rejects_dev_supervision():
     import run_gnn_joint_repair_pilot as joint
     with pytest.raises(ValueError,match='DEV supervision'):

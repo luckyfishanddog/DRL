@@ -408,6 +408,26 @@ class JointCompletionResult:
     rejection_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class JointGeometry:
+    """Geometry and fixed patterns only: deliberately has no ownership/routes."""
+    parents: tuple[ParentWeld, ...]
+    patterns: tuple[SplitPattern, ...]
+    revision: int = 0
+
+
+def joint_geometry(parents, patterns, config):
+    parents=tuple(sorted(parents,key=lambda p:p.parent_id))
+    patterns=tuple(sorted(patterns,key=lambda p:p.parent_id))
+    ids=[p.parent_id for p in parents]
+    if len(set(ids))!=len(ids) or len(patterns)!=len(parents) or {p.parent_id for p in patterns}!=set(ids):
+        raise ValueError('one fixed pattern per distinct parent is required')
+    geometry=JointGeometry(parents,patterns)
+    # Existing formal pattern validation; no complete assignment is invented.
+    block_map(geometry,config,scope=FORMAL_SCOPE_V2)
+    return geometry
+
+
 def joint_graph(reference, config):
     blocks = block_map(reference,config,scope=FORMAL_SCOPE_V2)
     graph = build_block_robot_graph(tuple(sorted(blocks.values(),key=lambda b:b.block_id)),
@@ -535,7 +555,9 @@ def prepare_joint_teacher_steps(reference, routes, directions, pending, actions,
             steps.append(dict(parent_ids=ids if child_index==0 else (),parent_features=parent_features if child_index==0 else None,
                               parent_target=ids.index(parent) if child_index==0 else None,
                               indices=indices,features=features,target=matches[0],
-                              candidate_actions=tuple(a for _,a in variants)))
+                              candidate_actions=tuple(a for _,a in variants),
+                              state_routes=state.routes,state_directions=state.directions,
+                              pending_parent_ids=tuple(sorted(pending)),teacher_action_key=joint_action_key(action)))
             state = variants[matches[0]][0]
             cursor += 1
         pending.remove(parent)
