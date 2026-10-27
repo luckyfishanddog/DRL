@@ -32,7 +32,7 @@ from mrta_reference.model import (
     WeldingBlock,
 )
 from mrta_reference.scope import FORMAL_SCOPE_V2
-from mrta_reference.solution import canonicalize
+from mrta_reference.solution import canonicalize, block_map
 
 
 NODE_DIM = 20
@@ -112,6 +112,7 @@ def build_block_robot_graph(
     config: ScientificConfig,
     *,
     include_weld_edges: bool = True,
+    include_parent_edges: bool = False,
 ) -> BlockRobotGraph:
     """Build block-nearness, same-rail-risk and block-to-eligible-robot edges."""
     ordered = tuple(blocks)
@@ -189,6 +190,12 @@ def build_block_robot_graph(
             for _, right in sorted(related)[:4]:
                 add(left, right, 2)
     robot_offset = len(ordered)
+    if include_parent_edges:
+        known = set(zip(edges, edge_types))
+        for i, left in enumerate(ordered):
+            for j, right in enumerate(ordered):
+                if i != j and left.parent_id == right.parent_id and ((i,j),2) not in known:
+                    add(i,j,2)
     for block_index, eligible in enumerate(eligibilities):
         for robot in eligible:
             add(block_index, robot_offset + robot, 3)
@@ -342,6 +349,223 @@ class BlockAssignmentRankingModel(nn.Module):
         return self.ranking_head(
             self._rows(graph, embeddings, block_id, dynamic_rows)[robot]
         ).squeeze(0)
+
+
+JOINT_DYNAMIC_DIM = 41
+JOINT_PARENT_DIM = 12
+
+
+class JointInsertionGNN(BlockAssignmentGNN):
+    """The existing two-layer GAT with conditional parent/insertion heads."""
+
+    def __init__(self, hidden_dim=64, heads=4):
+        super().__init__(hidden_dim, heads)
+        self.hidden_dim, self.heads = hidden_dim, heads
+        self.policy = nn.Identity()  # Assignment-only head is not used here.
+        self.parent_head = nn.Sequential(nn.Linear(hidden_dim+JOINT_PARENT_DIM,hidden_dim),
+                                         nn.ReLU(),nn.Linear(hidden_dim,1))
+        self.insertion_head = nn.Sequential(nn.Linear(4*hidden_dim+JOINT_DYNAMIC_DIM,hidden_dim),
+                                            nn.ReLU(),nn.Linear(hidden_dim,1))
+
+    def parent_logits(self, graph, embeddings, parent_ids, features):
+        pooled = torch.stack([embeddings[[graph.block_index[b.block_id] for b in graph.blocks
+                                          if b.parent_id==p]].mean(0) for p in parent_ids])
+        return self.parent_head(torch.cat((pooled,features),dim=1)).squeeze(1)
+
+    def joint_action_logits(self, embeddings, indices, features):
+        context = embeddings[indices.clamp_min(0)] * (indices>=0).unsqueeze(-1)
+        return self.insertion_head(torch.cat((context.flatten(1),features),dim=1)).squeeze(1)
+
+
+@dataclass(frozen=True)
+class JointCompletionResult:
+    solution: CanonicalSolution | None
+    directions: tuple[tuple[int, ...], ...] | None
+    actions: tuple
+    inference_seconds: float
+    rejection_reason: str | None = None
+
+
+def joint_graph(reference, config):
+    blocks = block_map(reference,config,scope=FORMAL_SCOPE_V2)
+    graph = build_block_robot_graph(tuple(sorted(blocks.values(),key=lambda b:b.block_id)),
+                                    reference.patterns,config,include_parent_edges=True)
+    return graph, blocks, {p.parent_id:p for p in reference.patterns}
+
+
+def joint_start_state(reference, routes, directions, pending, blocks, config):
+    from .lns import oriented_route_state
+    pending = set(pending)
+    if not pending <= {p.parent_id for p in reference.parents}:
+        raise ValueError('unknown pending parent')
+    actual = [b for route in routes for b in route]
+    expected = {b for b in blocks if blocks[b].parent_id not in pending}
+    if len(actual)!=len(set(actual)) or set(actual)!=expected:
+        raise ValueError('partial state must remove each pending parent completely')
+    state = oriented_route_state(routes,directions,blocks,config)
+    for r,route in enumerate(routes):
+        if any(not robot_is_eligible(blocks[b],r,config) for b in route):
+            raise ValueError('illegal retained assignment')
+        patterns={p.parent_id:p for p in reference.patterns}
+        for b in route:
+            p=patterns[blocks[b].parent_id]
+            if p.kind is SplitKind.X_SPLIT:
+                required=(0 if p.rail is Rail.UPPER else 2)+int(b.endswith('::1'))
+                if r!=required:
+                    raise ValueError('retained X_SPLIT child has wrong robot')
+    return state
+
+
+def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8):
+    from .lns import joint_block_candidates
+    scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
+    travel = [sum(arcs) for arcs in state.arc_costs]
+    ids, features = [], []
+    for p in sorted(pending):
+        children = sorted((b for b in blocks.values() if b.parent_id==p),key=lambda b:b.block_id)
+        if not joint_block_candidates(state,children[0],patterns[p],blocks,config,
+                                       insertion_limit=insertion_limit,first_only=True):
+            continue
+        legal = [r for r in range(4) if robot_is_eligible(children[0],r,config)]
+        if patterns[p].kind is SplitKind.X_SPLIT:
+            legal = [0 if patterns[p].rail is Rail.UPPER else 2]
+        ids.append(p)
+        features.append([*(v/scale for v in state.loads),*(v/scale for v in travel),
+                         sum(config.process_time(b.length) for b in children)/scale,
+                         min(state.loads[r]+travel[r] for r in legal)/scale,
+                         len(pending)/max(1,len(patterns)),len(children)/2])
+    return tuple(ids),torch.tensor(features,dtype=torch.float32).reshape(-1,JOINT_PARENT_DIM)
+
+
+def joint_candidate_inputs(graph, state, variants, blocks, config):
+    """Only geometry, the current prefix and executable local next states."""
+    from mrta_reference.geometry import oriented_endpoints
+    scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
+    n = max(1,len(blocks))
+    old_travel = [sum(arcs) for arcs in state.arc_costs]
+    def overlap(s,r):
+        left,right = (r//2*2,r//2*2+1)
+        if not s.routes[left] or not s.routes[right]:
+            return 0.0
+        left_end = max(max(blocks[b].start[0],blocks[b].end[0]) for b in s.routes[left])
+        right_start = min(min(blocks[b].start[0],blocks[b].end[0]) for b in s.routes[right])
+        return max(0.0,left_end+config.interference_dx-right_start)/20
+    def first_x(s,r):
+        return (oriented_endpoints(blocks[s.routes[r][0]],s.directions[r][0])[0][0]/20
+                if s.routes[r] else 0.0)
+    indices, features = [], []
+    for after,action in variants:
+        r,k = action.robot,action.position
+        route = state.routes[r]
+        pre = route[k-1] if k else None
+        post = route[k] if k<len(route) else None
+        indices.append([graph.block_index[action.block_id],graph.robot_offset+r,
+                        graph.block_index[pre] if pre else -1,graph.block_index[post] if post else -1])
+        start,end = oriented_endpoints(blocks[action.block_id],action.direction)
+        pre_old = state.directions[r][k-1] if pre else 0
+        post_old = state.directions[r][k] if post else 0
+        pre_new = after.directions[r][k-1] if pre else 0
+        post_new = after.directions[r][k+1] if post else 0
+        incoming = (math.dist(oriented_endpoints(blocks[pre],pre_new)[1],start)/config.empty_speed if pre else 0)
+        outgoing = (math.dist(end,oriented_endpoints(blocks[post],post_new)[0])/config.empty_speed if post else 0)
+        old_arc = (math.dist(oriented_endpoints(blocks[pre],pre_old)[1],
+                             oriented_endpoints(blocks[post],post_old)[0])/config.empty_speed if pre and post else 0)
+        estimated = [p+sum(arcs) for p,arcs in zip(after.loads,after.arc_costs)]
+        features.append([*(v/scale for v in state.loads),*(v/scale for v in old_travel),
+                         *(v/scale for v in estimated),*(len(route)/n for route in state.routes),
+                         k/max(1,len(route)),float(pre is not None),float(post is not None),float(action.direction),
+                         pre_old,pre_new,post_old,post_new,len(action.neighbour_changes)/2,
+                         incoming/scale,outgoing/scale,old_arc/scale,(after.travel-state.travel)/scale,
+                         overlap(state,r),overlap(after,r),float(r%2==0),
+                         start[0]/20,start[1]/12,end[0]/20,end[1]/12,
+                         first_x(state,r),first_x(after,r),first_x(state,r^1),max(estimated)/scale,sum(estimated)/scale])
+    return torch.tensor(indices,dtype=torch.long).reshape(-1,4),torch.tensor(features,dtype=torch.float32).reshape(-1,JOINT_DYNAMIC_DIM)
+
+
+def prepare_joint_teacher_steps(reference, routes, directions, pending, actions, config, *, insertion_limit=8):
+    """Validate every teacher label against the inference action set; never skip."""
+    from .lns import joint_block_candidates,joint_action_key,OrientedInsertionAction
+    graph,blocks,patterns = joint_graph(reference,config)
+    state = joint_start_state(reference,routes,directions,pending,blocks,config)
+    pending = set(pending)
+    steps = []
+    cursor = 0
+    while pending:
+        if cursor>=len(actions):
+            raise ValueError('teacher trajectory ended before complete parent coverage')
+        raw = actions[cursor]
+        parent = blocks[raw['block_id']].parent_id
+        ids,parent_features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit)
+        if parent not in ids:
+            raise ValueError(f'teacher parent absent from legal candidates: {parent}')
+        children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
+        for child_index,child in enumerate(children):
+            if cursor>=len(actions) or actions[cursor]['block_id']!=child.block_id:
+                raise ValueError('teacher must place both children atomically in block order')
+            raw = actions[cursor]
+            action = OrientedInsertionAction(raw['block_id'],raw['robot'],raw['position'],raw['direction'],
+                                              tuple(tuple(c) for c in raw['neighbour_changes']))
+            variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit)
+            matches = [i for i,(_,a) in enumerate(variants) if joint_action_key(a)==joint_action_key(action)]
+            if len(matches)!=1:
+                raise ValueError(f'teacher action missing/ambiguous: {joint_action_key(action)}; candidates={len(variants)}')
+            indices,features = joint_candidate_inputs(graph,state,variants,blocks,config)
+            steps.append(dict(parent_ids=ids if child_index==0 else (),parent_features=parent_features if child_index==0 else None,
+                              parent_target=ids.index(parent) if child_index==0 else None,
+                              indices=indices,features=features,target=matches[0]))
+            state = variants[matches[0]][0]
+            cursor += 1
+        pending.remove(parent)
+    if cursor!=len(actions):
+        raise ValueError('teacher trajectory contains extra actions')
+    return graph,steps,state
+
+
+def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
+                                 model: JointInsertionGNN, config, *, insertion_limit=8):
+    """One sequential neural policy, usable for partial or four-empty routes.
+
+    It returns failure as failure. No scheduler, heuristic repair or direction
+    optimizer is called; complete results are scheduled once by the caller.
+    """
+    from .lns import joint_block_candidates
+    started = time.perf_counter()
+    actions = []
+    try:
+        graph,blocks,patterns = joint_graph(reference,config)
+        state = joint_start_state(reference,routes,directions,pending_parent_ids,blocks,config)
+        pending = set(pending_parent_ids)
+        model.eval()
+        with torch.inference_mode():
+            embeddings = model.encode_static(graph)
+            while pending:
+                ids,features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit)
+                if not ids:
+                    raise ValueError('NO_LEGAL_PARENT_ACTION')
+                parent_logits = model.parent_logits(graph,embeddings,ids,features)
+                if not torch.isfinite(parent_logits).all():
+                    raise ValueError('NONFINITE_PARENT_LOGITS')
+                parent = ids[int(torch.argmax(parent_logits))]
+                children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
+                for child in children:
+                    variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit)
+                    if not variants:
+                        raise ValueError('NO_LEGAL_CHILD_INSERTION')
+                    indices,dynamic = joint_candidate_inputs(graph,state,variants,blocks,config)
+                    logits = model.joint_action_logits(embeddings,indices,dynamic)
+                    if not torch.isfinite(logits).all():
+                        raise ValueError('NONFINITE_INSERTION_LOGITS')
+                    state,action = variants[int(torch.argmax(logits))]
+                    actions.append(action)
+                pending.remove(parent)
+        solution = canonicalize(reference.parents,reference.patterns,
+                                tuple(Route(r,state.routes[r]) for r in range(4)),config,scope=FORMAL_SCOPE_V2,
+                                revision=reference.revision+1)
+        if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
+            raise ValueError('FIXED_PATTERN_CHANGED')
+        return JointCompletionResult(solution,state.directions,tuple(actions),time.perf_counter()-started)
+    except (ValueError,KeyError,IndexError,ArithmeticError) as error:
+        return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,str(error))
 
 
 def _home(robot: int, config: ScientificConfig) -> tuple[float, float]:

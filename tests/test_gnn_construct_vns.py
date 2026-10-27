@@ -5,6 +5,8 @@ from pathlib import Path
 import random
 import sys
 import time
+import pytest
+import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPT_DIR) not in sys.path:
@@ -52,6 +54,99 @@ from mrta_search.vns import (
 
 
 CONFIG = ScientificConfig()
+
+
+def _joint_simple_reference():
+    parents=(ParentWeld('joint-a',(1,9),(2,9)),ParentWeld('joint-b',(14,9),(15,9)))
+    return canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+                        {0:('joint-a::whole',),1:('joint-b::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+
+
+def test_joint_teacher_labels_replay_in_the_actual_student_pool():
+    from mrta_search.lns import _remove_parent_set,repair_partial_state_oriented
+    from mrta_search.gnn_constructor import prepare_joint_teacher_steps
+    reference=_joint_simple_reference()
+    partial=_remove_parent_set(reference,tuple(p.parent_id for p in reference.parents))
+    teacher=repair_partial_state_oriented(reference,((0,),(0,),(),()),partial,CONFIG,
+                                          coordination_proxy=True,direction_versions=2,seed=4)
+    assert teacher.candidate is not None
+    actions=[dict(block_id=a.block_id,robot=a.robot,position=a.position,direction=a.direction,
+                  neighbour_changes=a.neighbour_changes) for a in teacher.actions]
+    graph,steps,final=prepare_joint_teacher_steps(reference,partial.routes,((),(),(),()),
+                                                 partial.removed_parent_ids,actions,CONFIG)
+    assert final.routes==tuple(r.block_ids for r in teacher.candidate.solution.routes)
+    assert final.directions==teacher.directions
+    assert len(steps)==len(actions)==2
+    assert all(s['indices'].shape[1]==4 and s['features'].shape[1]==41 for s in steps)
+    broken=[dict(a) for a in actions]
+    broken[0]['position']=999
+    with pytest.raises(ValueError,match='missing/ambiguous'):
+        prepare_joint_teacher_steps(reference,partial.routes,((),(),(),()),partial.removed_parent_ids,broken,CONFIG)
+
+
+def test_joint_neural_logits_control_robot_choice_and_complete_real_b32(monkeypatch):
+    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
+    from mrta_search import lns
+    import run_joint_oriented_repair_pilot as direct
+    def forbidden(*args,**kwargs):
+        raise AssertionError('GNN must not fall back to heuristic repair')
+    monkeypatch.setattr(lns,'repair_partial_state_oriented',forbidden)
+    parent=ParentWeld('one',(1,9),(2,9))
+    reference=canonicalize((parent,),(SplitPattern('one',SplitKind.WHOLE),),{0:('one::whole',)},CONFIG)
+    for sign,expected in ((1,0),(-1,1)):
+        model=JointInsertionGNN()
+        with torch.no_grad():
+            for p in model.insertion_head.parameters():
+                p.zero_()
+            # A learned-head feature, not a decoder rule, controls left/right.
+            model.insertion_head[0].weight[0,4*64+31]=1
+            model.insertion_head[2].weight[0,0]=sign
+        result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),('one',),model,CONFIG)
+        assert result.solution is not None
+        assert result.actions[0].robot==expected
+        assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
+
+
+def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder():
+    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    import run_joint_oriented_repair_pilot as direct
+    parent=ParentWeld('joint-x',(0,8),(4,8))
+    pattern=next(p for p in build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)[parent.parent_id]
+                 if p.kind is SplitKind.X_SPLIT and p.point_id=='BX_CENTER')
+    reference=canonicalize((parent,),(pattern,),{0:('joint-x::0',),1:('joint-x::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    torch.manual_seed(20261027)
+    result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),('joint-x',),JointInsertionGNN(),CONFIG)
+    assert result.solution is not None
+    assert result.solution.patterns==(pattern,)
+    assert result.solution.routes[0].block_ids==('joint-x::0',)
+    assert result.solution.routes[1].block_ids==('joint-x::1',)
+    assert result.directions[2:]==((),())
+    assert len(result.actions)==2
+    assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
+
+
+def test_joint_data_preparation_rejects_dev_supervision():
+    import run_gnn_joint_repair_pilot as joint
+    with pytest.raises(ValueError,match='DEV supervision'):
+        joint.prepare_record(dict(entry=dict(split='MLP_DEV')))
+
+
+def test_joint_teacher_neighbour_flips_are_executable_student_actions():
+    from dataclasses import asdict
+    from mrta_search.lns import oriented_route_state,joint_block_candidates
+    from mrta_search.gnn_constructor import prepare_joint_teacher_steps
+    parents=tuple(ParentWeld(p,(x,9),(x+1,9)) for p,x in (('a',1),('b',4),('c',7)))
+    reference=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+                            {0:('a::whole','b::whole','c::whole')},CONFIG)
+    blocks=block_map(reference,CONFIG)
+    routes=(('a::whole','c::whole'),(),(),());directions=((1,1),(),(),())
+    state=oriented_route_state(routes,directions,blocks,CONFIG)
+    variants=joint_block_candidates(state,blocks['b::whole'],reference.patterns[1],blocks,CONFIG)
+    after,action=next((s,a) for s,a in variants if a.robot==0 and a.position==1 and a.neighbour_changes)
+    _,steps,replayed=prepare_joint_teacher_steps(reference,routes,directions,('b',),(asdict(action),),CONFIG)
+    assert replayed.routes==after.routes and replayed.directions==after.directions
+    assert steps[0]['features'][steps[0]['target'],24]>0
 
 
 def _parents():

@@ -802,6 +802,42 @@ def oriented_insert_variants(
     return tuple(rows[:keep]), used
 
 
+def joint_action_key(action: OrientedInsertionAction) -> tuple:
+    return (action.block_id, action.robot, action.position, action.direction,
+            tuple(tuple(change) for change in action.neighbour_changes))
+
+
+def joint_block_candidates(
+    state: OrientedRouteState, block: WeldingBlock, pattern: SplitPattern,
+    blocks: Mapping[str, WeldingBlock], config: ScientificConfig, *,
+    insertion_limit: int = 8, first_only: bool = False,
+):
+    """Shared student/teacher-replay action set, including neighbour flips.
+
+    All at-most-eight local direction configurations are exposed. The existing
+    bounded position rule is identical at training and inference. No teacher
+    label or future schedule is accepted by this function.
+    """
+    robots = [r for r in range(4) if robot_is_eligible(block, r, config)]
+    if pattern.kind is SplitKind.X_SPLIT:
+        robots = [(0 if pattern.rail.value == "UPPER" else 2) + int(block.block_id.endswith("::1"))]
+    rows = []
+    for robot in robots:
+        for position in bounded_insertion_positions(len(state.routes[robot]), insertion_limit):
+            variants, _ = oriented_insert_variants(state, block, robot, position, blocks, config,
+                                                   max_evaluations=8, keep=8)
+            for inserted, action in variants:
+                # Fixed-pattern normalization would collapse adjacent siblings.
+                sibling_ids = [b for b in inserted.routes[robot]
+                               if blocks[b].parent_id == block.parent_id and b != block.block_id]
+                if any(abs(inserted.routes[robot].index(b)-position)==1 for b in sibling_ids):
+                    continue
+                rows.append((inserted, action))
+                if first_only:
+                    return tuple(rows)
+    return tuple(rows)
+
+
 def _oriented_parent_alternatives(
     parent_id, routes, hints, blocks, pattern, config, *, insertion_limit,
     remaining_budget, direction_mode, original_directions, seed, state=None,
