@@ -132,6 +132,66 @@ def test_joint_data_preparation_rejects_dev_supervision():
         joint.prepare_record(dict(entry=dict(split='MLP_DEV')))
 
 
+def test_joint_record_identity_keeps_different_partial_learning_states():
+    from copy import deepcopy
+    import run_gnn_joint_repair_pilot as joint
+    record=dict(parents=[dict(parent_id='a',start=(1,9),end=(2,9))],
+                patterns=[dict(parent_id='a',kind='WHOLE',t=None,point_id=None,rail=None)],
+                partial_routes=[[],[],[],[]],partial_directions=[[],[],[],[]],pending_parents=['a'],
+                final_routes=[['a::whole'],[],[],[]],final_directions=[[0],[],[],[]])
+    same=deepcopy(record)
+    other=deepcopy(record);other['partial_routes'][1]=['retained::whole'];other['partial_directions'][1]=[1]
+    assert joint.record_key(record)==joint.record_key(same)
+    assert joint.record_key(record)!=joint.record_key(other)
+    other=deepcopy(record);other['parents'][0]['end']=(3,9)
+    assert joint.record_key(record)!=joint.record_key(other)
+
+
+def test_joint_train_scaling_roundtrips_and_v1_still_loads_strictly():
+    from mrta_search.gnn_constructor import JointInsertionGNN
+    torch.manual_seed(7)
+    legacy=JointInsertionGNN()
+    restored=JointInsertionGNN();restored.load_state_dict(legacy.state_dict(),strict=True)
+    embeddings=torch.randn(8,64);indices=torch.tensor([[0,4,-1,2],[0,5,1,-1]])
+    features=torch.randn(2,41)*0.001
+    assert torch.equal(legacy.joint_action_logits(embeddings,indices,features),
+                       restored.joint_action_logits(embeddings,indices,features))
+    normalized=JointInsertionGNN(normalize_inputs=True)
+    normalized.fit_input_scaling([dict(features=features,parent_features=torch.randn(3,12))])
+    assert torch.isfinite(normalized.scale_inputs(features,'joint')).all()
+    normalized_copy=JointInsertionGNN(normalize_inputs=True)
+    normalized_copy.load_state_dict(normalized.state_dict())
+    assert torch.equal(normalized.joint_action_logits(embeddings,indices,features),
+                       normalized_copy.joint_action_logits(embeddings,indices,features))
+
+
+def test_joint_feedback_selects_from_updated_incumbent_and_bounds_b32(monkeypatch):
+    from types import SimpleNamespace as NS
+    import run_gnn_joint_repair_pilot as joint
+    selections=[];scheduled=[]
+    def select(solution,directions,schedule,selection,**kwargs):
+        selections.append((solution,schedule.cmax))
+        return NS(routes=(),removed_parent_ids=('a',))
+    def repair(*args,**kwargs):
+        return NS(solution='candidate-'+str(len(selections)),directions=(),actions=())
+    def schedule(solution,directions,config):
+        scheduled.append(solution)
+        cmax={1:90.,5:80.}.get(len(scheduled),95.)
+        return NS(solution=solution,directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=cmax))
+    monkeypatch.setattr(joint,'select_bottleneck_parents',select)
+    monkeypatch.setattr(joint,'construct_or_repair_with_gnn',repair)
+    monkeypatch.setattr(joint,'partial_directions',lambda *args:())
+    monkeypatch.setattr(joint.oriented,'schedule_explicit',schedule)
+    monkeypatch.setattr(joint.oriented,'summary',lambda *args:{})
+    initial=NS(solution='initial',directions=(),schedule=NS(cmax=100.))
+    row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2',None,NS(seed=20261027))
+    assert row['accepted']==2 and row['best_cmax']==80.
+    assert row['b32_calls']==len(scheduled)==24
+    assert selections[0]==('initial',100.)
+    assert selections[1:5]==[('candidate-1',90.)]*4
+    assert selections[5:]==[('candidate-5',80.)]*19
+
+
 def test_joint_teacher_neighbour_flips_are_executable_student_actions():
     from dataclasses import asdict
     from mrta_search.lns import oriented_route_state,joint_block_candidates
@@ -585,4 +645,23 @@ def test_existing_role_manifest_keeps_train_and_dev_disjoint():
     assert len(train) == 17
     assert len(dev) == 6
     assert train.isdisjoint(dev)
+
+
+def test_expanded_joint_sheets_use_roles_and_geometry_instead_of_directory_names():
+    import statistics
+    from mrta_ranker import dataset
+    candidates=dataset.train_sheet_candidates()
+    split=dataset.read(dataset.SPLIT)
+    assert set(candidates)==set(split['MLP_TRAIN'])
+    assert any('/ID_TEST/' in path for path in candidates)
+    assert set(candidates).isdisjoint(split['MLP_DEV']+split['ORACLE_DEV_CONSUMED'])
+    for path,rows in candidates.items():
+        assert len({r['instance_id'] for r in rows[:3]})==3
+        for r in rows:
+            assert r['relative_path']==path and r['split']=='MLP_TRAIN'
+            assert r['validation_status']=='VALID' and r['duplicate_of'] is None
+            assert r['formal_compatibility']=='PASS' and 10<=r['N']<=90
+        counts=[r['N'] for r in rows]
+        assert rows[0]['N']==min(counts) and rows[2]['N']==max(counts)
+        assert abs(rows[1]['N']-statistics.median(counts))==min(abs(n-statistics.median(counts)) for n in counts)
 

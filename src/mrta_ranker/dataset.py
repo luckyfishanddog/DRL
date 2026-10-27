@@ -180,6 +180,72 @@ def load_parents(entry,*,split=None,loader=None):
     return to_parent_welds(instance)
 
 
+def train_sheet_candidates():
+    """All eligible sheets in the existing 17 TRAIN workbooks, geometry ordered.
+
+    The first three span each workbook's count range (min/median/max). Further
+    choices maximize distance in static count/spatial descriptors. This reads
+    manifest metadata only; load_parents retains the existing access checks.
+    """
+    split=validate_split(read(SPLIT))
+    manifest=read(DATASET)
+    roles=read(ROLES)
+    assert_v2_solver_access_allowed(roles,split['MLP_TRAIN'],allowed_roles=('V2_TRAIN_POOL',))
+    result={}
+    descriptors=('actual_weld_count','midpoint_dispersion','grid_occupancy_ratio',
+                 'quadrant_length_cv','upper_lower_length_imbalance','left_right_length_imbalance')
+    for path in sorted(split['MLP_TRAIN']):
+        rows=[e for e in manifest['instances'] if e['relative_path']==path
+              and e['validation_status']=='VALID' and e.get('duplicate_of') is None
+              and e.get('formal_compatibility')=='PASS' and 10<=e['actual_weld_count']<=90]
+        rows.sort(key=lambda e:(e['actual_weld_count'],e['instance_id']))
+        if len(rows)<3:
+            raise ValueError(f'TRAIN workbook has fewer than three eligible sheets: {path}')
+        chosen=[]
+        for target in (rows[0]['actual_weld_count'],statistics.median(e['actual_weld_count'] for e in rows),rows[-1]['actual_weld_count']):
+            chosen.append(min((e for e in rows if e not in chosen),key=lambda e:(abs(e['actual_weld_count']-target),e['instance_id'])))
+        spans={k:max(1e-6,max(e[k] for e in rows)-min(e[k] for e in rows)) for k in descriptors}
+        while len(chosen)<len(rows):
+            def distance(e):
+                return min(sum(((e[k]-c[k])/spans[k])**2 for k in descriptors) for c in chosen)
+            chosen.append(min((e for e in rows if e not in chosen),key=lambda e:(-distance(e),e['instance_id'])))
+        result[path]=[{**e,'split':'MLP_TRAIN','N':e['actual_weld_count']} for e in chosen]
+    return result
+
+
+def train_sheet_candidates():
+    """All eligible sheets in the existing 17 TRAIN workbooks, geometry ordered.
+
+    The first three span each workbook's count range (min/median/max). Further
+    choices maximize distance in static count/spatial descriptors. This reads
+    manifest metadata only; load_parents retains the existing access checks.
+    """
+    split=validate_split(read(SPLIT))
+    manifest=read(DATASET)
+    roles=read(ROLES)
+    assert_v2_solver_access_allowed(roles,split['MLP_TRAIN'],allowed_roles=('V2_TRAIN_POOL',))
+    result={}
+    descriptors=('actual_weld_count','midpoint_dispersion','grid_occupancy_ratio',
+                 'quadrant_length_cv','upper_lower_length_imbalance','left_right_length_imbalance')
+    for path in sorted(split['MLP_TRAIN']):
+        rows=[e for e in manifest['instances'] if e['relative_path']==path
+              and e['validation_status']=='VALID' and e.get('duplicate_of') is None
+              and e.get('formal_compatibility')=='PASS' and 10<=e['actual_weld_count']<=90]
+        rows.sort(key=lambda e:(e['actual_weld_count'],e['instance_id']))
+        if len(rows)<3:
+            raise ValueError(f'TRAIN workbook has fewer than three eligible sheets: {path}')
+        chosen=[]
+        for target in (rows[0]['actual_weld_count'],statistics.median(e['actual_weld_count'] for e in rows),rows[-1]['actual_weld_count']):
+            chosen.append(min((e for e in rows if e not in chosen),key=lambda e:(abs(e['actual_weld_count']-target),e['instance_id'])))
+        spans={k:max(1e-6,max(e[k] for e in rows)-min(e[k] for e in rows)) for k in descriptors}
+        while len(chosen)<len(rows):
+            def distance(e):
+                return min(sum(((e[k]-c[k])/spans[k])**2 for k in descriptors) for c in chosen)
+            chosen.append(min((e for e in rows if e not in chosen),key=lambda e:(-distance(e),e['instance_id'])))
+        result[path]=[{**e,'split':'MLP_TRAIN','N':e['actual_weld_count']} for e in chosen]
+    return result
+
+
 class Capture:
     """Last certified accepted-state boundary at or before each target; no future backfill."""
     def __init__(self):

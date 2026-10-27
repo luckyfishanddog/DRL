@@ -358,7 +358,7 @@ JOINT_PARENT_DIM = 12
 class JointInsertionGNN(BlockAssignmentGNN):
     """The existing two-layer GAT with conditional parent/insertion heads."""
 
-    def __init__(self, hidden_dim=64, heads=4):
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=False):
         super().__init__(hidden_dim, heads)
         self.hidden_dim, self.heads = hidden_dim, heads
         self.policy = nn.Identity()  # Assignment-only head is not used here.
@@ -366,15 +366,37 @@ class JointInsertionGNN(BlockAssignmentGNN):
                                          nn.ReLU(),nn.Linear(hidden_dim,1))
         self.insertion_head = nn.Sequential(nn.Linear(4*hidden_dim+JOINT_DYNAMIC_DIM,hidden_dim),
                                             nn.ReLU(),nn.Linear(hidden_dim,1))
+        # Optional TRAIN-fitted scaling; the default preserves V1 checkpoints
+        # and logits exactly. No new direction head or encoder is introduced.
+        self.normalize_inputs = normalize_inputs
+        if normalize_inputs:
+            for prefix,dim in (('joint',JOINT_DYNAMIC_DIM),('parent',JOINT_PARENT_DIM)):
+                self.register_buffer(prefix+'_mean',torch.zeros(dim))
+                self.register_buffer(prefix+'_scale',torch.ones(dim))
+
+    def fit_input_scaling(self, steps):
+        if not self.normalize_inputs:
+            raise ValueError('input scaling is disabled')
+        for prefix,key in (('joint','features'),('parent','parent_features')):
+            rows=torch.cat([s[key] for s in steps if s[key] is not None and len(s[key])])
+            if not torch.isfinite(rows).all():
+                raise ValueError('nonfinite TRAIN features')
+            getattr(self,prefix+'_mean').copy_(rows.mean(0))
+            getattr(self,prefix+'_scale').copy_(rows.std(0,unbiased=False).clamp_min(1e-3))
+
+    def scale_inputs(self, features, prefix):
+        if self.normalize_inputs:
+            return (features-getattr(self,prefix+'_mean'))/getattr(self,prefix+'_scale')
+        return features
 
     def parent_logits(self, graph, embeddings, parent_ids, features):
         pooled = torch.stack([embeddings[[graph.block_index[b.block_id] for b in graph.blocks
                                           if b.parent_id==p]].mean(0) for p in parent_ids])
-        return self.parent_head(torch.cat((pooled,features),dim=1)).squeeze(1)
+        return self.parent_head(torch.cat((pooled,self.scale_inputs(features,'parent')),dim=1)).squeeze(1)
 
     def joint_action_logits(self, embeddings, indices, features):
         context = embeddings[indices.clamp_min(0)] * (indices>=0).unsqueeze(-1)
-        return self.insertion_head(torch.cat((context.flatten(1),features),dim=1)).squeeze(1)
+        return self.insertion_head(torch.cat((context.flatten(1),self.scale_inputs(features,'joint')),dim=1)).squeeze(1)
 
 
 @dataclass(frozen=True)
@@ -512,7 +534,8 @@ def prepare_joint_teacher_steps(reference, routes, directions, pending, actions,
             indices,features = joint_candidate_inputs(graph,state,variants,blocks,config)
             steps.append(dict(parent_ids=ids if child_index==0 else (),parent_features=parent_features if child_index==0 else None,
                               parent_target=ids.index(parent) if child_index==0 else None,
-                              indices=indices,features=features,target=matches[0]))
+                              indices=indices,features=features,target=matches[0],
+                              candidate_actions=tuple(a for _,a in variants)))
             state = variants[matches[0]][0]
             cursor += 1
         pending.remove(parent)
