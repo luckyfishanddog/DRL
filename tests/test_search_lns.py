@@ -172,6 +172,150 @@ def test_wait_selector_keeps_actual_before_after_anchors():
         assert partial.removed_parent_ids == ("a", "b")
 
 
+def _oriented_fixture():
+    from mrta_reference.model import SplitPattern
+    parents = tuple(ParentWeld(p, (x, 9), (x + 1, 9))
+                    for p, x in (("a", 1), ("b", 3), ("c", 11), ("d", 13), ("e", 5)))
+    solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                            {0: ("a::whole", "b::whole", "e::whole"), 1: ("c::whole", "d::whole")}, FAST)
+    return solution, ((0, 1, 0), (1, 0), (), ())
+
+
+def test_oriented_local_arcs_match_full_cost_and_keep_unrelated_directions():
+    from mrta_search import lns
+    solution, directions = _oriented_fixture()
+    blocks = block_map(solution, FAST)
+    routes = (("a::whole", "b::whole"), ("c::whole", "d::whole"), (), ())
+    bits = ((0, 1), (1, 0), (), ())
+    state = lns.oriented_route_state(routes, bits, blocks, FAST)
+    rows, used = lns.oriented_insert_variants(state, blocks["e::whole"], 0, 1, blocks, FAST, keep=8)
+    assert used == 8
+    assert rows
+    for after, action in rows:
+        assert after.directions[1:] == state.directions[1:]
+        assert after.arc_costs[1:] == state.arc_costs[1:]
+        assert after.travel == pytest.approx(lns._directed_proxy(after.routes, after.directions, blocks, FAST))
+        assert after.loads == pytest.approx(lns._loads(after.routes, blocks, FAST))
+        assert action.block_id == "e::whole"
+        assert all(b in ("a::whole", "b::whole") for b, _, _ in action.neighbour_changes)
+
+
+@pytest.mark.parametrize("fixed", (True, False))
+def test_oriented_repair_actions_replay_and_fixed_bits_survive(fixed):
+    from mrta_search import lns
+    solution, directions = _oriented_fixture()
+    partial = lns._remove_parent_set(solution, ("b", "e"))
+    result = lns.repair_partial_state_oriented(solution, directions, partial, FAST,
+                                              fixed_directions=fixed, seed=61, max_insertion_evaluations=256)
+    assert result.candidate is not None
+    assert result.insertion_evaluations <= 256
+    old_bits = {b: d for route, bits in zip(solution.routes, directions) for b, d in zip(route.block_ids, bits)}
+    routes = [list(r) for r in partial.routes]
+    bits = [[old_bits[b] for b in r] for r in routes]
+    for action in result.actions:
+        routes[action.robot].insert(action.position, action.block_id)
+        bits[action.robot].insert(action.position, action.direction)
+        for b, old, new in action.neighbour_changes:
+            i = routes[action.robot].index(b)
+            assert bits[action.robot][i] == old
+            bits[action.robot][i] = new
+    assert tuple(tuple(r) for r in routes) == tuple(r.block_ids for r in result.candidate.solution.routes)
+    assert tuple(tuple(b) for b in bits) == result.directions
+    if fixed:
+        assert all(old_bits[b] == d for route, ds in zip(result.candidate.solution.routes, result.directions)
+                   for b, d in zip(route.block_ids, ds))
+
+
+def test_oriented_budget_visits_all_legal_robots_and_distinct_structures(monkeypatch):
+    from mrta_reference.model import SplitPattern
+    from mrta_search import lns
+    parent = ParentWeld("free", (4, 6), (5, 6))
+    solution = canonicalize((parent,), (SplitPattern("free", SplitKind.WHOLE),), {0: ("free::whole",)}, FAST)
+    blocks = block_map(solution, FAST)
+    visited = []
+    original = lns.oriented_insert_variants
+    def capture(state, block, robot, *args, **kwargs):
+        visited.append(robot)
+        return original(state, block, robot, *args, **kwargs)
+    monkeypatch.setattr(lns, "oriented_insert_variants", capture)
+    alternatives, used = lns._parent_alternatives("free", ((), (), (), ()), ((), (), (), ()), blocks,
+                                                 solution.patterns[0], FAST, insertion_limit=8, remaining_budget=8,
+                                                 direction_mode="JOINT", original_directions={"free::whole": 0}, seed=3)
+    assert set(visited) == {0, 1, 2, 3}
+    assert used <= 8
+    assert len(alternatives) == len({a.routes for a in alternatives}) == 4
+
+
+def _oriented_pilot_module():
+    from pathlib import Path
+    import runpy
+    return runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/run_joint_oriented_repair_pilot.py"))
+
+
+def test_new_initialization_and_x_smoke_never_call_dp_or_certifier(monkeypatch):
+    from mrta_reference import geometry, scheduler, certifier
+    from mrta_search import direction, initialization
+    def forbidden(*args, **kwargs):
+        raise AssertionError("forbidden DP/certifier path called")
+    monkeypatch.setattr(geometry, "optimize_directions", forbidden)
+    monkeypatch.setattr(scheduler, "optimize_directions", forbidden)
+    monkeypatch.setattr(direction, "optimize_directions_with_initial_feasibility", forbidden)
+    monkeypatch.setattr(direction, "refine_directions_bounded", forbidden)
+    monkeypatch.setattr(initialization, "optimize_directions_with_initial_feasibility", forbidden)
+    monkeypatch.setattr(initialization, "_route_empty_proxy", forbidden)
+    monkeypatch.setattr(initialization, "_improve_region_route", forbidden)
+    monkeypatch.setattr(certifier, "certify_schedule", forbidden)
+    monkeypatch.setattr(initialization, "certify_schedule", forbidden)
+    module = _oriented_pilot_module()
+    smoke = module["x_split_smoke"](ScientificConfig())
+    assert smoke["status"] == "FEASIBLE"
+    assert smoke["directions"][2:] == ((), ())
+    initial, attempts = module["common_initial"](_parents(), FAST)
+    assert initial is not None
+    assert attempts[-1]["status"] == "FEASIBLE"
+    from mrta_search import lns
+    partial = lns._remove_parent_set(initial.solution, (initial.solution.parents[0].parent_id,))
+    result = lns.repair_partial_state_oriented(initial.solution, initial.directions, partial, FAST, seed=4)
+    assert result.candidate is not None
+    module["schedule_explicit"](result.candidate.solution, result.directions, FAST)
+
+
+def test_direct_schedule_rejects_missing_vectors_and_missing_welds(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    module = _oriented_pilot_module()
+    solution, directions = _oriented_fixture()
+    with pytest.raises(ValueError, match="four explicit"):
+        module["schedule_explicit"](solution, directions[:2], FAST)
+    captured = []
+    def fake_schedule(solution, config, **kwargs):
+        captured.append(kwargs["orientations"])
+        return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=1, directions=directions)
+    monkeypatch.setitem(module["schedule_explicit"].__globals__, "reference_schedule_formal", fake_schedule)
+    with pytest.raises(ValueError, match="omitted or repeated"):
+        module["schedule_explicit"](solution, directions, FAST)
+    assert captured == [{r: directions[r] for r in range(4)}]
+
+
+def test_oriented_mandatory_y_keeps_two_children_and_full_directions():
+    from mrta_reference.geometry import generate_y_split_patterns
+    from mrta_search import lns
+    parent = ParentWeld("mandatory", (2, 5), (2, 7))
+    pattern = generate_y_split_patterns(parent, FAST)[0]
+    solution = canonicalize((parent,), (pattern,), {0: ("mandatory::1",), 2: ("mandatory::0",)}, FAST)
+    result = lns.repair_partial_state_oriented(solution, ((0,), (), (0,), ()),
+                                              lns._remove_parent_set(solution, (parent.parent_id,)),
+                                              FAST, seed=8, max_insertion_evaluations=128)
+    assert result.candidate is not None
+    assert result.candidate.solution.patterns == (pattern,)
+    assert result.insertion_evaluations <= 128
+    assert len(result.actions) == 2
+    blocks = block_map(result.candidate.solution, FAST)
+    assert set(blocks) == {"mandatory::0", "mandatory::1"}
+    for route, bits in zip(result.candidate.solution.routes, result.directions):
+        assert len(route.block_ids) == len(bits)
+        assert all(robot_is_eligible(blocks[b], route.robot_id, FAST) for b in route.block_ids)
+
+
 def test_mandatory_pair_insertion_uses_final_route_not_old_index_difference(monkeypatch):
     from mrta_reference.geometry import blocks_for_pattern, generate_y_split_patterns
     from mrta_reference.model import SplitPattern

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import itertools
 import math
 import random
 from typing import Mapping, Sequence
@@ -25,7 +26,7 @@ from mrta_reference.model import (
 )
 from mrta_reference.solution import block_map, canonicalize
 
-from .direction import DirectionVectors
+from .direction import DirectionVectors, _initial_error
 from .initialization import bounded_insertion_positions
 
 
@@ -115,6 +116,29 @@ class RepairResult:
     candidate: CompleteSearchCandidate | None
     insertion_evaluations: int
     rejection_reason: str | None = None
+    directions: DirectionVectors | None = None
+    actions: tuple[OrientedInsertionAction, ...] = ()
+
+
+@dataclass(frozen=True)
+class OrientedInsertionAction:
+    block_id: str
+    robot: int
+    position: int
+    direction: int
+    neighbour_changes: tuple[tuple[str, int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class OrientedRouteState:
+    routes: tuple[tuple[str, ...], ...]
+    directions: tuple[tuple[int, ...], ...]
+    loads: tuple[float, ...]
+    arc_costs: tuple[tuple[float, ...], ...]
+
+    @property
+    def travel(self) -> float:
+        return sum(sum(arcs) for arcs in self.arc_costs)
 
 
 @dataclass(frozen=True)
@@ -134,6 +158,8 @@ class _InsertionAlternative:
     hints: tuple[tuple[int, ...], ...]
     score: tuple[object, ...]
     trace: tuple[tuple[str, int, int, int], ...]
+    actions: tuple[OrientedInsertionAction, ...] = ()
+    oriented_state: OrientedRouteState | None = None
 
 
 def _parent_id(block_id: str) -> str:
@@ -532,7 +558,18 @@ def _parent_alternatives(
     insertion_limit: int,
     remaining_budget: int,
     incremental_scoring: bool = False,
+    direction_mode: str | None = None,
+    original_directions: Mapping[str, int] | None = None,
+    seed: int = 0,
+    oriented_state: OrientedRouteState | None = None,
 ) -> tuple[tuple[_InsertionAlternative, ...], int]:
+    if direction_mode is not None:
+        return _oriented_parent_alternatives(
+            parent_id, routes, hints, blocks, pattern, config,
+            insertion_limit=insertion_limit, remaining_budget=remaining_budget,
+            direction_mode=direction_mode, original_directions=original_directions or {},
+            seed=seed, state=oriented_state,
+        )
     parent_blocks = tuple(
         sorted(
             (block for block in blocks.values() if block.parent_id == parent_id),
@@ -674,6 +711,156 @@ def _parent_alternatives(
     return tuple(sorted(alternatives, key=lambda item: item.score)), evaluated
 
 
+def oriented_route_state(routes, directions, blocks, config) -> OrientedRouteState:
+    if len(routes) != 4 or len(directions) != 4:
+        raise ValueError("four explicit routes and direction vectors are required")
+    if any(len(route) != len(bits) or any(bit not in (0, 1) for bit in bits)
+           for route, bits in zip(routes, directions)):
+        raise ValueError("direction length/value mismatch")
+    routes = tuple(tuple(route) for route in routes)
+    directions = tuple(tuple(bits) for bits in directions)
+    return OrientedRouteState(routes, directions, _loads(routes, blocks, config),
+                              tuple(_route_arc_costs(route, directions[r], blocks, config)
+                                    for r, route in enumerate(routes)))
+
+
+def oriented_insert_variants(
+    state: OrientedRouteState, block: WeldingBlock, robot: int, position: int,
+    blocks: Mapping[str, WeldingBlock], config: ScientificConfig, *,
+    fixed_direction: int | None = None, locked_directions: Mapping[str, int] | None = None,
+    max_evaluations: int = 8, keep: int = 2, seed: int = 0,
+) -> tuple[tuple[tuple[OrientedRouteState, OrientedInsertionAction], ...], int]:
+    """One (block, robot, position, direction) decision with adjacent flips.
+
+    Only arcs incident to the inserted block or its immediate neighbours are
+    recomputed. Other routes and non-adjacent directions are retained verbatim.
+    No route DP, scheduler or certifier is called here.
+    """
+    locked = locked_directions or {}
+    route = state.routes[robot]
+    if not 0 <= position <= len(route) or not robot_is_eligible(block, robot, config):
+        raise ValueError("ineligible robot or invalid insertion position")
+    new_route = route[:position] + (block.block_id,) + route[position:]
+    original = dict(zip(route, state.directions[robot]))
+    local = tuple(i for i in (position - 1, position, position + 1) if 0 <= i < len(new_route))
+    choices = []
+    for i in local:
+        item = new_route[i]
+        if item in locked:
+            choices.append((locked[item],))
+        elif fixed_direction is not None:
+            choices.append((fixed_direction if i == position else original[item],))
+        else:
+            choices.append((0, 1))
+    combinations = list(itertools.product(*choices))
+    random.Random(seed).shuffle(combinations)
+    rows = []
+    used = 0
+    for bits in combinations[:max(0, max_evaluations)]:
+        used += 1
+        hint = bits[local.index(position)]
+        routes, directions = _insert_one(state.routes, state.directions, block, robot, position, hint)
+        vector = list(directions[robot])
+        for i, bit in zip(local, bits):
+            vector[i] = bit
+        directions = tuple(tuple(vector) if r == robot else directions[r] for r in range(4))
+        points = {r: oriented_endpoints(blocks[items[0]], directions[r][0])[0]
+                  for r, items in enumerate(routes) if items}
+        if _initial_error(points, config) is not None:
+            continue
+        # Reuse old arcs, splice the insertion, then refresh only up to four
+        # arcs touched by the predecessor/new block/successor direction tuple.
+        costs = list(_insert_route_arc_costs(route, state.directions[robot], state.arc_costs[robot],
+                                            block, position, hint, blocks, config))
+        for i in range(max(0, position - 2), min(len(new_route) - 1, position + 2)):
+            _, end = oriented_endpoints(blocks[new_route[i]], vector[i])
+            start, _ = oriented_endpoints(blocks[new_route[i + 1]], vector[i + 1])
+            costs[i] = math.dist(end, start) / config.empty_speed
+        arcs = tuple(tuple(costs) if r == robot else state.arc_costs[r] for r in range(4))
+        loads = tuple(value + (config.process_time(block.length) if r == robot else 0.0)
+                      for r, value in enumerate(state.loads))
+        changes = tuple((new_route[i], original[new_route[i]], vector[i]) for i in local
+                        if i != position and original[new_route[i]] != vector[i])
+        action = OrientedInsertionAction(block.block_id, robot, position, hint, changes)
+        candidate = OrientedRouteState(routes, directions, loads, arcs)
+        rows.append((candidate, action))
+    rows.sort(key=lambda row: (row[0].travel, row[0].directions))
+    return tuple(rows[:keep]), used
+
+
+def _oriented_parent_alternatives(
+    parent_id, routes, hints, blocks, pattern, config, *, insertion_limit,
+    remaining_budget, direction_mode, original_directions, seed, state=None,
+):
+    state = state or oriented_route_state(routes, hints, blocks, config)
+    children = sorted((b for b in blocks.values() if b.parent_id == parent_id), key=lambda b: b.block_id)
+    rng = random.Random(seed)
+    legal = []
+    for index, child in enumerate(children):
+        robots = [r for r in range(4) if robot_is_eligible(child, r, config)]
+        if pattern.kind is SplitKind.X_SPLIT:
+            robots = [(0 if pattern.rail.value == "UPPER" else 2) + index]
+        legal.append(robots)
+    groups = list(itertools.product(*legal))
+    rng.shuffle(groups)
+    alternatives = []
+    evaluated = 0
+    for group_index, robots in enumerate(groups):
+        # Every legal robot (or child robot pair) receives its own quota. With
+        # very small budgets the seeded group rotation avoids persistent R0 bias.
+        quota = remaining_budget // len(groups) + (group_index < remaining_budget % len(groups))
+        used_group = 0
+        positions = [bounded_insertion_positions(len(routes[robots[0]]), insertion_limit)]
+        if len(children) == 2:
+            positions.append(bounded_insertion_positions(len(routes[robots[1]]) + int(robots[0] == robots[1]), insertion_limit))
+        plans = list(itertools.product(*positions))
+        rng.shuffle(plans)
+        for plan in plans:
+            left = quota - used_group
+            if left < len(children):
+                break
+            allowance = min(left, 8 if len(children) == 1 else 24)
+            first_budget = allowance if len(children) == 1 else max(1, allowance // 3)
+            first_rows, used = oriented_insert_variants(
+                state, children[0], robots[0], plan[0], blocks, config,
+                fixed_direction=(original_directions[children[0].block_id] if direction_mode == "FIXED" else None),
+                max_evaluations=first_budget, keep=2, seed=rng.randrange(2**32),
+            )
+            used_group += used
+            complete = [(s, (a,)) for s, a in first_rows]
+            if len(children) == 2:
+                complete = []
+                for j, (first_state, first_action) in enumerate(first_rows):
+                    second_budget = (allowance - (used_group - (quota - left))) // (len(first_rows) - j)
+                    second_rows, used = oriented_insert_variants(
+                        first_state, children[1], robots[1], plan[1], blocks, config,
+                        fixed_direction=(original_directions[children[1].block_id] if direction_mode == "FIXED" else None),
+                        max_evaluations=max(0, second_budget), keep=2, seed=rng.randrange(2**32),
+                    )
+                    used_group += used
+                    complete.extend((s, (first_action, a)) for s, a in second_rows)
+            for final, actions in complete:
+                # Adjacent children would be merged by canonicalize. Exclude
+                # this structural action before it can crowd out fixed-mode alternatives.
+                if len(children) == 2 and any(
+                    children[0].block_id in route and children[1].block_id in route
+                    and abs(route.index(children[0].block_id) - route.index(children[1].block_id)) == 1
+                    for route in final.routes
+                ):
+                    continue
+                trace = tuple((a.block_id, a.robot, a.position, a.direction) for a in actions)
+                score = (max(final.loads), final.travel - state.travel, final.routes, final.directions)
+                alternatives.append(_InsertionAlternative(parent_id, final.routes, final.directions,
+                                                           score, trace, actions, final))
+        evaluated += used_group
+    # Regret compares distinct route structures, never two direction variants
+    # of the same assignment and insertion location.
+    by_structure = {}
+    for alternative in sorted(alternatives, key=lambda a: a.score):
+        by_structure.setdefault(alternative.routes, alternative)
+    return tuple(sorted(by_structure.values(), key=lambda a: a.score)), evaluated
+
+
 def repair_partial_state(
     current: CanonicalSolution,
     current_directions: DirectionVectors,
@@ -686,6 +873,8 @@ def repair_partial_state(
     max_insertion_evaluations: int = 4096,
     incremental_scoring: bool = False,
     preserve_patterns: bool = False,
+    direction_mode: str | None = None,
+    seed: int = 0,
 ) -> RepairResult:
     if partial.source_revision != current.revision:
         raise ValueError("stale partial state revision")
@@ -694,15 +883,23 @@ def repair_partial_state(
     patterns = {pattern.parent_id: pattern for pattern in partial.patterns}
     blocks = block_map(current, config)
     current_hints_by_block = _hints_from_current(current, current_directions)
+    if direction_mode is not None:
+        if direction_mode not in ("FIXED", "JOINT"):
+            raise ValueError("unknown oriented repair mode")
+        oriented_route_state(tuple(r.block_ids for r in current.routes), current_directions, blocks, config)
     routes = partial.routes
     hints = tuple(
         tuple(current_hints_by_block.get(item, 0) for item in route)
         for route in routes
     )
+    oriented_state = (oriented_route_state(routes, hints, blocks, config)
+                      if direction_mode is not None else None)
     pending = list(partial.removed_parent_ids)
     parents = {parent.parent_id: parent for parent in current.parents}
     trace: list[tuple[str, tuple[tuple[str, int, int, int], ...]]] = []
     evaluations = 0
+    actions: list[OrientedInsertionAction] = []
+    rng = random.Random(seed)
 
     while pending:
         if repair_operator is RepairOperator.GREEDY_REPAIR:
@@ -727,6 +924,10 @@ def repair_partial_state(
             1, (max_insertion_evaluations - evaluations) // future_calls
         )
         for parent_id in parents_to_evaluate:
+            oriented_options = ({} if direction_mode is None else dict(
+                direction_mode=direction_mode, original_directions=current_hints_by_block,
+                seed=rng.randrange(2**32), oriented_state=oriented_state,
+            ))
             alternatives, used = _parent_alternatives(
                 parent_id,
                 routes,
@@ -739,6 +940,7 @@ def repair_partial_state(
                     per_call_budget, max_insertion_evaluations - evaluations
                 ),
                 incremental_scoring=incremental_scoring,
+                **oriented_options,
             )
             evaluations += used
             alternatives_by_parent[parent_id] = alternatives
@@ -779,7 +981,9 @@ def repair_partial_state(
             selected_parent = min(regret_rows)[3]
         selected = viable[selected_parent][0]
         routes, hints = selected.routes, selected.hints
+        oriented_state = selected.oriented_state
         trace.append((selected_parent, selected.trace))
+        actions.extend(selected.actions)
         pending.remove(selected_parent)
 
     try:
@@ -854,7 +1058,23 @@ def repair_partial_state(
         - (max(current_loads) - min(current_loads)),
         provenance,
     )
-    return RepairResult(candidate, evaluations)
+    return RepairResult(candidate, evaluations, directions=(final_hints if direction_mode is not None else None),
+                        actions=tuple(actions))
+
+
+def repair_partial_state_oriented(
+    current: CanonicalSolution, current_directions: DirectionVectors,
+    partial: PartialSearchState, config: ScientificConfig, *,
+    fixed_directions: bool = False, insertion_limit: int = 8,
+    max_insertion_evaluations: int = 4096, seed: int = 0,
+) -> RepairResult:
+    """The existing Regret-2 loop with explicit, persistent action directions."""
+    return repair_partial_state(
+        current, current_directions, partial, DestroyOperator.RANDOM_REMOVAL,
+        RepairOperator.REGRET_2_REPAIR, config, insertion_limit=insertion_limit,
+        max_insertion_evaluations=max_insertion_evaluations, preserve_patterns=True,
+        direction_mode="FIXED" if fixed_directions else "JOINT", seed=seed,
+    )
 
 
 def _block_mid_x(block: WeldingBlock) -> float:

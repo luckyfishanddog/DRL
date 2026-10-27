@@ -968,6 +968,8 @@ def _region_boundary_plan(
     fixed: Mapping[int, Sequence[str]],
     blocks: Mapping[str, WeldingBlock],
     config: ScientificConfig,
+    *,
+    route_cost: Callable | None = None,
 ) -> tuple[tuple[object, ...], tuple[tuple[str, ...], tuple[str, ...]]]:
     """Cheaply select a contiguous X boundary; overlap is a penalty, not a veto."""
     ordered = tuple(sorted(block_ids, key=lambda item: _block_x_key(blocks[item])))
@@ -983,9 +985,8 @@ def _region_boundary_plan(
             sum(config.process_time(blocks[item].length) for item in route)
             for route in (left, right)
         )
-        empty = tuple(
-            _route_empty_proxy(route, blocks, config) for route in (left, right)
-        )
+        cost = _route_empty_proxy if route_cost is None else route_cost
+        empty = tuple(cost(route, blocks, config) for route in (left, right))
         overlap = 0.0
         if left and right:
             left_max = max(
@@ -1019,6 +1020,9 @@ def _construct_region_cooperative_initialization(
     parents: Sequence[ParentWeld],
     patterns: tuple[SplitPattern, ...],
     config: ScientificConfig,
+    *,
+    route_cost: Callable | None = None,
+    improve_routes: bool = True,
 ) -> CanonicalSolution:
     """Deterministic rail allocation, X-boundary balancing and bounded route ordering."""
     parent_by_id = {parent.parent_id: parent for parent in parents}
@@ -1069,6 +1073,7 @@ def _construct_region_cooperative_initialization(
         ),
     )
     candidates = []
+    plan_options = {} if route_cost is None else {"route_cost": route_cost}
     for order in dict.fromkeys(orders):
         groups = [list(rail_fixed[0]), list(rail_fixed[1])]
         for block_id in order:
@@ -1083,6 +1088,7 @@ def _construct_region_cooperative_initialization(
                         fixed,
                         blocks,
                         config,
+                        **plan_options,
                     )
                     for index in (0, 1)
                 )
@@ -1113,21 +1119,20 @@ def _construct_region_cooperative_initialization(
                 fixed,
                 blocks,
                 config,
+                **plan_options,
             )
             for index in (0, 1)
         )
         route_ids = [route for _, routes in plans for route in routes]
-        improved = tuple(
-            _improve_region_route(route, robot, blocks, config)
-            for robot, route in enumerate(route_ids)
-        )
+        improved = (tuple(_improve_region_route(route, robot, blocks, config)
+                          for robot, route in enumerate(route_ids))
+                    if improve_routes else tuple(route_ids))
         loads = tuple(
             sum(config.process_time(blocks[item].length) for item in route)
             for route in improved
         )
-        empty = tuple(
-            _route_empty_proxy(route, blocks, config) for route in improved
-        )
+        cost = _route_empty_proxy if route_cost is None else route_cost
+        empty = tuple(cost(route, blocks, config) for route in improved)
         score = (
             max(loads, default=0.0) + 0.10 * max(empty, default=0.0),
             max(loads, default=0.0),
