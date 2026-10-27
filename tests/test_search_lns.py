@@ -201,14 +201,17 @@ def test_oriented_local_arcs_match_full_cost_and_keep_unrelated_directions():
 
 
 @pytest.mark.parametrize("fixed", (True, False))
-def test_oriented_repair_actions_replay_and_fixed_bits_survive(fixed):
+@pytest.mark.parametrize("followup", (True, False))
+def test_oriented_repair_actions_replay_and_fixed_bits_survive(fixed, followup):
     from mrta_search import lns
     solution, directions = _oriented_fixture()
     partial = lns._remove_parent_set(solution, ("b", "e"))
     result = lns.repair_partial_state_oriented(solution, directions, partial, FAST,
-                                              fixed_directions=fixed, seed=61, max_insertion_evaluations=256)
+                                              fixed_directions=fixed, seed=61, max_insertion_evaluations=256,
+                                              coordination_proxy=followup, direction_versions=2 if followup else 1)
     assert result.candidate is not None
     assert result.insertion_evaluations <= 256
+    assert 1 <= len(result.direction_candidates) <= (2 if followup else 1)
     old_bits = {b: d for route, bits in zip(solution.routes, directions) for b, d in zip(route.block_ids, bits)}
     routes = [list(r) for r in partial.routes]
     bits = [[old_bits[b] for b in r] for r in routes]
@@ -278,6 +281,11 @@ def test_new_initialization_and_x_smoke_never_call_dp_or_certifier(monkeypatch):
     result = lns.repair_partial_state_oriented(initial.solution, initial.directions, partial, FAST, seed=4)
     assert result.candidate is not None
     module["schedule_explicit"](result.candidate.solution, result.directions, FAST)
+    beam_initial, attempts = module['common_initial_beam'](_parents(), FAST)
+    assert beam_initial is not None
+    assert sum(a['status'] in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE') for a in attempts) <= 8
+    smoke_new = module['x_split_smoke'](ScientificConfig(), repair_options=dict(coordination_proxy=True, direction_versions=2))
+    assert smoke_new['status'] == 'FEASIBLE'
 
 
 def test_direct_schedule_rejects_missing_vectors_and_missing_welds(monkeypatch):
@@ -314,6 +322,64 @@ def test_oriented_mandatory_y_keeps_two_children_and_full_directions():
     for route, bits in zip(result.candidate.solution.routes, result.directions):
         assert len(route.block_ids) == len(bits)
         assert all(robot_is_eligible(blocks[b], route.robot_id, FAST) for b in route.block_ids)
+
+
+def test_followup_proxy_and_two_direction_versions_keep_distinct_regret_structures():
+    from collections import Counter
+    from mrta_search import lns
+    solution, directions = _oriented_fixture()
+    blocks = block_map(solution, FAST)
+    partial = lns._remove_parent_set(solution, ("b",))
+    hint_by_id = {b:d for route,ds in zip(solution.routes,directions) for b,d in zip(route.block_ids,ds)}
+    hints = tuple(tuple(hint_by_id[b] for b in route) for route in partial.routes)
+    alternatives, used = lns._parent_alternatives(
+        "b", partial.routes, hints, blocks, solution.patterns[1], FAST,
+        insertion_limit=8, remaining_budget=256, direction_mode="JOINT",
+        original_directions=hint_by_id, seed=8, coordination_proxy=True, direction_versions=2,
+    )
+    assert used <= 256
+    counts = Counter(a.routes for a in alternatives)
+    assert max(counts.values()) == 2
+    assert len(counts) > 1
+    for a in alternatives:
+        assert a.score[:2] == lns.oriented_time_score(a.oriented_state)
+    best = alternatives[0]
+    second_structure = next(a for a in alternatives if a.routes != best.routes)
+    assert second_structure.routes != best.routes
+
+
+def test_joint_insertion_beam_has_bounded_route_diversity_and_full_coverage():
+    from mrta_search.initialization import build_oriented_insertion_beam
+    solution, _ = _oriented_fixture()
+    beam = build_oriented_insertion_beam(solution, FAST, seed=7)
+    assert 1 < len(beam) <= 4
+    assert len({state.routes for state, _ in beam}) > 1
+    expected = {b for route in solution.routes for b in route.block_ids}
+    for state, actions in beam:
+        actual = [b for route in state.routes for b in route]
+        assert len(actual) == len(set(actual)) == len(expected)
+        assert set(actual) == expected
+        assert len(actions) == len(expected)
+        assert all(len(route)==len(ds) for route,ds in zip(state.routes,state.directions))
+    with pytest.raises(ValueError, match="between 1 and 4"):
+        build_oriented_insertion_beam(solution, FAST, beam_width=5)
+
+
+def test_beam_initial_evaluates_at_most_four_and_selects_best_not_first(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    module = _oriented_pilot_module()
+    solution, _ = _oriented_fixture()
+    calls = []
+    monkeypatch.setitem(module['common_initial_beam'].__globals__, 'initial_reference', lambda *args: solution)
+    def fake_schedule(candidate, directions, config):
+        calls.append((candidate,directions))
+        # Every complete candidate succeeds; the fourth must still be evaluated.
+        schedule = ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100-len(calls),directions=directions)
+        return module['DirectedSolution'](candidate,directions,schedule)
+    monkeypatch.setitem(module['common_initial_beam'].__globals__, 'schedule_explicit', fake_schedule)
+    initial, attempts = module['common_initial_beam'](solution.parents,FAST)
+    assert len(calls) == len(attempts) == 4
+    assert initial.schedule.cmax == 96
 
 
 def test_mandatory_pair_insertion_uses_final_route_not_old_index_difference(monkeypatch):

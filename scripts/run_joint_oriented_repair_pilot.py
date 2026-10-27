@@ -22,7 +22,9 @@ from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.scheduler import reference_schedule_formal
 from mrta_reference.solution import block_map, canonicalize
 from mrta_search.direction import _initial_error
-from mrta_search.initialization import _patterns, _construct_region_cooperative_initialization
+from mrta_search.initialization import (
+    _patterns, _construct_region_cooperative_initialization, build_oriented_insertion_beam,
+)
 from mrta_search.gnn_constructor import construct_solution
 from mrta_search.lns import (
     BottleneckSelection, oriented_route_state, oriented_insert_variants,
@@ -121,10 +123,7 @@ def common_initial(parents, config):
     # proxies and its old route toolkit. Assignment/boundary logic is reused.
     for scheme in ("REGION_LOCAL", "RULE_X_LOCAL"):
         try:
-            solution = (_construct_region_cooperative_initialization(
-                parents, _patterns(parents, config), config,
-                route_cost=greedy_route_cost, improve_routes=False,
-            ) if scheme == "REGION_LOCAL" else construct_solution(parents, config).solution)
+            solution = initial_reference(parents, config, scheme)
         except (ValueError, ArithmeticError) as error:
             attempts.append(dict(scheme=scheme, status="CONSTRUCTION_FAILED", diagnostics=(str(error),)))
             continue
@@ -139,6 +138,44 @@ def common_initial(parents, config):
                                  diagnostics=candidate.schedule.diagnostics))
             if candidate.schedule.status is ScheduleStatus.FEASIBLE:
                 return candidate, attempts
+    return None, attempts
+
+
+def initial_reference(parents, config, scheme):
+    return (_construct_region_cooperative_initialization(
+        parents, _patterns(parents, config), config,
+        route_cost=greedy_route_cost, improve_routes=False,
+    ) if scheme == "REGION_LOCAL" else construct_solution(parents, config).solution)
+
+
+def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8):
+    attempts = []
+    for scheme in ("REGION_LOCAL", "RULE_X_LOCAL"):
+        try:
+            reference = initial_reference(parents, config, scheme)
+            beam = build_oriented_insertion_beam(reference, config, seed=seed,
+                                                 beam_width=4, insertion_limit=insertion_limit)
+        except (ValueError, ArithmeticError) as error:
+            attempts.append(dict(scheme=scheme, status="CONSTRUCTION_FAILED", diagnostics=(str(error),)))
+            continue
+        successful = []
+        for state, actions in beam:
+            try:
+                solution = canonicalize(reference.parents, reference.patterns,
+                                        tuple(Route(r, state.routes[r]) for r in range(4)),
+                                        config, scope=FORMAL_SCOPE_V2)
+                if solution.patterns != reference.patterns or tuple(r.block_ids for r in solution.routes) != state.routes:
+                    raise ValueError("fixed-mode beam candidate changed during canonicalization")
+                candidate = schedule_explicit(solution, state.directions, config)
+            except (ValueError, ArithmeticError) as error:
+                attempts.append(dict(scheme=scheme, status="CONSTRUCTION_FAILED", diagnostics=(str(error),)))
+                continue
+            attempts.append(dict(scheme=scheme, status=candidate.schedule.status.value,
+                                 diagnostics=candidate.schedule.diagnostics))
+            if candidate.schedule.status is ScheduleStatus.FEASIBLE:
+                successful.append(candidate)
+        if successful:
+            return min(successful, key=lambda c: c.schedule.cmax), attempts
     return None, attempts
 
 
@@ -171,7 +208,8 @@ def summary(initial, candidate, config):
                 cmax_before=initial.schedule.cmax, cmax_after=candidate.schedule.cmax)
 
 
-def run_group(name, method, q, partials, initial, args, config):
+def run_group(name, method, q, partials, initial, args, config, *,
+              repair_options=None, evaluate_duplicates=False, improving_candidates=None):
     started = time.perf_counter()
     row = dict(instance=name, method=method, q=q, initial_cmax=initial.schedule.cmax if initial else None,
                attempts=0, unique_partials=0, constructed=0, unique_candidates=0, schedule_success=0,
@@ -181,6 +219,8 @@ def run_group(name, method, q, partials, initial, args, config):
                movable_blocks=0, removed_from_critical_route=0,
                insertion_limit=args.insertion_limit, repair_budget=args.repair_budget, seed=args.seed,
                statuses="{}", repair_failures="{}", applicability="APPLICABLE")
+    if repair_options is not None:
+        row.update(retained_two_directions=0, restored_structure=0)
     if initial is None or not partials:
         row["applicability"] = "INITIALIZATION_FAILED" if initial is None else "NO_WAIT_NOT_APPLICABLE"
         return row, None, {}, None
@@ -201,13 +241,17 @@ def run_group(name, method, q, partials, initial, args, config):
         seed = args.seed + NAMES.index(name) * 10000 + q * 100 + attempt
         result = repair_partial_state_oriented(initial.solution, initial.directions, partial, config,
                                                fixed_directions=method.startswith("A0"), seed=seed,
-                                               insertion_limit=args.insertion_limit, max_insertion_evaluations=args.repair_budget)
+                                               insertion_limit=args.insertion_limit, max_insertion_evaluations=args.repair_budget,
+                                               **(repair_options or {}))
         row["insertion_evaluations"] += result.insertion_evaluations
         if result.candidate is None:
             failures[result.rejection_reason] += 1
             outcomes[attempt] = ("CONSTRUCTION_FAILED", None)
             continue
         row["constructed"] += 1
+        if repair_options is not None:
+            row["retained_two_directions"] += len(result.direction_candidates) == 2
+            row["restored_structure"] += tuple(r.block_ids for r in result.candidate.solution.routes) == tuple(r.block_ids for r in initial.solution.routes)
         solution = result.candidate.solution
         assert solution.patterns == initial.solution.patterns
         for r in range(4):
@@ -217,7 +261,7 @@ def run_group(name, method, q, partials, initial, args, config):
             assert all(initial_bits[b] == d for route, ds in zip(solution.routes, result.directions) for b, d in zip(route.block_ids, ds))
         candidate_key = (tuple(r.block_ids for r in solution.routes), result.directions)
         row["restored_original"] += candidate_key == key(initial)
-        if candidate_key in unique:
+        if candidate_key in unique and not evaluate_duplicates:
             outcomes[attempt] = outcomes[next(i for i, k in attempt_keys.items() if k == candidate_key)]
             continue
         unique.add(candidate_key)
@@ -245,6 +289,8 @@ def run_group(name, method, q, partials, initial, args, config):
             row["best_cmax"] = candidate.schedule.cmax
         improved = candidate.schedule.cmax < initial.schedule.cmax - 1e-9 * max(1, initial.schedule.cmax)
         if improved:
+            if improving_candidates is not None:
+                improving_candidates.append(details)
             row["improved"] += 1
             row["joint_expert_candidates"] += bool(changes["transfers"] and changes["flips"] and changes["reordered_routes"])
             row["direction_order_only_improved"] += bool(not changes["transfers"] and changes["flips"] and changes["reordered_routes"])
@@ -263,7 +309,7 @@ def run_group(name, method, q, partials, initial, args, config):
     return row, best, outcomes, example
 
 
-def x_split_smoke(config):
+def x_split_smoke(config, *, repair_options=None):
     parent = ParentWeld("formal-x", (0.0, 8.0), (4.0, 8.0))
     pattern = next(p for p in build_legal_pattern_catalog((parent,), config, FORMAL_SCOPE_V2)[parent.parent_id]
                    if p.kind is SplitKind.X_SPLIT and p.point_id == "BX_CENTER")
@@ -273,7 +319,7 @@ def x_split_smoke(config):
     initial = schedule_explicit(solution, directions, config)
     assert initial.schedule.status is ScheduleStatus.FEASIBLE
     result = repair_partial_state_oriented(solution, directions, _remove_parent_set(solution, (parent.parent_id,)),
-                                           config, seed=20261027)
+                                           config, seed=20261027, **(repair_options or {}))
     if result.candidate is None:
         raise ValueError(f"X smoke repair failed: {result.rejection_reason}")
     candidate = schedule_explicit(result.candidate.solution, result.directions, config)
@@ -417,6 +463,204 @@ def save(rows, initial_logs, cases, examples, paired, smoke, args):
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
+def followup_row(experiment, name, method, selection="", q=0):
+    return dict(experiment=experiment, instance=name, method=method, selection=selection, q=q,
+                initial_cmax=None, attempts=0, unique_candidates=0, b32_calls=0, b32_success=0,
+                improved=0, best_cmax=None, improvement_pct=None, runtime_s=0.0,
+                construction_rejections=0, deadlock=0, infeasible=0, restored_structure=0,
+                changed_assignment=0, reordered=0, changed_direction=0, joint_improved=0,
+                retained_two_directions=0, seed=20261027, insertion_limit=8, repair_budget=4096,
+                status="APPLICABLE")
+
+
+def save_followup(rows, paired, examples, unique_new, args):
+    csv_path = ROOT / "results/joint_oriented_repair_followup.csv"
+    report_path = ROOT / "docs/JOINT_ORIENTED_REPAIR_FOLLOWUP.md"
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    fmt = lambda v: "—" if v is None else f"{v:.3f}"
+    lines = ["# 联合方向初解与修复后续实验", "",
+             f"seed={args.seed}；q={args.q}；attempts={args.attempts}；insertion_limit={args.insertion_limit}；repair_budget={args.repair_budget}。",
+             "沿用 FORMAL_SCOPE_V2 与当前 0.0108/0.20m/s、20/30s、0.50m 窗口、0.20m 最短子段。仅使用六个已消耗 DEV 白名单几何。",
+             "初解 GREEDY 是旧逐步追加定向流程，BEAM 固定 REGION/RULE 的归属参考，逐块联合选择位置与局部方向；宽度最多 4，优先不同路线结构，单结构最多两个方向。"
+             "BEAM 每种策略最多四次完整 B32，全部评价后取成功者最低 Cmax，REGION 全失败才尝试 RULE。GREEDY 按原实现运行，调用数如实单列。",
+             "修复 OLD 使用旧最大加工负载/局部空走评分、单方向状态；NEW 使用 max(P+M)、sum(P+M) 及同结构最多两个方向状态，Regret 次优仍取不同结构。"
+             "两方向状态共享 4096 预算，不增加插入总评分次数；最终只选择一个完整候选调度。所有 OLD/NEW 共享同一新初解、逐次相同移除集合和 seed。",
+             "修复每次尝试最多一次 B32，成功构造的重复候选也按一次评价，避免因去重改变 OLD/NEW 实际调用预算；唯一候选数另列。"
+             "只比较 FEASIBLE 的真实 Cmax；DEADLOCK 是有限调度失败。未调用独立 DP/refinement、C2/C3/C4 或独立 certifier。"
+             "空路线也显式传入空方向；固定模式、覆盖、合法机器人及最终 WELD 操作继续使用必要程序检查。",
+             "WAIT 仅在 g36/g45 的新初解确有 WAIT 时做 q8、两次固定 seed 的诊断，不参与三种主选区的总量排名。", "",
+             "## A：共同几何上的初解对比", "",
+             "|实例|构造|B32 调用|成功|DEADLOCK|最终初解 Cmax|秒|",
+             "|---|---|---:|---:|---:|---:|---:|"]
+    for r in rows:
+        if r['experiment'] == 'A':
+            lines.append(f"|{r['instance']}|{r['method']}|{r['b32_calls']}|{r['b32_success']}|{r['deadlock']}|{fmt(r['best_cmax'])}|{r['runtime_s']:.3f}|")
+    lines += ["", "## B：同一新初解与移除集合的修复对比", "",
+              "改进数按尝试计；唯一数按路线与方向共同去重。最佳为成功候选最小 Cmax，可劣于初解。初解失败或无 WAIT 时不适用。", "",
+              "|实例|方法|q|初始 Cmax|尝试|唯一|B32 调用/成功|改善|最佳 Cmax|改善%|秒|",
+              "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for r in rows:
+        if r['experiment'] == 'B':
+            lines.append(f"|{r['instance']}|{r['method']}|{r['q']}|{fmt(r['initial_cmax'])}|{r['attempts']}|{r['unique_candidates']}|"
+                         f"{r['b32_calls']}/{r['b32_success']}|{r['improved']}|{fmt(r['best_cmax'])}|{fmt(r['improvement_pct'])}|{r['runtime_s']:.3f}|")
+    lines += ["", "## 配对与判断", ""]
+    old_init = {r['instance']: r for r in rows if r['method'] == 'GREEDY_INIT'}
+    beam_init = {r['instance']: r for r in rows if r['method'] == 'BEAM_INIT'}
+    wins = ties = losses = 0
+    for name, new in beam_init.items():
+        old = old_init[name]
+        if old['best_cmax'] is not None and new['best_cmax'] is not None:
+            delta = new['best_cmax'] - old['best_cmax']
+            wins += delta < -1e-6
+            ties += abs(delta) <= 1e-6
+            losses += delta > 1e-6
+    lines.append(f"初解 BEAM 对 GREEDY 的 Cmax 胜/平/负={wins}/{ties}/{losses}；"
+                 f"B32 调用 {sum(r['b32_calls'] for r in beam_init.values())}/{sum(r['b32_calls'] for r in old_init.values())}；"
+                 f"总耗时 {sum(r['runtime_s'] for r in beam_init.values()):.3f}/{sum(r['runtime_s'] for r in old_init.values()):.3f}s。"
+                 "这是初解构造比较，不用于归因修复评分效果。")
+    totals = {}
+    for label in ('OLD', 'NEW'):
+        selected = [r for r in rows if r['experiment']=='B' and r['method'].startswith(label) and r['selection']!='WAIT_ANCHORED']
+        totals[label] = {k: sum(r[k] for r in selected) for k in ('attempts','unique_candidates','b32_calls','b32_success','improved','runtime_s','joint_improved','retained_two_directions')}
+        lines.append(f"{label} 主实验合计：" + json.dumps(totals[label], ensure_ascii=False) + "。")
+    p = {k: sum(item[k] for item in paired if item['selection']!='WAIT_ANCHORED')
+         for k in ('both_success','new_wins','ties','old_wins','only_new_success','only_old_success')}
+    lines += ["同 seed 逐次配对（主实验）：" + json.dumps(p, ensure_ascii=False) + "。",
+              "旧评分与新评分的改善百分比均以该组共同 BEAM 初解为起点；不能与上一轮不同初解的百分比直接比较。",
+              "max(P+M) 没有 WAIT 或连续冲突反馈项，仍是代理。方向保留与评分本轮一并改变，不能把差异单独归因于某一项。",
+              f"NEW 跨 q/选区去重后有 {len(unique_new)} 个严格改善联合补全轨迹，涉及 "
+              f"{len({item['instance'] for item in unique_new.values()})} 个几何；其中同时改变归属、相对顺序、方向的有 "
+              f"{sum(bool(c['changes']['transfers'] and c['changes']['flips'] and c['changes']['reordered_routes']) for c in unique_new.values())} 个。",
+              "这些都是已消耗 DEV 上的机制证据，不是新独立测试或正式训练集。本轮结束后不再追加启发式模块，本次不启动训练。", "",
+              "## 典型任务变化", ""]
+    quality = [0, 0, 0]
+    for name in beam_init:
+        pools = {}
+        for label in ('OLD', 'NEW'):
+            pools[label] = min((r['best_cmax'] for r in rows if r['experiment']=='B' and r['instance']==name
+                                and r['method'].startswith(label) and r['selection']!='WAIT_ANCHORED'
+                                and r['best_cmax'] is not None), default=None)
+        if all(pools[label] is not None for label in ('OLD','NEW')):
+            delta = pools['NEW'] - pools['OLD']
+            quality[0 if delta < -1e-6 else 1 if abs(delta)<=1e-6 else 2] += 1
+    marker = lines.index("## 典型任务变化")
+    lines[marker:marker] = [
+        f"修复每例池内最佳 Cmax 的 NEW 胜/平/负={quality[0]}/{quality[1]}/{quality[2]}。"
+        "成功率和改善候选数量的提升，不意味着每例最佳 Cmax 都更好，不将 NEW 直接替换为唯一教师。",
+        "主要剩余问题是连续时空协调与局部代理/小宽度剪枝偏差。合法完整候选已经能产生归属、顺序、方向联合变化；"
+        "max(P+M) 仍不含真实 WAIT，beam 也可能过早丢弃较好的路线。不能把这些负结果解释为数学不可改善或证明动作空间完整。",
+        "下一步可以开始小规模 GNN 部分解补全训练验证，复用当前显式动作和 B32 接口；"
+        "使用既有 TRAIN 池采集去重轨迹，保留 OLD/NEW 教师中的有效补全，并继续用本轮 DEV 验证。"
+        "现有 DEV 轨迹足以调试学习接口，不足以单独组成正式泛化训练证据；不再追加一轮启发式堆叠。", "",
+    ]
+    for label, c in list(examples.items())[:3]:
+        changes = c['changes']
+        lines += [f"### {label}：{c['instance']} / {c['method']} / q{c['q']} / attempt {c['attempt']}", "",
+                  f"{c['status']}；Cmax {changes['cmax_before']}→{changes['cmax_after']}；"
+                  f"空走 {changes['travel_before']:.3f}→{changes['travel_after']:.3f}s；"
+                  f"WAIT {changes['wait_before']:.3f}→{fmt(changes['wait_after'])}s。",
+                  "归属：" + ("; ".join(f"{short(b)} R{a}→R{r}" for b,a,r in changes['transfers']) or "未变化") + "。",
+                  "重排路线：" + str(changes['reordered_routes']) + "；方向变化：" +
+                  ("; ".join(f"{short(b)} {a}→{d}" for b,a,d in changes['flips']) or "无") + "。",
+                  "动作：" + "; ".join(f"{short(a['block_id'])}→R{a['robot']}@{a['position']}/{a['direction']}"
+                                       + (f" 邻块{a['neighbour_changes']}" if a['neighbour_changes'] else "") for a in c['actions']) + "。", ""]
+    lines += ["## 复现", "", "```powershell",
+              "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_joint_oriented_repair_pilot.py --followup "
+              f"--instances {' '.join(args.instances)} --attempts {args.attempts} --q {' '.join(map(str,args.q))} "
+              f"--seed {args.seed} --insertion-limit {args.insertion_limit} --repair-budget {args.repair_budget}", "```", ""]
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_followup(args):
+    config = ScientificConfig()
+    entries = {e['sheet_name']: e for e in dataset.representatives_v05() if e['split']=='MLP_DEV'}
+    rows, paired, examples, unique_new = [], [], {}, {}
+    for name in args.instances:
+        parents = dataset.load_parents(entries[name])
+        initials = {}
+        for label, constructor in (('GREEDY_INIT', common_initial), ('BEAM_INIT', common_initial_beam)):
+            started = time.perf_counter()
+            initial, attempts = (constructor(parents, config) if label=='GREEDY_INIT' else
+                                 constructor(parents, config, seed=args.seed, insertion_limit=args.insertion_limit))
+            r = followup_row('A', name, label)
+            r.update(seed=args.seed, insertion_limit=args.insertion_limit, repair_budget=args.repair_budget,
+                     runtime_s=time.perf_counter()-started, attempts=len(attempts),
+                     b32_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts),
+                     b32_success=sum(a['status']=='FEASIBLE' for a in attempts),
+                     deadlock=sum(a['status']=='DEADLOCK' for a in attempts),
+                     construction_rejections=sum(a['status']=='CONSTRUCTION_FAILED' for a in attempts),
+                     best_cmax=None if initial is None else initial.schedule.cmax,
+                     status='INITIALIZATION_FAILED' if initial is None else 'FEASIBLE')
+            rows.append(r)
+            r['unique_candidates'] = r['b32_calls']
+            initials[label] = initial
+            print('FOLLOWUP INITIAL', name, label, r['best_cmax'], 'calls',r['b32_calls'], 'success',r['b32_success'],
+                  'time',round(r['runtime_s'],3),flush=True)
+        initial = initials['BEAM_INIT']
+        best_for_instance = None
+        fallback_example = None
+        for q in args.q:
+            selections = [BottleneckSelection.RANDOM, BottleneckSelection.TRAVEL, BottleneckSelection.LOAD]
+            if name in ('g36_w086','g45_w082') and q==8:
+                selections.append(BottleneckSelection.WAIT_ANCHORED)
+            for selection in selections:
+                partials = []
+                count = min(2, args.attempts) if selection is BottleneckSelection.WAIT_ANCHORED else args.attempts
+                if initial is not None:
+                    for attempt in range(count):
+                        seed = args.seed + NAMES.index(name)*10000 + q*100 + attempt
+                        partial = select_bottleneck_parents(initial.solution, initial.directions, initial.schedule,
+                                                            selection, q=q, seed=seed, config=config)
+                        if partial is None:
+                            break
+                        partials.append(partial)
+                outcomes = {}
+                for label in ('OLD','NEW'):
+                    improved_candidates = []
+                    options = dict(coordination_proxy=label=='NEW', direction_versions=2 if label=='NEW' else 1)
+                    raw, best, outcome, example = run_group(name, f'{label}_{selection.value}', q, partials,
+                                                           initial, args, config, repair_options=options,
+                                                           evaluate_duplicates=True, improving_candidates=improved_candidates)
+                    r = followup_row('B', name, f'{label}_{selection.value}', selection.value, q)
+                    statuses = json.loads(raw['statuses'])
+                    r.update(initial_cmax=raw['initial_cmax'], attempts=raw['attempts'], unique_candidates=raw['unique_candidates'],
+                             b32_calls=sum(statuses.values()), b32_success=raw['schedule_success'], improved=raw['improved'],
+                             best_cmax=raw['best_cmax'], improvement_pct=raw['improvement_pct'], runtime_s=raw['runtime_s'],
+                             construction_rejections=sum(json.loads(raw['repair_failures']).values()),
+                             deadlock=statuses.get('DEADLOCK',0), infeasible=statuses.get('INFEASIBLE',0),
+                             restored_structure=raw['restored_structure'], changed_assignment=raw['changed_assignment'],
+                             reordered=raw['reordered'], changed_direction=raw['changed_direction'],
+                             joint_improved=raw['joint_expert_candidates'], retained_two_directions=raw['retained_two_directions'],
+                             seed=args.seed, insertion_limit=args.insertion_limit, repair_budget=args.repair_budget,
+                             status=raw['applicability'])
+                    rows.append(r)
+                    outcomes[label] = outcome
+                    if label=='NEW':
+                        for c in improved_candidates:
+                            candidate_key = (name, tuple(tuple(route) for route in c['after_routes']), tuple(tuple(ds) for ds in c['after_directions']))
+                            unique_new.setdefault(candidate_key,c)
+                        if best is not None and (best_for_instance is None or best['changes']['cmax_after']<best_for_instance['changes']['cmax_after']):
+                            best_for_instance = best
+                        if example is not None:
+                            fallback_example = example
+                old, new = outcomes['OLD'], outcomes['NEW']
+                shared = old.keys() & new.keys()
+                both = [(old[i][1],new[i][1]) for i in shared if old[i][1] is not None and new[i][1] is not None]
+                paired.append(dict(instance=name, selection=selection.value, q=q, both_success=len(both),
+                                   new_wins=sum(b<a-1e-6 for a,b in both), ties=sum(abs(a-b)<=1e-6 for a,b in both),
+                                   old_wins=sum(a<b-1e-6 for a,b in both),
+                                   only_new_success=sum(new[i][1] is not None and old[i][1] is None for i in shared),
+                                   only_old_success=sum(old[i][1] is not None and new[i][1] is None for i in shared)))
+        if name in ('g36_w086','g45_w082','g33_w055'):
+            if best_for_instance is not None or fallback_example is not None:
+                examples[name] = best_for_instance or fallback_example
+        save_followup(rows, paired, examples, unique_new, args)
+    print('Saved results/joint_oriented_repair_followup.csv and docs/JOINT_ORIENTED_REPAIR_FOLLOWUP.md',flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instances", nargs="+", choices=NAMES, default=list(NAMES))
@@ -425,9 +669,13 @@ def main():
     parser.add_argument("--seed", type=int, default=20261027)
     parser.add_argument("--insertion-limit", type=int, default=8)
     parser.add_argument("--repair-budget", type=int, default=4096)
+    parser.add_argument("--followup", action="store_true", help="compare beam initialization and OLD/NEW oriented repair")
     args = parser.parse_args()
     if args.attempts < 1 or args.repair_budget < 1:
         parser.error("attempts and repair budget must be positive")
+    if args.followup:
+        run_followup(args)
+        return
     config = ScientificConfig()
     entries = {e['sheet_name']: e for e in dataset.representatives_v05() if e['split'] == 'MLP_DEV'}
     rows, logs, cases, examples, paired = [], {}, {}, {}, []

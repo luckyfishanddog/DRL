@@ -129,6 +129,68 @@ def bounded_insertion_positions(length: int, limit: int) -> tuple[int, ...]:
     return tuple(sorted({math.floor(index * length / (limit - 1)) for index in range(limit)}))
 
 
+def build_oriented_insertion_beam(
+    reference: CanonicalSolution, config: ScientificConfig, *,
+    beam_width: int = 4, insertion_limit: int = 8, seed: int = 0,
+):
+    """Keep REGION/RULE ownership and jointly insert positions/directions.
+
+    The beam contains partial route states, never complete-order direction
+    optimizations. No scheduler or independent direction optimizer is called.
+    """
+    if not 1 <= beam_width <= 4:
+        raise ValueError("joint insertion beam width must be between 1 and 4")
+    # Local import avoids the existing LNS -> initialization dependency cycle.
+    from .lns import oriented_route_state, oriented_insert_variants, oriented_time_score
+
+    blocks = block_map(reference, config)
+    empty = oriented_route_state(((), (), (), ()), ((), (), (), ()), blocks, config)
+    beam = ((empty, ()),)
+    rng = random.Random(seed)
+    ordered = [(r, route.block_ids[depth])
+               for depth in range(max((len(route.block_ids) for route in reference.routes), default=0))
+               for r, route in enumerate(reference.routes) if depth < len(route.block_ids)]
+    for robot, block_id in ordered:
+        candidates = {}
+        for state, actions in beam:
+            for position in bounded_insertion_positions(len(state.routes[robot]), insertion_limit):
+                variants, _ = oriented_insert_variants(
+                    state, blocks[block_id], robot, position, blocks, config,
+                    keep=2, seed=rng.randrange(2**32),
+                )
+                for inserted, action in variants:
+                    candidates.setdefault((inserted.routes, inserted.directions),
+                                          (inserted, actions + (action,)))
+        ranked = sorted(candidates.values(), key=lambda row: (
+            *oriented_time_score(row[0]), row[0].routes, row[0].directions,
+        ))
+        kept = []
+        structures = set()
+        # Prefer different route orders before filling spare slots with a
+        # second direction version of the same structure.
+        for row in ranked:
+            if row[0].routes not in structures:
+                kept.append(row)
+                structures.add(row[0].routes)
+                if len(kept) == beam_width:
+                    break
+        if len(kept) < beam_width:
+            keys = {(row[0].routes, row[0].directions) for row in kept}
+            for row in ranked:
+                key = (row[0].routes, row[0].directions)
+                if key not in keys and sum(k[0] == row[0].routes for k in keys) < 2:
+                    kept.append(row)
+                    keys.add(key)
+                    if len(kept) == beam_width:
+                        break
+        beam = tuple(sorted(kept, key=lambda row: (
+            *oriented_time_score(row[0]), row[0].routes, row[0].directions,
+        )))
+        if not beam:
+            break
+    return beam
+
+
 def _patterns(parents: Sequence[ParentWeld], config: ScientificConfig):
     result = []
     for parent in sorted(parents, key=lambda item: item.parent_id):

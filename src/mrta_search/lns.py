@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import itertools
 import math
@@ -118,6 +118,7 @@ class RepairResult:
     rejection_reason: str | None = None
     directions: DirectionVectors | None = None
     actions: tuple[OrientedInsertionAction, ...] = ()
+    direction_candidates: tuple[DirectionVectors, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -562,13 +563,16 @@ def _parent_alternatives(
     original_directions: Mapping[str, int] | None = None,
     seed: int = 0,
     oriented_state: OrientedRouteState | None = None,
+    coordination_proxy: bool = False,
+    direction_versions: int = 1,
 ) -> tuple[tuple[_InsertionAlternative, ...], int]:
     if direction_mode is not None:
         return _oriented_parent_alternatives(
             parent_id, routes, hints, blocks, pattern, config,
             insertion_limit=insertion_limit, remaining_budget=remaining_budget,
             direction_mode=direction_mode, original_directions=original_directions or {},
-            seed=seed, state=oriented_state,
+            seed=seed, state=oriented_state, coordination_proxy=coordination_proxy,
+            direction_versions=direction_versions,
         )
     parent_blocks = tuple(
         sorted(
@@ -724,6 +728,16 @@ def oriented_route_state(routes, directions, blocks, config) -> OrientedRouteSta
                                     for r, route in enumerate(routes)))
 
 
+def oriented_time_score(state: OrientedRouteState) -> tuple[float, float]:
+    """Construction proxy only: maximum P+M, then total P+M.
+
+    Rounding below a microsecond gives the secondary term a stable numerical
+    tie break. Actual acceptance remains entirely based on B32 Cmax.
+    """
+    estimated = tuple(p + sum(arcs) for p, arcs in zip(state.loads, state.arc_costs))
+    return round(max(estimated, default=0.0), 8), sum(estimated)
+
+
 def oriented_insert_variants(
     state: OrientedRouteState, block: WeldingBlock, robot: int, position: int,
     blocks: Mapping[str, WeldingBlock], config: ScientificConfig, *,
@@ -791,6 +805,7 @@ def oriented_insert_variants(
 def _oriented_parent_alternatives(
     parent_id, routes, hints, blocks, pattern, config, *, insertion_limit,
     remaining_budget, direction_mode, original_directions, seed, state=None,
+    coordination_proxy=False, direction_versions=1,
 ):
     state = state or oriented_route_state(routes, hints, blocks, config)
     children = sorted((b for b in blocks.values() if b.parent_id == parent_id), key=lambda b: b.block_id)
@@ -849,7 +864,9 @@ def _oriented_parent_alternatives(
                 ):
                     continue
                 trace = tuple((a.block_id, a.robot, a.position, a.direction) for a in actions)
-                score = (max(final.loads), final.travel - state.travel, final.routes, final.directions)
+                proxy = (oriented_time_score(final) if coordination_proxy
+                         else (max(final.loads), final.travel - state.travel))
+                score = (*proxy, final.routes, final.directions)
                 alternatives.append(_InsertionAlternative(parent_id, final.routes, final.directions,
                                                            score, trace, actions, final))
         evaluated += used_group
@@ -857,8 +874,11 @@ def _oriented_parent_alternatives(
     # of the same assignment and insertion location.
     by_structure = {}
     for alternative in sorted(alternatives, key=lambda a: a.score):
-        by_structure.setdefault(alternative.routes, alternative)
-    return tuple(sorted(by_structure.values(), key=lambda a: a.score)), evaluated
+        versions = by_structure.setdefault(alternative.routes, [])
+        if len(versions) < direction_versions and all(a.hints != alternative.hints for a in versions):
+            versions.append(alternative)
+    return tuple(sorted((a for versions in by_structure.values() for a in versions),
+                        key=lambda a: a.score)), evaluated
 
 
 def repair_partial_state(
@@ -875,11 +895,17 @@ def repair_partial_state(
     preserve_patterns: bool = False,
     direction_mode: str | None = None,
     seed: int = 0,
+    coordination_proxy: bool = False,
+    direction_versions: int = 1,
 ) -> RepairResult:
     if partial.source_revision != current.revision:
         raise ValueError("stale partial state revision")
     if max_insertion_evaluations < 1:
         raise ValueError("repair insertion budget must be positive")
+    if direction_versions not in (1, 2):
+        raise ValueError("at most two direction versions are supported")
+    if direction_mode is None and (coordination_proxy or direction_versions != 1):
+        raise ValueError("oriented repair options require explicit direction state")
     patterns = {pattern.parent_id: pattern for pattern in partial.patterns}
     blocks = block_map(current, config)
     current_hints_by_block = _hints_from_current(current, current_directions)
@@ -900,6 +926,7 @@ def repair_partial_state(
     evaluations = 0
     actions: list[OrientedInsertionAction] = []
     rng = random.Random(seed)
+    direction_paths = ((oriented_state, ()),)
 
     while pending:
         if repair_operator is RepairOperator.GREEDY_REPAIR:
@@ -924,25 +951,29 @@ def repair_partial_state(
             1, (max_insertion_evaluations - evaluations) // future_calls
         )
         for parent_id in parents_to_evaluate:
-            oriented_options = ({} if direction_mode is None else dict(
-                direction_mode=direction_mode, original_directions=current_hints_by_block,
-                seed=rng.randrange(2**32), oriented_state=oriented_state,
-            ))
-            alternatives, used = _parent_alternatives(
-                parent_id,
-                routes,
-                hints,
-                blocks,
-                patterns[parent_id],
-                config,
-                insertion_limit=insertion_limit,
-                remaining_budget=min(
-                    per_call_budget, max_insertion_evaluations - evaluations
-                ),
-                incremental_scoring=incremental_scoring,
-                **oriented_options,
-            )
-            evaluations += used
+            allowance = min(per_call_budget, max_insertion_evaluations - evaluations)
+            sources = direction_paths if direction_versions == 2 else ((oriented_state, ()),)
+            combined = []
+            for source_index, (source, prefix_actions) in enumerate(sources):
+                source_budget = allowance // len(sources) + (source_index < allowance % len(sources))
+                if source_budget < 1:
+                    continue
+                oriented_options = ({} if direction_mode is None else dict(
+                    direction_mode=direction_mode, original_directions=current_hints_by_block,
+                    seed=rng.randrange(2**32), oriented_state=source,
+                    coordination_proxy=coordination_proxy, direction_versions=direction_versions,
+                ))
+                alternatives, used = _parent_alternatives(
+                    parent_id, routes, (source.directions if source is not None else hints),
+                    blocks, patterns[parent_id], config,
+                    insertion_limit=insertion_limit, remaining_budget=source_budget,
+                    incremental_scoring=incremental_scoring, **oriented_options,
+                )
+                evaluations += used
+                if direction_versions == 2:
+                    alternatives = tuple(replace(a, actions=prefix_actions + a.actions) for a in alternatives)
+                combined.extend(alternatives)
+            alternatives = tuple(sorted(combined, key=lambda a: a.score))
             alternatives_by_parent[parent_id] = alternatives
             if evaluations >= max_insertion_evaluations:
                 break
@@ -959,7 +990,8 @@ def repair_partial_state(
             regret_rows = []
             for parent_id, alternatives in viable.items():
                 best = alternatives[0]
-                second = alternatives[1] if len(alternatives) > 1 else None
+                second = (next((a for a in alternatives[1:] if a.routes != best.routes), None)
+                          if direction_versions == 2 else (alternatives[1] if len(alternatives) > 1 else None))
                 primary = (
                     math.inf
                     if second is None
@@ -983,7 +1015,17 @@ def repair_partial_state(
         routes, hints = selected.routes, selected.hints
         oriented_state = selected.oriented_state
         trace.append((selected_parent, selected.trace))
-        actions.extend(selected.actions)
+        if direction_versions == 2:
+            actions = list(selected.actions)
+            retained = []
+            for alternative in viable[selected_parent]:
+                if alternative.routes == selected.routes and all(alternative.hints != p[0].directions for p in retained):
+                    retained.append((alternative.oriented_state, alternative.actions))
+                    if len(retained) == direction_versions:
+                        break
+            direction_paths = tuple(retained)
+        else:
+            actions.extend(selected.actions)
         pending.remove(selected_parent)
 
     try:
@@ -1028,6 +1070,10 @@ def repair_partial_state(
     )
     current_loads = _loads(current_routes, current_blocks, config)
     final_loads = _loads(final_routes, solution_blocks, config)
+    if direction_versions == 2:
+        parent_order = tuple(dict.fromkeys(_parent_id(a.block_id) for a in actions))
+        trace = [(p, tuple((a.block_id, a.robot, a.position, a.direction) for a in actions
+                           if _parent_id(a.block_id) == p)) for p in parent_order]
     repair_identity = tuple(trace)
     identity = CompleteCandidateIdentity(
         current.revision,
@@ -1059,7 +1105,9 @@ def repair_partial_state(
         provenance,
     )
     return RepairResult(candidate, evaluations, directions=(final_hints if direction_mode is not None else None),
-                        actions=tuple(actions))
+                        actions=tuple(actions), direction_candidates=(
+                            tuple(p[0].directions for p in direction_paths) if direction_versions == 2
+                            else ((final_hints,) if direction_mode is not None else ())))
 
 
 def repair_partial_state_oriented(
@@ -1067,6 +1115,7 @@ def repair_partial_state_oriented(
     partial: PartialSearchState, config: ScientificConfig, *,
     fixed_directions: bool = False, insertion_limit: int = 8,
     max_insertion_evaluations: int = 4096, seed: int = 0,
+    coordination_proxy: bool = False, direction_versions: int = 1,
 ) -> RepairResult:
     """The existing Regret-2 loop with explicit, persistent action directions."""
     return repair_partial_state(
@@ -1074,6 +1123,7 @@ def repair_partial_state_oriented(
         RepairOperator.REGRET_2_REPAIR, config, insertion_limit=insertion_limit,
         max_insertion_evaluations=max_insertion_evaluations, preserve_patterns=True,
         direction_mode="FIXED" if fixed_directions else "JOINT", seed=seed,
+        coordination_proxy=coordination_proxy, direction_versions=direction_versions,
     )
 
 
