@@ -21,6 +21,7 @@ from mrta_search import (
 )
 from mrta_search.pipeline import evaluate_iteration
 from mrta_search.lns import (
+    BottleneckSelection,
     CRRRBottleneck,
     CRRR_OPERATOR,
     CompleteCandidateIdentity,
@@ -28,6 +29,7 @@ from mrta_search.lns import (
     build_crrr_candidate,
     identify_crrr_region,
     lns_pair,
+    select_bottleneck_parents,
 )
 from mrta_search.stats import SearchStats
 
@@ -40,6 +42,134 @@ FAST = ScientificConfig(
     interference_dx=0.2,
     interference_dy=0.2,
 )
+
+
+@pytest.mark.parametrize("selection", tuple(BottleneckSelection))
+def test_bottleneck_selection_is_closed_replayable_and_wait_optional(selection):
+    initial = _initial()
+    solution, schedule = initial.best_solution, initial.best_schedule
+    schedule = replace(schedule, operations=tuple(op for op in schedule.operations
+                                                if op.kind is not OperationKind.WAIT))
+    if selection is BottleneckSelection.WAIT_ANCHORED:
+        assert select_bottleneck_parents(solution, initial.best_directions, schedule,
+                                         selection, q=2, seed=9, config=FAST) is None
+        wait = Operation("observed-wait", 0, OperationKind.WAIT, 0, 1,
+                         (1, 9), (1, 9), 0, solution.routes[0].block_ids[0])
+        schedule = replace(schedule, operations=schedule.operations + (wait,))
+    one = select_bottleneck_parents(solution, initial.best_directions, schedule,
+                                    selection, q=2, seed=9, config=FAST)
+    two = select_bottleneck_parents(solution, initial.best_directions, schedule,
+                                    selection, q=2, seed=9, config=FAST)
+    assert one == two
+    assert len(one.removed_parent_ids) == 2
+    for r, route in enumerate(solution.routes):
+        assert one.routes[r] == tuple(b for b in route.block_ids
+                                      if b.split("::", 1)[0] not in one.removed_parent_ids)
+    if selection is BottleneckSelection.RANDOM:
+        assert one == destroy_parents(solution, schedule, DestroyOperator.RANDOM_REMOVAL,
+                                      q=2, seed=9, config=FAST)
+
+
+def test_load_selector_includes_same_rail_mobility_without_cross_rail():
+    initial = _initial()
+    choices = [select_bottleneck_parents(initial.best_solution, initial.best_directions,
+                                        initial.best_schedule, BottleneckSelection.LOAD,
+                                        q=2, seed=s, config=FAST).removed_parent_ids for s in range(12)]
+    assert len(set(choices)) > 1
+    blocks = block_map(initial.best_solution, FAST)
+    old = {b: r for r, route in enumerate(initial.best_solution.routes) for b in route.block_ids}
+    for selected in choices:
+        assert any(robot_is_eligible(blocks[b], old[b] ^ 1, FAST)
+                   for b in blocks if blocks[b].parent_id in selected)
+    assert all(not robot_is_eligible(blocks[b], (old[b] + 2) % 4, FAST) for b in blocks)
+
+
+def test_travel_selection_weights_use_oriented_endpoints(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus, SplitPattern
+    from mrta_search import lns
+    parents = (ParentWeld("a", (1, 9), (5, 9)), ParentWeld("b", (6, 9), (10, 9)),
+               ParentWeld("c", (11, 9), (12, 9)))
+    solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                            {0: ("a::whole", "b::whole", "c::whole")}, FAST)
+    recorded = []
+    original_choices = random.Random.choices
+    def capture(self, population, weights=None, **kwargs):
+        recorded.append(tuple(weights))
+        return original_choices(self, population, weights=weights, **kwargs)
+    monkeypatch.setattr(random.Random, "choices", capture)
+    schedule = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10, robot_completion=(10, 0, 0, 0))
+    for hints in (((0, 0, 0), (), (), ()), ((1, 0, 0), (), (), ())):
+        lns.select_bottleneck_parents(solution, hints, schedule, BottleneckSelection.TRAVEL,
+                                      q=2, seed=1, config=FAST)
+    # Same segment midpoints, different exit point of a: 1m vs 5m travel.
+    assert recorded[1][0] == pytest.approx(5 * recorded[0][0])
+    assert recorded[1][1] == recorded[0][1]
+
+
+def test_fixed_pattern_repair_rejects_canonical_child_collapse(monkeypatch):
+    from mrta_reference.geometry import generate_y_split_patterns
+    from mrta_reference.model import Route, SplitPattern
+    from mrta_search import lns
+    parent = ParentWeld("a", (2, 6), (4, 6))
+    neighbour = ParentWeld("b", (5, 6), (6, 6))
+    pattern = generate_y_split_patterns(parent, FAST)[0]
+    solution = canonicalize((parent, neighbour), (pattern, SplitPattern("b", SplitKind.WHOLE)),
+                            {0: ("a::0", "b::whole", "a::1")}, FAST)
+    partial = lns._remove_parent_set(solution, ("a",))
+    def collapse(*args, **kwargs):
+        return ((lns._InsertionAlternative("a", (("a::0", "a::1", "b::whole"), (), (), ()),
+                                          ((0, 0, 0), (), (), ()), (0, 0), ()),), 1)
+    monkeypatch.setattr(lns, "_parent_alternatives", collapse)
+    result = repair_partial_state(solution, ((0, 0, 0), (), (), ()), partial,
+                                   DestroyOperator.RANDOM_REMOVAL, RepairOperator.REGRET_2_REPAIR,
+                                   FAST, preserve_patterns=True)
+    assert result.candidate is None
+    assert result.rejection_reason == "FIXED_PATTERN_CHANGED_BY_CANONICALIZATION"
+    legacy = repair_partial_state(solution, ((0, 0, 0), (), (), ()), partial,
+                                  DestroyOperator.RANDOM_REMOVAL, RepairOperator.REGRET_2_REPAIR, FAST)
+    assert legacy.candidate is not None
+    assert legacy.candidate.solution.patterns[0].kind is SplitKind.WHOLE
+
+
+@pytest.mark.parametrize("selection", tuple(BottleneckSelection))
+def test_bottleneck_selection_closes_split_children(selection):
+    from mrta_reference.geometry import generate_y_split_patterns
+    from mrta_reference.model import ScheduleResult, ScheduleStatus, SplitPattern
+    parent = ParentWeld("a", (2, 5), (2, 7))
+    other = ParentWeld("b", (5, 9), (6, 9))
+    pattern = generate_y_split_patterns(parent, FAST)[0]
+    solution = canonicalize((parent, other), (pattern, SplitPattern("b", SplitKind.WHOLE)),
+                            {0: ("a::1", "b::whole"), 2: ("a::0",)}, FAST)
+    wait = Operation("observed-wait", 0, OperationKind.WAIT, 2, 3,
+                     (2, 7), (2, 7), 0, "a::1")
+    schedule = ScheduleResult(ScheduleStatus.FEASIBLE, operations=(wait,), cmax=10,
+                              robot_completion=(10, 0, 8, 0))
+    partial = select_bottleneck_parents(solution, ((0, 0), (), (0,), ()), schedule,
+                                       selection, q=2, seed=1, config=FAST)
+    assert partial.removed_parent_ids == ("a", "b")
+    assert partial.routes == ((), (), (), ())
+    assert partial.patterns == solution.patterns
+
+
+def test_wait_selector_keeps_actual_before_after_anchors():
+    from mrta_reference.model import ScheduleResult, ScheduleStatus, SplitPattern
+    parents = tuple(ParentWeld(p, (x, 9), (x + 1, 9))
+                    for p, x in (("a", 1), ("b", 3), ("c", 17)))
+    solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                            {0: ("a::whole", "b::whole"), 1: ("c::whole",)}, FAST)
+    operations = (
+        Operation("post-a", 0, OperationKind.POST, 0, 5, (2, 9), (2, 9), 0, "a::whole"),
+        Operation("wait-b", 0, OperationKind.WAIT, 5, 10, (2, 9), (2, 9), 1, "b::whole"),
+        Operation("setup-b", 0, OperationKind.SETUP, 10, 11, (3, 9), (3, 9), 1, "b::whole"),
+        Operation("other", 1, OperationKind.WELD, 5, 10, (17, 9), (18, 9), 0, "c::whole"),
+    )
+    schedule = ScheduleResult(ScheduleStatus.FEASIBLE, operations=operations, cmax=11,
+                              robot_completion=(11, 10, 0, 0))
+    for seed in range(5):
+        partial = select_bottleneck_parents(solution, ((0, 0), (0,), (), ()), schedule,
+                                           BottleneckSelection.WAIT_ANCHORED,
+                                           q=2, seed=seed, config=FAST)
+        assert partial.removed_parent_ids == ("a", "b")
 
 
 def test_mandatory_pair_insertion_uses_final_route_not_old_index_difference(monkeypatch):

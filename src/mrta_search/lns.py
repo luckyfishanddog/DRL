@@ -44,6 +44,15 @@ class RepairOperator(str, Enum):
     REGRET_2_REPAIR = "REGRET_2_REPAIR"
 
 
+class BottleneckSelection(str, Enum):
+    """Offline pilot selectors; deliberately outside production OPERATOR_PAIRS."""
+
+    RANDOM = "RANDOM"
+    LOAD = "LOAD"
+    TRAVEL = "TRAVEL"
+    WAIT_ANCHORED = "WAIT_ANCHORED"
+
+
 class CRRRBottleneck(str, Enum):
     WAIT_BOUNDARY = "WAIT_BOUNDARY"
     LOAD_BOUNDARY = "LOAD_BOUNDARY"
@@ -348,6 +357,13 @@ def destroy_parents(
         removed = tuple(sorted(random.Random(seed).sample(parent_ids, q)))
     else:
         removed = tuple(sorted(_critical_parent_order(current, schedule, config)[:q]))
+    return _remove_parent_set(current, removed)
+
+
+def _remove_parent_set(
+    current: CanonicalSolution, removed: Sequence[str]
+) -> PartialSearchState:
+    removed = tuple(sorted(set(removed)))
     removed_set = set(removed)
     routes = tuple(
         tuple(item for item in route.block_ids if _parent_id(item) not in removed_set)
@@ -360,6 +376,131 @@ def destroy_parents(
         removed,
         current.revision,
     )
+
+
+def select_bottleneck_parents(
+    current: CanonicalSolution,
+    directions: DirectionVectors,
+    schedule: ScheduleResult,
+    selection: BottleneckSelection,
+    *,
+    q: int,
+    seed: int,
+    config: ScientificConfig,
+) -> PartialSearchState | None:
+    """Select closed parent groups using only the current certified timeline.
+
+    WAIT_ANCHORED uses observed waits and temporal/spatial neighbours, not
+    inferred causal blockers. None means no positive WAIT exists. Directions
+    are required so TRAVEL uses the actual exit/entry endpoints.
+    """
+    if not schedule.feasible:
+        raise ValueError("bottleneck selection requires a feasible current schedule")
+    if not 1 <= q <= len(current.parents):
+        raise ValueError("q must select one or more existing parents")
+    if selection is BottleneckSelection.RANDOM:
+        return destroy_parents(current, schedule, DestroyOperator.RANDOM_REMOVAL,
+                               q=q, seed=seed, config=config)
+    rng = random.Random(seed)
+    blocks = block_map(current, config)
+    patterns = {p.parent_id: p for p in current.patterns}
+    owners = {item: r for r, route in enumerate(current.routes) for item in route.block_ids}
+    parent_blocks = {p.parent_id: [] for p in current.parents}
+    for block in blocks.values():
+        parent_blocks[block.parent_id].append(block)
+    legal = {}
+    for item, block in blocks.items():
+        pattern = patterns[block.parent_id]
+        if pattern.kind is SplitKind.X_SPLIT:
+            base = 0 if pattern.rail.value == "UPPER" else 2
+            legal[item] = {base + int(item.endswith("::1"))}
+        else:
+            legal[item] = {r for r in range(4) if robot_is_eligible(block, r, config)}
+    movable = {p: any(legal[b.block_id] - {owners[b.block_id]} for b in bs)
+               for p, bs in parent_blocks.items()}
+    loads = _loads(tuple(r.block_ids for r in current.routes), blocks, config)
+    completion = schedule.robot_completion
+    max_completion = max(max(completion), config.numeric_epsilon)
+
+    def choose(rows):
+        values, weights = zip(*rows)
+        return rng.choices(values, weights=weights, k=1)[0]
+
+    anchors: list[str] = []
+    wait = None
+    if selection is BottleneckSelection.LOAD:
+        # Both completion and processing matter. All legal robot moves count,
+        # including left/right moves on the same rail.
+        robot = choose([(r, max(loads[r], 1e-9) * (completion[r] / max_completion) ** 2)
+                        for r in range(4) if current.routes[r].block_ids])
+        candidates = sorted({_parent_id(b) for b in current.routes[robot].block_ids})
+        flexible = [p for p in candidates if movable[p]]
+        anchors = [choose([(p, sum(config.process_time(b.length)
+                                  for b in parent_blocks[p] if owners[b.block_id] == robot))
+                           for p in (flexible or candidates)])]
+    elif selection is BottleneckSelection.TRAVEL:
+        arcs = []
+        for r, route in enumerate(current.routes):
+            for i, cost in enumerate(_route_arc_costs(route.block_ids, directions[r], blocks, config)):
+                arcs.append(((route.block_ids[i], route.block_ids[i + 1]),
+                             max(cost, 1e-9) * (0.25 + completion[r] / max_completion)))
+        if arcs:
+            anchors = list(dict.fromkeys(_parent_id(b) for b in choose(arcs)))
+        else:
+            anchors = [rng.choice(current.parents).parent_id]
+    elif selection is BottleneckSelection.WAIT_ANCHORED:
+        waits = [op for op in schedule.operations
+                 if op.kind is OperationKind.WAIT and op.duration > config.numeric_epsilon]
+        if not waits:
+            return None
+        wait = choose([(op, op.duration * (0.25 + completion[op.robot_id] / max_completion) ** 2)
+                       for op in waits])
+        own = [op for op in schedule.operations if op.robot_id == wait.robot_id
+               and op.block_id in blocks and op.kind is not OperationKind.WAIT]
+        before = [op for op in own if op.end_time <= wait.start_time + config.numeric_epsilon]
+        after = [op for op in own if op.start_time >= wait.end_time - config.numeric_epsilon]
+        for op in ([max(before, key=lambda op: op.end_time)] if before else []) + (
+            [min(after, key=lambda op: op.start_time)] if after else []
+        ):
+            if _parent_id(op.block_id) not in anchors:
+                anchors.append(_parent_id(op.block_id))
+        if not anchors and wait.block_id in blocks:
+            anchors.append(_parent_id(wait.block_id))
+    else:
+        raise ValueError(f"unknown bottleneck selection: {selection}")
+
+    anchor_blocks = [b for p in anchors for b in parent_blocks[p]]
+    receiver_robots = set().union(*(legal[b.block_id] for b in anchor_blocks))
+    adjacent = set()
+    for route in current.routes:
+        for i, item in enumerate(route.block_ids):
+            if _parent_id(item) in anchors:
+                adjacent.update(_parent_id(b) for b in route.block_ids[max(0, i - 1):i + 2])
+    wait_related: dict[str, float] = {}
+    if wait is not None:
+        for op in schedule.operations:
+            if op.robot_id == wait.robot_id or op.block_id not in blocks:
+                continue
+            overlap = max(0.0, min(op.end_time, wait.end_time) - max(op.start_time, wait.start_time))
+            if overlap:
+                distance = min(math.dist(wait.start, op.start), math.dist(wait.start, op.end))
+                p = _parent_id(op.block_id)
+                wait_related[p] = max(wait_related.get(p, 0.0), overlap / wait.duration / (0.5 + distance))
+    related = []
+    for p, bs in parent_blocks.items():
+        if p in anchors:
+            continue
+        distance = min((math.dist(x, y) for b in bs for a in anchor_blocks
+                        for x in (b.start, b.end) for y in (a.start, a.end)), default=20.0)
+        receiver = any(owners[b.block_id] in receiver_robots for b in bs)
+        weight = (0.1 + (1.0 + movable[p] + receiver) / (0.5 + distance)
+                  + 2.0 * (p in adjacent) + 8.0 * wait_related.get(p, 0.0))
+        related.append((p, weight))
+    # Weighted sampling without replacement gives different anchors/context
+    # across attempts, rather than repeatedly taking a deterministic top-q.
+    ranked = sorted(related, key=lambda row: -math.log(max(rng.random(), 1e-15)) / row[1])
+    removed = anchors[:q] + [p for p, _ in ranked[:max(0, q - len(anchors))]]
+    return _remove_parent_set(current, removed)
 
 
 def _insert_one(
@@ -544,6 +685,7 @@ def repair_partial_state(
     insertion_limit: int = 8,
     max_insertion_evaluations: int = 4096,
     incremental_scoring: bool = False,
+    preserve_patterns: bool = False,
 ) -> RepairResult:
     if partial.source_revision != current.revision:
         raise ValueError("stale partial state revision")
@@ -654,6 +796,8 @@ def repair_partial_state(
             ),
         )
         solution_blocks = block_map(solution, config)
+        if preserve_patterns and solution.patterns != current.patterns:
+            return RepairResult(None, evaluations, "FIXED_PATTERN_CHANGED_BY_CANONICALIZATION")
         if any(
             not robot_is_eligible(solution_blocks[item], route.robot_id, config)
             for route in solution.routes
