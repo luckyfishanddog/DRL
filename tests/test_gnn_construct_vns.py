@@ -107,7 +107,8 @@ def test_joint_neural_logits_control_robot_choice_and_complete_real_b32(monkeypa
         assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
 
 
-def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder():
+@pytest.mark.parametrize('decode_mode',('greedy','sample'))
+def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder(decode_mode):
     from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
     from mrta_reference.geometry import build_legal_pattern_catalog
     import run_joint_oriented_repair_pilot as direct
@@ -116,7 +117,8 @@ def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder():
                  if p.kind is SplitKind.X_SPLIT and p.point_id=='BX_CENTER')
     reference=canonicalize((parent,),(pattern,),{0:('joint-x::0',),1:('joint-x::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
     torch.manual_seed(20261027)
-    result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),('joint-x',),JointInsertionGNN(),CONFIG)
+    result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),('joint-x',),JointInsertionGNN(),CONFIG,
+                                      decode_mode=decode_mode,seed=20261027)
     assert result.solution is not None
     assert result.solution.patterns==(pattern,)
     assert result.solution.routes[0].block_ids==('joint-x::0',)
@@ -124,6 +126,85 @@ def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder():
     assert result.directions[2:]==((),())
     assert len(result.actions)==2
     assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
+
+
+def test_joint_default_greedy_matches_explicit_greedy_without_consuming_rng():
+    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn,joint_geometry
+    reference=_joint_simple_reference();model=JointInsertionGNN()
+    geometry=joint_geometry(reference.parents,reference.patterns,CONFIG)
+    args=(geometry,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
+    before=torch.get_rng_state().clone()
+    first=construct_or_repair_with_gnn(*args)
+    second=construct_or_repair_with_gnn(*args,decode_mode='greedy',seed=98765)
+    assert first.solution is not None and second.solution is not None
+    assert first.solution.routes==second.solution.routes and first.directions==second.directions
+    assert first.actions==second.actions and torch.equal(before,torch.get_rng_state())
+
+
+def test_joint_sampling_uses_softmax_for_both_heads_and_a_local_seed(monkeypatch):
+    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn,joint_geometry
+    parents=tuple(ParentWeld(str(i),(1+3*i,9),(1.5+3*i,9)) for i in range(6))
+    geometry=joint_geometry(parents,fixed_split_patterns(parents,CONFIG),CONFIG)
+    model=JointInsertionGNN();calls=[];original=torch.multinomial
+    def logits(size):
+        assert not model.training and torch.is_inference_mode_enabled()
+        return torch.linspace(-1,1,size)
+    monkeypatch.setattr(model,'parent_logits',lambda graph,embeddings,ids,features:logits(len(ids)))
+    monkeypatch.setattr(model,'joint_action_logits',lambda embeddings,indices,features:logits(len(indices)))
+    def draw(probabilities,num_samples,*,generator):
+        assert generator is not None and num_samples==1
+        assert torch.allclose(probabilities,torch.softmax(torch.linspace(-1,1,len(probabilities)),dim=0))
+        calls.append(len(probabilities))
+        return original(probabilities,num_samples,generator=generator)
+    monkeypatch.setattr(torch,'multinomial',draw)
+    before=torch.get_rng_state().clone()
+    args=(geometry,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in parents),model,CONFIG)
+    first=construct_or_repair_with_gnn(*args,decode_mode='sample',seed=20261028)
+    second=construct_or_repair_with_gnn(*args,decode_mode='sample',seed=20261028)
+    third=construct_or_repair_with_gnn(*args,decode_mode='sample',seed=20261029)
+    assert first.solution is not None and second.solution is not None and third.solution is not None
+    assert first.actions==second.actions and first.directions==second.directions
+    assert first.actions!=third.actions
+    assert len(calls)==3*2*len(parents)
+    assert torch.equal(before,torch.get_rng_state())
+    blocks=block_map(first.solution,CONFIG)
+    import run_gnn_multi_initial as multi
+    multi.check_complete(first)
+    assert {b for route in first.solution.routes for b in route.block_ids}==set(blocks)
+    for route,bits in zip(first.solution.routes,first.directions):
+        assert len(route.block_ids)==len(bits) and all(d in (0,1) for d in bits)
+        assert all(robot_is_eligible(blocks[b],route.robot_id,CONFIG) for b in route.block_ids)
+
+
+def test_multi4_reuses_duplicate_schedules_and_keeps_best_feasible(monkeypatch):
+    import run_gnn_multi_initial as multi
+    from types import SimpleNamespace as NS
+    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn,joint_geometry
+    reference=_joint_simple_reference();geometry=joint_geometry(reference.parents,reference.patterns,CONFIG)
+    model=JointInsertionGNN()
+    with torch.no_grad():
+        for parameter in model.parameters():parameter.zero_()
+        model.insertion_head[0].weight[0,4*64+31]=1
+        model.insertion_head[2].weight[0,0]=1
+    args=(geometry,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
+    a=construct_or_repair_with_gnn(*args)
+    with torch.no_grad():model.insertion_head[2].weight[0,0]=-1
+    b=construct_or_repair_with_gnn(*args)
+    assert a.solution is not None and b.solution is not None and a.solution.routes!=b.solution.routes
+    results=iter((a,a,b,b));modes=[];calls=[]
+    def construct(*args,**kwargs):
+        modes.append((kwargs['decode_mode'],kwargs['seed']));return next(results)
+    def schedule(solution,directions,config):
+        calls.append(solution.routes)
+        return NS(solution=solution,directions=directions,
+                  schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100. if len(calls)==1 else 90.))
+    monkeypatch.setattr(multi,'construct_or_repair_with_gnn',construct)
+    monkeypatch.setattr(multi.shared.pilot.oriented,'schedule_explicit',schedule)
+    greedy,combined,best=multi.neural_multi4(reference.parents,model,'GNN','TRAIN','unit',20261027)
+    assert modes==[('greedy',20261027),('sample',20261028),('sample',20261029),('sample',20261030)]
+    assert len(calls)==combined['b32_calls']==combined['unique_routes']==2
+    assert greedy['b32_calls']==1 and greedy['best_cmax']==100.
+    assert combined['best_cmax']==best.schedule.cmax==90.
 
 
 def test_shared_raw_geometry_initial_has_no_routes_or_heuristic_input(monkeypatch):

@@ -567,15 +567,26 @@ def prepare_joint_teacher_steps(reference, routes, directions, pending, actions,
 
 
 def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
-                                 model: JointInsertionGNN, config, *, insertion_limit=8):
+                                 model: JointInsertionGNN, config, *, insertion_limit=8,
+                                 decode_mode='greedy', seed=0):
     """One sequential neural policy, usable for partial or four-empty routes.
 
-    It returns failure as failure. No scheduler, heuristic repair or direction
-    optimizer is called; complete results are scheduled once by the caller.
+    Greedy remains the default. Sampling draws both decisions directly from
+    softmax(logits), at temperature 1, using a local explicitly seeded generator.
+    It returns failure as failure. Complete results are scheduled by the caller.
     """
     from .lns import joint_block_candidates
+    if decode_mode not in ('greedy','sample'):
+        raise ValueError('decode_mode must be greedy or sample')
     started = time.perf_counter()
     actions = []
+    generator=None
+    if decode_mode=='sample':
+        generator=torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
+    def choose(logits):
+        if decode_mode=='greedy':
+            return int(torch.argmax(logits))
+        return int(torch.multinomial(torch.softmax(logits,dim=0),1,generator=generator).item())
     try:
         graph,blocks,patterns = joint_graph(reference,config)
         state = joint_start_state(reference,routes,directions,pending_parent_ids,blocks,config)
@@ -590,7 +601,7 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                 parent_logits = model.parent_logits(graph,embeddings,ids,features)
                 if not torch.isfinite(parent_logits).all():
                     raise ValueError('NONFINITE_PARENT_LOGITS')
-                parent = ids[int(torch.argmax(parent_logits))]
+                parent = ids[choose(parent_logits)]
                 children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
                 for child in children:
                     variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit)
@@ -600,7 +611,7 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                     logits = model.joint_action_logits(embeddings,indices,dynamic)
                     if not torch.isfinite(logits).all():
                         raise ValueError('NONFINITE_INSERTION_LOGITS')
-                    state,action = variants[int(torch.argmax(logits))]
+                    state,action = variants[choose(logits)]
                     actions.append(action)
                 pending.remove(parent)
         solution = canonicalize(reference.parents,reference.patterns,
