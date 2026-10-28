@@ -176,6 +176,80 @@ def test_joint_sampling_uses_softmax_for_both_heads_and_a_local_seed(monkeypatch
         assert all(robot_is_eligible(blocks[b],route.robot_id,CONFIG) for b in route.block_ids)
 
 
+def test_joint_training_rollout_matches_sample_and_has_both_policy_gradients():
+    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn,rollout_joint_repair
+    torch.manual_seed(20261027)
+    model=JointInsertionGNN();reference=_joint_simple_reference()
+    args=(reference,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
+    inference=construct_or_repair_with_gnn(*args,decode_mode='sample',seed=20261027)
+    before=torch.get_rng_state().clone()
+    rollout=rollout_joint_repair(*args,seed=20261027)
+    assert rollout.completion.solution is not None
+    assert rollout.completion.actions==inference.actions and rollout.completion.directions==inference.directions
+    assert len(rollout.parent_log_probs)==len(rollout.insertion_log_probs)==2
+    assert torch.equal(before,torch.get_rng_state())
+    assert all(v.requires_grad for v in rollout.parent_log_probs+rollout.insertion_log_probs)
+    assert torch.equal(rollout.log_prob,torch.stack(rollout.parent_log_probs+rollout.insertion_log_probs).sum())
+    (-.25*rollout.log_prob).backward()
+    for head in ('layer1','layer2','parent_head','insertion_head'):
+        assert any(p.grad is not None and bool(p.grad.abs().sum()>0) for p in getattr(model,head).parameters())
+
+
+def test_joint_training_rollout_rejects_numeric_and_data_errors(monkeypatch):
+    from mrta_search.gnn_constructor import JointInsertionGNN,rollout_joint_repair
+    reference=_joint_simple_reference();model=JointInsertionGNN()
+    args=(reference,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
+    with pytest.raises(ValueError,match='remove each pending parent'):
+        rollout_joint_repair(reference,((),(),(),()),((),(),(),()),('joint-a',),model,CONFIG)
+    monkeypatch.setattr(model,'parent_logits',lambda graph,embeddings,ids,features:torch.full((len(ids),),float('nan')))
+    with pytest.raises(ValueError,match='NONFINITE_PARENT_LOGITS'):
+        rollout_joint_repair(*args)
+    with torch.inference_mode(),pytest.raises(RuntimeError,match='inference_mode'):
+        rollout_joint_repair(*args)
+
+
+def test_joint_training_dead_end_retains_sampled_prefix(monkeypatch):
+    from mrta_search import lns
+    from mrta_search.gnn_constructor import JointInsertionGNN,rollout_joint_repair
+    original=lns.joint_block_candidates;count=0
+    def candidates(*args,**kwargs):
+        nonlocal count
+        if not kwargs.get('first_only'):
+            count+=1
+            if count==2:return ()
+        return original(*args,**kwargs)
+    monkeypatch.setattr(lns,'joint_block_candidates',candidates)
+    model=JointInsertionGNN();reference=_joint_simple_reference()
+    result=rollout_joint_repair(reference,((),(),(),()),((),(),(),()),('joint-a','joint-b'),model,CONFIG,seed=17)
+    assert result.completion.solution is None and result.completion.rejection_reason=='NO_LEGAL_CHILD_INSERTION'
+    assert len(result.completion.actions)==len(result.insertion_log_probs)==1
+    assert len(result.parent_log_probs)==2 and result.log_prob.requires_grad
+
+
+def test_cmax_return_and_pair_budget_use_real_status_without_fake_cost(monkeypatch):
+    from types import SimpleNamespace as NS
+    import run_gnn_cmax_finetune as rl
+    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
+    def feasible(cmax):return NS(schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=cmax))
+    assert rl.terminal_return(feasible(80),100)==pytest.approx(20/180)
+    assert rl.terminal_return(feasible(120),100)==pytest.approx(-20/220)
+    assert rl.terminal_return(None,100)==-1
+    assert rl.terminal_return(NS(schedule=NS(status=ScheduleStatus.DEADLOCK,cmax=None)),100)==-1
+    with pytest.raises(ValueError,match='positive finite Cmax'):
+        rl.terminal_return(feasible(float('nan')),100)
+    reference=_joint_simple_reference()
+    result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),('joint-a','joint-b'),JointInsertionGNN(),CONFIG)
+    calls=[]
+    monkeypatch.setattr(rl.pilot.oriented,'schedule_explicit',lambda *args:(calls.append(args) or feasible(80)))
+    outcomes,budget=rl.score_pair(result,result,100)
+    assert budget==len(calls)==1 and outcomes[0][0] is outcomes[1][0]
+    assert outcomes[0][1]-outcomes[1][1]==0
+    def broken(*args):raise ValueError('numeric/data failure')
+    monkeypatch.setattr(rl.pilot.oriented,'schedule_explicit',broken)
+    with pytest.raises(ValueError,match='numeric/data failure'):
+        rl.score_pair(result,result,100)
+
+
 def test_multi4_reuses_duplicate_schedules_and_keeps_best_feasible(monkeypatch):
     import run_gnn_multi_initial as multi
     from types import SimpleNamespace as NS

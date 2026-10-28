@@ -566,62 +566,103 @@ def prepare_joint_teacher_steps(reference, routes, directions, pending, actions,
     return graph,steps,state
 
 
-def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
-                                 model: JointInsertionGNN, config, *, insertion_limit=8,
-                                 decode_mode='greedy', seed=0):
-    """One sequential neural policy, usable for partial or four-empty routes.
+class _JointActionUnavailable(ValueError):
+    """An ordinary policy dead end, distinct from corrupt inputs/numerics."""
 
-    Greedy remains the default. Sampling draws both decisions directly from
-    softmax(logits), at temperature 1, using a local explicitly seeded generator.
-    It returns failure as failure. Complete results are scheduled by the caller.
-    """
+
+@dataclass(frozen=True)
+class JointTrainingRollout:
+    completion: JointCompletionResult
+    parent_log_probs: tuple[torch.Tensor, ...]
+    insertion_log_probs: tuple[torch.Tensor, ...]
+    log_prob: torch.Tensor
+
+
+def _decode_joint(reference, routes, directions, pending_parent_ids, model, config,
+                  *, insertion_limit, choose):
+    """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
-    if decode_mode not in ('greedy','sample'):
-        raise ValueError('decode_mode must be greedy or sample')
     started = time.perf_counter()
     actions = []
-    generator=None
-    if decode_mode=='sample':
-        generator=torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
-    def choose(logits):
-        if decode_mode=='greedy':
-            return int(torch.argmax(logits))
-        return int(torch.multinomial(torch.softmax(logits,dim=0),1,generator=generator).item())
     try:
         graph,blocks,patterns = joint_graph(reference,config)
         state = joint_start_state(reference,routes,directions,pending_parent_ids,blocks,config)
         pending = set(pending_parent_ids)
-        model.eval()
-        with torch.inference_mode():
-            embeddings = model.encode_static(graph)
-            while pending:
-                ids,features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit)
-                if not ids:
-                    raise ValueError('NO_LEGAL_PARENT_ACTION')
-                parent_logits = model.parent_logits(graph,embeddings,ids,features)
-                if not torch.isfinite(parent_logits).all():
-                    raise ValueError('NONFINITE_PARENT_LOGITS')
-                parent = ids[choose(parent_logits)]
-                children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
-                for child in children:
-                    variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit)
-                    if not variants:
-                        raise ValueError('NO_LEGAL_CHILD_INSERTION')
-                    indices,dynamic = joint_candidate_inputs(graph,state,variants,blocks,config)
-                    logits = model.joint_action_logits(embeddings,indices,dynamic)
-                    if not torch.isfinite(logits).all():
-                        raise ValueError('NONFINITE_INSERTION_LOGITS')
-                    state,action = variants[choose(logits)]
-                    actions.append(action)
-                pending.remove(parent)
+        embeddings = model.encode_static(graph)
+        while pending:
+            ids,features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit)
+            if not ids:
+                raise _JointActionUnavailable('NO_LEGAL_PARENT_ACTION')
+            parent_logits = model.parent_logits(graph,embeddings,ids,features)
+            if not torch.isfinite(parent_logits).all():
+                raise ValueError('NONFINITE_PARENT_LOGITS')
+            parent = ids[choose(parent_logits,'parent')]
+            children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
+            for child in children:
+                variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit)
+                if not variants:
+                    raise _JointActionUnavailable('NO_LEGAL_CHILD_INSERTION')
+                indices,dynamic = joint_candidate_inputs(graph,state,variants,blocks,config)
+                logits = model.joint_action_logits(embeddings,indices,dynamic)
+                if not torch.isfinite(logits).all():
+                    raise ValueError('NONFINITE_INSERTION_LOGITS')
+                state,action = variants[choose(logits,'insertion')]
+                actions.append(action)
+            pending.remove(parent)
         solution = canonicalize(reference.parents,reference.patterns,
                                 tuple(Route(r,state.routes[r]) for r in range(4)),config,scope=FORMAL_SCOPE_V2,
                                 revision=reference.revision+1)
         if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
             raise ValueError('FIXED_PATTERN_CHANGED')
         return JointCompletionResult(solution,state.directions,tuple(actions),time.perf_counter()-started)
-    except (ValueError,KeyError,IndexError,ArithmeticError) as error:
+    except _JointActionUnavailable as error:
         return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,str(error))
+
+
+def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
+                                 model: JointInsertionGNN, config, *, insertion_limit=8,
+                                 decode_mode='greedy', seed=0):
+    """No-gradient greedy/sample decoding; complete results are scheduled outside."""
+    if decode_mode not in ('greedy','sample'):
+        raise ValueError('decode_mode must be greedy or sample')
+    generator=None
+    if decode_mode=='sample':
+        generator=torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
+    def choose(logits,kind):
+        if decode_mode=='greedy':
+            return int(torch.argmax(logits))
+        return int(torch.multinomial(torch.softmax(logits,dim=0),1,generator=generator).item())
+    model.eval()
+    with torch.inference_mode():
+        return _decode_joint(reference,routes,directions,pending_parent_ids,model,config,
+                             insertion_limit=insertion_limit,choose=choose)
+
+
+def rollout_joint_repair(reference, routes, directions, pending_parent_ids,
+                         model: JointInsertionGNN, config, *, insertion_limit=8, seed=0):
+    """Differentiable temperature-1 sampling of the SAME executable actions.
+
+    Only sampled indices are discrete. Both heads' selected log-softmax values
+    retain the graph through the GAT. Numeric/data errors propagate to the caller;
+    a genuine missing legal action preserves the sampled prefix for failure return.
+    """
+    if torch.is_inference_mode_enabled():
+        raise RuntimeError('training rollout cannot run inside inference_mode')
+    generator=torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
+    logs={'parent':[],'insertion':[]}
+    def choose(logits,kind):
+        index=int(torch.multinomial(torch.softmax(logits,dim=0),1,generator=generator).item())
+        logs[kind].append(torch.log_softmax(logits,dim=0)[index])
+        return index
+    # There is no stochastic dropout in this policy. Eval also makes the
+    # self-critical baseline and sampled branch use the same model semantics.
+    model.eval()
+    with torch.enable_grad():
+        completion=_decode_joint(reference,routes,directions,pending_parent_ids,model,config,
+                                 insertion_limit=insertion_limit,choose=choose)
+        terms=logs['parent']+logs['insertion']
+        log_prob=torch.stack(terms).sum() if terms else next(model.parameters()).new_zeros(())
+    return JointTrainingRollout(completion,tuple(logs['parent']),tuple(logs['insertion']),log_prob)
 
 
 def _home(robot: int, config: ScientificConfig) -> tuple[float, float]:
