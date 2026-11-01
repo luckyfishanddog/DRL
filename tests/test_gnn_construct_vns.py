@@ -529,13 +529,13 @@ def test_joint_feedback_selects_from_updated_incumbent_and_bounds_b32(monkeypatc
     def schedule(solution,directions,config):
         scheduled.append(solution)
         cmax={1:90.,5:80.}.get(len(scheduled),95.)
-        return NS(solution=solution,directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=cmax))
+        return NS(solution=solution,directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=cmax,operations=()))
     monkeypatch.setattr(joint,'select_bottleneck_parents',select)
     monkeypatch.setattr(joint,'construct_or_repair_with_gnn',repair)
     monkeypatch.setattr(joint,'partial_directions',lambda *args:())
     monkeypatch.setattr(joint.oriented,'schedule_explicit',schedule)
     monkeypatch.setattr(joint.oriented,'summary',lambda *args:{})
-    initial=NS(solution='initial',directions=(),schedule=NS(cmax=100.))
+    initial=NS(solution='initial',directions=(),schedule=NS(cmax=100.,operations=()))
     row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2',None,NS(seed=20261027))
     assert row['accepted']==2 and row['best_cmax']==80.
     assert row['b32_calls']==len(scheduled)==24
@@ -558,7 +558,7 @@ def test_joint_wait_feedback_without_wait_retains_load_search_and_records_fallba
     monkeypatch.setattr(joint,'construct_or_repair_with_gnn',lambda *args,**kwargs:
                         NS(solution='same',directions=(),actions=()))
     monkeypatch.setattr(joint,'partial_directions',lambda *args:())
-    initial=NS(solution='same',directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100.))
+    initial=NS(solution='same',directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100.,operations=()))
     monkeypatch.setattr(joint.oriented,'schedule_explicit',lambda *args:initial)
     row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2',None,NS(seed=20261027),
                               selectors=(joint.BottleneckSelection.WAIT_ANCHORED,),iterations=8)
@@ -569,6 +569,74 @@ def test_joint_wait_feedback_without_wait_retains_load_search_and_records_fallba
     assert [item['q'] for item in trace]==[4,4,4,8,8,8,4,4]
     assert all(item['selection']=='LOAD' and item['requested_selection']=='WAIT_ANCHORED'
                and item['selection_fallback']=='NO_POSITIVE_WAIT' for item in trace)
+
+
+def test_adaptive_wait_without_positive_wait_matches_base_budget_and_selections(monkeypatch):
+    import json
+    from types import SimpleNamespace as NS
+    import run_gnn_joint_repair_pilot as joint
+    ops=tuple(NS(kind=joint.OperationKind.WAIT,duration=d) for d in (0.,joint.CONFIG.numeric_epsilon/2))
+    initial=NS(solution='same',directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100.,operations=ops))
+    selections=[];calls=[]
+    def select(solution,directions,schedule,selection,**kwargs):
+        selections.append((selection,kwargs['q'],kwargs['seed']))
+        return NS(routes=(),removed_parent_ids=('a',))
+    def schedule(*args):
+        calls.append(args)
+        return initial
+    monkeypatch.setattr(joint,'select_bottleneck_parents',select)
+    monkeypatch.setattr(joint,'construct_or_repair_with_gnn',lambda *args,**kwargs:
+                        NS(solution='same',directions=(),actions=()))
+    monkeypatch.setattr(joint,'partial_directions',lambda *args:())
+    monkeypatch.setattr(joint.oriented,'schedule_explicit',schedule)
+    rows=[joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2',None,NS(seed=20261027),
+                                wait_feedback=feedback) for feedback in (False,True)]
+    assert selections[:24]==selections[24:]
+    assert [q for _,q,_ in selections[:24]]==[4,4,4,8,8,8]*4
+    assert [seed for _,_,seed in selections[:24]]==list(range(20261027,20261027+24))
+    assert len(calls)==48
+    assert all(r['attempts']==r['b32_calls']==24 and r['accepted']==0 for r in rows)
+    assert rows[1]['no_wait_rounds']==24 and rows[1]['wait_used']==rows[1]['wait_fallbacks']==0
+    for base,wait in zip(*(json.loads(r['trace']) for r in rows)):
+        assert {k:v for k,v in base.items() if k!='no_wait'}=={k:v for k,v in wait.items() if k!='no_wait'}
+
+
+@pytest.mark.parametrize('empty_partial',(False,True))
+def test_adaptive_wait_reads_only_accepted_schedule_and_recovers_original_selector(monkeypatch,empty_partial):
+    import json
+    from types import SimpleNamespace as NS
+    import run_gnn_joint_repair_pilot as joint
+    def state(cmax,wait):
+        return NS(solution=NS(routes=()),directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=cmax,
+                   operations=(NS(kind=joint.OperationKind.WAIT,duration=wait),)))
+    initial=state(100.,0.)
+    candidates=[state(90.,5.),state(90.,0.),state(80.,0.)]
+    calls=[];selections=[]
+    def select(solution,directions,schedule,selection,**kwargs):
+        selections.append((selection,schedule.cmax,joint.positive_wait_duration(schedule)))
+        if len(calls)==1 and selection is joint.BottleneckSelection.WAIT_ANCHORED:
+            return NS(routes=(),removed_parent_ids=()) if empty_partial else None
+        return NS(routes=(),removed_parent_ids=('a',))
+    def schedule(*args):
+        calls.append(args)
+        return candidates[min(len(calls)-1,2)]
+    monkeypatch.setattr(joint,'select_bottleneck_parents',select)
+    monkeypatch.setattr(joint,'construct_or_repair_with_gnn',lambda *args,**kwargs:
+                        NS(solution=NS(routes=()),directions=(),actions=()))
+    monkeypatch.setattr(joint,'partial_directions',lambda *args:())
+    monkeypatch.setattr(joint.oriented,'schedule_explicit',schedule)
+    monkeypatch.setattr(joint.oriented,'summary',lambda *args:{})
+    row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2-WAIT',None,NS(seed=20261027),wait_feedback=True)
+    trace=json.loads(row['trace'])
+    assert len(calls)==row['b32_calls']==row['attempts']==24
+    assert row['accepted']==2 and row['best_cmax']==80.
+    assert row['wait_used']==row['wait_accepted']==row['wait_fallbacks']==1
+    assert row['no_wait_rounds']==22
+    assert trace[1]['requested_selection']==trace[1]['selection']=='TRAVEL' and trace[1]['wait_fallback']
+    assert trace[2]['selection']=='WAIT_ANCHORED' and trace[2]['wait_before']==5. and trace[2]['accepted']
+    assert trace[3]['selection']=='RANDOM' and trace[3]['no_wait']
+    assert all(t['after']==t['before'] for t in trace if not t['accepted'])
+    assert all(t['after']<t['before'] for t in trace if t['accepted'])
 
 
 def test_joint_teacher_neighbour_flips_are_executable_student_actions():

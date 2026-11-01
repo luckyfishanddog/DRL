@@ -17,7 +17,7 @@ sys.path.insert(0,str(ROOT/'src'))
 import torch
 from torch import nn
 from mrta_ranker import dataset
-from mrta_reference.model import ParentWeld,SplitPattern,SplitKind,Rail,Route,ScientificConfig,ScheduleStatus
+from mrta_reference.model import ParentWeld,SplitPattern,SplitKind,Rail,Route,ScientificConfig,ScheduleStatus,OperationKind
 from mrta_reference.solution import canonicalize,block_map
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_search.lns import BottleneckSelection,repair_partial_state_oriented,select_bottleneck_parents
@@ -425,7 +425,12 @@ def eval_group(entry,initial,partials,method,selection,q,model,args):
     return row,examples
 
 
-def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=24):
+def positive_wait_duration(schedule):
+    return sum(op.duration for op in schedule.operations
+               if op.kind is OperationKind.WAIT and op.duration>CONFIG.numeric_epsilon)
+
+
+def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=24,wait_feedback=False):
     selectors=tuple(SELECTORS if selectors is None else selectors)
     if not selectors or iterations<1:
         raise ValueError('feedback search requires selectors and positive iterations')
@@ -437,7 +442,8 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
              improved=0,accepted=0,best_cmax=initial.schedule.cmax,best_candidate_cmax=None,runtime_s=0.,
              construction_failed=0,deadlock=0,infeasible=0,neural_actions=0,failures='{}',trace='[]',
              direction0_actions=0,direction1_actions=0,flip_actions=0,neighbour_flips=0,
-             initial_runtime_s=0.,seed=args.seed,source='CURRENT_RUN')
+             initial_runtime_s=0.,seed=args.seed,source='CURRENT_RUN',
+             initial_wait=positive_wait_duration(initial.schedule))
     trace=[];reasons=Counter()
     for iteration in range(iterations):
         requested_selection=selectors[iteration%len(selectors)]
@@ -446,15 +452,18 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
         # Adding WAIT must not also change which iteration uses q4 versus q8.
         q=(4,8)[(iteration//3)%2]
         seed=args.seed+oriented.NAMES.index(entry['sheet_name'])*10000+iteration
+        wait_before=positive_wait_duration(current.schedule)
+        if wait_feedback and wait_before>0:
+            selection=BottleneckSelection.WAIT_ANCHORED
         # Always select from the accepted incumbent, including its new B32 WAIT.
         partial=select_bottleneck_parents(current.solution,current.directions,current.schedule,selection,
                                           q=q,seed=seed,config=CONFIG)
         selection_fallback=None
-        if partial is None and selection is BottleneckSelection.WAIT_ANCHORED:
-            # No observed positive WAIT: retain the existing load selection and
-            # the same repair/B32 opportunity, while recording the actual choice.
-            selection=BottleneckSelection.LOAD
-            selection_fallback='NO_POSITIVE_WAIT'
+        if selection is BottleneckSelection.WAIT_ANCHORED and (partial is None or not partial.removed_parent_ids):
+            # Adaptive WAIT falls back to this iteration's original selector.
+            # Preserve the older explicit-WAIT ablation's LOAD fallback.
+            selection=requested_selection if wait_feedback else BottleneckSelection.LOAD
+            selection_fallback='WAIT_PARTIAL_UNAVAILABLE' if wait_feedback else 'NO_POSITIVE_WAIT'
             partial=select_bottleneck_parents(current.solution,current.directions,current.schedule,selection,
                                               q=q,seed=seed,config=CONFIG)
         before=current.schedule.cmax
@@ -472,9 +481,12 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
                        coordination_proxy=True,direction_versions=2,insertion_limit=8,max_insertion_evaluations=4096)
             solution=None if result.candidate is None else result.candidate.solution
         item=dict(iteration=iteration+1,selection=selection.value,q=q,seed=seed,
-                  removed=partial.removed_parent_ids,before=before,status='CONSTRUCTION_FAILED',candidate_cmax=None,accepted=False)
-        if requested_selection is not selection:
-            item.update(requested_selection=requested_selection.value,selection_fallback=selection_fallback)
+                  requested_selection=requested_selection.value,selection_fallback=selection_fallback,
+                  wait_before=wait_before,wait_used=selection is BottleneckSelection.WAIT_ANCHORED,
+                  no_wait=wait_feedback and wait_before==0,
+                  wait_fallback=selection_fallback=='WAIT_PARTIAL_UNAVAILABLE',
+                  removed=partial.removed_parent_ids,before=before,status='CONSTRUCTION_FAILED',
+                  candidate_cmax=None,candidate_wait=None,accepted=False)
         if solution is None:
             row['construction_failed']+=1;reasons[result.rejection_reason]+=1
         else:
@@ -485,9 +497,16 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
             if candidate.schedule.status is ScheduleStatus.FEASIBLE:
                 row['b32_success']+=1
                 cmax=candidate.schedule.cmax;item['candidate_cmax']=cmax
+                item['candidate_wait']=positive_wait_duration(candidate.schedule)
                 row['best_candidate_cmax']=cmax if row['best_candidate_cmax'] is None else min(cmax,row['best_candidate_cmax'])
                 if cmax<before-1e-9*max(1,before):
                     item['changes']=oriented.summary(current,candidate,CONFIG)
+                    if wait_feedback and item['wait_used']:
+                        # Retain actual accepted states for case studies; no replay B32.
+                        item['routes_before']=[r.block_ids for r in current.solution.routes]
+                        item['directions_before']=current.directions
+                        item['routes_after']=[r.block_ids for r in candidate.solution.routes]
+                        item['directions_after']=candidate.directions
                     item['accepted']=True
                     current=candidate
                     row['accepted']+=1;row['improved']+=1
@@ -495,10 +514,16 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
                 row['deadlock']+=1
             else:
                 row['infeasible']+=1
-        item['after']=current.schedule.cmax;trace.append(item)
+        item['after']=current.schedule.cmax
+        item['wait_after']=positive_wait_duration(current.schedule)
+        trace.append(item)
         print('ITERATION',entry['sheet_name'],method,iteration+1,item['status'],round(before,3),
               item['candidate_cmax'],'accepted',item['accepted'],flush=True)
     row.update(best_cmax=current.schedule.cmax,runtime_s=time.perf_counter()-started,
+               final_wait=positive_wait_duration(current.schedule),
+               wait_used=sum(t['wait_used'] for t in trace),no_wait_rounds=sum(t['no_wait'] for t in trace),
+               wait_fallbacks=sum(t['wait_fallback'] for t in trace),
+               wait_accepted=sum(t['wait_used'] and t['accepted'] for t in trace),
                trace=json.dumps(trace,ensure_ascii=False),failures=json.dumps(reasons))
     return row
 
@@ -646,9 +671,120 @@ def evaluate(model,checkpoint,args):
     print('Saved',CSV,REPORT,flush=True)
 
 
+def save_wait_results(rows,args):
+    csv_path=ROOT/'results/gnn_joint_wait_feedback_v1.csv'
+    report_path=ROOT/'docs/GNN_JOINT_WAIT_FEEDBACK_V1.md'
+    with csv_path.open('w',newline='',encoding='utf-8-sig') as f:
+        writer=csv.DictWriter(f,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+    lines=['# GNN-V2：调度等待反馈选区实验','',
+           '## 实验设置','',
+           f'六个现有 MLP_DEV，seed={args.seed}，CPU单线程；加载 `models/gnn_joint_repair_v2.pt`，未训练或生成教师数据。',
+           '每实例只计算一次共同 Beam 初解，并把同一个初解对象交给 BASE 和 WAIT；模型、联合插入、B32、24轮预算均相同。',
+           '原定选区 RANDOM/TRAVEL/LOAD 循环；q序列为 [4,4,4,8,8,8] 重复4次；种子为 seed+实例原索引×10000+零基迭代号。',
+           'WAIT每轮读取当前已接纳调度，累计 duration>numeric_epsilon 的 WAIT。存在正WAIT才覆盖为WAIT_ANCHORED；无WAIT保留原定选区；WAIT部分解不可用则回退本轮原定选区。',
+           '仅完整候选调用一次B32；判断WAIT不调用调度器。接纳沿用原实现 Cnew<Cold−1e−9×max(1,Cold)。方向和邻块翻转仍在联合插入中决定。',
+           'WAIT_ANCHORED 是等待时空关联代理，未识别真实因果阻塞操作。旧Regret-2和静态WAIT试验结果未混入本次数据。',
+           '运行时间仅含24轮选区、补全、B32和记录，不含共同Beam、Excel及模型加载。CSV每行对应一条24轮轨迹，trace保留逐轮原定/实际选区、WAIT、回退、移除集合、候选及接纳状态。','',
+           '## 最终结果','',
+           '|实例|方法|共同初始Cmax|最终Cmax|改善%|接纳|B32成功/调用|24轮秒|',
+           '|---|---|---:|---:|---:|---:|---:|---:|']
+    for r in rows:
+        gain=100*(r['initial_cmax']-r['best_cmax'])/r['initial_cmax']
+        lines.append(f"|{r['instance']}|{r['method']}|{r['initial_cmax']:.6f}|{r['best_cmax']:.6f}|{gain:.6f}|{r['accepted']}|{r['b32_success']}/{r['b32_calls']}|{r['runtime_s']:.3f}|")
+    lines+=['','WAIT相对于BASE（相同1e−9相对容差）：','',
+            '|实例|WAIT−BASE Cmax秒|胜/平/负|','|---|---:|---|']
+    outcomes=Counter()
+    for name in dict.fromkeys(r['instance'] for r in rows):
+        pair={r['method']:r for r in rows if r['instance']==name}
+        base=pair['GNN-V2-BASE']['best_cmax'];wait=pair['GNN-V2-WAIT']['best_cmax']
+        eps=1e-9*max(1,base,wait)
+        outcome='胜' if wait<base-eps else '负' if wait>base+eps else '平'
+        outcomes[outcome]+=1
+        lines.append(f'|{name}|{wait-base:+.6f}|{outcome}|')
+    lines+=['',f"WAIT对BASE：{outcomes['胜']}胜、{outcomes['平']}平、{outcomes['负']}负。",'',
+            '## 等待反馈的实际作用','',
+            '|实例|WAIT使用|无WAIT沿用原区|部分解失败回退|WAIT候选成功/调用|WAIT接纳|WAIT组初始→最终WAIT秒|BASE最终WAIT秒|WAIT选区不同移除集合|',
+            '|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+    wait_rows=[r for r in rows if r['method']=='GNN-V2-WAIT']
+    cases=[]
+    for r in wait_rows:
+        trace=json.loads(r['trace']);used=[t for t in trace if t['wait_used']]
+        base=next(b for b in rows if b['instance']==r['instance'] and b['method']=='GNN-V2-BASE')
+        calls=sum(t['status']!='CONSTRUCTION_FAILED' for t in used)
+        success=sum(t['status']=='FEASIBLE' for t in used)
+        unique=len({tuple(t['removed']) for t in used})
+        lines.append(f"|{r['instance']}|{r['wait_used']}|{r['no_wait_rounds']}|{r['wait_fallbacks']}|{success}/{calls}|{r['wait_accepted']}|{r['initial_wait']:.6f}→{r['final_wait']:.6f}|{base['final_wait']:.6f}|{unique}|")
+        accepted=[t for t in used if t['accepted']]
+        if accepted:
+            cases.append((r['instance'],max(accepted,key=lambda t:t['before']-t['after'])))
+    lines+=['',f"WAIT实际使用 {sum(r['wait_used'] for r in wait_rows)} 次，严格接纳 {sum(r['wait_accepted'] for r in wait_rows)} 次；无WAIT沿用原区 {sum(r['no_wait_rounds'] for r in wait_rows)} 次，部分解失败回退 {sum(r['wait_fallbacks'] for r in wait_rows)} 次。",'',
+            '## 实际接纳案例','']
+    def case_priority(pair):
+        name,t=pair
+        group={r['method']:r for r in rows if r['instance']==name}
+        winner=group['GNN-V2-WAIT']['best_cmax']<group['GNN-V2-BASE']['best_cmax']-1e-9*max(1,group['GNN-V2-BASE']['best_cmax'])
+        return winner,t['before']-t['after']
+    cases.sort(key=case_priority,reverse=True)
+    lines+=['案例优先展示最终胜过BASE的实例，各取其最大一次WAIT接纳；以下简写 inst编号:行号，完整ID和完整路线/方向保留在CSV。','']
+    for name,t in cases[:2]:
+        lines += [f"### {name}，第{t['iteration']}轮，q={t['q']}",'',
+                  f"原定{t['requested_selection']}，实际WAIT_ANCHORED；移除父焊缝：`{', '.join(map(oriented.short,t['removed']))}`。",
+                  f"Cmax {t['before']:.6f}→{t['after']:.6f}s；WAIT {t['wait_before']:.6f}→{t['wait_after']:.6f}s。",'',
+                  '|移除父的块|原机器人/位置/方向|重构机器人/位置/方向|原相邻块（前/后）|重构相邻块（前/后）|',
+                  '|---|---|---|---|---|']
+        def locations(routes,directions):
+            return {b:(r,i,ds[i],route[i-1] if i else 'START',route[i+1] if i+1<len(route) else 'END')
+                    for r,(route,ds) in enumerate(zip(routes,directions)) for i,b in enumerate(route)}
+        before=locations(t['routes_before'],t['directions_before'])
+        after=locations(t['routes_after'],t['directions_after'])
+        for b in before:
+            if b.split('::',1)[0] not in t['removed']:continue
+            old=before[b];new=after[b]
+            lines.append(f'|{oriented.short(b)}|R{old[0]}/{old[1]}/{old[2]}|R{new[0]}/{new[1]}/{new[2]}|{oriented.short(old[3])} / {oriented.short(old[4])}|{oriented.short(new[3])} / {oriented.short(new[4])}|')
+        transfers=[(oriented.short(b),a,z) for b,a,z in t['changes']['transfers']]
+        flips=[(oriented.short(b),a,z) for b,a,z in t['changes']['flips']]
+        lines += ['', '位置从0开始；相邻块给出实际插入前后次序。',
+                  f"保留块相对次序改变的路线：{t['changes']['reordered_routes']}；全部归属变化：`{transfers}`；全部方向变化（含邻块）：`{flips}`。",'']
+    if not cases:
+        lines+=['没有WAIT_ANCHORED被实际使用且严格改善的案例。','']
+    lines+=['## 失败与结论','',
+            '|方法|构造失败|DEADLOCK|其他调度失败|接纳总数|搜索B32成功/调用|24轮总秒|',
+            '|---|---:|---:|---:|---:|---:|---:|']
+    for method in ('GNN-V2-BASE','GNN-V2-WAIT'):
+        group=[r for r in rows if r['method']==method]
+        totals={k:sum(r[k] for r in group) for k in ('construction_failed','deadlock','infeasible','accepted','b32_success','b32_calls','runtime_s')}
+        lines.append(f"|{method}|{totals['construction_failed']}|{totals['deadlock']}|{totals['infeasible']}|{totals['accepted']}|{totals['b32_success']}/{totals['b32_calls']}|{totals['runtime_s']:.3f}|")
+    lines+=['','最终以Cmax为准；WAIT下降或某轮接纳本身不代表超过BASE。DEADLOCK仅表示当前B32搜索未找到调度，不能证明数学不可行。',
+            '这是一组固定种子、六个DEV实例的控制变量实验，不能据此宣称跨种子的稳定性。','',
+            '## 复现','',
+            "```powershell\n& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B scripts/run_gnn_joint_repair_pilot.py --phase wait-eval\n```",'工作目录 `D:\\pybullet_test\\MRTA_GA\\DRL`。']
+    report_path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
+
+
+def evaluate_wait(model,args):
+    _,dev=entries();by_name={e['sheet_name']:e for e in dev}
+    rows=[]
+    model.eval()
+    for name in oriented.NAMES:
+        if name not in args.dev_instances:continue
+        entry=by_name[name];started=time.perf_counter()
+        initial,attempts=oriented.common_initial_beam(dataset.load_parents(entry),CONFIG,seed=args.seed)
+        initial_time=time.perf_counter()-started
+        if initial is None:raise ValueError(f'Existing DEV Beam initial failed: {name}')
+        print('WAIT EVAL INITIAL',name,initial.schedule.cmax,'WAIT',positive_wait_duration(initial.schedule),flush=True)
+        for wait_feedback in (False,True):
+            method='GNN-V2-WAIT' if wait_feedback else 'GNN-V2-BASE'
+            row=iterative_group(entry,initial,method,model,args,wait_feedback=wait_feedback)
+            row['initial_runtime_s']=initial_time
+            row['initial_b32_calls']=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts)
+            rows.append(row)
+        save_wait_results(rows,args)
+    print('Saved WAIT feedback CSV and report',flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--phase',choices=('all','data','train','eval'),default='all')
+    parser.add_argument('--phase',choices=('all','data','train','eval','wait-eval'),default='all')
     parser.add_argument('--seed',type=int,default=20261027)
     parser.add_argument('--epochs',type=int,default=30)
     parser.add_argument('--train-attempts',type=int,default=3)
@@ -679,7 +815,10 @@ def main():
         checkpoint=torch.load(MODEL,map_location='cpu',weights_only=True)
         model=JointInsertionGNN(checkpoint['hidden_dim'],checkpoint['heads'],normalize_inputs=checkpoint.get('normalize_inputs',False))
         model.load_state_dict(checkpoint['state_dict'])
-    evaluate(model,checkpoint,args)
+    if args.phase=='wait-eval':
+        evaluate_wait(model,args)
+    else:
+        evaluate(model,checkpoint,args)
 
 
 if __name__=='__main__':
