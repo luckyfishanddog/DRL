@@ -160,19 +160,15 @@ def robot_is_eligible(block: WeldingBlock, robot_id: int, config: ScientificConf
 
 
 def split_axis_offsets(delta: float, prefix: str) -> tuple[tuple[float, str], ...]:
-    """Finite legacy +/-0.2 points plus the configured outer window.
+    """Only configured boundaries and center; no extra legacy inner cuts.
 
-    Keep legacy identities when enlarging the window. Smaller explicit windows
-    retain their historical boundary semantics. Coincident points are deduped
-    by each generator, with the legacy sources preceding MIDPOINT.
+    Default delta=0.5 therefore omits the old +/-0.2 intersections. Keep the
+    surviving boundary identities so historical outer cuts are not renamed.
+    Explicit historical small-window configurations retain their boundaries.
     """
-    inner = min(0.20, delta)
-    sources = [(-inner, prefix + "_LOWER"), (0.0, prefix + "_CENTER"),
-               (inner, prefix + "_UPPER")]
-    if delta > 0.20:
-        sources.extend(((-delta, prefix + "_OUTER_LOWER"),
-                        (delta, prefix + "_OUTER_UPPER")))
-    return tuple(sources)
+    boundary = "_OUTER" if delta > 0.20 else ""
+    return ((-delta, prefix + boundary + "_LOWER"), (0.0, prefix + "_CENTER"),
+            (delta, prefix + boundary + "_UPPER"))
 
 
 def generate_y_split_patterns(

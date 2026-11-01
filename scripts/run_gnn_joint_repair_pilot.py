@@ -425,23 +425,38 @@ def eval_group(entry,initial,partials,method,selection,q,model,args):
     return row,examples
 
 
-def iterative_group(entry,initial,method,model,args):
+def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=24):
+    selectors=tuple(SELECTORS if selectors is None else selectors)
+    if not selectors or iterations<1:
+        raise ValueError('feedback search requires selectors and positive iterations')
     started=time.perf_counter()
     current=initial
-    row=dict(experiment='STATEFUL_24',instance=entry['sheet_name'],method=method,selection='RANDOM/TRAVEL/LOAD',
-             q='4/8',initial_cmax=initial.schedule.cmax,attempts=24,constructed=0,b32_calls=0,b32_success=0,
+    row=dict(experiment=f'STATEFUL_{iterations}',instance=entry['sheet_name'],method=method,
+             selection='/'.join(selection.value for selection in selectors),
+             q='4/8',initial_cmax=initial.schedule.cmax,attempts=iterations,constructed=0,b32_calls=0,b32_success=0,
              improved=0,accepted=0,best_cmax=initial.schedule.cmax,best_candidate_cmax=None,runtime_s=0.,
              construction_failed=0,deadlock=0,infeasible=0,neural_actions=0,failures='{}',trace='[]',
              direction0_actions=0,direction1_actions=0,flip_actions=0,neighbour_flips=0,
              initial_runtime_s=0.,seed=args.seed,source='CURRENT_RUN')
     trace=[];reasons=Counter()
-    for iteration in range(24):
-        selection=SELECTORS[iteration%3]
+    for iteration in range(iterations):
+        requested_selection=selectors[iteration%len(selectors)]
+        selection=requested_selection
+        # Keep the original destruction-size sequence across selector ablations.
+        # Adding WAIT must not also change which iteration uses q4 versus q8.
         q=(4,8)[(iteration//3)%2]
         seed=args.seed+oriented.NAMES.index(entry['sheet_name'])*10000+iteration
         # Always select from the accepted incumbent, including its new B32 WAIT.
         partial=select_bottleneck_parents(current.solution,current.directions,current.schedule,selection,
                                           q=q,seed=seed,config=CONFIG)
+        selection_fallback=None
+        if partial is None and selection is BottleneckSelection.WAIT_ANCHORED:
+            # No observed positive WAIT: retain the existing load selection and
+            # the same repair/B32 opportunity, while recording the actual choice.
+            selection=BottleneckSelection.LOAD
+            selection_fallback='NO_POSITIVE_WAIT'
+            partial=select_bottleneck_parents(current.solution,current.directions,current.schedule,selection,
+                                              q=q,seed=seed,config=CONFIG)
         before=current.schedule.cmax
         if method.startswith('GNN'):
             result=construct_or_repair_with_gnn(current.solution,partial.routes,partial_directions(current,partial),
@@ -458,6 +473,8 @@ def iterative_group(entry,initial,method,model,args):
             solution=None if result.candidate is None else result.candidate.solution
         item=dict(iteration=iteration+1,selection=selection.value,q=q,seed=seed,
                   removed=partial.removed_parent_ids,before=before,status='CONSTRUCTION_FAILED',candidate_cmax=None,accepted=False)
+        if requested_selection is not selection:
+            item.update(requested_selection=requested_selection.value,selection_fallback=selection_fallback)
         if solution is None:
             row['construction_failed']+=1;reasons[result.rejection_reason]+=1
         else:

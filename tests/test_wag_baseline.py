@@ -158,6 +158,40 @@ def test_wag_assignment_is_balanced_deterministic_multiple_and_eligible():
         _assert_valid(solution, config)
 
 
+def test_wag_boundary_includes_work_already_fixed_by_x_split():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    config = ScientificConfig()
+    parents = (ParentWeld('x', (2., 9.), (14., 9.)),
+               ParentWeld('free', (1., 9.), (1.5, 9.)))
+    catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+    split = next(p for p in catalog['x']
+                 if p.kind is SplitKind.X_SPLIT and p.point_id == 'BX_OUTER_LOWER')
+    solution = generate_wag_assignments(parents, (split, catalog['free'][0]), config,
+                                        max_variants=1, scope=FORMAL_SCOPE_V2)[0]
+    # The right X child is longer. Putting the free weld on R1, as the old
+    # empty-load calculation did, increases an existing imbalance.
+    assert 'free::whole' in solution.routes[0].block_ids
+    assert 'x::0' in solution.routes[0].block_ids
+    assert 'x::1' in solution.routes[1].block_ids
+
+
+def test_wag_shared_y_assignment_accounts_for_fixed_x_rail_load():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    config = ScientificConfig()
+    parents = (ParentWeld('x', (2., 3.), (14., 3.)),
+               ParentWeld('shared', (17., 6.), (18., 6.)))
+    catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+    split = next(p for p in catalog['x'] if p.kind is SplitKind.X_SPLIT)
+    solution = generate_wag_assignments(parents, (split, catalog['shared'][0]), config,
+                                        max_variants=1, scope=FORMAL_SCOPE_V2)[0]
+    # The lower rail already has the X children; it is not an empty rail tied
+    # with the upper one when the shared-Y whole weld is assigned.
+    owner = next(r.robot_id for r in solution.routes if 'shared::whole' in r.block_ids)
+    assert owner in (0, 1)
+
+
 def test_nearest_farthest_two_opt_and_factorial_window_five():
     config = ScientificConfig()
     parents = _parents()[:5]

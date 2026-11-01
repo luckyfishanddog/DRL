@@ -105,7 +105,7 @@ def test_v2_shared_catalog_is_deterministic_finite_and_mandatory_y_closed():
     short_x = [item for item in first["short"] if item.kind is SplitKind.X_SPLIT]
     assert short_x
     assert {item.point_id for item in short_x} <= {
-        "BX_LOWER", "BX_CENTER", "BX_UPPER", "MIDPOINT"
+        "BX_OUTER_LOWER", "BX_CENTER", "BX_OUTER_UPPER", "MIDPOINT"
     }
     assert not any(item.kind is SplitKind.X_SPLIT for item in first["vertical"])
     assert first["mandatory"]
@@ -246,8 +246,8 @@ def test_scientific_config_serialization_and_hash_are_value_only_and_stable() ->
 def test_y_candidates_are_only_boundaries_center_midpoint_and_deterministically_deduplicated() -> None:
     parent = ParentWeld("cross", (1.0, 5.0), (1.0, 7.0))
     candidates = generate_y_split_patterns(parent, CONFIG)
-    assert [candidate.point_id for candidate in candidates] == ["BY_OUTER_LOWER", "BY_LOWER", "BY_CENTER", "BY_UPPER", "BY_OUTER_UPPER"]
-    assert [candidate.t for candidate in candidates] == pytest.approx([0.25, 0.4, 0.5, 0.6, 0.75])
+    assert [candidate.point_id for candidate in candidates] == ["BY_OUTER_LOWER", "BY_CENTER", "BY_OUTER_UPPER"]
+    assert [candidate.t for candidate in candidates] == pytest.approx([0.25, 0.5, 0.75])
     assert all(candidate.mandatory for candidate in candidates)
     assert candidates == generate_y_split_patterns(parent, CONFIG)
     # The geometric midpoint duplicates BY_CENTER here and is deterministically removed.
@@ -324,8 +324,8 @@ def test_finite_x_candidates_are_deterministic_geometry_only_and_deduplicated() 
     first = generate_x_split_patterns(parent, 3.0, CONFIG, rail=Rail.UPPER)
     second = generate_x_split_patterns(parent, 3.0, CONFIG, rail=Rail.UPPER)
     assert first == second
-    assert [item.point_id for item in first] == ["BX_OUTER_LOWER", "BX_LOWER", "BX_CENTER", "BX_UPPER", "BX_OUTER_UPPER"]
-    assert [item.t for item in first] == pytest.approx([0.375, 0.45, 0.5, 0.55, 0.625])
+    assert [item.point_id for item in first] == ["BX_OUTER_LOWER", "BX_CENTER", "BX_OUTER_UPPER"]
+    assert [item.t for item in first] == pytest.approx([0.375, 0.5, 0.625])
     assert all(item.rail is Rail.UPPER for item in first)
     assert all(parent.point(item.t)[0] != 10.0 for item in first if item.t is not None)
 
@@ -425,14 +425,17 @@ def test_direction_dp_exact_ties_reversed_geometry_and_zero_transition() -> None
 
 
 @pytest.mark.parametrize('axis', ('Y','X'))
-def test_range_05_retains_all_legacy_cut_geometry_and_ids(axis):
+def test_range_05_removes_legacy_inner_cuts_but_keeps_center(axis):
     old=ScientificConfig(delta_x=.2,delta_y=.2)
     parent=ParentWeld('p',(1.,5.),(1.,7.)) if axis=='Y' else ParentWeld('p',(1.,8.),(5.,8.))
     generate=(lambda cfg:generate_y_split_patterns(parent,cfg)) if axis=='Y' else (lambda cfg:generate_x_split_patterns(parent,3.,cfg,rail=Rail.UPPER))
     earlier=generate(old);current=generate(CONFIG)
+    center=next(p for p in earlier if p.point_id.endswith('_CENTER'))
+    assert any(center.point_id==q.point_id and center.t==pytest.approx(q.t) for q in current)
     for p in earlier:
-        assert any(p.point_id==q.point_id and p.t==pytest.approx(q.t) for q in current)
-    assert len(current)==5
+        if p.point_id.endswith(('_LOWER','_UPPER')):
+            assert not any(p.t==pytest.approx(q.t) for q in current)
+    assert len(current)==3
     assert len({p.point_id for p in current})==len(current)
     assert len({round(p.t,10) for p in current})==len(current)
 
@@ -479,7 +482,7 @@ def test_x_endpoints_vertical_and_short_children_filtered_at_05():
     assert not generate_x_split_patterns(ParentWeld('v',(3.,7.),(3.,9.)),3.,CONFIG,rail=Rail.UPPER)
     parent=ParentWeld('p',(2.5,8.),(3.5,8.))
     points=[parent.point(p.t)[0] for p in generate_x_split_patterns(parent,3.,CONFIG,rail=Rail.UPPER)]
-    assert points==pytest.approx([2.8,3.,3.2])
+    assert points==pytest.approx([3.])
     for length,allowed in ((.398,False),(.4,True)):
         short=ParentWeld('short',(3.-length/2,8.),(3.+length/2,8.))
         cuts=generate_x_split_patterns(short,3.,CONFIG,rail=Rail.UPPER)
@@ -511,7 +514,7 @@ def test_outer_x_canonical_catalog_and_fixed_robot_pair(rail,robots,y):
         canonicalize((parent,),(pattern,),{robots[0]:('p::0',),robots[1]:('p::1',)},ScientificConfig(delta_x=.2,delta_y=.2),scope=FORMAL_SCOPE_V2)
 
 
-@pytest.mark.parametrize('point_id', ('BY_OUTER_LOWER','BY_LOWER','BY_CENTER','BY_UPPER','BY_OUTER_UPPER'))
+@pytest.mark.parametrize('point_id', ('BY_OUTER_LOWER','BY_CENTER','BY_OUTER_UPPER'))
 def test_new_y_cut_is_canonical_and_independently_certified(point_id):
     from mrta_reference.solution import canonicalize
     from mrta_reference.scope import FORMAL_SCOPE_V2
@@ -526,6 +529,20 @@ def test_new_y_cut_is_canonical_and_independently_certified(point_id):
     assert certify_schedule(sol,schedule,CONFIG,scope=FORMAL_SCOPE_V2).certified
     forged=replace(schedule,operations=())
     assert not certify_schedule(sol,forged,CONFIG,scope=FORMAL_SCOPE_V2).certified
+
+
+@pytest.mark.parametrize('mid_y', (5.8,6.2))
+def test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies(mid_y):
+    from mrta_reference.solution import canonicalize
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.certifier import certify_schedule
+    parent=ParentWeld('p',(1.,mid_y-1.),(5.,mid_y+1.))
+    pattern=next(p for p in generate_y_split_patterns(parent,CONFIG) if p.point_id=='MIDPOINT')
+    sol=canonicalize((parent,),(pattern,),{2:('p::0',),0:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(1,),2:(0,)})
+    report=certify_schedule(sol,schedule,CONFIG,scope=FORMAL_SCOPE_V2)
+    assert report.certified,report.errors
 
 
 def test_outer_x_shared_point_has_no_continuous_interference_exception():
@@ -552,6 +569,22 @@ def test_outer_x_shared_point_has_no_continuous_interference_exception():
     report=certify_schedule(sol,forged,CONFIG,scope=FORMAL_SCOPE_V2)
     assert not report.certified
     assert any('interference:' in error or 'order violation' in error for error in report.errors)
+
+
+@pytest.mark.parametrize('axis', ('Y', 'X'))
+def test_removed_inner_cut_cannot_reenter_formal_catalog(axis):
+    from mrta_reference.solution import canonicalize
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    if axis=='Y':
+        parent=ParentWeld('p',(2.,5.),(2.,7.))
+        pattern=SplitPattern('p',SplitKind.Y_SPLIT,.4,'BY_LOWER',True)
+        routes={2:('p::0',),0:('p::1',)}
+    else:
+        parent=ParentWeld('p',(1.,8.),(5.,8.))
+        pattern=SplitPattern('p',SplitKind.X_SPLIT,.45,'BX_LOWER',rail=Rail.UPPER)
+        routes={0:('p::0',),1:('p::1',)}
+    with pytest.raises(ValueError,match='absent from legal catalog'):
+        canonicalize((parent,),(pattern,),routes,CONFIG,scope=FORMAL_SCOPE_V2)
 
 
 def test_three_solvers_really_consume_same_expanded_catalog():

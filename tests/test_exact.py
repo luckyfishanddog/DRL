@@ -136,6 +136,23 @@ def _fixed_whole_schedule(parents, routes, directions):
     return result
 
 
+def test_eligibility_load_bound_charges_rail_capacity_and_mandatory_split():
+    from mrta_exact.lower_bounds import eligibility_load_lower_bound
+    config = ScientificConfig(weld_speed=1, empty_speed=1, t_pre=1, t_post=1)
+    # Two upper-only vertical parents: total work 8 must fit on two robots.
+    parents = (ParentWeld('a', (2, 8), (2, 10)), ParentWeld('b', (15, 8), (15, 10)))
+    bound = eligibility_load_lower_bound(parents, config)
+    assert bound['lb_process'] == pytest.approx(4)
+    assert bound['robot_prices'] == pytest.approx((0.5, 0.5, 0, 0))
+    assert bound['lb_process'] > bound['analytical_lb0']
+    # Four mandatory parents: each needs two blocks, so work is 4*(4+4)=32.
+    parents = tuple(ParentWeld(str(i), (1+5*i, 4), (1+5*i, 8)) for i in range(4))
+    bound = eligibility_load_lower_bound(parents, config)
+    assert bound['lb_process'] == pytest.approx(8)
+    assert bound['lp_objective'] == pytest.approx(8)
+    assert eligibility_load_lower_bound((), config)['lb_process'] == 0
+
+
 def test_lb0_manual_empty_and_parameter_sensitive_calculations() -> None:
     config = replace(FAST_CONFIG, t_pre=2.0, t_post=3.0)
     parents = (

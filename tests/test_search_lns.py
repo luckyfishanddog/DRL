@@ -44,12 +44,148 @@ FAST = ScientificConfig(
 )
 
 
+@pytest.mark.parametrize('kind', (SplitKind.Y_SPLIT, SplitKind.X_SPLIT))
+def test_oriented_mode_repair_rebuilds_children_and_charges_setup(kind):
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.model import SplitPattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.lns import _remove_parent_set, repair_partial_state_oriented
+    config = ScientificConfig()
+    parents = (ParentWeld('p', (2., 5.8), (6., 6.4)),
+               ParentWeld('a', (0.5, 9.), (1., 9.)),
+               ParentWeld('b', (17., 3.), (18., 3.)))
+    current = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                           {0: ('a::whole',), 1: (), 2: ('p::whole', 'b::whole'), 3: ()},
+                           config, scope=FORMAL_SCOPE_V2)
+    partial = _remove_parent_set(current, ('p',))
+    target = next(p for p in build_legal_pattern_catalog(current.parents, config, FORMAL_SCOPE_V2)['p']
+                  if p.kind is kind)
+    partial = replace(partial, patterns=tuple(target if p.parent_id=='p' else p for p in partial.patterns))
+    result = repair_partial_state_oriented(current, ((0,), (), (0, 0), ()), partial, config,
+                coordination_proxy=True, direction_versions=2, allow_pattern_changes=True)
+    assert result.candidate is not None, result.rejection_reason
+    solution = result.candidate.solution
+    blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
+    assert 'p::whole' not in blocks and {'p::0', 'p::1'} <= set(blocks)
+    assert sum(config.process_time(b.length) for b in blocks.values() if b.parent_id=='p') == pytest.approx(
+        config.process_time(parents[0].length)+50.)
+    for old, new in zip(partial.routes, solution.routes):
+        assert tuple(b for b in new.block_ids if blocks[b].parent_id!='p') == old
+    if kind is SplitKind.X_SPLIT:
+        base = 0 if target.rail.value=='UPPER' else 2
+        assert 'p::0' in solution.routes[base].block_ids
+        assert 'p::1' in solution.routes[base+1].block_ids
+
+
+def test_two_parent_mode_proposals_and_joint_repair_preserve_closed_coverage():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.model import SplitPattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.lns import _remove_parent_set,rank_parent_mode_pairs,repair_partial_state_oriented
+    config = ScientificConfig()
+    parents = (ParentWeld('a',(2.,5.6),(4.,6.4)),ParentWeld('b',(14.,5.6),(16.,6.4)),
+               ParentWeld('keep',(7.,9.),(8.,9.)))
+    solution = canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+                            {0:('a::whole','keep::whole'),3:('b::whole',)},config,scope=FORMAL_SCOPE_V2)
+    partial = _remove_parent_set(solution,('a','b'))
+    proposals = rank_parent_mode_pairs(solution,partial,config)
+    catalog = build_legal_pattern_catalog(parents,config,FORMAL_SCOPE_V2)
+    assert proposals and proposals == rank_parent_mode_pairs(solution,partial,config)
+    assert len(set(proposals)) == len(proposals) <= 3
+    for pair in proposals:
+        assert {p.parent_id for p in pair} == {'a','b'}
+        assert all(p in catalog[p.parent_id] and p.kind is not SplitKind.WHOLE for p in pair)
+    assert rank_parent_mode_pairs(solution,_remove_parent_set(solution,('a',)),config) == ()
+    # Explicitly exercise simultaneous WHOLE -> optional Y for both parents.
+    changed={p:next(v for v in catalog[p] if v.kind is SplitKind.Y_SPLIT) for p in ('a','b')}
+    partial=replace(partial,patterns=tuple(changed.get(p.parent_id,p) for p in partial.patterns))
+    repaired=repair_partial_state_oriented(solution,((0,0),(),(),(0,)),partial,config,
+        seed=11,insertion_limit=8,max_insertion_evaluations=4096,
+        coordination_proxy=True,direction_versions=2,allow_pattern_changes=True)
+    assert repaired.candidate is not None,repaired.rejection_reason
+    after=repaired.candidate.solution
+    blocks=block_map(after,config,scope=FORMAL_SCOPE_V2)
+    assert set(blocks)=={'a::0','a::1','b::0','b::1','keep::whole'}
+    assert sorted(x for route in after.routes for x in route.block_ids)==sorted(blocks)
+    assert sum(config.process_time(b.length) for b in blocks.values()) == pytest.approx(
+        sum(config.process_time(p.length) for p in parents)+100.)
+    assert 'keep::whole' in after.routes[0].block_ids
+
+
+def test_pair_diversity_preserves_best_and_covers_distinct_parent_pairs():
+    from mrta_reference.model import SplitPattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.lns import _remove_parent_set,rank_parent_mode_pairs
+    config=ScientificConfig()
+    parents=tuple(ParentWeld(pid,(x,5.6),(x+2.,6.4)) for pid,x in (('a',2.),('b',8.),('c',14.)))
+    solution=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+        {0:('a::whole',),1:('b::whole',),3:('c::whole',)},config,scope=FORMAL_SCOPE_V2)
+    partial=_remove_parent_set(solution,('a','b','c'))
+    ranked=rank_parent_mode_pairs(solution,partial,config,limit=1000)
+    diverse=rank_parent_mode_pairs(solution,partial,config,limit=3,diverse_pairs=True)
+    assert diverse[0]==ranked[0]
+    assert len({tuple(p.parent_id for p in pair) for pair in diverse})==3
+    for pair in diverse:
+        key=tuple(p.parent_id for p in pair)
+        assert pair==next(v for v in ranked if tuple(p.parent_id for p in v)==key)
+    partial=_remove_parent_set(solution,('a','b'))
+    assert rank_parent_mode_pairs(solution,partial,config,limit=3,diverse_pairs=True)==rank_parent_mode_pairs(
+        solution,partial,config,limit=3)
+    assert rank_parent_mode_pairs(solution,partial,config,limit=0,diverse_pairs=True)==()
+
+
+def test_mode_repair_uses_new_cut_when_child_ids_are_unchanged():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.lns import _remove_parent_set, repair_partial_state_oriented
+    config = ScientificConfig()
+    parent = ParentWeld('p', (4., 3.), (4., 9.))
+    patterns = build_legal_pattern_catalog((parent,), config, FORMAL_SCOPE_V2)['p']
+    old, target = patterns[0], patterns[-1]
+    current = canonicalize((parent,), (old,), {0: ('p::1',), 2: ('p::0',)},
+                           config, scope=FORMAL_SCOPE_V2)
+    partial = replace(_remove_parent_set(current, ('p',)), patterns=(target,))
+    result = repair_partial_state_oriented(current, ((0,), (), (0,), ()), partial, config,
+                coordination_proxy=True, direction_versions=2, allow_pattern_changes=True)
+    assert result.candidate is not None, result.rejection_reason
+    before = block_map(current, config, scope=FORMAL_SCOPE_V2)
+    after = block_map(result.candidate.solution, config, scope=FORMAL_SCOPE_V2)
+    assert set(before) == set(after) == {'p::0', 'p::1'}
+    assert after['p::0'].end == pytest.approx(parent.point(target.t))
+    assert after['p::0'].length != pytest.approx(before['p::0'].length)
+    assert result.candidate.projected_process_makespan == pytest.approx(
+        max(sum(config.process_time(after[b].length) for b in route.block_ids)
+            for route in result.candidate.solution.routes))
+
+
+def test_mode_repair_rejects_changed_geometry_of_retained_parent():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.model import SplitPattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.lns import _remove_parent_set, repair_partial_state_oriented
+    config = ScientificConfig()
+    parents = (ParentWeld('p', (2., 6.), (6., 6.)), ParentWeld('q', (10., 3.), (11., 3.)))
+    current = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                           {0: ('p::whole',), 1: (), 2: ('q::whole',), 3: ()}, config, scope=FORMAL_SCOPE_V2)
+    partial = _remove_parent_set(current, ('q',))
+    target = next(p for p in build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)['p']
+                  if p.kind is SplitKind.Y_SPLIT)
+    partial = replace(partial, patterns=(target, partial.patterns[1]))
+    with pytest.raises(ValueError, match='complete removal'):
+        repair_partial_state_oriented(current, ((0,), (), (0,), ()), partial, config, allow_pattern_changes=True)
+
+
 @pytest.mark.parametrize("selection", tuple(BottleneckSelection))
 def test_bottleneck_selection_is_closed_replayable_and_wait_optional(selection):
     initial = _initial()
     solution, schedule = initial.best_solution, initial.best_schedule
     schedule = replace(schedule, operations=tuple(op for op in schedule.operations
                                                 if op.kind is not OperationKind.WAIT))
+    if selection is BottleneckSelection.SHARED_Y_PAIR:
+        # This fixture has only upper-rail welds; a missing link is explicit.
+        assert select_bottleneck_parents(solution, initial.best_directions, schedule,
+                                         selection, q=2, seed=9, config=FAST) is None
+        return
     if selection is BottleneckSelection.WAIT_ANCHORED:
         assert select_bottleneck_parents(solution, initial.best_directions, schedule,
                                          selection, q=2, seed=9, config=FAST) is None
@@ -131,7 +267,8 @@ def test_fixed_pattern_repair_rejects_canonical_child_collapse(monkeypatch):
     assert legacy.candidate.solution.patterns[0].kind is SplitKind.WHOLE
 
 
-@pytest.mark.parametrize("selection", tuple(BottleneckSelection))
+@pytest.mark.parametrize("selection", tuple(s for s in BottleneckSelection
+                                           if s is not BottleneckSelection.SHARED_Y_PAIR))
 def test_bottleneck_selection_closes_split_children(selection):
     from mrta_reference.geometry import generate_y_split_patterns
     from mrta_reference.model import ScheduleResult, ScheduleStatus, SplitPattern
@@ -170,6 +307,41 @@ def test_wait_selector_keeps_actual_before_after_anchors():
                                            BottleneckSelection.WAIT_ANCHORED,
                                            q=2, seed=seed, config=FAST)
         assert partial.removed_parent_ids == ("a", "b")
+
+
+def test_shared_y_pair_closes_both_parents_and_retains_unrelated_routes():
+    from mrta_reference.geometry import generate_y_split_patterns
+    from mrta_reference.model import ScheduleResult, ScheduleStatus, SplitPattern
+    from mrta_search.lns import shared_y_parent_links
+    parents = (ParentWeld("a", (2, 5), (2, 7)),
+               ParentWeld("b", (1, 6), (3, 6)),
+               ParentWeld("c", (10, 9), (11, 9)))
+    pattern = next(p for p in generate_y_split_patterns(parents[0], FAST) if abs(p.t - 0.5) < 1e-8)
+    solution = canonicalize(parents, (pattern, SplitPattern("b", SplitKind.WHOLE),
+                                     SplitPattern("c", SplitKind.WHOLE)),
+                            {0: ("a::1", "c::whole"), 2: ("a::0", "b::whole")}, FAST)
+    # Intersecting interiors, no close endpoints. Serialized safe WELDs still
+    # form a proximity link; the link itself is not a collision or blocker.
+    ops = (Operation("a-upper", 0, OperationKind.WELD, 0, 1, (2, 6), (2, 7), 0, "a::1"),
+           Operation("a-lower", 2, OperationKind.WELD, 0, 1, (2, 5), (2, 6), 0, "a::0"),
+           Operation("b-lower", 2, OperationKind.WELD, 2, 4, (1, 6), (3, 6), 1, "b::whole"))
+    schedule = ScheduleResult(ScheduleStatus.FEASIBLE, operations=ops, cmax=5,
+                              robot_completion=(5, 0, 4, 0))
+    links = shared_y_parent_links(solution, schedule, FAST)
+    assert [(a, b) for a, b, _ in links] == [("a", "b")]
+    for seed in range(4):
+        partial = select_bottleneck_parents(solution, ((0, 0), (), (0, 0), ()), schedule,
+                    BottleneckSelection.SHARED_Y_PAIR, q=2, seed=seed, config=FAST)
+        assert partial.removed_parent_ids == ("a", "b")
+        assert partial.routes == (("c::whole",), (), (), ())
+        assert partial.patterns == solution.patterns
+    delayed = replace(schedule, operations=ops[:2] + (replace(ops[2], start_time=20, end_time=22),))
+    assert shared_y_parent_links(solution, delayed, FAST)[0][2] < links[0][2]
+    outside = replace(schedule, operations=ops[:2] + (replace(ops[2], start=(1, 4), end=(3, 4)),))
+    assert shared_y_parent_links(solution, outside, FAST) == ()
+    # Repeated phases must not multiply the edge score.
+    repeated = replace(schedule, operations=ops + (replace(ops[2], operation_id="duplicate"),))
+    assert shared_y_parent_links(solution, repeated, FAST) == links
 
 
 def _oriented_fixture():
@@ -322,6 +494,51 @@ def test_oriented_mandatory_y_keeps_two_children_and_full_directions():
     for route, bits in zip(result.candidate.solution.routes, result.directions):
         assert len(route.block_ids) == len(bits)
         assert all(robot_is_eligible(blocks[b], route.robot_id, FAST) for b in route.block_ids)
+
+
+def test_nominal_coordination_matches_route_time_without_interference():
+    from mrta_search.lns import nominal_coordination_features, oriented_route_state, oriented_time_score
+    solution, directions = _oriented_fixture()
+    from mrta_reference.model import Route
+    solution = replace(solution, routes=(Route(0, tuple(b for r in solution.routes for b in r.block_ids)),
+                                        Route(1, ()), Route(2, ()), Route(3, ())))
+    directions = (tuple(d for bits in directions for d in bits), (), (), ())
+    features = nominal_coordination_features(solution, directions, FAST)
+    state = oriented_route_state(tuple(r.block_ids for r in solution.routes), directions,
+                                 block_map(solution, FAST), FAST)
+    assert features['nominal_cmax'] == pytest.approx(oriented_time_score(state)[0])
+    assert features['exposure_seconds'] == (0, 0, 0, 0)
+    assert features['exposure_score'] == features['nominal_cmax']
+
+
+def test_nominal_coordination_measures_continuous_cross_rail_proximity():
+    from mrta_reference.model import SplitPattern
+    from mrta_search.lns import nominal_coordination_features
+    config = replace(FAST, t_pre=0, t_post=0)
+    parents = (ParentWeld('a', (0, 6), (2, 6)), ParentWeld('b', (2, 6), (0, 6)))
+    solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                            {0: ('a::whole',), 2: ('b::whole',)}, config)
+    features = nominal_coordination_features(solution, ((0,), (), (0,), ()), config)
+    # Opposing speed 1: |2t-2| <= 0.2 lasts 0.2 seconds, at the interiors.
+    assert features['proximity_seconds'] == pytest.approx((0.2, 0, 0.2, 0))
+    assert features['same_rail_order_seconds'] == (0, 0, 0, 0)
+    assert features['exposure_score'] == pytest.approx(2.2)
+    reverse = nominal_coordination_features(solution, ((0,), (), (1,), ()), config)
+    assert reverse['exposure_seconds'] == pytest.approx((2, 0, 2, 0))
+
+
+def test_nominal_coordination_counts_same_rail_order_and_unions_overlaps():
+    from mrta_reference.model import SplitPattern
+    from mrta_search.lns import nominal_coordination_features
+    config = replace(FAST, t_pre=0, t_post=0)
+    parents = (ParentWeld('a', (5, 6), (7, 6)), ParentWeld('b', (1, 9), (3, 9)),
+               ParentWeld('c', (5, 6.1), (7, 6.1)))
+    solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                            {0: ('a::whole',), 1: ('b::whole',), 2: ('c::whole',)}, config)
+    features = nominal_coordination_features(solution, ((0,), (0,), (0,), ()), config)
+    assert features['same_rail_order_seconds'] == pytest.approx((2, 2, 0, 0))
+    assert features['proximity_seconds'] == pytest.approx((2, 0, 2, 0))
+    assert features['exposure_seconds'] == pytest.approx((2, 2, 2, 0))
 
 
 def test_followup_proxy_and_two_direction_versions_keep_distinct_regret_structures():

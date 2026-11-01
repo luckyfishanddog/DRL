@@ -14,6 +14,157 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import run_gnn_construct_vns_pilot as pilot_script
 
+
+@pytest.mark.parametrize('late_second', (False,True))
+def test_beam_round_robin_preserves_timely_incumbent(monkeypatch,late_second):
+    from types import SimpleNamespace
+    import run_joint_oriented_repair_pilot as oriented
+    config=ScientificConfig()
+    parent=ParentWeld('p',(1.,9.),(2.,9.))
+    solution=canonicalize((parent,),(SplitPattern('p',SplitKind.WHOLE),),
+                           {0:('p::whole',)},config,scope=FORMAL_SCOPE_V2)
+    state=SimpleNamespace(routes=(('p::whole',),(),(),()),directions=((0,),(),(),()))
+    clock=[0.]
+    monkeypatch.setattr(oriented.time,'perf_counter',lambda:clock[0])
+    monkeypatch.setattr(oriented,'initial_reference',lambda *args:solution)
+    monkeypatch.setattr(oriented,'build_oriented_insertion_beam',lambda *args,**kwargs:((state,()),)*4)
+    def scheduled(sol,directions,cfg):
+        first=clock[0]==0.
+        clock[0]=1. if first else (4. if late_second else 2.)
+        result=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100. if first else 50.)
+        return oriented.DirectedSolution(sol,directions,result)
+    monkeypatch.setattr(oriented,'schedule_explicit',scheduled)
+    current,attempts=oriented.common_initial_beam((parent,),config,deadline=3.,interleave=True,
+                                                 accept_candidate=lambda candidate:clock[0]<=3.)
+    assert [a['scheme'] for a in attempts]==['REGION_LOCAL','RULE_X_LOCAL']
+    assert current.schedule.cmax==(100. if late_second else 50.)
+    assert attempts[-1]['admitted'] is not late_second
+
+
+def test_joint_policy_rejects_normalized_siblings_without_crashing_solver():
+    from mrta_search.gnn_constructor import JointInsertionGNN,joint_geometry,construct_or_repair_with_gnn
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    config=ScientificConfig()
+    parents=(ParentWeld('p',(2.,6.),(6.,6.)),)
+    pattern=next(p for p in build_legal_pattern_catalog(parents,config,FORMAL_SCOPE_V2)['p']
+                 if p.kind is SplitKind.Y_SPLIT)
+    geometry=joint_geometry(parents,(pattern,),config)
+    result=construct_or_repair_with_gnn(geometry,(('p::0','p::1'),(),(),()),((0,0),(),(),()),
+                                      (),JointInsertionGNN(64,4),config)
+    assert result.solution is None and result.directions is None
+    assert result.rejection_reason=='FIXED_PATTERN_CHANGED'
+
+def test_destroyed_head_conflict_can_be_repaired_without_accepting_illegal_final_start(monkeypatch):
+    from mrta_search.gnn_constructor import JointInsertionGNN,joint_geometry,construct_or_repair_with_gnn
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    import run_joint_oriented_repair_pilot as oriented
+    config=ScientificConfig()
+    parents=(ParentWeld('bridge',(2.,9.),(2.,3.)),ParentWeld('keep',(8.,2.),(9.,2.)),
+             ParentWeld('right',(5.,1.),(6.,1.)))
+    catalog=build_legal_pattern_catalog(parents,config,FORMAL_SCOPE_V2)
+    cut=next(p for p in catalog['bridge'] if p.point_id=='BY_CENTER')
+    patterns=(cut,SplitPattern('keep',SplitKind.WHOLE),SplitPattern('right',SplitKind.WHOLE))
+    source=canonicalize(parents,patterns,{0:('bridge::0',),2:('bridge::1','keep::whole'),3:('right::whole',)},
+        config,scope=FORMAL_SCOPE_V2)
+    original=oriented.schedule_explicit(source,((0,),(),(0,0),(0,)),config)
+    assert certify_schedule(source,original.schedule,config,scope=FORMAL_SCOPE_V2).certified
+    model=JointInsertionGNN(64,4)
+    with torch.no_grad():
+        for parameter in model.parameters():parameter.zero_()
+    # Prefer late insertion positions: merely permitting invalid partial starts
+    # would leave the conflict unresolved, so restoration must take priority.
+    monkeypatch.setattr(model,'joint_action_logits',lambda embeddings,indices,dynamic:
+        torch.arange(dynamic.shape[0],dtype=embeddings.dtype,device=embeddings.device))
+    args=(joint_geometry(parents,patterns,config),((),(),('keep::whole',),('right::whole',)),
+          ((),(),(0,),(0,)),('bridge',),model,config)
+    strict=construct_or_repair_with_gnn(*args)
+    assert strict.solution is None and strict.rejection_reason=='NO_LEGAL_PARENT_ACTION'
+    assert not strict.actions  # Upper child must precede the child repairing R2's head.
+    permissive=construct_or_repair_with_gnn(*args,allow_partial_start_conflicts=True,prefer_legal_start_recovery=False)
+    assert permissive.solution is None and permissive.rejection_reason=='UNRESOLVED_PARTIAL_START_CONFLICT'
+    repaired=construct_or_repair_with_gnn(*args,allow_partial_start_conflicts=True)
+    assert repaired.solution is not None,repaired.rejection_reason
+    assert len(repaired.actions)==2 and repaired.actions[0].block_id=='bridge::0'
+    scheduled=oriented.schedule_explicit(repaired.solution,repaired.directions,config)
+    assert certify_schedule(repaired.solution,scheduled.schedule,config,scope=FORMAL_SCOPE_V2).certified
+    # With no missing parent left, the same invalid R2/R3 deployment must fail.
+    unresolved=construct_or_repair_with_gnn(joint_geometry(parents[1:],patterns[1:],config),
+        args[1],args[2],(),model,config,allow_partial_start_conflicts=True)
+    assert unresolved.solution is None and unresolved.rejection_reason=='UNRESOLVED_PARTIAL_START_CONFLICT'
+
+
+def test_outer_deadline_does_not_restart_local_search_budget(monkeypatch):
+    import run_gnn_multi_initial as study
+    import run_joint_oriented_repair_pilot as oriented
+    parent=ParentWeld('p',(1.,9.),(2.,9.))
+    solution=canonicalize((parent,),(SplitPattern('p',SplitKind.WHOLE),),
+        {0:('p::whole',)},study.CONFIG,scope=FORMAL_SCOPE_V2)
+    current=oriented.schedule_explicit(solution,((0,),(),(),()),study.CONFIG)
+    def forbidden(*args,**kwargs):raise AssertionError('search started after outer deadline')
+    monkeypatch.setattr(study,'_evaluate_mode_bundle',forbidden)
+    result=study._online_bundle_search(current,'NEW','SINGLE',1,30.,None,absolute_deadline=time.perf_counter()-1.)
+    assert result['trace']==[] and result['reference_calls']==0 and result['budget']==0.
+    assert result['cmax']==current.schedule.cmax and result['status']=='CERTIFIED'
+
+
+def test_recovery_sampling_deduplicates_states_preserves_directions_and_first_context():
+    import copy
+    import run_gnn_multi_initial as study
+    def trial(block,bit):
+        return dict(status='DEADLOCK',changed_modes=[],incumbent_before=100.,late=False,
+            patterns=[{'parent_id':'p'}],routes=[[block],[],[],[]],directions=[[bit],[],[],[]],
+            frontier_exhausted=False,recovery_rollouts=32)
+    first=[trial('a',0),trial('a',1),trial('b',0),trial('b',1)]
+    repeated=copy.deepcopy(first*8)
+    for row in repeated:row['incumbent_before']=90.
+    def run(seed,trace):
+        return dict(record='sparse_run',version=study.SPARSE_VERSION,instance='sample',repairer='GNN',
+            policy='SINGLE',seed=seed,solution={'parents':[]},trace=trace)
+    rows=[run(2,repeated),run(1,first)]
+    cases,population=study._stratified_recovery_sample(rows)
+    assert study._stratified_recovery_sample(list(reversed(rows)))==(cases,population)
+    assert len(cases)==3 and population[0]['unique']==4 and population[0]['occurrences']==36
+    # Directions distinguish complete candidates. Repeated proposals must not
+    # gain extra chances or replace the preselected first comparison context.
+    assert all(len(c['occurrences'])==9 and c['occurrences'][0]['seed']==1 for c in cases)
+    assert all(c['occurrences'][0]['incumbent']==100. for c in cases)
+    duplicated=copy.deepcopy(rows)
+    duplicated[0]['trace']*=2
+    extra,_=study._stratified_recovery_sample(duplicated)
+    assert [(c['routes'],c['directions']) for c in extra]==[(c['routes'],c['directions']) for c in cases]
+
+
+def test_fixed_route_bound_skips_only_nonimproving_candidates_and_keeps_real_evaluation(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_multi_initial as study
+    import run_joint_oriented_repair_pilot as oriented
+    import mrta_search.lns as lns
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(3.,9.),(4.,9.)))
+    patterns=tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents)
+    solution=canonicalize(parents,patterns,{0:('a::whole','b::whole')},study.CONFIG,scope=FORMAL_SCOPE_V2)
+    directions=((0,0),(),(),())
+    current=oriented.schedule_explicit(solution,directions,study.CONFIG)
+    bound=study._fixed_route_time_bound(solution,directions)
+    assert bound==pytest.approx(current.schedule.cmax)
+    partial=lns._remove_parent_set(solution,('a',))
+    monkeypatch.setattr(lns,'repair_partial_state_oriented',lambda *args,**kwargs:
+        SimpleNamespace(candidate=SimpleNamespace(solution=solution),directions=directions,rejection_reason=None))
+    calls=[];original=oriented.schedule_explicit
+    def measured(*args,**kwargs):
+        calls.append(1);return original(*args,**kwargs)
+    monkeypatch.setattr(oriented,'schedule_explicit',measured)
+    skipped=study._evaluate_mode_bundle(current,partial,(),'NEW',1,None,improvement_ceiling=bound-1.)
+    assert skipped['status']=='NONIMPROVING_ROUTE_BOUND' and skipped['reference_calls']==0
+    assert not calls and skipped['cmax'] is None and not skipped['certified']
+    # A promising candidate and the conservative numerical boundary still go
+    # through the actual scheduler and independent certificate.
+    for ceiling in (bound+1.,bound-0.5e-7,None):
+        evaluated=study._evaluate_mode_bundle(current,partial,(),'NEW',1,None,improvement_ceiling=ceiling)
+        assert evaluated['certified'] and evaluated['reference_calls']==1
+        assert evaluated['cmax']==pytest.approx(bound)
+    assert len(calls)==3
+
+
 from mrta_baselines.common import CommonBaselineEvaluator
 from mrta_reference.certifier import certify_schedule
 from mrta_reference.geometry import robot_is_eligible
@@ -391,6 +542,33 @@ def test_joint_feedback_selects_from_updated_incumbent_and_bounds_b32(monkeypatc
     assert selections[0]==('initial',100.)
     assert selections[1:5]==[('candidate-1',90.)]*4
     assert selections[5:]==[('candidate-5',80.)]*19
+
+
+def test_joint_wait_feedback_without_wait_retains_load_search_and_records_fallback(monkeypatch):
+    import json
+    from types import SimpleNamespace as NS
+    import run_gnn_joint_repair_pilot as joint
+    selections=[]
+    def select(solution,directions,schedule,selection,**kwargs):
+        selections.append(selection)
+        if selection is joint.BottleneckSelection.WAIT_ANCHORED:
+            return None
+        return NS(routes=(),removed_parent_ids=('a',))
+    monkeypatch.setattr(joint,'select_bottleneck_parents',select)
+    monkeypatch.setattr(joint,'construct_or_repair_with_gnn',lambda *args,**kwargs:
+                        NS(solution='same',directions=(),actions=()))
+    monkeypatch.setattr(joint,'partial_directions',lambda *args:())
+    initial=NS(solution='same',directions=(),schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100.))
+    monkeypatch.setattr(joint.oriented,'schedule_explicit',lambda *args:initial)
+    row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2',None,NS(seed=20261027),
+                              selectors=(joint.BottleneckSelection.WAIT_ANCHORED,),iterations=8)
+    assert selections==[joint.BottleneckSelection.WAIT_ANCHORED,joint.BottleneckSelection.LOAD]*8
+    assert row['attempts']==row['b32_calls']==8
+    assert row['accepted']==0 and row['best_cmax']==100.
+    trace=json.loads(row['trace'])
+    assert [item['q'] for item in trace]==[4,4,4,8,8,8,4,4]
+    assert all(item['selection']=='LOAD' and item['requested_selection']=='WAIT_ANCHORED'
+               and item['selection_fallback']=='NO_POSITIVE_WAIT' for item in trace)
 
 
 def test_joint_teacher_neighbour_flips_are_executable_student_actions():

@@ -294,7 +294,8 @@ def save(rows, cases, examples, initial_records, args):
     lines += ["## 构造与失败诊断", "",
               "movable/positions 是每次部分解的静态合法机会累计（位置数不含两方向和双子块笛卡尔组合），不是已经枚举的动作数。"
               "CSV 另含真实插入评分次数、固定模式拒绝、原结构恢复、同轨/跨轨迁移和多路线重排计数。", ""]
-    for selection in BottleneckSelection:
+    for selection in (BottleneckSelection.RANDOM, BottleneckSelection.LOAD,
+                      BottleneckSelection.TRAVEL, BottleneckSelection.WAIT_ANCHORED):
         subset = [r for r in rows if r["selection"] == selection.value]
         fields = ("attempts", "unique_partials", "unique_candidates", "certified", "improved", "restored_original",
                   "movable_blocks", "same_rail_movable_blocks", "cross_rail_movable_blocks", "legal_positions",
@@ -322,7 +323,8 @@ def save(rows, cases, examples, initial_records, args):
             zero_instances.append((name, sum(r["attempts"] for r in subset),
                                    sum(r["unique_candidates"] for r in subset)))
     coverage = {s.value: len({r["instance"] for r in rows if r["selection"] == s.value and r["improved"]})
-                for s in BottleneckSelection}
+                for s in (BottleneckSelection.RANDOM, BottleneckSelection.LOAD,
+                          BottleneckSelection.TRAVEL, BottleneckSelection.WAIT_ANCHORED)}
     lines += ["", "## 结论", "",
               f"本轮完成 {attempted} 次适用选区尝试、{sum(r['unique_candidates'] for r in rows)} 个组内唯一完整候选；"
               f"状态 {dict(statuses)}；{sum(r['improved'] for r in rows)} 个组内改善候选。跨组可能重合，不能据此声称全局同样数量的独特专家。"
@@ -377,7 +379,8 @@ def main():
         initial_records.append((entry, initial, elapsed))
         print(f"INITIAL {name} {initial.source} Cmax={initial.metrics.cmax:.6f} time={elapsed:.3f}", flush=True)
         for q in args.q:
-            for selection in BottleneckSelection:
+            for selection in (BottleneckSelection.RANDOM, BottleneckSelection.LOAD,
+                              BottleneckSelection.TRAVEL, BottleneckSelection.WAIT_ANCHORED):
                 row, best, example = run_group(entry, initial, evaluator, selection, q, args, config)
                 rows.append(row)
                 if best is not None:

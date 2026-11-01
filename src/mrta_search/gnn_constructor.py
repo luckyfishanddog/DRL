@@ -458,7 +458,7 @@ def joint_start_state(reference, routes, directions, pending, blocks, config):
     return state
 
 
-def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8):
+def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8,check_initial_feasibility=True):
     from .lns import joint_block_candidates
     scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
     travel = [sum(arcs) for arcs in state.arc_costs]
@@ -466,7 +466,8 @@ def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_l
     for p in sorted(pending):
         children = sorted((b for b in blocks.values() if b.parent_id==p),key=lambda b:b.block_id)
         if not joint_block_candidates(state,children[0],patterns[p],blocks,config,
-                                       insertion_limit=insertion_limit,first_only=True):
+                                       insertion_limit=insertion_limit,first_only=True,
+                                       check_initial_feasibility=check_initial_feasibility):
             continue
         legal = [r for r in range(4) if robot_is_eligible(children[0],r,config)]
         if patterns[p].kind is SplitKind.X_SPLIT:
@@ -579,9 +580,11 @@ class JointTrainingRollout:
 
 
 def _decode_joint(reference, routes, directions, pending_parent_ids, model, config,
-                  *, insertion_limit, choose):
+                  *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True):
     """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
+    from .direction import _initial_error
+    from mrta_reference.geometry import oriented_endpoints
     started = time.perf_counter()
     actions = []
     try:
@@ -589,8 +592,17 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
         state = joint_start_state(reference,routes,directions,pending_parent_ids,blocks,config)
         pending = set(pending_parent_ids)
         embeddings = model.encode_static(graph)
+        def valid_start(s):
+            points={r:oriented_endpoints(blocks[route[0]],s.directions[r][0])[0]
+                    for r,route in enumerate(s.routes) if route}
+            return _initial_error(points,config) is None
+        def check_start(s):
+            # A destroyed state's exposed heads are not its final deployment.
+            # Once a legal partial start is restored, retain the original prune.
+            return not allow_partial_start_conflicts or valid_start(s)
         while pending:
-            ids,features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit)
+            ids,features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit,
+                                               check_initial_feasibility=check_start(state))
             if not ids:
                 raise _JointActionUnavailable('NO_LEGAL_PARENT_ACTION')
             parent_logits = model.parent_logits(graph,embeddings,ids,features)
@@ -599,7 +611,9 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
             parent = ids[choose(parent_logits,'parent')]
             children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
             for child in children:
-                variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit)
+                variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit,
+                                                   check_initial_feasibility=check_start(state),
+                                                   prefer_legal_start_recovery=prefer_legal_start_recovery)
                 if not variants:
                     raise _JointActionUnavailable('NO_LEGAL_CHILD_INSERTION')
                 indices,dynamic = joint_candidate_inputs(graph,state,variants,blocks,config)
@@ -609,11 +623,18 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                 state,action = variants[choose(logits,'insertion')]
                 actions.append(action)
             pending.remove(parent)
+        if allow_partial_start_conflicts and not valid_start(state):
+            raise _JointActionUnavailable('UNRESOLVED_PARTIAL_START_CONFLICT')
         solution = canonicalize(reference.parents,reference.patterns,
                                 tuple(Route(r,state.routes[r]) for r in range(4)),config,scope=FORMAL_SCOPE_V2,
                                 revision=reference.revision+1)
         if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
-            raise ValueError('FIXED_PATTERN_CHANGED')
+            # A completed policy path can make retained optional siblings
+            # adjacent. Canonicalization then merges them into WHOLE, for which
+            # the old child directions are no longer a valid explicit vector.
+            # Reject this ordinary action-path dead end, as the rule repairer
+            # does; do not abort the entire solver or silently reuse directions.
+            raise _JointActionUnavailable('FIXED_PATTERN_CHANGED')
         return JointCompletionResult(solution,state.directions,tuple(actions),time.perf_counter()-started)
     except _JointActionUnavailable as error:
         return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,str(error))
@@ -621,8 +642,15 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
 
 def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
                                  model: JointInsertionGNN, config, *, insertion_limit=8,
-                                 decode_mode='greedy', seed=0):
-    """No-gradient greedy/sample decoding; complete results are scheduled outside."""
+                                 decode_mode='greedy', seed=0,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True):
+    """No-gradient decoding; complete results are scheduled outside.
+
+    The opt-in partial-start repair can restore heads exposed by destruction.
+    It retains the normal prune as soon as the partial start is legal and never
+    returns an unresolved conflicting full start. Default decoding and training
+    retain their original action space. When restoration is available, prefer
+    it to staying in conflict; the preference can be disabled for ablation.
+    """
     if decode_mode not in ('greedy','sample'):
         raise ValueError('decode_mode must be greedy or sample')
     generator=None
@@ -635,7 +663,9 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
     model.eval()
     with torch.inference_mode():
         return _decode_joint(reference,routes,directions,pending_parent_ids,model,config,
-                             insertion_limit=insertion_limit,choose=choose)
+                             insertion_limit=insertion_limit,choose=choose,
+                             allow_partial_start_conflicts=allow_partial_start_conflicts,
+                             prefer_legal_start_recovery=prefer_legal_start_recovery)
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,

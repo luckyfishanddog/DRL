@@ -148,35 +148,50 @@ def initial_reference(parents, config, scheme):
     ) if scheme == "REGION_LOCAL" else construct_solution(parents, config).solution)
 
 
-def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8):
+def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
+                        deadline=None, accept_candidate=None, interleave=False):
     attempts = []
-    for scheme in ("REGION_LOCAL", "RULE_X_LOCAL"):
-        try:
-            reference = initial_reference(parents, config, scheme)
-            beam = build_oriented_insertion_beam(reference, config, seed=seed,
-                                                 beam_width=4, insertion_limit=insertion_limit)
-        except (ValueError, ArithmeticError) as error:
-            attempts.append(dict(scheme=scheme, status="CONSTRUCTION_FAILED", diagnostics=(str(error),)))
-            continue
-        successful = []
-        for state, actions in beam:
+    schemes=("REGION_LOCAL", "RULE_X_LOCAL")
+    beams={}
+    successful=[]
+    order=([(scheme,index) for index in range(4) for scheme in schemes] if interleave else
+           [(scheme,index) for scheme in schemes for index in range(4)])
+    for scheme,index in order:
+        if deadline is not None and time.perf_counter()>=deadline:break
+        if scheme not in beams:
             try:
-                solution = canonicalize(reference.parents, reference.patterns,
-                                        tuple(Route(r, state.routes[r]) for r in range(4)),
-                                        config, scope=FORMAL_SCOPE_V2)
-                if solution.patterns != reference.patterns or tuple(r.block_ids for r in solution.routes) != state.routes:
-                    raise ValueError("fixed-mode beam candidate changed during canonicalization")
-                candidate = schedule_explicit(solution, state.directions, config)
+                reference=initial_reference(parents,config,scheme)
+                beam=build_oriented_insertion_beam(reference,config,seed=seed,
+                                                   beam_width=4,insertion_limit=insertion_limit)
+                beams[scheme]=(reference,beam)
             except (ValueError, ArithmeticError) as error:
-                attempts.append(dict(scheme=scheme, status="CONSTRUCTION_FAILED", diagnostics=(str(error),)))
+                attempts.append(dict(scheme=scheme,status="CONSTRUCTION_FAILED",diagnostics=(str(error),)))
+                beams[scheme]=(None,())
+        reference,beam=beams[scheme]
+        if index<len(beam):
+            if deadline is not None and time.perf_counter()>=deadline:break
+            state,_=beam[index]
+            try:
+                solution=canonicalize(reference.parents,reference.patterns,
+                                      tuple(Route(r,state.routes[r]) for r in range(4)),
+                                      config,scope=FORMAL_SCOPE_V2)
+                if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
+                    raise ValueError('fixed-mode beam candidate changed during canonicalization')
+                candidate=schedule_explicit(solution,state.directions,config)
+            except (ValueError,ArithmeticError) as error:
+                attempts.append(dict(scheme=scheme,status='CONSTRUCTION_FAILED',diagnostics=(str(error),)))
+                if successful and ((interleave and scheme==schemes[-1]) or (not interleave and index==3)):
+                    break
                 continue
-            attempts.append(dict(scheme=scheme, status=candidate.schedule.status.value,
-                                 diagnostics=candidate.schedule.diagnostics))
-            if candidate.schedule.status is ScheduleStatus.FEASIBLE:
+            admitted=(candidate.schedule.status is ScheduleStatus.FEASIBLE and
+                      (accept_candidate is None or accept_candidate(candidate)))
+            attempts.append(dict(scheme=scheme,status=candidate.schedule.status.value,
+                                 diagnostics=candidate.schedule.diagnostics,admitted=admitted))
+            if admitted and (accept_candidate is not None or deadline is None or time.perf_counter()<=deadline):
                 successful.append(candidate)
-        if successful:
-            return min(successful, key=lambda c: c.schedule.cmax), attempts
-    return None, attempts
+        end_round=(scheme==schemes[-1]) if interleave else (index==3)
+        if successful and end_round:break
+    return (min(successful,key=lambda c:c.schedule.cmax) if successful else None),attempts
 
 
 def key(candidate):
@@ -694,7 +709,8 @@ def main():
         for q in args.q:
             selection_start = time.perf_counter()
             partials = {}
-            for selection in BottleneckSelection:
+            for selection in (BottleneckSelection.RANDOM, BottleneckSelection.LOAD,
+                              BottleneckSelection.TRAVEL, BottleneckSelection.WAIT_ANCHORED):
                 selected = []
                 if initial is not None:
                     for attempt in range(args.attempts):

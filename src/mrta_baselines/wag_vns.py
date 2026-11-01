@@ -343,6 +343,8 @@ def _balanced_boundary_assign(
     pair: tuple[int, int],
     blocks: Mapping[str, WeldingBlock],
     config: ScientificConfig,
+    *,
+    fixed_loads: Sequence[float] = (0.0, 0.0, 0.0, 0.0),
 ) -> tuple[int, tuple[str, ...]]:
     ordered = tuple(
         sorted(
@@ -354,8 +356,8 @@ def _balanced_boundary_assign(
     )
     best = None
     for boundary in range(len(ordered) + 1):
-        left = sum(config.process_time(blocks[item].length) for item in ordered[:boundary])
-        right = sum(config.process_time(blocks[item].length) for item in ordered[boundary:])
+        left = fixed_loads[pair[0]] + sum(config.process_time(blocks[item].length) for item in ordered[:boundary])
+        right = fixed_loads[pair[1]] + sum(config.process_time(blocks[item].length) for item in ordered[boundary:])
         candidate = (max(left, right), abs(left - right), boundary)
         if best is None or candidate < best:
             best = candidate
@@ -382,6 +384,11 @@ def generate_wag_assignments(
             else (2, 3)
         )
     }
+    # X children cannot move, but their work still occupies the assigned rail
+    # and robot when balancing the remaining WHOLE/Y blocks.
+    fixed_loads = [0.0] * 4
+    for block_id, robot in fixed_x_robot.items():
+        fixed_loads[robot] += config.process_time(blocks[block_id].length)
     rail_groups: dict[str, list[str]] = {"UPPER": [], "LOWER": []}
     flexible: list[str] = []
     for block_id, block in blocks.items():
@@ -401,6 +408,8 @@ def generate_wag_assignments(
         key: sum(config.process_time(blocks[item].length) for item in values)
         for key, values in rail_groups.items()
     }
+    rail_load["UPPER"] += fixed_loads[0] + fixed_loads[1]
+    rail_load["LOWER"] += fixed_loads[2] + fixed_loads[3]
     for block_id in sorted(
         flexible,
         key=lambda item: (
@@ -412,10 +421,10 @@ def generate_wag_assignments(
         rail_load[rail] += config.process_time(blocks[block_id].length)
 
     upper_boundary, upper_order = _balanced_boundary_assign(
-        rail_groups["UPPER"], (0, 1), blocks, config
+        rail_groups["UPPER"], (0, 1), blocks, config, fixed_loads=fixed_loads
     )
     lower_boundary, lower_order = _balanced_boundary_assign(
-        rail_groups["LOWER"], (2, 3), blocks, config
+        rail_groups["LOWER"], (2, 3), blocks, config, fixed_loads=fixed_loads
     )
     offsets = sorted(
         itertools.product(range(-2, 3), repeat=2),

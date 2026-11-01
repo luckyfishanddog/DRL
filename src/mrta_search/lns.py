@@ -52,6 +52,7 @@ class BottleneckSelection(str, Enum):
     LOAD = "LOAD"
     TRAVEL = "TRAVEL"
     WAIT_ANCHORED = "WAIT_ANCHORED"
+    SHARED_Y_PAIR = "SHARED_Y_PAIR"
 
 
 class CRRRBottleneck(str, Enum):
@@ -405,6 +406,72 @@ def _remove_parent_set(
     )
 
 
+def shared_y_parent_links(
+    current: CanonicalSolution,
+    schedule: ScheduleResult,
+    config: ScientificConfig,
+) -> tuple[tuple[str, str, float], ...]:
+    """Observed cross-rail proximity, not causal blockers or collision evidence.
+
+    Clip SETUP/WELD/POST to the shared Y band. Connect distinct parents when
+    their swept boxes are within the existing interference distances, even
+    when their visits are separated in time. Max aggregation avoids counting
+    a parent repeatedly merely because its execution has more phases/children.
+    """
+    if not schedule.feasible:
+        raise ValueError("shared-Y links require a feasible current schedule")
+    parents = {p.parent_id: p for p in current.parents}
+    visits = ([], [])
+    waits = {p: 0.0 for p in parents}
+    low, high = config.by
+    eps = config.numeric_epsilon
+    for op in schedule.operations:
+        if op.block_id is None or _parent_id(op.block_id) not in parents:
+            continue
+        parent = _parent_id(op.block_id)
+        if op.kind is OperationKind.WAIT:
+            waits[parent] += op.duration
+        if op.kind not in (OperationKind.SETUP, OperationKind.WELD, OperationKind.POST):
+            continue
+        if op.duration <= eps:
+            continue
+        dy = op.end[1] - op.start[1]
+        if abs(dy) <= eps:
+            if not low - eps <= op.start[1] <= high + eps:
+                continue
+            a, b = 0.0, 1.0
+        else:
+            ends = sorted(((low - op.start[1]) / dy, (high - op.start[1]) / dy))
+            a, b = max(0.0, ends[0]), min(1.0, ends[1])
+            if b <= a + eps:
+                continue
+        t0, t1 = op.start_time + a * op.duration, op.start_time + b * op.duration
+        x0, y0 = op.point_at(t0)
+        x1, y1 = op.point_at(t1)
+        visits[op.robot_id // 2].append((parent, op.robot_id, t0, t1,
+                                       min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1)))
+    links: dict[tuple[str, str], float] = {}
+    cmax = max(max(schedule.robot_completion), eps)
+    for a in visits[0]:
+        for b in visits[1]:
+            if a[0] == b[0]:
+                continue
+            dx = max(0.0, a[4] - b[5], b[4] - a[5])
+            dy = max(0.0, a[6] - b[7], b[6] - a[7])
+            if dx > config.interference_dx + eps or dy > config.interference_dy + eps:
+                continue
+            gap = max(0.0, a[2] - b[3], b[2] - a[3])
+            scale = max(a[3] - a[2], b[3] - b[2], config.t_pre + config.t_post, eps)
+            criticality = max(schedule.robot_completion[a[1]], schedule.robot_completion[b[1]]) / cmax
+            pressure = (waits[a[0]] + waits[b[0]]) / max(
+                config.process_time(parents[a[0]].length) + config.process_time(parents[b[0]].length), eps)
+            score = (0.25 + criticality) ** 2 * (1.0 + pressure) / (
+                (1.0 + dx / config.interference_dx + dy / config.interference_dy) * (1.0 + gap / scale))
+            pair = tuple(sorted((a[0], b[0])))
+            links[pair] = max(links.get(pair, 0.0), score)
+    return tuple((a, b, score) for (a, b), score in sorted(links.items()))
+
+
 def select_bottleneck_parents(
     current: CanonicalSolution,
     directions: DirectionVectors,
@@ -418,8 +485,10 @@ def select_bottleneck_parents(
     """Select closed parent groups using only the current certified timeline.
 
     WAIT_ANCHORED uses observed waits and temporal/spatial neighbours, not
-    inferred causal blockers. None means no positive WAIT exists. Directions
-    are required so TRAVEL uses the actual exit/entry endpoints.
+    inferred causal blockers. SHARED_Y_PAIR keeps both ends of an observed
+    cross-rail proximity link (q >= 2). None means no positive WAIT or no
+    shared-Y link, respectively; callers must explicitly handle that case.
+    Directions are required so TRAVEL uses actual exit/entry endpoints.
     """
     if not schedule.feasible:
         raise ValueError("bottleneck selection requires a feasible current schedule")
@@ -455,7 +524,14 @@ def select_bottleneck_parents(
 
     anchors: list[str] = []
     wait = None
-    if selection is BottleneckSelection.LOAD:
+    if selection is BottleneckSelection.SHARED_Y_PAIR:
+        links = shared_y_parent_links(current, schedule, config)
+        if not links:
+            return None
+        anchors = list(choose([((a, b), weight) for a, b, weight in links]))
+        # For q=1, prefer the parent owned by a later-finishing robot.
+        anchors.sort(key=lambda p: (-max(completion[owners[b.block_id]] for b in parent_blocks[p]), p))
+    elif selection is BottleneckSelection.LOAD:
         # Both completion and processing matter. All legal robot moves count,
         # including left/right moves on the same rail.
         robot = choose([(r, max(loads[r], 1e-9) * (completion[r] / max_completion) ** 2)
@@ -738,17 +814,99 @@ def oriented_time_score(state: OrientedRouteState) -> tuple[float, float]:
     return round(max(estimated, default=0.0), 8), sum(estimated)
 
 
+def nominal_coordination_features(solution, directions, config):
+    """Score a complete candidate before B32, without dispatching or delaying it.
+
+    All four independent routes start at zero. Continuous proximity and
+    same-rail order exposure are measured on those nominal timelines. Union
+    durations avoid counting simultaneous conflicts multiple times per robot.
+    P+M+exposure is a ranking heuristic, NOT a wait estimate, feasibility test,
+    or bound on coordinated makespan. It intentionally has no fitted weight.
+    """
+    from mrta_reference.geometry import _axis_band_interval
+    from mrta_reference.model import RobotRoute
+    from mrta_reference.scheduler import build_operation_templates
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
+    state = oriented_route_state(tuple(r.block_ids for r in solution.routes), directions, blocks, config)
+    templates = tuple(build_operation_templates(RobotRoute(r, tuple(blocks[b] for b in route),
+                                                           state.directions[r]), config)
+                      for r, route in enumerate(state.routes))
+    completion = tuple(ops[-1].end_time if ops else 0.0 for ops in templates)
+    proximity = [[] for _ in range(4)]
+    order = [[] for _ in range(4)]
+    eps = config.numeric_epsilon
+    for first_robot in range(4):
+        for second_robot in range(first_robot + 1, 4):
+            first_ops, second_ops = templates[first_robot], templates[second_robot]
+            i = j = 0
+            # Each route is contiguous and ordered: sweep overlapping phases.
+            while i < len(first_ops) and j < len(second_ops):
+                a, b = first_ops[i], second_ops[j]
+                lo, hi = max(a.start_time, b.start_time), min(a.end_time, b.end_time)
+                if hi > lo + eps:
+                    pa, pb = a.point_at(lo), b.point_at(lo)
+                    va = tuple((y-x)/a.duration for x, y in zip(a.start, a.end))
+                    vb = tuple((y-x)/b.duration for x, y in zip(b.start, b.end))
+                    near = (0.0, hi-lo)
+                    for axis, limit in ((0, config.interference_dx), (1, config.interference_dy)):
+                        near = _axis_band_interval(va[axis]-vb[axis], pa[axis]-pb[axis],
+                                                   limit+eps, *near)
+                        if near is None or near[1] <= near[0]:
+                            near = None
+                            break
+                    if near is not None:
+                        interval = (lo+near[0], lo+near[1])
+                        proximity[first_robot].append(interval)
+                        proximity[second_robot].append(interval)
+                    if first_robot // 2 == second_robot // 2:
+                        # first_robot is the left robot (0 or 2).
+                        d0 = pa[0] + config.interference_dx - pb[0] - eps
+                        velocity = va[0] - vb[0]
+                        d1 = d0 + velocity*(hi-lo)
+                        if max(d0, d1) > 0.0:
+                            start, end = lo, hi
+                            if d0 <= 0.0:
+                                start = lo-d0/velocity
+                            elif d1 <= 0.0:
+                                end = lo-d0/velocity
+                            order[first_robot].append((start, end))
+                            order[second_robot].append((start, end))
+                if a.end_time <= b.end_time:
+                    i += 1
+                else:
+                    j += 1
+
+    def union_seconds(intervals):
+        total = 0.0
+        end = -math.inf
+        for start, stop in sorted(intervals):
+            total += max(0.0, stop-max(start, end))
+            end = max(end, stop)
+        return total
+
+    exposure = tuple(union_seconds(proximity[r]+order[r]) for r in range(4))
+    return dict(nominal_completion=completion, nominal_cmax=max(completion),
+                total_nominal_time=sum(completion), exposure_seconds=exposure,
+                proximity_seconds=tuple(union_seconds(v) for v in proximity),
+                same_rail_order_seconds=tuple(union_seconds(v) for v in order),
+                exposure_score=max(t+e for t,e in zip(completion, exposure)))
+
+
 def oriented_insert_variants(
     state: OrientedRouteState, block: WeldingBlock, robot: int, position: int,
     blocks: Mapping[str, WeldingBlock], config: ScientificConfig, *,
     fixed_direction: int | None = None, locked_directions: Mapping[str, int] | None = None,
     max_evaluations: int = 8, keep: int = 2, seed: int = 0,
+    check_initial_feasibility: bool = True,
 ) -> tuple[tuple[tuple[OrientedRouteState, OrientedInsertionAction], ...], int]:
     """One (block, robot, position, direction) decision with adjacent flips.
 
     Only arcs incident to the inserted block or its immediate neighbours are
     recomputed. Other routes and non-adjacent directions are retained verbatim.
     No route DP, scheduler or certifier is called here.
+    Disabling the start check is only for a non-executed partial repair state;
+    its caller must validate the completed start before returning a solution.
     """
     locked = locked_directions or {}
     route = state.routes[robot]
@@ -780,7 +938,7 @@ def oriented_insert_variants(
         directions = tuple(tuple(vector) if r == robot else directions[r] for r in range(4))
         points = {r: oriented_endpoints(blocks[items[0]], directions[r][0])[0]
                   for r, items in enumerate(routes) if items}
-        if _initial_error(points, config) is not None:
+        if check_initial_feasibility and _initial_error(points, config) is not None:
             continue
         # Reuse old arcs, splice the insertion, then refresh only up to four
         # arcs touched by the predecessor/new block/successor direction tuple.
@@ -810,7 +968,8 @@ def joint_action_key(action: OrientedInsertionAction) -> tuple:
 def joint_block_candidates(
     state: OrientedRouteState, block: WeldingBlock, pattern: SplitPattern,
     blocks: Mapping[str, WeldingBlock], config: ScientificConfig, *,
-    insertion_limit: int = 8, first_only: bool = False,
+    insertion_limit: int = 8, first_only: bool = False, check_initial_feasibility: bool = True,
+    prefer_legal_start_recovery: bool = True,
 ):
     """Shared student/teacher-replay action set, including neighbour flips.
 
@@ -825,7 +984,8 @@ def joint_block_candidates(
     for robot in robots:
         for position in bounded_insertion_positions(len(state.routes[robot]), insertion_limit):
             variants, _ = oriented_insert_variants(state, block, robot, position, blocks, config,
-                                                   max_evaluations=8, keep=8)
+                                                   max_evaluations=8, keep=8,
+                                                   check_initial_feasibility=check_initial_feasibility)
             for inserted, action in variants:
                 # Fixed-pattern normalization would collapse adjacent siblings.
                 sibling_ids = [b for b in inserted.routes[robot]
@@ -835,6 +995,13 @@ def joint_block_candidates(
                 rows.append((inserted, action))
                 if first_only:
                     return tuple(rows)
+    if not check_initial_feasibility and prefer_legal_start_recovery:
+        restored=[]
+        for inserted,action in rows:
+            points={r:oriented_endpoints(blocks[route[0]],inserted.directions[r][0])[0]
+                    for r,route in enumerate(inserted.routes) if route}
+            if _initial_error(points,config) is None:restored.append((inserted,action))
+        if restored:rows=restored
     return tuple(rows)
 
 
@@ -933,6 +1100,7 @@ def repair_partial_state(
     seed: int = 0,
     coordination_proxy: bool = False,
     direction_versions: int = 1,
+    allow_pattern_changes: bool = False,
 ) -> RepairResult:
     if partial.source_revision != current.revision:
         raise ValueError("stale partial state revision")
@@ -943,12 +1111,28 @@ def repair_partial_state(
     if direction_mode is None and (coordination_proxy or direction_versions != 1):
         raise ValueError("oriented repair options require explicit direction state")
     patterns = {pattern.parent_id: pattern for pattern in partial.patterns}
-    blocks = block_map(current, config)
+    current_blocks = block_map(current, config)
+    if allow_pattern_changes:
+        from mrta_reference.scope import FORMAL_SCOPE_V2
+        if partial.parents != current.parents or direction_mode != "JOINT":
+            raise ValueError("mode repair requires the same parents and joint directions")
+        old_patterns = {p.parent_id: p for p in current.patterns}
+        pending_ids = set(partial.removed_parent_ids)
+        if any(p != old_patterns[p.parent_id] and p.parent_id not in pending_ids
+               for p in partial.patterns):
+            raise ValueError("mode changes require complete removal of the parent")
+        retained = [b for route in partial.routes for b in route]
+        expected = {b for b, block in current_blocks.items() if block.parent_id not in pending_ids}
+        if len(retained) != len(set(retained)) or set(retained) != expected:
+            raise ValueError("mode repair requires parent-closed partial routes")
+        blocks = block_map(partial, config, scope=FORMAL_SCOPE_V2)
+    else:
+        blocks = current_blocks
     current_hints_by_block = _hints_from_current(current, current_directions)
     if direction_mode is not None:
         if direction_mode not in ("FIXED", "JOINT"):
             raise ValueError("unknown oriented repair mode")
-        oriented_route_state(tuple(r.block_ids for r in current.routes), current_directions, blocks, config)
+        oriented_route_state(tuple(r.block_ids for r in current.routes), current_directions, current_blocks, config)
     routes = partial.routes
     hints = tuple(
         tuple(current_hints_by_block.get(item, 0) for item in route)
@@ -1078,7 +1262,8 @@ def repair_partial_state(
             ),
         )
         solution_blocks = block_map(solution, config)
-        if preserve_patterns and solution.patterns != current.patterns:
+        target_patterns = partial.patterns if allow_pattern_changes else current.patterns
+        if preserve_patterns and solution.patterns != target_patterns:
             return RepairResult(None, evaluations, "FIXED_PATTERN_CHANGED_BY_CANONICALIZATION")
         if any(
             not robot_is_eligible(solution_blocks[item], route.robot_id, config)
@@ -1111,6 +1296,8 @@ def repair_partial_state(
         trace = [(p, tuple((a.block_id, a.robot, a.position, a.direction) for a in actions
                            if _parent_id(a.block_id) == p)) for p in parent_order]
     repair_identity = tuple(trace)
+    if allow_pattern_changes:
+        repair_identity = (tuple((p.pattern_id, p.t) for p in partial.patterns), repair_identity)
     identity = CompleteCandidateIdentity(
         current.revision,
         CandidateSourceKind.LNS_REPAIRED.value,
@@ -1152,6 +1339,7 @@ def repair_partial_state_oriented(
     fixed_directions: bool = False, insertion_limit: int = 8,
     max_insertion_evaluations: int = 4096, seed: int = 0,
     coordination_proxy: bool = False, direction_versions: int = 1,
+    allow_pattern_changes: bool = False,
 ) -> RepairResult:
     """The existing Regret-2 loop with explicit, persistent action directions."""
     return repair_partial_state(
@@ -1160,7 +1348,131 @@ def repair_partial_state_oriented(
         max_insertion_evaluations=max_insertion_evaluations, preserve_patterns=True,
         direction_mode="FIXED" if fixed_directions else "JOINT", seed=seed,
         coordination_proxy=coordination_proxy, direction_versions=direction_versions,
+        allow_pattern_changes=allow_pattern_changes,
     )
+
+
+def rank_parent_mode_changes(current, partial, config):
+    """Rank one-parent legal mode changes by an assignment-only load estimate.
+
+    Each alternative includes its actual per-block setup/post cost. Other
+    parents keep their incumbent assignment only for this inexpensive ranking;
+    the subsequent repair can move the entire removed set. This is neither a
+    schedulability test nor a lower bound on that subsequent repair.
+    """
+    from mrta_reference.geometry import build_legal_pattern_catalog, blocks_for_pattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    catalog = build_legal_pattern_catalog(current.parents, config, FORMAL_SCOPE_V2)
+    old = {p.parent_id: p for p in current.patterns}
+    parents = {p.parent_id: p for p in current.parents}
+    blocks = block_map(current, config, scope=FORMAL_SCOPE_V2)
+    owners = {b: r for r, route in enumerate(current.routes) for b in route.block_ids}
+    loads = _loads(tuple(r.block_ids for r in current.routes), blocks, config)
+    rows = []
+    for pid in partial.removed_parent_ids:
+        residual = list(loads)
+        for b, block in blocks.items():
+            if block.parent_id == pid:
+                residual[owners[b]] -= config.process_time(block.length)
+        for pattern in catalog[pid]:
+            if pattern == old[pid]:
+                continue
+            children = blocks_for_pattern(parents[pid], pattern, config)
+            legal = []
+            for child in children:
+                if pattern.kind is SplitKind.X_SPLIT:
+                    legal.append(((0 if pattern.rail.value == 'UPPER' else 2)
+                                  + int(child.block_id.endswith('::1')),))
+                else:
+                    legal.append(tuple(r for r in range(4) if robot_is_eligible(child, r, config)))
+            estimates = []
+            for assignment in itertools.product(*legal):
+                # Adjacent same-robot siblings normalize to WHOLE in the real
+                # model. Same-robot split assignments remain a permissive proxy:
+                # repair must insert them non-adjacently or choose WHOLE itself.
+                projected = list(residual)
+                for child, robot in zip(children, assignment):
+                    projected[robot] += config.process_time(child.length)
+                estimates.append((max(projected), max(projected)-min(projected)))
+            if estimates:
+                score = (*min(estimates), sum(config.process_time(c.length) for c in children),
+                         pid, pattern.pattern_id)
+                rows.append((score, pattern))
+    return tuple(pattern for _, pattern in sorted(rows, key=lambda row: row[0]))
+
+
+def rank_parent_mode_pairs(current, partial, config, *, limit=3, diverse_pairs=False):
+    """Rank simultaneous changes of two distinct removed parents.
+
+    Enumerate their full public legal mode catalogs, not just individually
+    promising modes. Minimize max processing load, then spread and total new
+    processing. All other parents keep incumbent owners for this proxy only;
+    actual repair may move the entire removed set. No scheduler is called.
+    With diverse_pairs, take the best mode of each distinct unordered parent
+    pair first, then fill unused slots by the original ranking. The top proposal
+    is unchanged; diversity is a candidate coverage heuristic, not a new score.
+    """
+    import numpy as np
+    from mrta_reference.geometry import build_legal_pattern_catalog, blocks_for_pattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    if limit < 0:
+        raise ValueError('limit must be nonnegative')
+    if limit == 0 or len(partial.removed_parent_ids) < 2:
+        return ()
+    catalog = build_legal_pattern_catalog(current.parents, config, FORMAL_SCOPE_V2)
+    old = {p.parent_id:p for p in current.patterns}
+    parents = {p.parent_id:p for p in current.parents}
+    blocks = block_map(current, config, scope=FORMAL_SCOPE_V2)
+    routes = tuple(r.block_ids for r in current.routes)
+    loads = np.asarray(_loads(routes, blocks, config))
+    owners = {b:r for r,route in enumerate(routes) for b in route}
+    options = {}; contributions = {}
+    for pid in partial.removed_parent_ids:
+        contributions[pid] = np.zeros(4)
+        for b,block in blocks.items():
+            if block.parent_id == pid:
+                contributions[pid][owners[b]] += config.process_time(block.length)
+        options[pid] = []
+        for pattern in catalog[pid]:
+            if pattern == old[pid]:
+                continue
+            children = blocks_for_pattern(parents[pid], pattern, config)
+            legal = [((0 if pattern.rail.value == 'UPPER' else 2)+index,)
+                     if pattern.kind is SplitKind.X_SPLIT else
+                     tuple(r for r in range(4) if robot_is_eligible(child,r,config))
+                     for index,child in enumerate(children)]
+            vectors = []
+            for assignment in itertools.product(*legal):
+                vector = np.zeros(4)
+                for child,robot in zip(children,assignment):
+                    vector[robot] += config.process_time(child.length)
+                vectors.append(vector)
+            if vectors:
+                options[pid].append((pattern,np.asarray(vectors),sum(config.process_time(c.length) for c in children)))
+    rows = []
+    for a,b in itertools.combinations(sorted(options),2):
+        residual = loads-contributions[a]-contributions[b]
+        for pa,va,work_a in options[a]:
+            for pb,vb,work_b in options[b]:
+                projected = (residual+va[:,None,:]+vb[None,:,:]).reshape(-1,4)
+                peaks = projected.max(axis=1)
+                spread = peaks-projected.min(axis=1)
+                best = np.lexsort((spread,peaks))[0]
+                score = (float(peaks[best]),float(spread[best]),work_a+work_b,
+                         a,pa.pattern_id,pa.t if pa.t is not None else -1.,
+                         b,pb.pattern_id,pb.t if pb.t is not None else -1.)
+                rows.append((score,(pa,pb)))
+    ordered=[patterns for _,patterns in sorted(rows,key=lambda row:row[0])]
+    if not diverse_pairs:
+        return tuple(ordered[:limit])
+    chosen=[];seen_pairs=set()
+    for patterns in ordered:
+        key=tuple(p.parent_id for p in patterns)
+        if key not in seen_pairs:
+            chosen.append(patterns);seen_pairs.add(key)
+            if len(chosen)==limit:return tuple(chosen)
+    chosen.extend(p for p in ordered if p not in chosen)
+    return tuple(chosen[:limit])
 
 
 def _block_mid_x(block: WeldingBlock) -> float:
