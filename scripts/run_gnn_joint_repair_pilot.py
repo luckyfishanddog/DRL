@@ -782,9 +782,117 @@ def evaluate_wait(model,args):
     print('Saved WAIT feedback CSV and report',flush=True)
 
 
+def save_parent_selection_report(rows,blocked,args):
+    lines=['','## 6. 冻结V2父选择消融：learned 对 MRV-LPT','',
+           f'2026-11-01；seed={args.seed}；冻结 `models/gnn_joint_repair_v2.pt`，CPU单线程；未训练或生成标签。',
+           f'复用原固定初解实验：RANDOM/TRAVEL/LOAD × q4/q8 × 每组8次，共48个部分解/实例；每次seed={args.seed}+原实例索引×10000+q×100+零基attempt。两方法从同一个部分解、保留方向和pending父集合独立补全，不更新初解，不执行24轮反馈。',
+           'learned保留parent_head；MRV仅在同一个joint_parent_inputs可选父集合中排序。每个子块的选择数估计为合法机器人对应bounded_insertion_positions数量之和；父级取各子块数量的乘积，然后按父总加工时间降序、parent_id升序破同分。各子块均使用当前路线长度，不枚举完整父级组合，不额外评价方向或未来状态。X子块固定机器人规则与joint_block_candidates一致。',
+           '此为低成本MRV估计，不是方向、首任务和同父邻接剪枝后的精确完整动作数；父级可选性和实际动作仍完全使用原候选生成器。',
+           '共同insertion_limit=8、greedy解码、GNN插入评分、方向/邻块翻转、固定模式与B32；每个完整候选仅一次B32，失败候选全部保留。每对交替先运行learned/MRV，以减轻固定执行顺序对计时的影响。',
+           '时间仅含逐次构造和B32，不含共同Beam、Excel、模型加载及CSV写入；最佳Cmax包含共同初解。严格改善沿用 Cnew<Cinitial−1e−9×max(1,Cinitial)。','',
+           '|实例|方法|初始Cmax|完成补全|B32成功/尝试|严格改善|最佳Cmax|改善%|秒|',
+           '|---|---|---:|---:|---:|---:|---:|---:|---:|']
+    bests={}
+    for name in dict.fromkeys(r['instance'] for r in rows):
+        bests[name]={}
+        for mode in ('learned','mrv'):
+            group=[r for r in rows if r['instance']==name and r['parent_selection_mode']==mode]
+            initial=group[0]['initial_cmax']
+            best=min([initial]+[r['cmax'] for r in group if r['status']=='FEASIBLE'])
+            bests[name][mode]=best
+            lines.append(f"|{name}|{mode}|{initial:.6f}|{sum(r['constructed'] for r in group)}/{len(group)}|{sum(r['status']=='FEASIBLE' for r in group)}/{len(group)}|{sum(r['improved'] for r in group)}|{best:.6f}|{100*(initial-best)/initial:.6f}|{sum(r['runtime_s'] for r in group):.3f}|")
+    lines+=['','|方法|完成补全|B32成功/尝试|成功率|严格改善|构造+B32秒|',
+            '|---|---:|---:|---:|---:|---:|']
+    for mode in ('learned','mrv'):
+        group=[r for r in rows if r['parent_selection_mode']==mode]
+        success=sum(r['status']=='FEASIBLE' for r in group)
+        lines.append(f"|{mode}|{sum(r['constructed'] for r in group)}/{len(group)}|{success}/{len(group)}|{100*success/max(1,len(group)):.3f}%|{sum(r['improved'] for r in group)}|{sum(r['runtime_s'] for r in group):.3f}|")
+    lines+=['','逐实例最佳Cmax配对（MRV相对于learned）：','',
+            '|实例|MRV−learned秒|胜/平/负|','|---|---:|---|']
+    outcomes=Counter()
+    for name,pair in bests.items():
+        a,b=pair['learned'],pair['mrv'];eps=1e-9*max(1,a,b)
+        outcome='胜' if b<a-eps else '负' if b>a+eps else '平'
+        outcomes[outcome]+=1
+        lines.append(f'|{name}|{b-a:+.6f}|{outcome}|')
+    lines+=['',f"完成{len(rows)//2}组配对输入、{len(rows)}次补全；MRV逐实例最佳为{outcomes['胜']}胜、{outcomes['平']}平、{outcomes['负']}负。这些候选来自{len(bests)}个几何，不能当作更多独立几何样本做统计推断。"]
+    different=[(r['instance'],r['historical_initial_cmax'],r['initial_cmax']) for r in rows
+               if r['initial_cmax']!=r['historical_initial_cmax']]
+    if different:
+        name,old,new=different[0]
+        lines+=['',f'输入限制：经用户允许，{name}使用当前Beam初值{new:.6f}s（原V2为{old:.6f}s）。该例A/B严格共享当前48个输入，但不能称为原48个部分解的复现；其余实例沿用原设置。']
+    if blocked:
+        lines+=['','未执行的输入：']+[f'- {reason}' for reason in blocked]
+    command='scripts/run_gnn_joint_repair_pilot.py --phase parent-eval'
+    if args.parent_allow_current_initial:command+=' --parent-allow-current-initial'
+    lines+=['',f'复现：在DRL目录，用指定Python执行 `{command}`；逐次结果为 `results/gnn_joint_parent_selection_v1.csv`。']
+    marker='\n## 6. 冻结V2父选择消融：learned 对 MRV-LPT'
+    original=REPORT.read_text(encoding='utf-8').split(marker,1)[0].rstrip()
+    REPORT.write_text(original+'\n'+'\n'.join(lines)+'\n',encoding='utf-8')
+
+
+def evaluate_parent_selection(model,args,*,previous_rows=()):
+    """Original fixed-input DEV experiment; only the parent ordering changes."""
+    _,dev=entries();by_name={e['sheet_name']:e for e in dev}
+    historical=list(csv.DictReader(CSV.open(encoding='utf-8-sig')))
+    output=ROOT/'results/gnn_joint_parent_selection_v1.csv'
+    rows=list(previous_rows);blocked=[]
+    fields=('instance','selection','q','attempt','seed','removed_parent_ids','parent_selection_mode',
+            'initial_cmax','historical_initial_cmax','constructed','status','cmax','improved','runtime_s','rejection_reason')
+    # Open the requested output before expensive computation; stream each pair.
+    with output.open('a' if rows else 'w',newline='',encoding='utf-8-sig') as f:
+        writer=csv.DictWriter(f,fieldnames=fields)
+        if not rows:writer.writeheader()
+        f.flush()
+        for name in oriented.NAMES:
+            if name not in args.dev_instances:continue
+            entry=by_name[name]
+            initial,_=oriented.common_initial_beam(dataset.load_parents(entry),CONFIG,seed=args.seed)
+            if initial is None:
+                blocked.append(f'{name}: existing Beam failed');continue
+            old=next(r for r in historical if r['instance']==name and r['method']=='GNN-V2' and r['experiment']=='PAIRED_FIXED')
+            old_cmax=float(old['initial_cmax'])
+            if abs(initial.schedule.cmax-old_cmax)>1e-9*max(1,old_cmax) and not args.parent_allow_current_initial:
+                blocked.append(f'{name}: original Beam {old_cmax:.6f}s, current Beam {initial.schedule.cmax:.6f}s; original directed routes unavailable')
+                print('PARENT INPUT UNAVAILABLE',blocked[-1],flush=True);continue
+            for q in (4,8):
+                for selection in SELECTORS:
+                    for attempt in range(8):
+                        seed=args.seed+oriented.NAMES.index(name)*10000+q*100+attempt
+                        partial=select_bottleneck_parents(initial.solution,initial.directions,initial.schedule,selection,
+                                                          q=q,seed=seed,config=CONFIG)
+                        directions=partial_directions(initial,partial)
+                        order=('learned','mrv') if attempt%2==0 else ('mrv','learned')
+                        for mode in order:
+                            started=time.perf_counter()
+                            result=construct_or_repair_with_gnn(initial.solution,partial.routes,directions,
+                                partial.removed_parent_ids,model,CONFIG,insertion_limit=8,
+                                decode_mode='greedy',parent_selection_mode=mode)
+                            status='CONSTRUCTION_FAILED';cmax=None
+                            if result.solution is not None:
+                                scheduled=oriented.schedule_explicit(result.solution,result.directions,CONFIG)
+                                status=scheduled.schedule.status.value
+                                if scheduled.schedule.status is ScheduleStatus.FEASIBLE:cmax=scheduled.schedule.cmax
+                            elapsed=time.perf_counter()-started
+                            row=dict(instance=name,selection=selection.value,q=q,attempt=attempt,seed=seed,
+                                removed_parent_ids=json.dumps(partial.removed_parent_ids,ensure_ascii=False),
+                                parent_selection_mode=mode,initial_cmax=initial.schedule.cmax,historical_initial_cmax=old_cmax,
+                                constructed=result.solution is not None,status=status,cmax=cmax,
+                                improved=cmax is not None and cmax<initial.schedule.cmax-1e-9*max(1,initial.schedule.cmax),
+                                runtime_s=elapsed,rejection_reason=result.rejection_reason)
+                            rows.append(row);writer.writerow(row)
+                        f.flush()
+                    print('PARENT PAIRED',name,selection.value,q,'8 pairs saved',flush=True)
+    save_parent_selection_report(rows,blocked,args)
+    print('Saved',output,'and appended',REPORT,flush=True)
+    return rows
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--phase',choices=('all','data','train','eval','wait-eval'),default='all')
+    parser.add_argument('--phase',choices=('all','data','train','eval','wait-eval','parent-eval'),default='all')
+    parser.add_argument('--parent-allow-current-initial',action='store_true',
+                        help='allow a current Beam initial differing from the historical V2 input')
     parser.add_argument('--seed',type=int,default=20261027)
     parser.add_argument('--epochs',type=int,default=30)
     parser.add_argument('--train-attempts',type=int,default=3)
@@ -817,6 +925,8 @@ def main():
         model.load_state_dict(checkpoint['state_dict'])
     if args.phase=='wait-eval':
         evaluate_wait(model,args)
+    elif args.phase=='parent-eval':
+        evaluate_parent_selection(model,args)
     else:
         evaluate(model,checkpoint,args)
 

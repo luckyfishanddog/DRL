@@ -579,12 +579,35 @@ class JointTrainingRollout:
     log_prob: torch.Tensor
 
 
+def mrv_parent(state, parent_ids, blocks, patterns, config, *, insertion_limit=8):
+    """Cheap robot/position count product, then LPT and stable parent ID.
+
+    parent_ids is the same feasible-first-child pool used by the learned head.
+    Counts use current route lengths for every child, without enumerating joint
+    combinations or changing any direction/start/sibling candidate pruning.
+    """
+    from .initialization import bounded_insertion_positions
+    def priority(parent):
+        children=sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
+        choices=1
+        for child in children:
+            robots=[r for r in range(4) if robot_is_eligible(child,r,config)]
+            if patterns[parent].kind is SplitKind.X_SPLIT:
+                robots=[(0 if patterns[parent].rail is Rail.UPPER else 2)+int(child.block_id.endswith('::1'))]
+            choices*=sum(len(bounded_insertion_positions(len(state.routes[r]),insertion_limit)) for r in robots)
+        return choices,-sum(config.process_time(b.length) for b in children),parent
+    return min(parent_ids,key=priority)
+
+
 def _decode_joint(reference, routes, directions, pending_parent_ids, model, config,
-                  *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True):
+                  *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
+                  parent_selection_mode='learned'):
     """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
     from .direction import _initial_error
     from mrta_reference.geometry import oriented_endpoints
+    if parent_selection_mode not in ('learned','mrv'):
+        raise ValueError('parent_selection_mode must be learned or mrv')
     started = time.perf_counter()
     actions = []
     try:
@@ -605,10 +628,13 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                                                check_initial_feasibility=check_start(state))
             if not ids:
                 raise _JointActionUnavailable('NO_LEGAL_PARENT_ACTION')
-            parent_logits = model.parent_logits(graph,embeddings,ids,features)
-            if not torch.isfinite(parent_logits).all():
-                raise ValueError('NONFINITE_PARENT_LOGITS')
-            parent = ids[choose(parent_logits,'parent')]
+            if parent_selection_mode=='learned':
+                parent_logits = model.parent_logits(graph,embeddings,ids,features)
+                if not torch.isfinite(parent_logits).all():
+                    raise ValueError('NONFINITE_PARENT_LOGITS')
+                parent = ids[choose(parent_logits,'parent')]
+            else:
+                parent = mrv_parent(state,ids,blocks,patterns,config,insertion_limit=insertion_limit)
             children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
             for child in children:
                 variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit,
@@ -642,7 +668,8 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
 
 def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
                                  model: JointInsertionGNN, config, *, insertion_limit=8,
-                                 decode_mode='greedy', seed=0,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True):
+                                 decode_mode='greedy', seed=0,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
+                                 parent_selection_mode='learned'):
     """No-gradient decoding; complete results are scheduled outside.
 
     The opt-in partial-start repair can restore heads exposed by destruction.
@@ -650,6 +677,8 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
     returns an unresolved conflicting full start. Default decoding and training
     retain their original action space. When restoration is available, prefer
     it to staying in conflict; the preference can be disabled for ablation.
+    parent_selection_mode changes only parent ordering: learned head or cheap
+    deterministic MRV-LPT. Both retain the same insertion head and action pool.
     """
     if decode_mode not in ('greedy','sample'):
         raise ValueError('decode_mode must be greedy or sample')
@@ -665,7 +694,8 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
         return _decode_joint(reference,routes,directions,pending_parent_ids,model,config,
                              insertion_limit=insertion_limit,choose=choose,
                              allow_partial_start_conflicts=allow_partial_start_conflicts,
-                             prefer_legal_start_recovery=prefer_legal_start_recovery)
+                             prefer_legal_start_recovery=prefer_legal_start_recovery,
+                             parent_selection_mode=parent_selection_mode)
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,

@@ -258,8 +258,9 @@ def test_joint_neural_logits_control_robot_choice_and_complete_real_b32(monkeypa
         assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
 
 
+@pytest.mark.parametrize('parent_selection_mode',('learned','mrv'))
 @pytest.mark.parametrize('decode_mode',('greedy','sample'))
-def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder(decode_mode):
+def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder(decode_mode,parent_selection_mode):
     from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
     from mrta_reference.geometry import build_legal_pattern_catalog
     import run_joint_oriented_repair_pilot as direct
@@ -269,7 +270,7 @@ def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder(dec
     reference=canonicalize((parent,),(pattern,),{0:('joint-x::0',),1:('joint-x::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
     torch.manual_seed(20261027)
     result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),('joint-x',),JointInsertionGNN(),CONFIG,
-                                      decode_mode=decode_mode,seed=20261027)
+                                      decode_mode=decode_mode,seed=20261027,parent_selection_mode=parent_selection_mode)
     assert result.solution is not None
     assert result.solution.patterns==(pattern,)
     assert result.solution.routes[0].block_ids==('joint-x::0',)
@@ -286,10 +287,61 @@ def test_joint_default_greedy_matches_explicit_greedy_without_consuming_rng():
     args=(geometry,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
     before=torch.get_rng_state().clone()
     first=construct_or_repair_with_gnn(*args)
-    second=construct_or_repair_with_gnn(*args,decode_mode='greedy',seed=98765)
+    second=construct_or_repair_with_gnn(*args,decode_mode='greedy',seed=98765,parent_selection_mode='learned')
     assert first.solution is not None and second.solution is not None
     assert first.solution.routes==second.solution.routes and first.directions==second.directions
     assert first.actions==second.actions and torch.equal(before,torch.get_rng_state())
+
+
+def test_mrv_uses_child_count_product_then_lpt_then_stable_id(monkeypatch):
+    from types import SimpleNamespace as NS
+    import mrta_search.gnn_constructor as joint
+    state=NS(routes=((),('r',)*3,('r',)*7,('r',)*15))
+    config=NS(process_time=lambda length:length)
+    blocks={name:NS(block_id=name,parent_id=parent,length=length)
+            for name,parent,length in (('a0','a',9),('a1','a',9),('b0','b',1),('c0','c',2),('d0','d',2))}
+    patterns={p:NS(kind=SplitKind.WHOLE) for p in ('a','b','c','d')}
+    legal={'a0':(1,),'a1':(1,),'b0':(0,2),'c0':(0,2),'d0':(0,2)}
+    monkeypatch.setattr(joint,'robot_is_eligible',lambda block,robot,config:robot in legal[block.block_id])
+    # a has 4*4 choices, versus b's 1+8; an additive child count would choose a.
+    assert joint.mrv_parent(state,('a','b'),blocks,patterns,config)=='b'
+    assert joint.mrv_parent(state,('b','c'),blocks,patterns,config)=='c'
+    assert joint.mrv_parent(state,('d','c'),blocks,patterns,config)=='c'
+    # X children are forced to upper robots 0/1: 1*4, not all eligible robots.
+    blocks={'x::0':NS(block_id='x::0',parent_id='x',length=1),
+            'x::1':NS(block_id='x::1',parent_id='x',length=1),'b0':blocks['b0']}
+    monkeypatch.setattr(joint,'robot_is_eligible',lambda *args:True)
+    patterns={'x':NS(kind=SplitKind.X_SPLIT,rail=joint.Rail.UPPER),'b':patterns['b']}
+    assert joint.mrv_parent(state,('x','b'),blocks,patterns,config)=='x'
+
+
+def test_mrv_skips_parent_head_and_preserves_the_common_insertion_pool(monkeypatch):
+    import mrta_search.gnn_constructor as joint
+    from mrta_search import lns
+    reference=_joint_simple_reference();model=joint.JointInsertionGNN()
+    monkeypatch.setattr(model,'parent_logits',lambda graph,embeddings,ids,features:torch.zeros(len(ids)))
+    pools=[]
+    real_candidates=lns.joint_block_candidates
+    def candidates(state,block,*args,**kwargs):
+        rows=real_candidates(state,block,*args,**kwargs)
+        pools.append((state.routes,state.directions,block.block_id,kwargs,
+                      tuple(lns.joint_action_key(a) for _,a in rows)))
+        return rows
+    monkeypatch.setattr(lns,'joint_block_candidates',candidates)
+    args=(reference,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
+    learned=joint.construct_or_repair_with_gnn(*args)
+    original_pools=pools[:];pools.clear()
+    def forbidden(*args):
+        raise AssertionError('MRV must not call parent_head')
+    monkeypatch.setattr(model,'parent_logits',forbidden)
+    before=torch.get_rng_state().clone()
+    mrv=joint.construct_or_repair_with_gnn(*args,parent_selection_mode='mrv')
+    assert original_pools==pools
+    assert learned.solution is not None and mrv.solution is not None
+    assert learned.actions==mrv.actions and learned.directions==mrv.directions
+    assert learned.solution.routes==mrv.solution.routes and torch.equal(before,torch.get_rng_state())
+    with pytest.raises(ValueError,match='parent_selection_mode'):
+        joint.construct_or_repair_with_gnn(*args,parent_selection_mode='unknown')
 
 
 def test_joint_sampling_uses_softmax_for_both_heads_and_a_local_seed(monkeypatch):
