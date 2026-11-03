@@ -904,7 +904,7 @@ def test_method_independent_sampler_is_deterministic_canonical_and_search_free(
 def test_method_independent_pattern_sampling_selects_kind_before_y_candidate() -> None:
     profiler=sys.modules[__name__]
 
-    parent = ParentWeld("optional-many-y", (1.0, 5.8), (9.0, 10.0))
+    parent = ParentWeld("optional-many-y", (1.0, 5.5), (9.0, 10.0))
 
     class RecordingRng:
         def __init__(self):

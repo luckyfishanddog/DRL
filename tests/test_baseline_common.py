@@ -60,6 +60,22 @@ def test_checkpoint_semantics_do_not_backfill_late_feasible_solution():
     assert evaluator.checkpoint_values() == {5.0: None, 30.0: 90.0, 60.0: None}
 
 
+def test_baseline_keeps_timely_solution_when_late_candidate_updates_native_best():
+    from dataclasses import replace
+
+    config, parents, solution = _solution()
+    evaluator = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V1_1, time_limit=30.0)
+    candidate = evaluator.evaluate(solution, source="TIMELY")
+    assert candidate.metrics is not None
+    late = replace(candidate, completed_at=31.0, source="LATE",
+                   metrics=replace(candidate.metrics, cmax=candidate.metrics.cmax - 1.0))
+    evaluator._record_best(late)
+    result = evaluator.finish(method_id="FIXTURE", method_config_hash="fixture",
+                              iterations=1, initialization_time=0.0)
+    assert result.best_source == "LATE"
+    assert result.timely_best == candidate
+
+
 def test_failure_has_no_penalty_cmax_and_is_separately_classified():
     config, parents, _ = _solution()
     evaluator = CommonBaselineEvaluator(

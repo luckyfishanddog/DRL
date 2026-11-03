@@ -30,7 +30,7 @@ def _run(
     parents = to_parent_welds(instance)
     result = run_bounded_sa_oi(
         parents,
-        ScientificConfig(delta_x=0.20, delta_y=0.20),
+        ScientificConfig(delta_x=0.20, delta_y=0.20, min_child_length=0.20),
         SearchConfig(time_limit=budget),
         seed=20260929,
         scope=FORMAL_SCOPE_V1_1,
@@ -115,7 +115,7 @@ def _range_parents(entry, ppo):
 
 def _range_config(group):
     y, x = _RANGE_GROUPS[group]
-    return ScientificConfig(delta_y=y, delta_x=x)
+    return ScientificConfig(delta_y=y, delta_x=x, min_child_length=0.20)
 
 
 def _range_catalog(entries, ppo):
@@ -227,9 +227,9 @@ def _range_write(report, payload):
     from statistics import mean, median
     results = payload["runs"]
     text = "# Y/X 拆分范围 0.5 m：正确性与 development sensitivity\n\n"
-    text += ("当前默认 delta_y=delta_x=0.50 m；最短子焊缝仍为 0.20 m；干涉距离仍为 0.50 m。"
-        "Y 候选为 5.5/5.8/6.0/6.2/6.5，X 为各轨固定中心 ±0.5/±0.2/0，保留合法 MIDPOINT。"
-        "旧点身份保留，新增点使用 OUTER_LOWER/OUTER_UPPER；几何重复去重。按用户最新指示，本轮只保留 A/D 对比，不分析 B/C 单变量方案。\n\n"
+    text += ("这项历史范围敏感性实验使用 0.20 m 最短子段和 0.50 m 干涉距离。"
+        "D 组 Y 固定切点为 5.5/6.0/6.5 m，X 为各轨中心及 ±0.5 m。A 组使用各轴 ±0.2 m 窗口。"
+        "两组均保留合法 MIDPOINT。\n\n"
         "覆盖区域是任务层假设：上轨覆盖 y≥5.5，下轨覆盖 y≤6.5；未做 URDF/IK 物理可达性验证。"
         "Y 覆盖改变 WHOLE/mandatory Y 及 X 中心，A/D 不是同一可行域下的纯算法竞赛。\n\n"
         "Phase3-Z、Phase4-0/0B、Phase4-1A/B/C 均保持历史 0.2 配置身份；旧标签、模型与结论未重写。"

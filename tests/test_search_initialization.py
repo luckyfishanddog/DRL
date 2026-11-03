@@ -646,4 +646,4 @@ def test_jrrb_preserves_mandatory_y_x_children_and_scientific_split_limits():
         assert all(block.length>=FAST.min_child_length-FAST.numeric_epsilon
                    for block in block_map(candidate.solution,FAST).values())
     assert FAST.delta_x==pytest.approx(.5) and FAST.delta_y==pytest.approx(.5)
-    assert FAST.min_child_length==pytest.approx(.2)
+    assert FAST.min_child_length==pytest.approx(.5)

@@ -68,7 +68,7 @@ class ScientificConfig:
     empty_speed: float = 0.20
     t_pre: float = 20.0
     t_post: float = 30.0
-    min_child_length: float = 0.20
+    min_child_length: float = 0.50
     delta_x: float = 0.50
     delta_y: float = 0.50
     interference_dx: float = 0.50

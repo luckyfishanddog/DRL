@@ -23,7 +23,8 @@ from mrta_search.gnn_constructor import (
 
 CSV=ROOT/'results/gnn_multi_initial.csv'
 REPORT=ROOT/'docs/GNN_MULTI_INITIAL.md'
-CONFIG=shared.CONFIG
+from dataclasses import replace as _replace_config
+CONFIG=_replace_config(shared.CONFIG,min_child_length=0.20)
 EMPTY=shared.EMPTY
 
 
@@ -143,11 +144,14 @@ def main():
                                                'diversity-online','diversity-summary','diversity-audit',
                                                'sparse-online','sparse-summary','sparse-audit','sparse-constructor-diagnostic',
                                                'sparse-recovery-budget','recovery-stratified','recovery-summary',
-                                               'bound-shadow','bound-online','bound-summary','fresh-e2e','fresh-summary','summary'))
+                                               'bound-shadow','bound-online','bound-summary','fresh-e2e','fresh-summary','summary','minchild05'))
     parser.add_argument('--workers',type=int,default=4)
     parser.add_argument('--seconds',type=float,default=30.)
     args=parser.parse_args()
     torch.set_num_threads(1)
+    if args.mode_study == 'minchild05':
+        run_minchild05(args.workers)
+        return
     if args.mode_study:
         run_mode_study(args)
         return
@@ -331,7 +335,7 @@ def _mode_worker_init():
     torch.set_num_threads(1)
 
 
-def _mode_search(parents,method,seed,budget,max_iterations):
+def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, certify=True):
     from dataclasses import asdict,replace
     from mrta_reference.certifier import certify_schedule
     from mrta_search.lns import rank_parent_mode_changes,select_bottleneck_parents,repair_partial_state_oriented
@@ -343,15 +347,16 @@ def _mode_search(parents,method,seed,budget,max_iterations):
     initial_events=[]
     def accept_initial(candidate):
         nonlocal certificates
-        check=certify_schedule(candidate.solution,candidate.schedule,CONFIG,scope=FORMAL_SCOPE_V2)
-        certificates+=1
-        if not check.certified:raise ValueError(check.errors)
+        if certify:
+            check=certify_schedule(candidate.solution,candidate.schedule,config,scope=FORMAL_SCOPE_V2)
+            certificates+=1
+            if not check.certified:raise ValueError(check.errors)
         elapsed=time.perf_counter()-started
         if elapsed>budget:return False
         if not initial_events or candidate.schedule.cmax<initial_events[-1][1]:
             initial_events.append([elapsed,candidate.schedule.cmax,'INITIAL'])
         return True
-    current,attempts=pilot.oriented.common_initial_beam(parents,CONFIG,seed=seed,
+    current,attempts=pilot.oriented.common_initial_beam(parents,config,seed=seed,
         deadline=started+budget,accept_candidate=accept_initial,interleave=True)
     calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts)
     init_elapsed=time.perf_counter()-started
@@ -371,12 +376,12 @@ def _mode_search(parents,method,seed,budget,max_iterations):
         selector=pilot.SELECTORS[iteration%3]
         q=min(len(parents),(4,8)[(iteration//3)%2])
         partial=select_bottleneck_parents(current.solution,current.directions,current.schedule,selector,
-                                          q=q,seed=local_seed,config=CONFIG)
+                                          q=q,seed=local_seed,config=config)
         changed=[]
         try_mode=(method.startswith('MODE') and iteration%2==1) or (
             method=='ADAPT_NEW' and iteration-last_mode_iteration>=mode_period)
         if try_mode:
-            alternatives=rank_parent_mode_changes(current.solution,partial,CONFIG)
+            alternatives=rank_parent_mode_changes(current.solution,partial,config)
             if alternatives:
                 # One actual proposal per iteration, with gradual access to
                 # lower-ranked legal alternatives. No hidden B32 screening.
@@ -387,12 +392,12 @@ def _mode_search(parents,method,seed,budget,max_iterations):
                 last_mode_iteration=iteration
         if time.perf_counter()-started>=budget:break
         if model is not None:
-            geometry=joint_geometry(parents,partial.patterns,CONFIG)
+            geometry=joint_geometry(parents,partial.patterns,config)
             result=construct_or_repair_with_gnn(geometry,partial.routes,pilot.partial_directions(current,partial),
-                                               partial.removed_parent_ids,model,CONFIG,insertion_limit=8)
+                                               partial.removed_parent_ids,model,config,insertion_limit=8)
             solution=result.solution
         else:
-            result=repair_partial_state_oriented(current.solution,current.directions,partial,CONFIG,
+            result=repair_partial_state_oriented(current.solution,current.directions,partial,config,
                       seed=local_seed,insertion_limit=8,max_insertion_evaluations=4096,
                       coordination_proxy=True,direction_versions=2,allow_pattern_changes=bool(changed))
             solution=None if result.candidate is None else result.candidate.solution
@@ -402,7 +407,7 @@ def _mode_search(parents,method,seed,budget,max_iterations):
         if solution is None:
             item['reason']=result.rejection_reason
         elif time.perf_counter()-started<budget:
-            candidate=pilot.oriented.schedule_explicit(solution,result.directions,CONFIG)
+            candidate=pilot.oriented.schedule_explicit(solution,result.directions,config)
             row['reference_calls']+=1
             item['status']=candidate.schedule.status.value
             item.update(patterns=[asdict(p) for p in solution.patterns],
@@ -411,10 +416,11 @@ def _mode_search(parents,method,seed,budget,max_iterations):
                         recovery_exhausted=candidate.schedule.recovery_exhausted,
                         frontier_exhausted=candidate.schedule.frontier_exhausted)
             if candidate.schedule.status is ScheduleStatus.FEASIBLE:
-                check=certify_schedule(solution,candidate.schedule,CONFIG,scope=FORMAL_SCOPE_V2)
-                row['certifier_calls']+=1
-                item['certified']=check.certified
-                if not check.certified:raise ValueError(check.errors)
+                if certify:
+                    check=certify_schedule(solution,candidate.schedule,config,scope=FORMAL_SCOPE_V2)
+                    row['certifier_calls']+=1
+                    item['certified']=check.certified
+                    if not check.certified:raise ValueError(check.errors)
                 item['cmax']=candidate.schedule.cmax
                 elapsed=time.perf_counter()-started
                 if elapsed<=budget and candidate.schedule.cmax<current.schedule.cmax-1e-9*max(1.,current.schedule.cmax):
@@ -438,9 +444,10 @@ def _mode_search(parents,method,seed,budget,max_iterations):
         row['trace'].append(item)
         iteration+=1
     elapsed=time.perf_counter()-started
-    row.update(status='CERTIFIED',cmax=current.schedule.cmax,iterations=iteration,actual_runtime=elapsed,
+    row.update(status='CERTIFIED' if certify else 'FEASIBLE',cmax=current.schedule.cmax,iterations=iteration,actual_runtime=elapsed,
                overshoot=max(0.,elapsed-budget),solution=asdict(current.solution),directions=current.directions,
                robot_completion=current.schedule.robot_completion,
+               schedule_summary=None if certify else _minchild_metrics(current.solution,current.schedule,config),
                split_count=sum(p.kind.value!='WHOLE' for p in current.solution.patterns))
     return row
 
@@ -2862,6 +2869,107 @@ def summarize_neighborhood_study(rows):
                 formula='per context percent change, average within geometry then across geometries; '
                         'retain incumbent on failure/worsening; bootstrap 20000 geometry resamples, seed20261030, no multiplicity adjustment',
                 summary=stats,pairs=pairs)
+
+
+def _minchild_metrics(solution, schedule, config):
+    from mrta_reference.solution import block_map
+    from mrta_reference.model import OperationKind
+
+    blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
+    loads = [sum(config.process_time(blocks[b].length) for b in route.block_ids)
+             for route in solution.routes]
+    return dict(max_load=max(loads), loads=json.dumps(loads),
+                travel=sum(op.duration for op in schedule.operations if op.kind is OperationKind.MOVE),
+                wait=sum(op.duration for op in schedule.operations if op.kind is OperationKind.WAIT),
+                split_count=sum(p.kind.value != 'WHOLE' for p in solution.patterns))
+
+
+def _minchild_job(job):
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.model import ScientificConfig
+    from mrta_baselines.wag_vns import run_adapted_wag_vns_v2, AdaptedWAGConfig
+    from mrta_baselines.hga import run_adapted_hga_v2, AdaptedHGAConfig
+
+    parents, row = job
+    config = ScientificConfig()
+    method, seed = row['method'], row['seed']
+    if method in ('WAG', 'HGA'):
+        run, settings = ((run_adapted_wag_vns_v2, AdaptedWAGConfig()) if method == 'WAG'
+                         else (run_adapted_hga_v2, AdaptedHGAConfig()))
+        out = run(parents, config, settings, seed=seed, time_limit=30., checkpoints=(30.,))
+        best = out.timely_best
+        row.update(status='FEASIBLE' if best else 'TIME_LIMIT_NO_FEASIBLE',
+                   runtime=out.actual_runtime, cmax=None if best is None else best.schedule.cmax)
+        solution = None if best is None else best.solution
+        if best:
+            row.update(_minchild_metrics(solution, best.schedule, config))
+    else:
+        out = _mode_search(parents, method, seed, 30., 1000000, config=config, certify=False)
+        row.update(status=out['status'], runtime=out['actual_runtime'], cmax=out['cmax'],
+                   mode_accepted=out['mode_accepted'])
+        solution = out['solution']
+        row.update(out.get('schedule_summary') or {})
+    if solution is not None:
+        from dataclasses import asdict
+        catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+        patterns = solution['patterns'] if isinstance(solution, dict) else [asdict(p) for p in solution.patterns]
+        for pattern in patterns:
+            if not any(pattern == asdict(p) for p in catalog[pattern['parent_id']]):
+                raise ValueError(f"{method} returned a pattern outside the shared catalog: {pattern}")
+    return row
+
+
+def run_minchild05(workers):
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from collections import Counter
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    import multiprocessing
+
+    entries = [r for r in _study_rows() if r.get('record') == 'instance'
+               and r.get('stage') == 'INDEPENDENT' and r.get('version') == 'parent-mode-v2']
+    fields = ('instance','N','method','seed','status','reason','cmax','runtime',
+              'old_whole','old_y_split','old_x_split','new_whole','new_y_split','new_x_split',
+              'split_count','max_load','loads','travel','wait','mode_accepted')
+    jobs = []
+    with (ROOT/'results/joint_weld_minchild05_pilot.csv').open('w', encoding='utf-8-sig', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for entry in entries:
+            parents = tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in entry['parents'])
+            counts = {}
+            reason = ''
+            for label, config in (('old', CONFIG), ('new', ScientificConfig())):
+                try:
+                    catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+                except ValueError as error:
+                    if label != 'new':
+                        raise
+                    reason = str(error)
+                    continue
+                sizes = Counter(p.kind.value.lower() for options in catalog.values() for p in options)
+                counts.update({f'{label}_{kind}': sizes[kind] for kind in ('whole','y_split','x_split')})
+            for seed in (20261031, 20261032):
+                for method in ('MODE_NEW','MODE_GNN','WAG','HGA','FIXED_NEW'):
+                    row = dict(instance=entry['instance'], N=len(parents), seed=seed, method=method, **counts)
+                    if reason:
+                        writer.writerow(dict(row,status='NO_LEGAL_MODE',reason=reason))
+                    else:
+                        jobs.append((parents,row))
+        stream.flush()
+        print('MINCHILD05', len(entries), 'layouts', len(jobs), 'runs', workers, 'workers', flush=True)
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn'),
+                                 initializer=_mode_worker_init) as pool:
+            futures = {pool.submit(_minchild_job, job): job[1] for job in jobs}
+            for future in as_completed(futures):
+                try:
+                    row = future.result()
+                except Exception as error:
+                    row = dict(futures[future],status='EXECUTION_ERROR',reason=str(error))
+                writer.writerow(row)
+                stream.flush()
+                print(row['instance'], row['method'], row['seed'], row['status'], row.get('cmax'),
+                      row.get('reason',''), flush=True)
 
 
 if __name__=='__main__':main()

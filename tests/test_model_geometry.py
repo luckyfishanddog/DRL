@@ -224,7 +224,7 @@ def test_scientific_defaults_and_whole_eligibility() -> None:
     assert CONFIG.t_post == 30.0
     assert CONFIG.by == (5.5, 6.5)
     assert CONFIG.delta_x == CONFIG.delta_y == 0.5
-    assert CONFIG.min_child_length == 0.2
+    assert CONFIG.min_child_length == 0.5
     assert CONFIG.interference_dx == CONFIG.interference_dy == 0.5
     assert whole_eligible_rails((0, 6.0), (2, 6.1), CONFIG) == frozenset((Rail.UPPER, Rail.LOWER))
     assert whole_eligible_rails((0, 7.0), (2, 8.0), CONFIG) == frozenset((Rail.UPPER,))
@@ -263,16 +263,16 @@ def test_y_candidates_are_only_boundaries_center_midpoint_and_deterministically_
 
 def test_split_length_conservation_and_lmin_validation() -> None:
     parent = ParentWeld("p", (0.0, 8.0), (1.0, 8.0))
-    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.2, "given-x", rail=Rail.UPPER)
+    pattern = SplitPattern("p", SplitKind.X_SPLIT, 0.5, "given-x", rail=Rail.UPPER)
     blocks = blocks_for_pattern(parent, pattern, CONFIG)
     assert len(blocks) == 2
     assert sum(block.length for block in blocks) == pytest.approx(parent.length)
     assert min(block.length for block in blocks) >= CONFIG.min_child_length
     with pytest.raises(ValueError, match="Lmin"):
-        blocks_for_pattern(parent, SplitPattern("p", SplitKind.X_SPLIT, 0.19, "short", rail=Rail.UPPER), CONFIG)
+        blocks_for_pattern(parent, SplitPattern("p", SplitKind.X_SPLIT, 0.499, "short", rail=Rail.UPPER), CONFIG)
 
     exactly = blocks_for_pattern(
-        parent, SplitPattern("p", SplitKind.X_SPLIT, 0.2, "exact-lmin", rail=Rail.UPPER), CONFIG
+        parent, SplitPattern("p", SplitKind.X_SPLIT, 0.5, "exact-lmin", rail=Rail.UPPER), CONFIG
     )
     assert exactly[0].length == pytest.approx(CONFIG.min_child_length)
     with pytest.raises(ValueError, match="Lmin"):
@@ -459,14 +459,14 @@ def test_y_whole_eligibility_and_mandatory_change_with_task_coverage():
             assert robot_is_eligible(lower,2,CONFIG) and robot_is_eligible(upper,0,CONFIG)
 
 
-@pytest.mark.parametrize('length,allowed', ((.398,False),(.4,True)))
+@pytest.mark.parametrize('length,allowed', ((.998,False),(1.,True)))
 def test_y_exact_euclidean_child_minimum(length,allowed):
     parent=ParentWeld('p',(1.,6.-length/2),(1.,6.+length/2))
     patterns=generate_y_split_patterns(parent,CONFIG)
     assert bool(patterns)==allowed
     if allowed:
         assert len(patterns)==1
-        assert [b.length for b in blocks_for_pattern(parent,patterns[0],CONFIG)]==pytest.approx([.2,.2])
+        assert [b.length for b in blocks_for_pattern(parent,patterns[0],CONFIG)]==pytest.approx([.5,.5])
 
 
 def test_oblique_cut_uses_euclidean_length_not_axis_projection():
@@ -483,10 +483,23 @@ def test_x_endpoints_vertical_and_short_children_filtered_at_05():
     parent=ParentWeld('p',(2.5,8.),(3.5,8.))
     points=[parent.point(p.t)[0] for p in generate_x_split_patterns(parent,3.,CONFIG,rail=Rail.UPPER)]
     assert points==pytest.approx([3.])
-    for length,allowed in ((.398,False),(.4,True)):
+    for length,allowed in ((.8,False),(.998,False),(1.,True)):
         short=ParentWeld('short',(3.-length/2,8.),(3.+length/2,8.))
         cuts=generate_x_split_patterns(short,3.,CONFIG,rail=Rail.UPPER)
         assert bool(cuts)==allowed
+
+
+def test_short_whole_and_mandatory_y_without_legal_cut():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    short = ParentWeld('short', (1., 8.), (1.8, 8.))
+    catalog = build_legal_pattern_catalog((short,), CONFIG, FORMAL_SCOPE_V2)
+    assert [p.kind for p in catalog['short']] == [SplitKind.WHOLE]
+    # Use a smaller overlap only to construct a mandatory infeasibility fixture.
+    config = ScientificConfig(delta_y=.2)
+    crossing = ParentWeld('crossing', (1., 5.7), (1., 6.3))
+    with pytest.raises(ValueError, match='mandatory Y family is empty'):
+        build_legal_pattern_catalog((crossing,), config, FORMAL_SCOPE_V2)
 
 
 def test_y_expansion_changes_rail_specific_weighted_centers():

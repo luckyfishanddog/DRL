@@ -153,6 +153,7 @@ class BaselineResult:
     termination_reason: str
     initial_candidate: EvaluatedCandidate | None
     initial_reference_calls: int
+    timely_best: EvaluatedCandidate | None = None
 
     @property
     def final_certified(self) -> bool:
@@ -249,6 +250,7 @@ class CommonBaselineEvaluator:
         self.deadline = self.started + self.time_limit
         self.accounting = BaselineAccounting()
         self.best: EvaluatedCandidate | None = None
+        self.timely_best: EvaluatedCandidate | None = None
         self.best_events: list[BaselineBestEvent] = []
         self.first_certified: float | None = None
         self.failure_diagnostics: list[str] = []
@@ -293,6 +295,10 @@ class CommonBaselineEvaluator:
     def _record_best(self, candidate: EvaluatedCandidate) -> None:
         if candidate.metrics is None:
             return
+        if candidate.completed_at <= self.time_limit and (
+            self.timely_best is None or candidate.metrics.compare(self.timely_best.metrics) < 0
+        ):
+            self.timely_best = candidate
         if self.first_certified is None:
             self.first_certified = candidate.completed_at
         if self.best is None or candidate.metrics.compare(self.best.metrics) < 0:  # type: ignore[arg-type]
@@ -502,6 +508,7 @@ class CommonBaselineEvaluator:
         else:
             status = BaselineStatus.TIME_LIMIT_NO_FEASIBLE
         return BaselineResult(
+            timely_best=self.timely_best,
             method_id=method_id,
             status=status,
             solution=None if best is None else best.solution,
