@@ -606,6 +606,46 @@ def select_bottleneck_parents(
     return _remove_parent_set(current, removed)
 
 
+def select_schedule_blocker_parents(current, schedule, evidence, *, q, seed, config):
+    """Experimental direct-blocker core plus immediate route neighbours only.
+
+    Returns the closed partial and selected evidence. q is an upper bound.
+    Forbidden-interval union coverage ranks direct blocking parents; it is not
+    a causal decomposition of waiting time. No distance/time proxy is added.
+    """
+    if not schedule.feasible or not 1<=q<=len(current.parents):
+        raise ValueError('blocker selection requires a feasible schedule and valid q')
+    blocks=block_map(current,config)
+    events=[event for event in evidence if event.waiting.duration>config.numeric_epsilon
+            and event.delayed_block_id in blocks
+            and any(block_id in blocks for _,block_id,_ in event.blocker_intervals)]
+    if not events:return None,None
+    completion=schedule.robot_completion
+    maximum=max(max(completion),config.numeric_epsilon)
+    weights=[e.waiting.duration*(0.25+completion[e.waiting.robot_id]/maximum)**2 for e in events]
+    event=random.Random(seed).choices(events,weights=weights,k=1)[0]
+    delayed=blocks[event.delayed_block_id].parent_id
+    intervals={}
+    for _,block_id,spans in event.blocker_intervals:
+        if block_id in blocks:
+            intervals.setdefault(blocks[block_id].parent_id,[]).extend(spans)
+    def contribution(parent):
+        total=0.;end=-math.inf
+        for lo,hi in sorted(intervals[parent]):
+            total+=max(0.,hi-max(lo,end));end=max(end,hi)
+        return total
+    core=[delayed]+sorted((p for p in intervals if p!=delayed),key=lambda p:(-contribution(p),p))
+    removed=core[:q]
+    if len(removed)<q:
+        neighbours=set()
+        for route in current.routes:
+            for i,block_id in enumerate(route.block_ids):
+                if blocks[block_id].parent_id in core:
+                    neighbours.update(blocks[b].parent_id for b in route.block_ids[max(0,i-1):i+2])
+        removed+=sorted(neighbours-set(removed))[:q-len(removed)]
+    return _remove_parent_set(current,removed),event
+
+
 def _insert_one(
     routes: tuple[tuple[str, ...], ...],
     hints: tuple[tuple[int, ...], ...],

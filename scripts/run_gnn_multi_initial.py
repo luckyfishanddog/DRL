@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+import gzip
 import json
 from pathlib import Path
 import sys
@@ -306,7 +307,7 @@ def run_diagnostic(args):
             pilot.oriented.schedule_explicit=original
 
 
-STUDY_PATH=ROOT/'results/parent_mode_reconstruction_20261030.jsonl'
+STUDY_PATH=ROOT/'results/parent_mode_reconstruction_20261030.jsonl.gz'
 STUDY_VERSION='parent-mode-v4-outer'
 STUDY_ARMS=('FIXED_NEW','MODE_NEW','FIXED_GNN','MODE_GNN','ADAPT_NEW')
 
@@ -314,13 +315,16 @@ STUDY_ARMS=('FIXED_NEW','MODE_NEW','FIXED_GNN','MODE_GNN','ADAPT_NEW')
 def _study_append(row):
     # The user explicitly authorized this one new result file. Geometry,
     # parameters and run traces share it; no workbook/checkpoint is created.
-    with STUDY_PATH.open('a',encoding='utf-8') as stream:
-        stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+'\n')
+    line = json.dumps(row, ensure_ascii=False, allow_nan=False)
+    with gzip.open(STUDY_PATH, 'at', encoding='utf-8') as stream:
+        stream.write(line + '\n')
 
 
 def _study_rows():
-    return ([json.loads(line) for line in STUDY_PATH.read_text(encoding='utf-8').splitlines() if line]
-            if STUDY_PATH.exists() else [])
+    if not STUDY_PATH.exists():
+        return []
+    with gzip.open(STUDY_PATH, 'rt', encoding='utf-8') as stream:
+        return [json.loads(line) for line in stream if line.strip()]
 
 
 def _mode_worker_init():

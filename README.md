@@ -1,5 +1,9 @@
 # Multi-Robot Weld Allocation and Sequencing
 
+Historical work and results: [experiment record](docs/DRL已完成工作与实验结果.md).
+
+Parent-mode reconstruction traces are stored as [gzip-compressed JSON Lines](results/parent_mode_reconstruction_20261030.jsonl.gz). The study script reads and appends to this file directly. Historical references to the plain JSONL name refer to the same records.
+
 Current research direction (2026-10-26): [joint graph-policy construction and conflict-related reconstruction](docs/多机器人焊缝分配与排序实验方案.md). The revised plan contains primary literature and official GitHub sources, a concrete joint-insertion/partial-reconstruction design, common-domain comparisons with HGA/WAG, and implementation mapping to existing files. It is a proposed method, not a trained replacement or a superiority claim. A fresh 18-evaluation replay of the existing six DEV instances reproduced the current weakness: RULE+GNN-order has 2 wins/4 losses versus RULE (median Cmax +0.51%); the existing joint model has 1 win/4 losses plus one DEADLOCK (median +2.96% on the five successful pairs). No new files or model weights were created, and solver defaults are unchanged. The historical stages below retain their original scope.
 
 FORMAL_SCOPE_V2 active: WHOLE / Y_SPLIT / X_SPLIT.
@@ -19,8 +23,8 @@ The Phase3-Z and Phase4-0/0B/1A/1B/1C evidence below is **historical delta_x=del
 - Historical V1 fixed-model follow-up: LARGE MLP-C2 Top8 capture median is 92.24% in TRAIN vs 0% in DEV; 10/12 DEV material states miss improvement before C4. MEDIUM captures improvement in 4/6 states at Top8, then loses all four at C4. Both stages need attention; GAT: NOT YET.
 - TWO_OPT_STAR remains OFF. V2_VALIDATION is consumed; final ID_TEST remains sealed.
 
-Scientific rules: [FORMAL_SCOPE_V2](docs/FORMAL_SCOPE_V2.md) and [实验方案](docs/多机器人焊缝分配与排序实验方案.md).
-Current evidence: [offline pool/materiality](docs/PHASE4_0B_POOL_SCALING_AND_MATERIALITY_20261007.md), [native production pool and MLP split](docs/PHASE4_1A_PRODUCTION_POOL_AND_MLP_DATA_PREP_20261007.md), [V1 failure and cleanup](docs/PHASE4_1B_MLP_CANDIDATE_RANKER_20261007.md), [Top-K objective results](docs/PHASE4_1C_MLP_TOPK_RANKER_20261008.md), [Phase4-1C result JSON](data/development/phase4_1c_mlp_results.json).
+Scientific rules: [FORMAL_SCOPE_V2](docs/DRL已完成工作与实验结果.md) and [实验方案](docs/多机器人焊缝分配与排序实验方案.md).
+Current evidence: [offline pool/materiality](docs/DRL已完成工作与实验结果.md), [native production pool and MLP split](docs/DRL已完成工作与实验结果.md), [V1 failure and cleanup](docs/DRL已完成工作与实验结果.md), [Top-K objective results](docs/DRL已完成工作与实验结果.md), [Phase4-1C result JSON](data/development/phase4_1c_mlp_results.json).
 Historical formal Phase3-Z remains FAIL / 179 of 180 certified; no final-test superiority claim is made.
 
 ## Run locally
@@ -59,7 +63,7 @@ Four native S1 pools contain 44 certified ≥0.5% improvements; C2 retains 3 and
 
 A geometry-only clearance partition replaces the fifth construction when explicitly enabled, within the original 5/5/1 initialization budgets and existing bounded direction attempts. It fixes I3's serial fallback, but is **not recommended as the default**: all 16 fresh paired 60-second runs certified; I3 improves in both seeds, S1 improves slightly/moderately but both improved runs have zero search Cmax gain, S2 worsens 39.67%/21.70%, and N55 improves slightly. Production initialization stays **BASELINE**, with heuristic C2/C4. No MLP/GAT training.
 
-Report and raw diagnostics: [initialization and screening results](docs/INITIALIZATION_AND_S1_SCREENING_FIX.md), [fixed states and actual labels](data/development/s1_screening_diagnostic.sqlite). Historical results remain unchanged. Final full regression: **317 passed**.
+Report and raw diagnostics: [initialization and screening results](docs/DRL已完成工作与实验结果.md), [fixed states and actual labels](data/development/s1_screening_diagnostic.sqlite). Historical results remain unchanged. Final full regression: **317 passed**.
 
 ## Coordination-aware C2 development result (0.50 m)
 
@@ -67,7 +71,7 @@ The optional `COORDINATION_AWARE_C2` preserves family access and the cheap-score
 
 On the four existing S1 states, C2 material selections increased 3→4 while unchanged C4 retained 1→1. Across nine additional N35/N55/N85 consumed-development states, C2 certified rate increased 30.56%→43.06%, material selections 7/49→9/49 and DEADLOCK 48/72→39/72; unchanged C4 retained 2/49 in both cases. In 24 fresh native 60-second runs, all certified and all 12 paired Cmax@60 values tied exactly. Coordination scoring used 1.150 s across its twelve runs (0.160% of wall-clock budgets), with no M/K/reference-budget change.
 
-Production therefore remains baseline initialization + `BASELINE_C2` + heuristic C4. The inexpensive proxy is retained only as a development ablation. Evidence now supports collecting new 0.50-domain TRAIN/DEV labels for a ranking-aligned MLP-C2 study, with C4 trained on the real C2 hard distribution; no MLP/GAT training was started here. Details: [coordination-aware C2 report](docs/C2_COORDINATION_AWARE_SCREENING.md) and the existing [raw diagnostic database](data/development/s1_screening_diagnostic.sqlite). Full regression: **320 passed**.
+Production therefore remains baseline initialization + `BASELINE_C2` + heuristic C4. The inexpensive proxy is retained only as a development ablation. Evidence now supports collecting new 0.50-domain TRAIN/DEV labels for a ranking-aligned MLP-C2 study, with C4 trained on the real C2 hard distribution; no MLP/GAT training was started here. Details: [coordination-aware C2 report](docs/DRL已完成工作与实验结果.md) and the existing [raw diagnostic database](data/development/s1_screening_diagnostic.sqlite). Full regression: **320 passed**.
 
 ## Region-cooperative initialization (0.50 m)
 
@@ -75,7 +79,7 @@ Production therefore remains baseline initialization + `BASELINE_C2` + heuristic
 
 All **10/10 zero-search** and **48/48 real 60-second** consumed-development runs certified. Region+HEURISTIC versus baseline+HEURISTIC is **9/3/0 wins/ties/losses**, median Cmax change **−4.56%**. Region+GAT versus Region+HEURISTIC is **6/2/4**, median **−0.07%** and mean **+0.14%**; frozen GAT V05 has no stable independent gain on the stronger seed. I3 is repaired, S2 improves instead of regressing, S1 still falls back, and the roughly 50% initial improvements on N55-I6/N85-I9 are followed by little or no further search improvement.
 
-Because the upgraded method was developed only on consumed-development workbooks, production remains `BASELINE` until new independent workbooks are available. The frozen region method is the candidate for that test. Results: [region-cooperative initialization report](docs/REGION_COOPERATIVE_INITIALIZATION_RESULTS.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`.
+Because the upgraded method was developed only on consumed-development workbooks, production remains `BASELINE` until new independent workbooks are available. The frozen region method is the candidate for that test. Results: [region-cooperative initialization report](docs/DRL已完成工作与实验结果.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`.
 
 ## CRRR structural-neighborhood result (0.50 m)
 
@@ -83,13 +87,13 @@ Because the upgraded method was developed only on consumed-development workbooks
 
 All 24 new consumed-development 60-second runs certified. CRRR+HEURISTIC versus original REGION+HEURISTIC is **2/8/2**, median 0.00%, mean **+1.60%**, including a **+20.95%** S1 regression. CRRR+GAT versus original REGION+GAT is **1/7/4**, median 0.00%, mean -0.62%; its only win is I5 seed 20261702 (-22.81%), while the other I5 seed worsens +7.20%. Across 2272 CRRR attempts, 1855 are unique, 88 reach C2, 44 reach C4/B32, 27 are accepted, but only **3 strictly reduce Cmax**, all on I5. Four-state offline replay confirms useful S1/I5 candidates exist but the frozen online funnel often misses them.
 
-Decision: **CRRR is not a default neighborhood** and the enhanced search is not frozen as a new paper method. The code remains an optional ablation; no further GAT training or neighborhood stacking follows from this development result. Complete evidence: [CRRR search results](docs/CRRR_SEARCH_RESULTS.md). Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
+Decision: **CRRR is not a default neighborhood** and the enhanced search is not frozen as a new paper method. The code remains an optional ablation; no further GAT training or neighborhood stacking follows from this development result. Complete evidence: [CRRR search results](docs/DRL已完成工作与实验结果.md). Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
 
 ### CRRR C2 access follow-up
 
 The default-off `CRRR_ACCESS_C2` preserves the original four-family access and can replace at most one non-protected Top8 slot using a fixed, pre-direction comparison of projected process load, route-travel delta, same-rail overlap and first-task order risk. Offline replay retains the known improving S1/I5 CRRR candidates without injecting I6/I9 candidates; only I5 improves the known Top8 certified bound.
 
-All 12 new consumed-development 60-second runs certified. CRRR C2 access rises from 32 to 71 selections, but C4 remains 10 and all ten B32 results are `DEADLOCK`; CRRR accepted moves and strict Cmax improvements are both zero. Versus the original CRRR heuristic it is **1/11/0**, median 0.00%; the sole difference has no access injection or CRRR C4 evaluation and is not attributable to CRRR. Versus REGION+original LNS it remains **2/8/2**, median 0.00%, mean **+1.54%**, with the same **+20.95%** S1 regression. Decision: `CRRR_ACCESS_C2` and CRRR stay default-off, and no further CRRR score tuning is justified. Evidence: [CRRR C2 access results](docs/CRRR_C2_ACCESS_RESULTS.md). Current regression: **334 passed**.
+All 12 new consumed-development 60-second runs certified. CRRR C2 access rises from 32 to 71 selections, but C4 remains 10 and all ten B32 results are `DEADLOCK`; CRRR accepted moves and strict Cmax improvements are both zero. Versus the original CRRR heuristic it is **1/11/0**, median 0.00%; the sole difference has no access injection or CRRR C4 evaluation and is not attributable to CRRR. Versus REGION+original LNS it remains **2/8/2**, median 0.00%, mean **+1.54%**, with the same **+20.95%** S1 regression. Decision: `CRRR_ACCESS_C2` and CRRR stay default-off, and no further CRRR score tuning is justified. Evidence: [CRRR C2 access results](docs/DRL已完成工作与实验结果.md). Current regression: **334 passed**.
 
 ## Equivalent LNS computation acceleration (0.50 m)
 
@@ -97,7 +101,7 @@ The optional `lns_incremental_scoring` path removes repeated four-route load and
 
 WHOLE/Y/X unit replay and native fixed-iteration N35/N55/N85 replay match candidate identities/order, C2 Top8, direction, C4 Top2, B32, SA and final solutions exactly. Single-process microbenchmarks show **3.09×–4.71×** LNS-repair and **1.22×–2.39×** complete candidate-generation speedups. In 24 instrumented 60-second consumed-development runs, all certify; accelerated versus legacy is **3/9/0 wins/ties/losses**, median Cmax change **0.00%**, mean **−1.82%**, worst **0.00%**. Iterations rise 133→202, search references 460→696, and strict Cmax decreases 33→37. Gains occur on one S1 seed and both I5 seeds; all N85 pairs tie.
 
-Decision: retain the equivalent acceleration as a default-off candidate for new independent validation. It improves real search opportunity without changing decisions, but does not close the historical HGA/WAG gap and is not a new search-method contribution. Evidence: [LNS equivalent acceleration report](docs/LNS_EQUIVALENT_ACCELERATION_RESULTS.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
+Decision: retain the equivalent acceleration as a default-off candidate for new independent validation. It improves real search opportunity without changing decisions, but does not close the historical HGA/WAG gap and is not a new search-method contribution. Evidence: [LNS equivalent acceleration report](docs/DRL已完成工作与实验结果.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
 
 ## Upgraded independent five-method comparison (0.50 m)
 
@@ -105,7 +109,7 @@ The frozen independent-test methods are `BASELINE_HEURISTIC`, `REGION_FAST_HEURI
 
 All **375/375 real 60-second runs** completed. BASELINE, REGION_FAST_HEURISTIC, REGION_FAST_GAT and WAG certified 75/75; HGA certified 73/75, with two unretried `TIME_LIMIT_NO_FEASIBLE` runs on the hardest LARGE workbook. At workbook-level five-seed medians, REGION_FAST_HEURISTIC versus BASELINE is **11/4/0**, median **-2.25%**, mean **-8.86%**. Frozen GAT versus the identical REGION+FAST skeleton is **8/2/5**, median **-0.23%**, mean **-4.28%**; its workbook bootstrap median interval crosses zero, so it is not a stable independent gain.
 
-Against WAG, REGION_FAST_HEURISTIC is **7/0/8** (median +0.10%, mean +13.68%) and REGION_FAST_GAT is **8/0/7** (median -0.29%, mean +7.82%). MEDIUM and the high-work-content LARGE_04 remain serious weaknesses; on LARGE_04, WAG median Cmax is 6663.3 s versus 10562.3 s for REGION_FAST_HEURISTIC and 10355.4 s for GAT. The enhanced deterministic configuration is therefore frozen as the principal GRC-ALNS method, while GAT V05 remains a learning ablation rather than the claimed source of stable superiority. The evidence supports robust improvement over original ALNS, not uniform superiority over HGA/WAG. Full results: [upgraded independent comparison](docs/UPGRADED_GRC_INDEPENDENT_COMPARISON.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. DRL regression: **335 passed**; project-root plus DRL discovery: **707 passed, 1 skipped, 3 subtests passed**.
+Against WAG, REGION_FAST_HEURISTIC is **7/0/8** (median +0.10%, mean +13.68%) and REGION_FAST_GAT is **8/0/7** (median -0.29%, mean +7.82%). MEDIUM and the high-work-content LARGE_04 remain serious weaknesses; on LARGE_04, WAG median Cmax is 6663.3 s versus 10562.3 s for REGION_FAST_HEURISTIC and 10355.4 s for GAT. The enhanced deterministic configuration is therefore frozen as the principal GRC-ALNS method, while GAT V05 remains a learning ablation rather than the claimed source of stable superiority. The evidence supports robust improvement over original ALNS, not uniform superiority over HGA/WAG. Full results: [upgraded independent comparison](docs/DRL已完成工作与实验结果.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. DRL regression: **335 passed**; project-root plus DRL discovery: **707 passed, 1 skipped, 3 subtests passed**.
 
 ## First runnable GRC-ALNS (0.50 m)
 
@@ -115,7 +119,7 @@ Fixed 0.50-domain MLP-C2/C4 and a two-layer, four-head, hidden-64 GAT are now op
 
 On DEV, heuristic→GAT C2 material capture is **8.99%→14.61%**, certified rate **31.99%→42.28%**, and material zero-capture **43.75%→37.50%**. C4 capture is **2.25%→4.78%**, but much of the C2 gain is still lost. Removing weld-weld edges leaves every reported stratified Top-K metric unchanged, so this first version does not establish an incremental graph-relation benefit.
 
-The required 18 native 60-second development runs all have certified Cmax@60 and zero numeric failures. Relative to heuristic, MLP is **1/0/5** and GAT **3/0/3** wins/ties/losses: GAT loses both N35 pairs, wins both N55 pairs, and splits N85. GAT ranking consumes 30.896 s across its six 60-second runs (8.58% of their wall-clock budgets). Therefore GAT is retained as a runnable development/paper method, but is **not recommended as production default**. Full evidence and per-tier tables: [GRC-ALNS first results](docs/GRC_ALNS_GAT_FIRST_RESULTS.md); raw candidates, labels, offline metrics and run records: `data/development/graph_ranker_dataset_v05.sqlite`.
+The required 18 native 60-second development runs all have certified Cmax@60 and zero numeric failures. Relative to heuristic, MLP is **1/0/5** and GAT **3/0/3** wins/ties/losses: GAT loses both N35 pairs, wins both N55 pairs, and splits N85. GAT ranking consumes 30.896 s across its six 60-second runs (8.58% of their wall-clock budgets). Therefore GAT is retained as a runnable development/paper method, but is **not recommended as production default**. Full evidence and per-tier tables: [GRC-ALNS first results](docs/DRL已完成工作与实验结果.md); raw candidates, labels, offline metrics and run records: `data/development/graph_ranker_dataset_v05.sqlite`.
 
 Final regression after GRC integration: **323 passed** with `pytest -q -p no:cacheprovider`.
 
@@ -125,7 +129,7 @@ V05 inference now batches block projection and reuses exact ordered-route summar
 
 `gat_v06.pt` replaces the telescoping adjacency mean with real consecutive-weld transition tokens and gives C4 its own trainable transition/route/fusion adapter. C4 adapter gradient is nonzero and C4 training leaves C2 outputs unchanged. The independently trained `gat_v06_no_weld_edges.pt` differs on 24/34 C2 and 10/34 C4 Top-K selections, but full-graph DEV C4 material capture exceeds the ablation by only **0.28 percentage points**; graph-relation benefit remains weak.
 
-In the complete 48-run consumed-development matrix, all runs certify with zero numeric failures. V06 versus heuristic is **6/2/4 wins/ties/losses**, median Cmax change **−0.01%** (N35 **2/1/1**, N55 **2/0/2**, N85 **2/1/1**). V06 performs 144 iterations and 606 reference calls versus heuristic 133/488, but DEV material capture is below V05 at both C2 (13.48% vs 14.61%) and C4 (3.65% vs 4.78%), and large opposite-direction instance effects persist. Production therefore remains heuristic; V05 acceleration is retained, while V06 is development-only. Full evidence: [GRC-ALNS V2 results](docs/GRC_ALNS_V2_RESULTS.md). Final regression: **326 passed**.
+In the complete 48-run consumed-development matrix, all runs certify with zero numeric failures. V06 versus heuristic is **6/2/4 wins/ties/losses**, median Cmax change **−0.01%** (N35 **2/1/1**, N55 **2/0/2**, N85 **2/1/1**). V06 performs 144 iterations and 606 reference calls versus heuristic 133/488, but DEV material capture is below V05 at both C2 (13.48% vs 14.61%) and C4 (3.65% vs 4.78%), and large opposite-direction instance effects persist. Production therefore remains heuristic; V05 acceleration is retained, while V06 is development-only. Full evidence: [GRC-ALNS V2 results](docs/DRL已完成工作与实验结果.md). Final regression: **326 passed**.
 
 ## B32 hard deadline and initialization diagnosis (2026-10)
 

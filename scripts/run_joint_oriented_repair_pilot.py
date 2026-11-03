@@ -44,7 +44,7 @@ class DirectedSolution:
     schedule: object
 
 
-def schedule_explicit(solution, directions, config):
+def schedule_explicit(solution, directions, config, *, feasible_dispatch_observer=None):
     """Basic input/output checks and exactly one call to the existing B32."""
     blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
     normalized = canonicalize(solution.parents, solution.patterns, solution.routes, config, scope=FORMAL_SCOPE_V2)
@@ -61,7 +61,8 @@ def schedule_explicit(solution, directions, config):
         if any(not robot_is_eligible(blocks[b], r, config) for b in route.block_ids):
             raise ValueError("robot eligibility mismatch")
     explicit = {r: tuple(directions[r]) for r in range(4)}
-    schedule = reference_schedule_formal(solution, config, scope=FORMAL_SCOPE_V2, orientations=explicit)
+    schedule = reference_schedule_formal(solution, config, scope=FORMAL_SCOPE_V2, orientations=explicit,
+        **({'feasible_dispatch_observer':feasible_dispatch_observer} if feasible_dispatch_observer is not None else {}))
     if schedule.status is ScheduleStatus.FEASIBLE:
         welds = [op for op in schedule.operations if op.kind is OperationKind.WELD]
         if Counter(op.block_id for op in welds) != Counter(blocks.keys()):
@@ -149,7 +150,7 @@ def initial_reference(parents, config, scheme):
 
 
 def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
-                        deadline=None, accept_candidate=None, interleave=False):
+                        deadline=None, accept_candidate=None, interleave=False,feasible_dispatch_observer=None):
     attempts = []
     schemes=("REGION_LOCAL", "RULE_X_LOCAL")
     beams={}
@@ -177,7 +178,8 @@ def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
                                       config,scope=FORMAL_SCOPE_V2)
                 if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
                     raise ValueError('fixed-mode beam candidate changed during canonicalization')
-                candidate=schedule_explicit(solution,state.directions,config)
+                candidate=schedule_explicit(solution,state.directions,config,
+                    **({'feasible_dispatch_observer':feasible_dispatch_observer} if feasible_dispatch_observer is not None else {}))
             except (ValueError,ArithmeticError) as error:
                 attempts.append(dict(scheme=scheme,status='CONSTRUCTION_FAILED',diagnostics=(str(error),)))
                 if successful and ((interleave and scheme==schemes[-1]) or (not interleave and index==3)):

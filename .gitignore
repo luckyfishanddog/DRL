@@ -3,6 +3,3 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 /data/local/ppo_smokeset/
-
-# Large raw experiment data stays local
-/results/parent_mode_reconstruction_20261030.jsonl

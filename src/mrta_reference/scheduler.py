@@ -907,6 +907,7 @@ class PreparedDispatchProblem:
     fixed_index_snapshots: dict[tuple[Operation, ...], _RelevantFixedIndex] = field(
         default_factory=dict
     )
+    feasible_dispatch_observer: Callable | None = field(default=None,repr=False,compare=False)
 
 
 def prepare_dispatch_problem(
@@ -1111,13 +1112,16 @@ class _OptimizedDispatchKernel:
         return result
 
     def feasible_result(self, state: DispatchState) -> ScheduleResult:
-        return ScheduleResult(
+        result = ScheduleResult(
             ScheduleStatus.FEASIBLE,
             tuple(sorted(state.fixed_operations, key=_operation_sort_key)),
             max(state.completion, default=0.0),
             state.completion,
             directions=self.directions,
         )
+        if self.prepared is not None and self.prepared.feasible_dispatch_observer is not None:
+            self.prepared.feasible_dispatch_observer(result,state.fixed_operations)
+        return result
 
     def deadlock_result(
         self, state: DispatchState, choice_set: DispatchChoiceSet
@@ -1694,6 +1698,7 @@ _limited_discrepancy_dispatch_recovery = _limited_discrepancy_dispatch_recovery_
 def reference_schedule_from_templates_formal(
     templates_by_robot, config: ScientificConfig, *, scope: FormalScope = ACTIVE_FORMAL_SCOPE,
     directions=((), (), (), ()), profile: SchedulerProfile | None = None,
+    feasible_dispatch_observer=None,
 ) -> ScheduleResult:
     """Formal dispatch policy for operation fixtures; no parent-coverage claim."""
     scope.validate_implemented()
@@ -1723,6 +1728,7 @@ def reference_schedule_from_templates_formal(
             directions=directions,
             profile=profile,
         )
+        prepared.feasible_dispatch_observer=feasible_dispatch_observer
         baseline_outcome = _prepared_dispatch_outcome(
             prepared, profile=profile, collect_trace=True
         )
@@ -1751,6 +1757,7 @@ def reference_schedule_formal(
     scope: FormalScope = ACTIVE_FORMAL_SCOPE,
     orientations: Mapping[int, Sequence[int]] | None = None,
     profile: SchedulerProfile | None = None,
+    feasible_dispatch_observer=None,
 ) -> ScheduleResult:
     """The common formal evaluator. Development callbacks/X providers are absent."""
     scope.validate_implemented()
@@ -1801,7 +1808,8 @@ def reference_schedule_formal(
     )
     def dispatch(templates, cfg, *, directions, profile):
         return reference_schedule_from_templates_formal(
-            templates, cfg, scope=scope, directions=directions, profile=profile
+            templates, cfg, scope=scope, directions=directions, profile=profile,
+            **({'feasible_dispatch_observer':feasible_dispatch_observer} if feasible_dispatch_observer is not None else {})
         )
     result = _reference_schedule_with(
         solution,
@@ -1819,6 +1827,62 @@ def reference_schedule_formal(
         state_budget=scope.deadlock_state_budget or 0,
         rollout_budget=scope.deadlock_rollout_budget or 0,
     )
+
+
+@dataclass(frozen=True)
+class ScheduleWaitBlockers:
+    """ESS evidence on one WAIT in the selected rollout, not causal attribution."""
+    waiting: Operation
+    delayed_operation: Operation
+    delayed_block_id: str
+    # Actual blocker operation ID, its task block, clipped forbidden intervals.
+    blocker_intervals: tuple[tuple[str,str,tuple[tuple[float,float],...]],...]
+
+
+def selected_schedule_wait_blockers(solution, directions, schedule, commit_order, config):
+    """Recompute ESS only on exact selected commit prefixes; no rollout/search.
+
+    The optional observer captures each feasible rollout's commit order. The
+    caller must select the order whose operations equal the returned B32 result.
+    MOVE and WAIT-before-MOVE map to that template's destination weld block.
+    """
+    if not schedule.feasible or tuple(sorted(commit_order,key=_operation_sort_key))!=schedule.operations:
+        raise ValueError('blocker extraction requires the final selected feasible commit order')
+    routes=build_robot_routes(solution,config,{r:ds for r,ds in enumerate(directions)},
+                              x_split_validator=finite_x_split_validator(solution.parents,config)
+                              if any(p.kind is SplitKind.X_SPLIT for p in solution.patterns) else None)
+    templates={}
+    task_blocks={}
+    for route in routes:
+        for op in build_operation_templates(route,config):
+            templates[op.operation_id]=op
+            block_index=int(op.operation_id.split(':B',1)[1].split(':',1)[0])
+            task_blocks[op.robot_id,op.sequence_index]=route.blocks[block_index].block_id
+    index=_RelevantFixedIndex();events=[]
+    for position,op in enumerate(commit_order):
+        if op.kind is OperationKind.WAIT and op.duration>config.numeric_epsilon:
+            delayed=commit_order[position+1]
+            if delayed.robot_id!=op.robot_id or delayed.sequence_index!=op.sequence_index:
+                raise ValueError('selected WAIT is not followed by its delayed operation')
+            template=templates[delayed.operation_id]
+            relevant=index.relevant(op.robot_id,op.start_time,config)
+            start,_,ids=earliest_safe_start_optimized(template,op.start_time,relevant,config)
+            if start!=delayed.start_time or start!=op.end_time:
+                raise ValueError('selected WAIT ESS does not reproduce its actual start time')
+            by_id={fixed.operation_id:fixed for fixed in relevant}
+            blockers=[]
+            for operation_id in ids:
+                fixed=by_id[operation_id]
+                intervals=forbidden_start_intervals(template.robot_id,template.duration,
+                    template.start,template.end,fixed,op.start_time,config)
+                clipped=tuple((max(lo,op.start_time),min(hi,start)) for lo,hi in intervals
+                              if max(lo,op.start_time)<=min(hi,start))
+                block_id=task_blocks.get((fixed.robot_id,fixed.sequence_index))
+                if block_id is not None:
+                    blockers.append((operation_id,block_id,clipped))
+            events.append(ScheduleWaitBlockers(op,delayed,task_blocks[op.robot_id,op.sequence_index],tuple(blockers)))
+        index.add(op)
+    return tuple(sorted(events,key=lambda event:_operation_sort_key(event.waiting)))
 
 
 @dataclass(frozen=True)
