@@ -2,6 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
+from functools import cached_property
 import math
 import numpy as np
 import torch
@@ -14,6 +15,11 @@ class StaticGraph:
     edge_index: torch.Tensor
     edge_type: torch.Tensor
     parent_index: dict[str,int]
+
+    @cached_property
+    def incoming_edges(self):
+        destination = self.edge_index[1]
+        return tuple(torch.where(destination == node)[0] for node in range(len(self.node_features)))
 
 
 def build_static_graph(parents,config,*,include_weld_edges=True):
@@ -81,15 +87,23 @@ class SparseGATLayer(nn.Module):
         self.relation=nn.Embedding(4,heads);self.bias=nn.Parameter(torch.zeros(hidden_dim));self.reset_parameters()
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.linear.weight);nn.init.xavier_uniform_(self.src);nn.init.xavier_uniform_(self.dst);nn.init.zeros_(self.relation.weight)
-    def forward(self,x,edge_index,edge_type):
+    def forward(self,x,edge_index,edge_type,*,incoming_edges=None):
         h=self.linear(x).view(x.shape[0],self.heads,self.width);source,destination=edge_index
         logits=(h[source]*self.src).sum(-1)+(h[destination]*self.dst).sum(-1)+self.relation(edge_type)
         logits=nn.functional.leaky_relu(logits,.2);out=torch.zeros_like(h)
-        for node in range(x.shape[0]):
-            mask=destination==node
-            if bool(mask.any()):
-                alpha=torch.softmax(logits[mask],dim=0)
-                out[node]=(alpha.unsqueeze(-1)*h[source[mask]]).sum(0)
+        if incoming_edges is None:
+            for node in range(x.shape[0]):
+                mask=destination==node
+                if bool(mask.any()):
+                    alpha=torch.softmax(logits[mask],dim=0)
+                    out[node]=(alpha.unsqueeze(-1)*h[source[mask]]).sum(0)
+        else:
+            # Keep each node's original edge order and reduction shape. Only
+            # repeated boolean membership scans are removed; no scatter sum.
+            for node,indices in enumerate(incoming_edges):
+                if indices.numel():
+                    alpha=torch.softmax(logits[indices],dim=0)
+                    out[node]=(alpha.unsqueeze(-1)*h[source[indices]]).sum(0)
         return out.reshape(x.shape[0],-1)+self.bias
 
 
@@ -97,8 +111,9 @@ class StaticGATEncoder(nn.Module):
     def __init__(self,input_dim=18,hidden_dim=64,heads=4):
         super().__init__();self.layer1=SparseGATLayer(input_dim,hidden_dim,heads);self.layer2=SparseGATLayer(hidden_dim,hidden_dim,heads)
     def forward(self,graph):
-        x=nn.functional.elu(self.layer1(graph.node_features,graph.edge_index,graph.edge_type))
-        return self.layer2(x,graph.edge_index,graph.edge_type)
+        x=nn.functional.elu(self.layer1(graph.node_features,graph.edge_index,graph.edge_type,
+                                      incoming_edges=graph.incoming_edges))
+        return self.layer2(x,graph.edge_index,graph.edge_type,incoming_edges=graph.incoming_edges)
 
 
 class GraphCandidateRanker(nn.Module):

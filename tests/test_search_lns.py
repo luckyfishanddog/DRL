@@ -45,7 +45,7 @@ FAST = ScientificConfig(
 
 
 @pytest.mark.parametrize('kind', (SplitKind.Y_SPLIT, SplitKind.X_SPLIT))
-def test_oriented_mode_repair_rebuilds_children_and_charges_setup(kind):
+def test_oriented_mode_repair_rebuilds_children_and_charges_setup(kind,monkeypatch):
     from mrta_reference.geometry import build_legal_pattern_catalog
     from mrta_reference.model import SplitPattern
     from mrta_reference.scope import FORMAL_SCOPE_V2
@@ -63,6 +63,12 @@ def test_oriented_mode_repair_rebuilds_children_and_charges_setup(kind):
     partial = replace(partial, patterns=tuple(target if p.parent_id=='p' else p for p in partial.patterns))
     result = repair_partial_state_oriented(current, ((0,), (), (0, 0), ()), partial, config,
                 coordination_proxy=True, direction_versions=2, allow_pattern_changes=True)
+    from mrta_search import lns
+    with monkeypatch.context() as comparison:
+        comparison.setattr(lns,'oriented_insert_variants',_reference_oriented_insert_variants)
+        reference = repair_partial_state_oriented(current, ((0,), (), (0, 0), ()), partial, config,
+                    coordination_proxy=True, direction_versions=2, allow_pattern_changes=True)
+    assert result == reference
     assert result.candidate is not None, result.rejection_reason
     solution = result.candidate.solution
     blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
@@ -1191,3 +1197,165 @@ def test_q6_destroy_repair_crosses_a_basin_atomic_short_budget_cannot() -> None:
     assert alns.best_schedule.cmax == pytest.approx(exact.best_cmax)
     assert alns.stats.improvements_by_family[CandidateSourceKind.LNS_REPAIRED.value] >= 1
     assert alns.final_certification is not None and alns.final_certification.certified
+
+
+def _reference_oriented_insert_variants(
+    state,block,robot,position,blocks,config,*,fixed_direction=None,locked_directions=None,
+    max_evaluations=8,keep=2,seed=0,check_initial_feasibility=True,recompute_all_arcs=True,
+):
+    """Uncached enumeration with full route-arc recomputation for equivalence checks."""
+    import itertools
+    from mrta_reference.geometry import oriented_endpoints
+    from mrta_search import lns
+    route=state.routes[robot]
+    if not 0<=position<=len(route) or not robot_is_eligible(block,robot,config):
+        raise ValueError('ineligible robot or invalid insertion position')
+    inserted=route[:position]+(block.block_id,)+route[position:]
+    original=dict(zip(route,state.directions[robot]));locked=locked_directions or {}
+    local=tuple(i for i in (position-1,position,position+1) if 0<=i<len(inserted))
+    choices=[]
+    for i in local:
+        key=inserted[i]
+        choices.append((locked[key],) if key in locked else
+                       ((fixed_direction if i==position else original[key],)
+                        if fixed_direction is not None else (0,1)))
+    combinations=list(itertools.product(*choices));random.Random(seed).shuffle(combinations)
+    rows=[];used=0
+    for values in combinations[:max(0,max_evaluations)]:
+        used+=1;hint=values[local.index(position)]
+        routes,bits=lns._insert_one(state.routes,state.directions,block,robot,position,hint)
+        vector=list(bits[robot])
+        for i,value in zip(local,values):vector[i]=value
+        bits=tuple(tuple(vector) if r==robot else bits[r] for r in range(4))
+        points={r:oriented_endpoints(blocks[items[0]],bits[r][0])[0]
+                for r,items in enumerate(routes) if items}
+        if check_initial_feasibility and lns._initial_error(points,config) is not None:continue
+        if recompute_all_arcs:
+            full=lns.oriented_route_state(routes,bits,blocks,config)
+        else:
+            # The original incremental loop is retained for timing comparisons;
+            # no cache, candidate order or numerical reduction is changed here.
+            import math
+            costs=list(lns._insert_route_arc_costs(route,state.directions[robot],state.arc_costs[robot],
+                                                 block,position,hint,blocks,config))
+            for i in range(max(0,position-2),min(len(inserted)-1,position+2)):
+                _,end=oriented_endpoints(blocks[inserted[i]],vector[i])
+                start,_=oriented_endpoints(blocks[inserted[i+1]],vector[i+1])
+                costs[i]=math.dist(end,start)/config.empty_speed
+            arcs=tuple(tuple(costs) if r==robot else state.arc_costs[r] for r in range(4))
+        # Preserve the established incremental processing-time arithmetic;
+        # route travel is independently recalculated from every endpoint pair.
+        loads=tuple(value+(config.process_time(block.length) if r==robot else 0.)
+                    for r,value in enumerate(state.loads))
+        full=(replace(full,loads=loads) if recompute_all_arcs
+              else lns.OrientedRouteState(routes,bits,loads,arcs))
+        changes=tuple((inserted[i],original[inserted[i]],vector[i]) for i in local
+                      if i!=position and original[inserted[i]]!=vector[i])
+        rows.append((full,lns.OrientedInsertionAction(block.block_id,robot,position,hint,changes)))
+    rows.sort(key=lambda row:(row[0].travel,row[0].directions))
+    return tuple(rows[:keep]),used
+
+
+@pytest.mark.parametrize('fixed',(None,0,1))
+@pytest.mark.parametrize('check_start',(False,True))
+@pytest.mark.parametrize('budget',(0,1,3,8))
+def test_cached_oriented_insertions_equal_full_recomputation(fixed,check_start,budget):
+    from mrta_reference.geometry import blocks_for_pattern
+    from mrta_reference.model import SplitPattern
+    from mrta_search import lns
+    solution,_=_oriented_fixture();blocks=block_map(solution,FAST)
+    free=ParentWeld('free',(7.,6.),(8.,6.))
+    blocks.update({b.block_id:b for b in blocks_for_pattern(free,SplitPattern('free',SplitKind.WHOLE),FAST)})
+    state=lns.oriented_route_state((('a::whole','b::whole'),('c::whole','d::whole'),(),()),
+                                   ((0,1),(1,0),(),()),blocks,FAST)
+    cases=[('e::whole',r,p) for r in (0,1) for p in (0,1,2)]
+    cases += [('free::whole',r,0) for r in (2,3)]
+    for block_id,robot,position in cases:
+        for locks in (None,{'a::whole':1,'free::whole':0}):
+            kwargs=dict(fixed_direction=fixed,locked_directions=locks,max_evaluations=budget,
+                        keep=8,seed=19,check_initial_feasibility=check_start)
+            expected=_reference_oriented_insert_variants(state,blocks[block_id],robot,position,blocks,FAST,**kwargs)
+            actual=lns.oriented_insert_variants(state,blocks[block_id],robot,position,blocks,FAST,**kwargs)
+            assert actual==expected
+
+
+def test_cached_oriented_reconstruction_preserves_every_action_and_direction(monkeypatch):
+    from mrta_search import lns
+    solution,bits=_oriented_fixture();partial=lns._remove_parent_set(solution,('b','e'))
+    for seed in (0,61,99):
+        kwargs=dict(seed=seed,max_insertion_evaluations=256,coordination_proxy=True,direction_versions=2)
+        actual=lns.repair_partial_state_oriented(solution,bits,partial,FAST,**kwargs)
+        with monkeypatch.context() as comparison:
+            comparison.setattr(lns,'oriented_insert_variants',_reference_oriented_insert_variants)
+            expected=lns.repair_partial_state_oriented(solution,bits,partial,FAST,**kwargs)
+        assert actual==expected
+
+
+def test_cached_start_check_keeps_legal_and_rejected_first_directions():
+    from mrta_reference.geometry import blocks_for_pattern
+    from mrta_reference.model import SplitPattern
+    from mrta_search import lns
+    parents=(ParentWeld('left',(1.,9.),(2.,9.)),ParentWeld('right',(3.1,9.),(4.1,9.)),
+             ParentWeld('insert',(2.8,9.),(3.8,9.)))
+    blocks={b.block_id:b for p in parents for b in blocks_for_pattern(p,SplitPattern(p.parent_id,SplitKind.WHOLE),FAST)}
+    state=lns.oriented_route_state((('left::whole',),('right::whole',),(),()),
+                                   ((0,),(0,),(),()),blocks,FAST)
+    args=(state,blocks['insert::whole'],0,0,blocks,FAST)
+    actual=lns.oriented_insert_variants(*args,keep=8)
+    assert actual==_reference_oriented_insert_variants(*args,keep=8)
+    assert actual[0] and {action.direction for _,action in actual[0]}=={0}
+    unchecked=lns.oriented_insert_variants(*args,keep=8,check_initial_feasibility=False)
+    assert {action.direction for _,action in unchecked[0]}=={0,1}
+
+
+def _reference_joint_block_candidates(state,block,pattern,blocks,config,*,insertion_limit=8,
+                                     first_only=False,check_initial_feasibility=True,prefer_legal_start_recovery=True):
+    from mrta_reference.geometry import oriented_endpoints
+    from mrta_search import lns
+    robots=[r for r in range(4) if robot_is_eligible(block,r,config)]
+    if pattern.kind is SplitKind.X_SPLIT:
+        robots=[(0 if pattern.rail.value=='UPPER' else 2)+int(block.block_id.endswith('::1'))]
+    rows=[]
+    for robot in robots:
+        for position in lns.bounded_insertion_positions(len(state.routes[robot]),insertion_limit):
+            variants,_=_reference_oriented_insert_variants(state,block,robot,position,blocks,config,
+                max_evaluations=8,keep=8,check_initial_feasibility=check_initial_feasibility,recompute_all_arcs=False)
+            for inserted,action in variants:
+                siblings=[b for b in inserted.routes[robot] if blocks[b].parent_id==block.parent_id and b!=block.block_id]
+                if any(abs(inserted.routes[robot].index(b)-position)==1 for b in siblings):continue
+                rows.append((inserted,action))
+                if first_only:return tuple(rows)
+    if not check_initial_feasibility and prefer_legal_start_recovery:
+        restored=[]
+        for inserted,action in rows:
+            points={r:oriented_endpoints(blocks[route[0]],inserted.directions[r][0])[0]
+                    for r,route in enumerate(inserted.routes) if route}
+            if lns._initial_error(points,config) is None:restored.append((inserted,action))
+        if restored:rows=restored
+    return tuple(rows)
+
+
+@pytest.mark.parametrize('kind',(SplitKind.WHOLE,SplitKind.Y_SPLIT,SplitKind.X_SPLIT))
+@pytest.mark.parametrize('check_start',(False,True))
+@pytest.mark.parametrize('first_only',(False,True))
+def test_joint_sibling_prefilter_preserves_all_actions_and_order(kind,check_start,first_only):
+    from mrta_reference.geometry import build_legal_pattern_catalog,blocks_for_pattern
+    from mrta_reference.model import SplitPattern,Rail
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search import lns
+    config=ScientificConfig()
+    parents=(ParentWeld('p',(7.2,5.8),(11.2,6.2)),ParentWeld('a',(.5,9.),(1.5,9.)),
+             ParentWeld('b',(17.,3.),(18.,3.)))
+    pattern=next(p for p in build_legal_pattern_catalog(parents,config,FORMAL_SCOPE_V2)['p']
+                 if p.kind is kind and (kind is not SplitKind.X_SPLIT or p.rail is Rail.UPPER))
+    patterns=(pattern,SplitPattern('a',SplitKind.WHOLE),SplitPattern('b',SplitKind.WHOLE))
+    by_id={p.parent_id:p for p in parents}
+    blocks={b.block_id:b for p in patterns for b in blocks_for_pattern(by_id[p.parent_id],p,config)}
+    routes=(('a::whole',)+(('p::0',) if kind is not SplitKind.WHOLE else ()),(),('b::whole',),())
+    bits=tuple((0,)*len(r) for r in routes)
+    state=lns.oriented_route_state(routes,bits,blocks,config)
+    block=blocks['p::whole' if kind is SplitKind.WHOLE else 'p::1']
+    for recovery in (False,True):
+        kwargs=dict(first_only=first_only,check_initial_feasibility=check_start,prefer_legal_start_recovery=recovery)
+        assert lns.joint_block_candidates(state,block,pattern,blocks,config,**kwargs)==_reference_joint_block_candidates(
+            state,block,pattern,blocks,config,**kwargs)

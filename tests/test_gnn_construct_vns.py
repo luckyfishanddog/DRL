@@ -320,6 +320,47 @@ def _joint_simple_reference():
                         {0:('joint-a::whole',),1:('joint-b::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
 
 
+def test_coordination_context_observes_route_order_direction_and_partner():
+    from mrta_search.gnn_constructor import CoordinationJointInsertionGNN,joint_graph
+    torch.manual_seed(14)
+    reference=_joint_simple_reference()
+    graph,_,_=joint_graph(reference,CONFIG)
+    model=CoordinationJointInsertionGNN()
+    embeddings=model.encode_static(graph)
+    forward=(('joint-a::whole','joint-b::whole'),(),(),())
+    reverse=(('joint-b::whole','joint-a::whole'),(),(),())
+    directions=((0,0),(),(),())
+    original=model.contextualize_state(graph,embeddings,forward,directions)
+    reordered=model.contextualize_state(graph,embeddings,reverse,directions)
+    flipped=model.contextualize_state(graph,embeddings,forward,((1,0),(),(),()))
+    # R1 must see changes in its R0 partner, even though its own route is empty.
+    partner=graph.robot_offset+1
+    assert not torch.allclose(original[partner],flipped[partner])
+    assert not torch.allclose(original[partner],reordered[partner])
+    original.square().mean().backward()
+    for module in (model.route_direction,model.route_messages,model.route_norm):
+        assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum()>0
+                   for p in module.parameters())
+    model.use_dynamic_context=False
+    assert model.contextualize_state(graph,embeddings,forward,directions) is embeddings
+
+
+def test_coordination_decoding_refreshes_only_the_actual_partial_routes(monkeypatch):
+    from mrta_search.gnn_constructor import CoordinationJointInsertionGNN,construct_or_repair_with_gnn
+    reference=_joint_simple_reference()
+    model=CoordinationJointInsertionGNN()
+    observed=[]
+    original=model.contextualize_state
+    def observe(graph,embeddings,routes,directions):
+        observed.append(sum(map(len,routes)))
+        return original(graph,embeddings,routes,directions)
+    monkeypatch.setattr(model,'contextualize_state',observe)
+    result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),
+                                      tuple(p.parent_id for p in reference.parents),model,CONFIG)
+    assert result.solution is not None
+    assert observed==[0,1]
+
+
 def test_joint_teacher_labels_replay_in_the_actual_student_pool():
     from mrta_search.lns import _remove_parent_set,repair_partial_state_oriented
     from mrta_search.gnn_constructor import prepare_joint_teacher_steps
@@ -1270,4 +1311,327 @@ def test_expanded_joint_sheets_use_roles_and_geometry_instead_of_directory_names
         counts=[r['N'] for r in rows]
         assert rows[0]['N']==min(counts) and rows[2]['N']==max(counts)
         assert abs(rows[1]['N']-statistics.median(counts))==min(abs(n-statistics.median(counts)) for n in counts)
+
+
+def _research_retained_state(solution, directions, cmax):
+    from dataclasses import asdict
+    return dict(solution=dict(parents=[asdict(p) for p in solution.parents],
+                              patterns=[asdict(p) for p in solution.patterns],
+                              routes=[asdict(r) for r in solution.routes]),
+                directions=directions, cmax=cmax)
+
+
+def test_research_graph_identity_separates_geometry_and_patterns_from_route_labels():
+    import run_gnn_shared_construction as shared
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    parents=(ParentWeld('p',(1.,5.8),(3.,6.2)),)
+    whole=canonicalize(parents,(SplitPattern('p',SplitKind.WHOLE),),
+                       {0:('p::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    other_owner=canonicalize(parents,whole.patterns,{1:('p::whole',)},CONFIG,
+                             scope=FORMAL_SCOPE_V2)
+    pattern=next(p for p in build_legal_pattern_catalog(parents,CONFIG,FORMAL_SCOPE_V2)['p']
+                 if p.kind is SplitKind.Y_SPLIT)
+    split=canonicalize(parents,(pattern,),{0:('p::0',),2:('p::1',)},CONFIG,
+                       scope=FORMAL_SCOPE_V2)
+    shifted_parents=(replace(parents[0],start=(2.,5.8),end=(4.,6.2)),)
+    shifted=canonicalize(shifted_parents,whole.patterns,{0:('p::whole',)},CONFIG,
+                         scope=FORMAL_SCOPE_V2)
+    restored=[shared.research_restore(_research_retained_state(s,bits,100.),CONFIG)
+              for s,bits in ((whole,((0,),(),(),())),(other_owner,((),(1,),(),())),
+                             (split,((0,),(),(0,),())),(shifted,((0,),(),(),())))]
+    assert restored[0][2]==restored[1][2]==restored[2][2]
+    assert restored[0][3]==restored[1][3]
+    assert restored[0][4]!=restored[1][4]
+    assert restored[0][3]!=restored[2][3]
+    assert restored[0][2]!=restored[3][2]
+    assert len({r[3] for r in restored})==3
+    with pytest.raises(ValueError,match='invalid explicit directions'):
+        shared.research_restore(_research_retained_state(whole,((),(),(),()),100.),CONFIG)
+
+
+@pytest.mark.parametrize('kind',('parent','insertion'))
+def test_research_multiteacher_targets_keep_quality_weight_at_shared_prefix(monkeypatch,kind):
+    from types import SimpleNamespace
+    import run_gnn_shared_construction as shared
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),)
+    if kind=='parent':
+        parents+=(ParentWeld('b',(4.,9.),(5.,9.)),)
+        route_pairs=({0:('a::whole','b::whole')},{0:('b::whole','a::whole')})
+        bits_pairs=(((0,0),(),(),()),((0,0),(),(),()))
+    else:
+        route_pairs=({0:('a::whole',)},{1:('a::whole',)})
+        bits_pairs=(((0,),(),(),()),((),(1,),(),()))
+    patterns=tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents)
+    solutions=[canonicalize(parents,patterns,routes,CONFIG,scope=FORMAL_SCOPE_V2)
+               for routes in route_pairs]
+    rows=[dict(instance='same-geometry',method=method,seed=seed,
+               details=dict(final_state=_research_retained_state(solution,bits,cmax)))
+          for seed,(method,solution,bits,cmax) in enumerate(zip(
+              ('HGA','WAG'),solutions,bits_pairs,(100.,200.)))]
+    teachers,coverage=shared.research_teachers(rows,CONFIG)
+    assert coverage['selected_teachers']==2
+    assert {t['teacher'] for t in teachers}=={'HGA','WAG'}
+    cmax_by_solution={s.canonical_json:c for s,c in zip(solutions,(100.,200.))}
+    # Keep the real action generator and constructive teacher replay. Scheduling
+    # is isolated here so unequal quality weights can be checked independently.
+    monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',lambda solution,bits,config:
+        SimpleNamespace(solution=solution,directions=bits,schedule=ScheduleResult(
+            ScheduleStatus.FEASIBLE,cmax=cmax_by_solution[solution.canonical_json])))
+    monkeypatch.setattr(shared,'research_certify',lambda scheduled,config:True)
+    graphs,examples,steps,diagnostics=shared.research_prepare(teachers,CONFIG)
+    assert len(graphs)==1 and len(diagnostics)==2
+    assert all(d['replay_status']=='REPLAYED' for d in diagnostics)
+    at_empty=[e for e in examples if e['kind']==kind
+              and all(not route for route in e['step']['state_routes'])]
+    assert len(at_empty)==1
+    target=at_empty[0]['target']
+    assert target.sum().item()==pytest.approx(1.)
+    assert sorted(target[target>0].tolist())==pytest.approx([1/3,2/3])
+    assert at_empty[0]['weight']==pytest.approx(.75)
+    assert len(steps)==sum(len(p) for p in route_pairs[0].values())*2
+
+
+@pytest.mark.parametrize('alias_parent',(False,True))
+def test_research_holdout_rejects_geometry_alias_before_model_loading(monkeypatch,alias_parent):
+    import run_gnn_shared_construction as shared
+    parent=ParentWeld('p',(1.,9.),(2.,9.))
+    solution=canonicalize((parent,),(SplitPattern('p',SplitKind.WHOLE),),
+                           {0:('p::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    state=_research_retained_state(solution,((0,),(),(),()),100.)
+    geometry_key=shared.research_restore(state,CONFIG)[2]
+    if alias_parent:
+        alias=replace(parent,parent_id='renamed-parent')
+        renamed=canonicalize((alias,),(SplitPattern(alias.parent_id,SplitKind.WHOLE),),
+                              {0:(alias.parent_id+'::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+        state=_research_retained_state(renamed,((0,),(),(),()),100.)
+    def forbidden(*args,**kwargs):
+        raise AssertionError('holdout overlap reached model loading')
+    monkeypatch.setattr(shared,'load_model',forbidden)
+    rows=[dict(instance='renamed-evaluation-instance',tier='SMALL',
+               details=dict(final_state=state))]
+    with pytest.raises(ValueError,match='training/evaluation geometry overlap'):
+        shared.research_evaluate(None,rows,CONFIG,1,training_geometry_keys={geometry_key})
+
+
+def test_all_mode_teachers_keep_superior_region_and_mode_final_states():
+    import run_gnn_shared_construction as shared
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    parents=(ParentWeld('p',(1.,5.8),(3.,6.2)),)
+    whole=canonicalize(parents,(SplitPattern('p',SplitKind.WHOLE),),{0:('p::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    pattern=next(p for p in build_legal_pattern_catalog(parents,CONFIG,FORMAL_SCOPE_V2)['p'] if p.kind is SplitKind.Y_SPLIT)
+    split=canonicalize(parents,(pattern,),{0:('p::0',),2:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    rows=[dict(instance='SMALL_01',method=method,seed=1,details=dict(
+        initial_state=_research_retained_state(whole,((0,),(),(),()),200.),
+        final_state=_research_retained_state(split,((0,),(),(0,),()),100.))) for method in ('MODE_NEW','REGION')]
+    fixed,_=shared.research_teachers(rows,CONFIG)
+    all_modes,coverage=shared.research_teachers(rows,CONFIG,deployment_only=False)
+    assert len(fixed)==len(all_modes)==1
+    assert fixed[0]['cmax']==200. and fixed[0]['source_state']=='initial_state'
+    assert all_modes[0]['cmax']==100. and all_modes[0]['source_state']=='final_state'
+    assert set(all_modes[0]['teachers'])=={'MODE_NEW','REGION'}
+    assert coverage['nonfixed_pattern_states']==2
+    assert coverage.get('excluded_nondeployment_patterns',0)==0
+
+
+def test_refinement_split_keeps_all_method_seeds_and_detects_physical_alias():
+    import run_gnn_shared_construction as shared
+    def row(name,offset,method,seed):
+        p=ParentWeld('p',(1.+offset,9.),(2.+offset,9.))
+        solution=canonicalize((p,),(SplitPattern('p',SplitKind.WHOLE),),{0:('p::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+        return dict(instance=name,tier='SMALL',method=method,seed=seed,
+                    details=dict(final_state=_research_retained_state(solution,((0,),(),(),()),100.)))
+    rows=[row(name,offset,method,seed) for name,offset in (('SMALL_01',0.),('SMALL_02',5.))
+          for method in ('MODE_NEW','REGION') for seed in (1,2)]
+    train,holdout,info=shared.refinement_split(rows)
+    assert len(train)==len(holdout)==4
+    assert {r['instance'] for r in train}=={'SMALL_01'}
+    assert {r['instance'] for r in holdout}=={'SMALL_02'}
+    assert info['training_geometries']==info['holdout_geometries']==1
+    rows.append(row('SMALL_02',0.,'HGA',3))
+    with pytest.raises(ValueError,match='training/evaluation geometry overlap'):
+        shared.refinement_split(rows)
+
+
+def test_best_mode_labels_do_not_average_away_a_superior_split():
+    import run_gnn_shared_construction as shared
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    parents=(ParentWeld('p',(1.,5.8),(3.,6.2)),)
+    whole=SplitPattern('p',SplitKind.WHOLE)
+    cut=next(p for p in build_legal_pattern_catalog(parents,CONFIG,FORMAL_SCOPE_V2)['p'] if p.kind is SplitKind.Y_SPLIT)
+    rows=[]
+    for robot,method in enumerate(('HGA','WAG','FIXED_NEW')):
+        solution=canonicalize(parents,(whole,),{robot:('p::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+        bits=tuple((0,) if r==robot else () for r in range(4))
+        rows.append(dict(instance='SMALL_01',method=method,seed=1,
+            details=dict(final_state=_research_retained_state(solution,bits,200.))))
+    split=canonicalize(parents,(cut,),{0:('p::0',),2:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    rows.append(dict(instance='SMALL_01',method='MODE_NEW',seed=1,
+        details=dict(final_state=_research_retained_state(split,((0,),(),(0,),()),100.))))
+    teachers,_=shared.research_teachers(rows,CONFIG,deployment_only=False)
+    averaged=shared.refinement_mode_examples(teachers,CONFIG)[0]
+    best=shared.refinement_mode_examples(teachers,CONFIG,best_only=True)[0]
+    assert averaged['target'][averaged['features'][:,0]==1].sum()>.5
+    assert best['target'][best['features'][:,1]==1].sum()==pytest.approx(1.)
+    assert best['changed']
+
+
+def test_neural_portfolio_preserves_both_robust_proposals_when_new_policy_fails(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_shared_construction as shared
+    reference=_joint_simple_reference();old=object();new=object();scheduled=[]
+    def construct(geometry,routes,directions,pending,model,config,**options):
+        if model is new:return SimpleNamespace(solution=None,directions=None,rejection_reason='NO_LEGAL_CHILD_INSERTION')
+        bits=((0,),(0,),(),()) if options['decode_mode']=='greedy' else ((1,),(0,),(),())
+        return SimpleNamespace(solution=reference,directions=bits,rejection_reason=None)
+    def schedule(solution,bits,config):
+        scheduled.append(bits)
+        return shared.pilot.oriented.DirectedSolution(solution,bits,ScheduleResult(
+            ScheduleStatus.FEASIBLE,cmax=100. if bits[0][0] else 123.))
+    monkeypatch.setattr(shared,'construct_or_repair_with_gnn',construct)
+    monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',schedule)
+    monkeypatch.setattr(shared,'research_certify',lambda candidate,config:True)
+    best,info=shared.neural_initial_portfolio(reference.parents,old,new,CONFIG,reference_calls=3)
+    assert best.schedule.cmax==100.
+    assert len(scheduled)==info['b32_calls']==2
+    assert len(info['attempts'])==3 and info['attempts'][-1]['status']=='CONSTRUCTION_FAILED'
+
+
+def test_neural_archive_retains_exact_weights_and_skips_diagnostics_at_inference(monkeypatch):
+    import io
+    import run_gnn_shared_construction as shared
+    from mrta_search.gnn_constructor import CoordinationJointInsertionGNN,ModeJointInsertionGNN
+    old=CoordinationJointInsertionGNN();new=ModeJointInsertionGNN()
+    payload=dict(model_type='CoordinationJointInsertionGNN',state_dict=old.state_dict(),
+        normalize_inputs=True,use_dynamic_context=False,training=dict(loss=[2.,1.],failures=[None,'DEADLOCK']),
+        refinement_candidate=dict(model_type='ModeJointInsertionGNN',state_dict=new.state_dict(),
+            normalize_inputs=True,use_dynamic_context=False,refinement=dict(methods=['REGION','MODE_NEW'],cmax=123.45)))
+    stream=io.BytesIO();shared.save_neural_checkpoint(payload,stream)
+    stream.seek(0);full=shared.read_neural_checkpoint(stream)
+    assert full['training']==payload['training']
+    assert full['refinement_candidate']['refinement']==payload['refinement_candidate']['refinement']
+    for a,b in ((payload['state_dict'],full['state_dict']),
+                (payload['refinement_candidate']['state_dict'],full['refinement_candidate']['state_dict'])):
+        assert all(torch.equal(a[k],b[k]) for k in a)
+    monkeypatch.setattr(shared,'_expand_neural_checkpoint',lambda *args:
+        (_ for _ in ()).throw(AssertionError('inference expanded research diagnostics')))
+    stream.seek(0);loaded_old,loaded_new=shared.load_neural_initial_models(stream)
+    assert not loaded_old.use_dynamic_context and not loaded_new.use_dynamic_context
+    assert all(torch.equal(old.state_dict()[k],loaded_old.state_dict()[k]) for k in old.state_dict())
+    assert all(torch.equal(new.state_dict()[k],loaded_new.state_dict()[k]) for k in new.state_dict())
+
+
+def test_mode_policy_exposes_current_legal_catalog_and_stable_parent_ties():
+    from mrta_search.gnn_constructor import ModeJointInsertionGNN,legal_mode_inputs,select_gnn_patterns
+    from mrta_reference.geometry import build_legal_pattern_catalog,blocks_for_pattern
+    config=ScientificConfig()
+    parents=(ParentWeld('flex',(2.,6.),(8.,6.)),ParentWeld('cross',(10.,9.),(10.,3.)))
+    graph,candidates,features=legal_mode_inputs(parents,config)
+    catalog=build_legal_pattern_catalog(tuple(sorted(parents,key=lambda p:p.parent_id)),config,FORMAL_SCOPE_V2)
+    expected=tuple(pattern for parent in sorted(parents,key=lambda p:p.parent_id)
+                   for pattern in catalog[parent.parent_id])
+    assert candidates==expected and features.shape==(len(expected),12)
+    assert torch.isfinite(features).all()
+    assert any(pattern.kind is SplitKind.WHOLE for pattern in candidates)
+    assert any(pattern.kind is SplitKind.Y_SPLIT and pattern.mandatory for pattern in candidates)
+    assert any(pattern.kind is SplitKind.X_SPLIT for pattern in candidates)
+    by_id={parent.parent_id:parent for parent in parents}
+    assert all(child.length>=config.min_child_length-config.numeric_epsilon for pattern in candidates
+               for child in blocks_for_pattern(by_id[pattern.parent_id],pattern,config))
+    model=ModeJointInsertionGNN(16,4)
+    assert model.use_dynamic_context is False
+    with torch.no_grad():
+        for parameter in model.mode_head.parameters():parameter.zero_()
+    assert select_gnn_patterns(parents,model,config)==tuple(catalog[p.parent_id][0]
+        for p in sorted(parents,key=lambda p:p.parent_id))
+    assert set(graph.parent_block_indices)==set(by_id)
+
+
+def test_mode_logits_accept_repeated_parent_candidates_and_backpropagate():
+    from mrta_search.gnn_constructor import ModeJointInsertionGNN,legal_mode_inputs
+    torch.manual_seed(27)
+    config=ScientificConfig();parents=(ParentWeld('flex',(2.,6.),(8.,6.)),)
+    graph,candidates,features=legal_mode_inputs(parents,config)
+    assert len(candidates)>1
+    model=ModeJointInsertionGNN(16,4)
+    features=features.clone().requires_grad_()
+    logits=model.mode_logits(graph,model.encode_static(graph),tuple(p.parent_id for p in candidates),features)
+    assert logits.shape==(len(candidates),) and torch.isfinite(logits).all()
+    assert logits.unique().numel()>1
+    logits.square().mean().backward()
+    assert features.grad is not None and torch.isfinite(features.grad).all() and features.grad.abs().sum()>0
+    for module in (model.mode_head,model.geometry_skip):
+        assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum()>0
+                   for p in module.parameters())
+
+
+def test_mode_checkpoint_roundtrip_preserves_type_weights_and_context_without_files(monkeypatch):
+    import io
+    import run_gnn_shared_construction as shared
+    from mrta_search.gnn_constructor import ModeJointInsertionGNN,select_gnn_patterns
+    model=ModeJointInsertionGNN(16,4,normalize_inputs=True)
+    checkpoint=dict(model_type='ModeJointInsertionGNN',hidden_dim=16,heads=4,normalize_inputs=True,
+                    use_dynamic_context=False,state_dict=model.state_dict())
+    buffer=io.BytesIO();torch.save(checkpoint,buffer);serialized=buffer.getvalue()
+    original_load=torch.load;requested=Path('in-memory-mode-checkpoint.pt')
+    def load_memory(path,**kwargs):
+        assert path==requested and kwargs==dict(map_location='cpu',weights_only=True)
+        return original_load(io.BytesIO(serialized),**kwargs)
+    monkeypatch.setattr(shared.torch,'load',load_memory)
+    restored,metadata=shared.load_model(requested)
+    assert isinstance(restored,ModeJointInsertionGNN) and restored.use_dynamic_context is False
+    assert metadata['model_type']=='ModeJointInsertionGNN'
+    assert all(torch.equal(value,restored.state_dict()[key]) for key,value in model.state_dict().items())
+    parents=(ParentWeld('flex',(2.,6.),(8.,6.)),)
+    assert select_gnn_patterns(parents,restored,ScientificConfig())==select_gnn_patterns(parents,model,ScientificConfig())
+
+
+@pytest.mark.parametrize('kind',(SplitKind.WHOLE,SplitKind.Y_SPLIT,SplitKind.X_SPLIT,'mandatory_y'))
+@pytest.mark.parametrize('check_start',(False,True))
+@pytest.mark.parametrize('limit',(2,8))
+def test_joint_existence_matches_full_pool_for_modes_siblings_and_partial_starts(kind,check_start,limit):
+    from mrta_reference.geometry import build_legal_pattern_catalog,blocks_for_pattern
+    from mrta_reference.model import Rail
+    from mrta_search import lns
+    config=ScientificConfig()
+    parent=(ParentWeld('p',(10.,9.),(10.,3.)) if kind=='mandatory_y'
+            else ParentWeld('p',(7.2,5.8),(11.2,6.2)))
+    others=(ParentWeld('a',(.5,9.),(1.5,9.)),ParentWeld('b',(17.,3.),(18.,3.)),
+            ParentWeld('c',(10.,9.),(11.,9.)),ParentWeld('d',(5.,9.),(6.,9.)))
+    catalog=build_legal_pattern_catalog((parent,*others),config,FORMAL_SCOPE_V2)
+    pattern=next(p for p in catalog['p'] if
+        (p.kind is SplitKind.Y_SPLIT and p.mandatory if kind=='mandatory_y' else p.kind is kind)
+        and (p.kind is not SplitKind.X_SPLIT or p.rail is Rail.UPPER))
+    blocks={child.block_id:child for p in (parent,*others)
+            for child in blocks_for_pattern(p,pattern if p.parent_id=='p' else SplitPattern(p.parent_id,SplitKind.WHOLE),config)}
+    block=blocks['p::whole' if kind is SplitKind.WHOLE else 'p::1']
+    routes=[((),(),(),()),(('a::whole',),('c::whole',),('b::whole',),()),
+            (('c::whole',),('d::whole',),('b::whole',),()),
+            (('a::whole','d::whole','c::whole'),(),('b::whole',),())]
+    if kind is not SplitKind.WHOLE:
+        routes.extend(((('a::whole','p::0'),('c::whole',),('b::whole',),()),
+                       (('a::whole',),('p::0','c::whole'),('b::whole',),())))
+    for route_set in routes:
+        for bit in (0,1):
+            bits=tuple((bit,)*len(route) for route in route_set)
+            state=lns.oriented_route_state(route_set,bits,blocks,config)
+            expected=bool(lns.joint_block_candidates(state,block,pattern,blocks,config,
+                insertion_limit=limit,first_only=True,check_initial_feasibility=check_start))
+            assert lns.has_joint_block_candidate(state,block,pattern,blocks,config,
+                insertion_limit=limit,check_initial_feasibility=check_start) is expected
+            if not check_start:
+                for recovery in (False,True):
+                    assert bool(lns.joint_block_candidates(state,block,pattern,blocks,config,
+                        insertion_limit=limit,check_initial_feasibility=False,
+                        prefer_legal_start_recovery=recovery)) is expected
+
+
+def test_joint_existence_does_not_build_or_sort_direction_variants(monkeypatch):
+    from mrta_search import lns
+    from mrta_search.gnn_constructor import joint_graph,joint_start_state
+    reference=_joint_simple_reference();graph,blocks,patterns=joint_graph(reference,CONFIG)
+    state=joint_start_state(reference,((),(),(),()),((),(),(),()),tuple(patterns),blocks,CONFIG)
+    block=next(iter(blocks.values()))
+    def forbidden(*args,**kwargs):raise AssertionError('existence query constructed arc costs')
+    monkeypatch.setattr(lns,'oriented_insert_variants',forbidden)
+    assert lns.has_joint_block_candidate(state,block,patterns[block.parent_id],blocks,CONFIG)
 

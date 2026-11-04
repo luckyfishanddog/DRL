@@ -966,43 +966,125 @@ def oriented_insert_variants(
             choices.append((0, 1))
     combinations = list(itertools.product(*choices))
     random.Random(seed).shuffle(combinations)
+    # A local direction combination changes only this robot's vector. Keep
+    # immutable route data once, and reuse identical geometry calculations.
+    routes = state.routes[:robot] + (new_route,) + state.routes[robot + 1:]
+    base_vector = list(state.directions[robot])
+    base_vector.insert(position, 0)
+    insertion_index = local.index(position)
+    duration = config.process_time(block.length)
+    loads = tuple(value + (duration if r == robot else 0.0)
+                  for r, value in enumerate(state.loads))
+    base_costs = _insert_route_arc_costs(route, state.directions[robot], state.arc_costs[robot],
+                                         block, position, 0, blocks, config)
+    refreshed_arcs = tuple(range(max(0, position - 2), min(len(new_route) - 1, position + 2)))
+    arc_cache = {}
+    other_points = ({r: oriented_endpoints(blocks[items[0]], state.directions[r][0])[0]
+                     for r, items in enumerate(state.routes) if r != robot and items}
+                    if check_initial_feasibility else {})
+    first_block = blocks[new_route[0]]
+    legal_first = {}
+    route_totals = tuple(sum(arcs) for arcs in state.arc_costs)
     rows = []
     used = 0
     for bits in combinations[:max(0, max_evaluations)]:
         used += 1
-        hint = bits[local.index(position)]
-        routes, directions = _insert_one(state.routes, state.directions, block, robot, position, hint)
-        vector = list(directions[robot])
+        hint = bits[insertion_index]
+        vector = base_vector.copy()
         for i, bit in zip(local, bits):
             vector[i] = bit
-        directions = tuple(tuple(vector) if r == robot else directions[r] for r in range(4))
-        points = {r: oriented_endpoints(blocks[items[0]], directions[r][0])[0]
-                  for r, items in enumerate(routes) if items}
-        if check_initial_feasibility and _initial_error(points, config) is not None:
-            continue
+        if check_initial_feasibility:
+            first = vector[0]
+            if first not in legal_first:
+                points = dict(other_points)
+                points[robot] = oriented_endpoints(first_block, first)[0]
+                legal_first[first] = _initial_error(points, config) is None
+            if not legal_first[first]:
+                continue
+        directions = state.directions[:robot] + (tuple(vector),) + state.directions[robot + 1:]
         # Reuse old arcs, splice the insertion, then refresh only up to four
         # arcs touched by the predecessor/new block/successor direction tuple.
-        costs = list(_insert_route_arc_costs(route, state.directions[robot], state.arc_costs[robot],
-                                            block, position, hint, blocks, config))
-        for i in range(max(0, position - 2), min(len(new_route) - 1, position + 2)):
-            _, end = oriented_endpoints(blocks[new_route[i]], vector[i])
-            start, _ = oriented_endpoints(blocks[new_route[i + 1]], vector[i + 1])
-            costs[i] = math.dist(end, start) / config.empty_speed
-        arcs = tuple(tuple(costs) if r == robot else state.arc_costs[r] for r in range(4))
-        loads = tuple(value + (config.process_time(block.length) if r == robot else 0.0)
-                      for r, value in enumerate(state.loads))
+        costs = list(base_costs)
+        for i in refreshed_arcs:
+            key = (i, vector[i], vector[i + 1])
+            if key not in arc_cache:
+                _, end = oriented_endpoints(blocks[new_route[i]], vector[i])
+                start, _ = oriented_endpoints(blocks[new_route[i + 1]], vector[i + 1])
+                arc_cache[key] = math.dist(end, start) / config.empty_speed
+            costs[i] = arc_cache[key]
+        arcs = state.arc_costs[:robot] + (tuple(costs),) + state.arc_costs[robot + 1:]
         changes = tuple((new_route[i], original[new_route[i]], vector[i]) for i in local
                         if i != position and original[new_route[i]] != vector[i])
         action = OrientedInsertionAction(block.block_id, robot, position, hint, changes)
         candidate = OrientedRouteState(routes, directions, loads, arcs)
         rows.append((candidate, action))
-    rows.sort(key=lambda row: (row[0].travel, row[0].directions))
+    # Retain the original within-route and then robot-order summations exactly.
+    rows.sort(key=lambda row: (sum(route_totals[:robot] + (sum(row[0].arc_costs[robot]),)
+                                   + route_totals[robot + 1:]), row[0].directions))
     return tuple(rows[:keep]), used
 
 
 def joint_action_key(action: OrientedInsertionAction) -> tuple:
     return (action.block_id, action.robot, action.position, action.direction,
             tuple(tuple(change) for change in action.neighbour_changes))
+
+
+def _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit):
+    """Common robot/position pool, including direction-independent sibling pruning."""
+    robots = [r for r in range(4) if robot_is_eligible(block, r, config)]
+    if pattern.kind is SplitKind.X_SPLIT:
+        robots = [(0 if pattern.rail.value == "UPPER" else 2) + int(block.block_id.endswith("::1"))]
+    for robot in robots:
+        route = state.routes[robot]
+        for position in bounded_insertion_positions(len(route), insertion_limit):
+            if any(blocks[route[i]].parent_id == block.parent_id and route[i] != block.block_id
+                   for i in (position - 1, position) if 0 <= i < len(route)):
+                continue
+            yield robot, position
+
+
+def has_joint_block_candidate(state, block, pattern, blocks, config, *,
+                              insertion_limit=8, check_initial_feasibility=True):
+    """Exact membership of the joint action pool, without building route costs.
+
+    The public generator evaluates every local direction tuple (at most eight)
+    and retains all eight. At position 0 the new head has both directions; at
+    position 1 the previous head may flip; later positions leave it unchanged.
+    Other robots' heads stay fixed. Arc costs and sorting cannot remove the
+    last legal tuple, so the same initial-head check decides existence.
+    """
+    points = None
+    unchanged_legal = None
+    legal_heads = {}
+    for robot, position in _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit):
+        # Match oriented_insert_variants' validation for malformed forced X
+        # assignments, after the same position/sibling filtering.
+        if not robot_is_eligible(block, robot, config):
+            raise ValueError("ineligible robot or invalid insertion position")
+        if not check_initial_feasibility:
+            return True
+        if points is None:
+            points = {r: oriented_endpoints(blocks[route[0]], state.directions[r][0])[0]
+                      for r, route in enumerate(state.routes) if route}
+        if position >= 2:
+            if unchanged_legal is None:
+                unchanged_legal = _initial_error(points, config) is None
+            if unchanged_legal:
+                return True
+            continue
+        head = block if position == 0 else blocks[state.routes[robot][0]]
+        key = robot, head.block_id
+        if key not in legal_heads:
+            legal_heads[key] = False
+            for direction in (0, 1):
+                candidate_points = dict(points)
+                candidate_points[robot] = oriented_endpoints(head, direction)[0]
+                if _initial_error(candidate_points, config) is None:
+                    legal_heads[key] = True
+                    break
+        if legal_heads[key]:
+            return True
+    return False
 
 
 def joint_block_candidates(
@@ -1017,24 +1099,15 @@ def joint_block_candidates(
     bounded position rule is identical at training and inference. No teacher
     label or future schedule is accepted by this function.
     """
-    robots = [r for r in range(4) if robot_is_eligible(block, r, config)]
-    if pattern.kind is SplitKind.X_SPLIT:
-        robots = [(0 if pattern.rail.value == "UPPER" else 2) + int(block.block_id.endswith("::1"))]
     rows = []
-    for robot in robots:
-        for position in bounded_insertion_positions(len(state.routes[robot]), insertion_limit):
-            variants, _ = oriented_insert_variants(state, block, robot, position, blocks, config,
-                                                   max_evaluations=8, keep=8,
-                                                   check_initial_feasibility=check_initial_feasibility)
-            for inserted, action in variants:
-                # Fixed-pattern normalization would collapse adjacent siblings.
-                sibling_ids = [b for b in inserted.routes[robot]
-                               if blocks[b].parent_id == block.parent_id and b != block.block_id]
-                if any(abs(inserted.routes[robot].index(b)-position)==1 for b in sibling_ids):
-                    continue
-                rows.append((inserted, action))
-                if first_only:
-                    return tuple(rows)
+    for robot, position in _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit):
+        variants, _ = oriented_insert_variants(state, block, robot, position, blocks, config,
+                                               max_evaluations=8, keep=8,
+                                               check_initial_feasibility=check_initial_feasibility)
+        for inserted, action in variants:
+            rows.append((inserted, action))
+            if first_only:
+                return tuple(rows)
     if not check_initial_feasibility and prefer_legal_start_recovery:
         restored=[]
         for inserted,action in rows:

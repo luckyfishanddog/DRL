@@ -7,6 +7,7 @@ rule, and the policy head scores eligible robots while an assignment is construc
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import math
 import time
 from typing import Mapping, Sequence
@@ -47,6 +48,18 @@ class BlockRobotGraph:
     blocks: tuple[WeldingBlock, ...]
     block_index: Mapping[str, int]
     robot_offset: int
+
+    @cached_property
+    def parent_block_indices(self):
+        grouped = {}
+        for index, block in enumerate(self.blocks):
+            grouped.setdefault(block.parent_id, []).append(index)
+        return grouped
+
+    @cached_property
+    def incoming_edges(self):
+        destination = self.edge_index[1]
+        return tuple(torch.where(destination == node)[0] for node in range(len(self.node_features)))
 
 
 @dataclass(frozen=True)
@@ -225,9 +238,10 @@ class BlockAssignmentGNN(nn.Module):
 
     def encode_static(self, graph: BlockRobotGraph) -> torch.Tensor:
         hidden = torch.nn.functional.elu(
-            self.layer1(graph.node_features, graph.edge_index, graph.edge_type)
+            self.layer1(graph.node_features, graph.edge_index, graph.edge_type,
+                        incoming_edges=graph.incoming_edges)
         )
-        return self.layer2(hidden, graph.edge_index, graph.edge_type)
+        return self.layer2(hidden, graph.edge_index, graph.edge_type,incoming_edges=graph.incoming_edges)
 
     def action_logits(
         self,
@@ -308,9 +322,10 @@ class BlockAssignmentRankingModel(nn.Module):
         if self.encoder_kind == "mlp":
             return self.node_mlp(graph.node_features)
         hidden = torch.nn.functional.elu(
-            self.layer1(graph.node_features, graph.edge_index, graph.edge_type)
+            self.layer1(graph.node_features, graph.edge_index, graph.edge_type,
+                        incoming_edges=graph.incoming_edges)
         )
-        return self.layer2(hidden, graph.edge_index, graph.edge_type)
+        return self.layer2(hidden, graph.edge_index, graph.edge_type,incoming_edges=graph.incoming_edges)
 
     def _rows(
         self,
@@ -390,13 +405,140 @@ class JointInsertionGNN(BlockAssignmentGNN):
         return features
 
     def parent_logits(self, graph, embeddings, parent_ids, features):
-        pooled = torch.stack([embeddings[[graph.block_index[b.block_id] for b in graph.blocks
-                                          if b.parent_id==p]].mean(0) for p in parent_ids])
+        pooled = torch.stack([embeddings[graph.parent_block_indices[p]].mean(0) for p in parent_ids])
         return self.parent_head(torch.cat((pooled,self.scale_inputs(features,'parent')),dim=1)).squeeze(1)
 
     def joint_action_logits(self, embeddings, indices, features):
         context = embeddings[indices.clamp_min(0)] * (indices>=0).unsqueeze(-1)
         return self.insertion_head(torch.cat((context.flatten(1),self.scale_inputs(features,'joint')),dim=1)).squeeze(1)
+
+    def contextualize_state(self, graph, embeddings, routes, directions):
+        """Legacy policies retain their original static embeddings exactly."""
+        return embeddings
+
+
+class CoordinationJointInsertionGNN(JointInsertionGNN):
+    """Refresh route/order/direction and same-rail context at every decision.
+
+    These edges describe the student's current partial solution only. They do
+    not assert schedulability: complete candidates still need B32 and the
+    independent certifier. The original static policy/checkpoints are intact.
+    """
+
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True):
+        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs)
+        # Keep each weld's own geometry when attention neighborhoods coincide.
+        self.geometry_skip = nn.Linear(NODE_DIM, hidden_dim)
+        self.route_direction = nn.Embedding(2, hidden_dim)
+        self.route_messages = nn.ModuleDict({
+            relation: nn.Linear(hidden_dim, hidden_dim, bias=False)
+            for relation in ('successor', 'predecessor', 'owner', 'rail')
+        })
+        self.route_norm = nn.LayerNorm(hidden_dim)
+        self.use_dynamic_context = True
+
+    def encode_static(self, graph):
+        return super().encode_static(graph) + self.geometry_skip(graph.node_features)
+
+    def contextualize_state(self, graph, embeddings, routes, directions):
+        if not self.use_dynamic_context:
+            return embeddings
+        if len(routes) != 4 or len(directions) != 4:
+            raise ValueError('dynamic context expects four directed routes')
+        edges = {name: [] for name in self.route_messages}
+        placed, bits = [], []
+        for robot, (route, ds) in enumerate(zip(routes, directions)):
+            if len(route) != len(ds) or any(d not in (0, 1) for d in ds):
+                raise ValueError('dynamic context has invalid route directions')
+            nodes = [graph.block_index[b] for b in route]
+            placed.extend(nodes)
+            bits.extend(ds)
+            owner = graph.robot_offset + robot
+            for node in nodes:
+                edges['owner'].extend(((node, owner), (owner, node)))
+            edges['successor'].extend(zip(nodes[:-1], nodes[1:]))
+            edges['predecessor'].extend(zip(nodes[1:], nodes[:-1]))
+        if len(set(placed)) != len(placed):
+            raise ValueError('dynamic context contains duplicate blocks')
+        for robot in range(4):
+            edges['rail'].append((graph.robot_offset + robot,
+                                  graph.robot_offset + (robot ^ 1)))
+        edge_tensors = {
+            name: torch.tensor(pairs, dtype=torch.long, device=embeddings.device).t()
+            for name, pairs in edges.items() if pairs
+        }
+        h = embeddings
+        if placed:
+            indices = torch.tensor(placed, dtype=torch.long, device=h.device)
+            orientation = torch.tensor(bits, dtype=torch.long, device=h.device)
+            h = h.index_add(0, indices, self.route_direction(orientation))
+        # Ordered neighbors -> route owner -> same-rail partner is three hops.
+        # Reuse the same transforms at each hop; no future route is supplied.
+        for _ in range(3):
+            message = torch.zeros_like(h)
+            degree = h.new_zeros((len(h), 1))
+            for relation, (source, destination) in edge_tensors.items():
+                message = message.index_add(0, destination,
+                                            self.route_messages[relation](h[source]))
+                degree = degree.index_add(0, destination,
+                                          h.new_ones((len(destination), 1)))
+            h = self.route_norm(h + nn.functional.elu(message / degree.clamp_min(1)))
+        return h
+
+
+class ModeJointInsertionGNN(CoordinationJointInsertionGNN):
+    """Choose legal parent modes before constructing their directed routes."""
+
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True):
+        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs)
+        self.use_dynamic_context = False
+        self.mode_head = nn.Sequential(nn.Linear(hidden_dim + 12, hidden_dim),
+                                       nn.ReLU(), nn.Linear(hidden_dim, 1))
+
+    def mode_logits(self, graph, embeddings, parent_ids, features):
+        pooled = {parent: embeddings[graph.parent_block_indices[parent]].mean(0)
+                  for parent in dict.fromkeys(parent_ids)}
+        context = torch.stack([pooled[parent] for parent in parent_ids])
+        return self.mode_head(torch.cat((context, features), dim=1)).squeeze(1)
+
+
+def legal_mode_inputs(parents, config):
+    """Static parent geometry and each currently legal mode, in catalog order."""
+    parents = tuple(sorted(parents, key=lambda parent: parent.parent_id))
+    graph, _, _ = joint_graph(joint_geometry(parents, fixed_split_patterns(parents, config), config), config)
+    catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+    candidates, features = [], []
+    for parent in parents:
+        for pattern in catalog[parent.parent_id]:
+            children = blocks_for_pattern(parent, pattern, config)
+            lengths = [child.length for child in children]
+            process = [config.process_time(length) for length in lengths]
+            candidates.append(pattern)
+            features.append([float(pattern.kind is SplitKind.WHOLE),
+                             float(pattern.kind is SplitKind.Y_SPLIT),
+                             float(pattern.kind is SplitKind.X_SPLIT), float(pattern.mandatory),
+                             pattern.t if pattern.t is not None else .5,
+                             float(pattern.rail is Rail.UPPER), float(pattern.rail is Rail.LOWER),
+                             len(children)/2, min(lengths)/parent.length, max(lengths)/parent.length,
+                             min(process)/2500, max(process)/2500])
+    return graph, tuple(candidates), torch.tensor(features, dtype=torch.float32).reshape(-1, 12)
+
+
+def select_gnn_patterns(parents, model, config):
+    """One deterministic argmax per parent; no route or teacher is an input."""
+    graph, candidates, features = legal_mode_inputs(parents, config)
+    model.eval()
+    with torch.inference_mode():
+        embeddings = model.encode_static(graph)
+        logits = model.mode_logits(graph, embeddings, tuple(p.parent_id for p in candidates), features)
+        if not torch.isfinite(logits).all():
+            raise ValueError('NONFINITE_MODE_LOGITS')
+        best = {}
+        for index, pattern in enumerate(candidates):
+            previous = best.get(pattern.parent_id)
+            if previous is None or logits[index] > logits[previous]:
+                best[pattern.parent_id] = index
+    return tuple(candidates[best[parent.parent_id]] for parent in sorted(parents,key=lambda p:p.parent_id))
 
 
 @dataclass(frozen=True)
@@ -459,21 +601,25 @@ def joint_start_state(reference, routes, directions, pending, blocks, config):
 
 
 def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8,check_initial_feasibility=True):
-    from .lns import joint_block_candidates
+    from .lns import has_joint_block_candidate
     scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
     travel = [sum(arcs) for arcs in state.arc_costs]
+    grouped = {}
+    for block in blocks.values():
+        grouped.setdefault(block.parent_id, []).append(block)
+    prefix = [*(v/scale for v in state.loads), *(v/scale for v in travel)]
     ids, features = [], []
     for p in sorted(pending):
-        children = sorted((b for b in blocks.values() if b.parent_id==p),key=lambda b:b.block_id)
-        if not joint_block_candidates(state,children[0],patterns[p],blocks,config,
-                                       insertion_limit=insertion_limit,first_only=True,
-                                       check_initial_feasibility=check_initial_feasibility):
+        children = sorted(grouped[p],key=lambda b:b.block_id)
+        if not has_joint_block_candidate(state,children[0],patterns[p],blocks,config,
+                                         insertion_limit=insertion_limit,
+                                         check_initial_feasibility=check_initial_feasibility):
             continue
         legal = [r for r in range(4) if robot_is_eligible(children[0],r,config)]
         if patterns[p].kind is SplitKind.X_SPLIT:
             legal = [0 if patterns[p].rail is Rail.UPPER else 2]
         ids.append(p)
-        features.append([*(v/scale for v in state.loads),*(v/scale for v in travel),
+        features.append([*prefix,
                          sum(config.process_time(b.length) for b in children)/scale,
                          min(state.loads[r]+travel[r] for r in legal)/scale,
                          len(pending)/max(1,len(patterns)),len(children)/2])
@@ -486,16 +632,40 @@ def joint_candidate_inputs(graph, state, variants, blocks, config):
     scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
     n = max(1,len(blocks))
     old_travel = [sum(arcs) for arcs in state.arc_costs]
+    prefix = [*(v/scale for v in state.loads), *(v/scale for v in old_travel)]
+    route_lengths = [len(route)/n for route in state.routes]
+    # A position's eight direction variants share identical route geometry.
+    # These local caches retain the original sums and min/max operations.
+    bounds = {}
+    arc_sums = {id(arcs): value for arcs, value in zip(state.arc_costs, old_travel)}
+    endpoints = {}
+    def oriented(block_id, direction):
+        key = (block_id, direction)
+        if key not in endpoints:
+            endpoints[key] = oriented_endpoints(blocks[block_id], direction)
+        return endpoints[key]
+    def route_bounds(route):
+        if route not in bounds:
+            bounds[route] = (max(max(blocks[b].start[0],blocks[b].end[0]) for b in route),
+                             min(min(blocks[b].start[0],blocks[b].end[0]) for b in route))
+        return bounds[route]
+    def arc_sum(arcs):
+        key = id(arcs)
+        if key not in arc_sums:
+            arc_sums[key] = sum(arcs)
+        return arc_sums[key]
     def overlap(s,r):
         left,right = (r//2*2,r//2*2+1)
         if not s.routes[left] or not s.routes[right]:
             return 0.0
-        left_end = max(max(blocks[b].start[0],blocks[b].end[0]) for b in s.routes[left])
-        right_start = min(min(blocks[b].start[0],blocks[b].end[0]) for b in s.routes[right])
+        left_end = route_bounds(s.routes[left])[0]
+        right_start = route_bounds(s.routes[right])[1]
         return max(0.0,left_end+config.interference_dx-right_start)/20
     def first_x(s,r):
-        return (oriented_endpoints(blocks[s.routes[r][0]],s.directions[r][0])[0][0]/20
+        return (oriented(s.routes[r][0],s.directions[r][0])[0][0]/20
                 if s.routes[r] else 0.0)
+    old_overlap = [overlap(state,r) for r in range(4)]
+    old_first_x = [first_x(state,r) for r in range(4)]
     indices, features = [], []
     for after,action in variants:
         r,k = action.robot,action.position
@@ -504,24 +674,23 @@ def joint_candidate_inputs(graph, state, variants, blocks, config):
         post = route[k] if k<len(route) else None
         indices.append([graph.block_index[action.block_id],graph.robot_offset+r,
                         graph.block_index[pre] if pre else -1,graph.block_index[post] if post else -1])
-        start,end = oriented_endpoints(blocks[action.block_id],action.direction)
+        start,end = oriented(action.block_id,action.direction)
         pre_old = state.directions[r][k-1] if pre else 0
         post_old = state.directions[r][k] if post else 0
         pre_new = after.directions[r][k-1] if pre else 0
         post_new = after.directions[r][k+1] if post else 0
-        incoming = (math.dist(oriented_endpoints(blocks[pre],pre_new)[1],start)/config.empty_speed if pre else 0)
-        outgoing = (math.dist(end,oriented_endpoints(blocks[post],post_new)[0])/config.empty_speed if post else 0)
-        old_arc = (math.dist(oriented_endpoints(blocks[pre],pre_old)[1],
-                             oriented_endpoints(blocks[post],post_old)[0])/config.empty_speed if pre and post else 0)
-        estimated = [p+sum(arcs) for p,arcs in zip(after.loads,after.arc_costs)]
-        features.append([*(v/scale for v in state.loads),*(v/scale for v in old_travel),
-                         *(v/scale for v in estimated),*(len(route)/n for route in state.routes),
+        incoming = (math.dist(oriented(pre,pre_new)[1],start)/config.empty_speed if pre else 0)
+        outgoing = (math.dist(end,oriented(post,post_new)[0])/config.empty_speed if post else 0)
+        old_arc = (math.dist(oriented(pre,pre_old)[1],oriented(post,post_old)[0])/config.empty_speed if pre and post else 0)
+        estimated = [p+arc_sum(arcs) for p,arcs in zip(after.loads,after.arc_costs)]
+        features.append([*prefix,
+                         *(v/scale for v in estimated),*route_lengths,
                          k/max(1,len(route)),float(pre is not None),float(post is not None),float(action.direction),
                          pre_old,pre_new,post_old,post_new,len(action.neighbour_changes)/2,
                          incoming/scale,outgoing/scale,old_arc/scale,(after.travel-state.travel)/scale,
-                         overlap(state,r),overlap(after,r),float(r%2==0),
+                         old_overlap[r],overlap(after,r),float(r%2==0),
                          start[0]/20,start[1]/12,end[0]/20,end[1]/12,
-                         first_x(state,r),first_x(after,r),first_x(state,r^1),max(estimated)/scale,sum(estimated)/scale])
+                         old_first_x[r],first_x(after,r),old_first_x[r^1],max(estimated)/scale,sum(estimated)/scale])
     return torch.tensor(indices,dtype=torch.long).reshape(-1,4),torch.tensor(features,dtype=torch.float32).reshape(-1,JOINT_DYNAMIC_DIM)
 
 
@@ -629,21 +798,27 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
             if not ids:
                 raise _JointActionUnavailable('NO_LEGAL_PARENT_ACTION')
             if parent_selection_mode=='learned':
-                parent_logits = model.parent_logits(graph,embeddings,ids,features)
+                current_embeddings = model.contextualize_state(graph,embeddings,state.routes,state.directions)
+                parent_logits = model.parent_logits(graph,current_embeddings,ids,features)
                 if not torch.isfinite(parent_logits).all():
                     raise ValueError('NONFINITE_PARENT_LOGITS')
                 parent = ids[choose(parent_logits,'parent')]
             else:
                 parent = mrv_parent(state,ids,blocks,patterns,config,insertion_limit=insertion_limit)
             children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
-            for child in children:
+            for child_index,child in enumerate(children):
                 variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit,
                                                    check_initial_feasibility=check_start(state),
                                                    prefer_legal_start_recovery=prefer_legal_start_recovery)
                 if not variants:
                     raise _JointActionUnavailable('NO_LEGAL_CHILD_INSERTION')
                 indices,dynamic = joint_candidate_inputs(graph,state,variants,blocks,config)
-                logits = model.joint_action_logits(embeddings,indices,dynamic)
+                # The parent decision and its first child see the identical
+                # state. Reuse only without gradients; training keeps its
+                # original independent autograd accumulation paths.
+                if child_index or parent_selection_mode!='learned' or torch.is_grad_enabled():
+                    current_embeddings = model.contextualize_state(graph,embeddings,state.routes,state.directions)
+                logits = model.joint_action_logits(current_embeddings,indices,dynamic)
                 if not torch.isfinite(logits).all():
                     raise ValueError('NONFINITE_INSERTION_LOGITS')
                 state,action = variants[choose(logits,'insertion')]
