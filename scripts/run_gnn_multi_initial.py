@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
 import torch
 import run_gnn_shared_construction as shared
-from mrta_reference.model import ScheduleStatus
+from mrta_reference.model import ScheduleStatus, ScientificConfig
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map
 from mrta_search.gnn_constructor import (
@@ -25,12 +25,13 @@ CSV=ROOT/'results/gnn_multi_initial.csv'
 REPORT=ROOT/'docs/GNN_MULTI_INITIAL.md'
 from dataclasses import replace as _replace_config
 CONFIG=_replace_config(shared.CONFIG,min_child_length=0.20)
+CONFIG_05=ScientificConfig()
 EMPTY=shared.EMPTY
 
 
-def check_complete(result):
+def check_complete(result,config=CONFIG):
     """Basic executable structure checks, without any extra evaluator."""
-    blocks=block_map(result.solution,CONFIG,scope=FORMAL_SCOPE_V2)
+    blocks=block_map(result.solution,config,scope=FORMAL_SCOPE_V2)
     actual=[b for route in result.solution.routes for b in route.block_ids]
     if Counter(actual)!=Counter(blocks.keys()) or len(result.directions)!=4:
         raise ValueError('incomplete/duplicate block coverage or direction vectors')
@@ -50,25 +51,25 @@ def check_complete(result):
             raise ValueError('parent children were not completely inserted in block order')
 
 
-def neural_multi4(parents,model,label,phase,instance,seed):
+def neural_multi4(parents,model,label,phase,instance,seed,*,config=CONFIG):
     """Return both nested-budget rows and the actual best scheduled candidate."""
     started=time.perf_counter()
-    geometry=joint_geometry(parents,fixed_split_patterns(parents,CONFIG),CONFIG)
+    geometry=joint_geometry(parents,fixed_split_patterns(parents,config),config)
     pending=tuple(p.parent_id for p in parents)
     outcomes=[];scheduled_by_routes={};calls=0;greedy_row=None
     paths=[('greedy',seed)]+[('sample',seed+i) for i in (1,2,3)]
     for index,(mode,path_seed) in enumerate(paths):
-        result=construct_or_repair_with_gnn(geometry,EMPTY,EMPTY,pending,model,CONFIG,
+        result=construct_or_repair_with_gnn(geometry,EMPTY,EMPTY,pending,model,config,
                                           insertion_limit=8,decode_mode=mode,seed=path_seed)
         scheduled=None;called=0;duplicate=False
         status='CONSTRUCTION_FAILED';cmax=None
         if result.solution is not None:
-            check_complete(result)
+            check_complete(result,config)
             key=(tuple(r.block_ids for r in result.solution.routes),result.directions)
             if key in scheduled_by_routes:
                 scheduled=scheduled_by_routes[key];duplicate=True
             else:
-                scheduled=shared.pilot.oriented.schedule_explicit(result.solution,result.directions,CONFIG)
+                scheduled=shared.pilot.oriented.schedule_explicit(result.solution,result.directions,config)
                 scheduled_by_routes[key]=scheduled;calls+=1;called=1
             status=scheduled.schedule.status.value
             if scheduled.schedule.status is ScheduleStatus.FEASIBLE:cmax=scheduled.schedule.cmax
@@ -76,6 +77,8 @@ def neural_multi4(parents,model,label,phase,instance,seed):
         if index==0:
             greedy_row=dict(phase=phase,instance=instance,method=label+'-Greedy',status=status,best_cmax=cmax,
                             b32_calls=calls,runtime_s=time.perf_counter()-started,unique_routes=len(scheduled_by_routes))
+            if config is CONFIG_05 and cmax is not None:
+                greedy_row.update(_minchild_metrics(scheduled.solution,scheduled.schedule,config))
         print('CANDIDATE',phase,instance,label,index+1,mode,'seed',path_seed,status,'Cmax',cmax,
               'B32',called,'duplicate',duplicate,'actions',len(result.actions),
               'failure',result.rejection_reason,flush=True)
@@ -84,6 +87,8 @@ def neural_multi4(parents,model,label,phase,instance,seed):
     multi_row=dict(phase=phase,instance=instance,method=label+'-Multi4',status='FEASIBLE' if best else 'FAILED',
                    best_cmax=None if best is None else best.schedule.cmax,b32_calls=calls,
                    runtime_s=time.perf_counter()-started,unique_routes=len(scheduled_by_routes))
+    if config is CONFIG_05 and best is not None:
+        multi_row.update(_minchild_metrics(best.solution,best.schedule,config))
     if greedy_row['status']=='FEASIBLE' and (best is None or best.schedule.cmax>greedy_row['best_cmax']):
         raise ValueError('multi4 lost its own feasible greedy candidate')
     return greedy_row,multi_row,best
@@ -147,8 +152,12 @@ def main():
                                                'bound-shadow','bound-online','bound-summary','fresh-e2e','fresh-summary','summary','minchild05'))
     parser.add_argument('--workers',type=int,default=4)
     parser.add_argument('--seconds',type=float,default=30.)
+    parser.add_argument('--final-stage',choices=('initial','ablation','diagnosis','formal','report','all'))
     args=parser.parse_args()
     torch.set_num_threads(1)
+    if args.final_stage:
+        run_final_stages(args)
+        return
     if args.mode_study == 'minchild05':
         run_minchild05(args.workers)
         return
@@ -335,14 +344,16 @@ def _mode_worker_init():
     torch.set_num_threads(1)
 
 
-def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, certify=True):
+def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, certify=True,
+                 common_initial=None,initial_seconds=0.,initial_attempts=None,save_timeline=False):
     from dataclasses import asdict,replace
     from mrta_reference.certifier import certify_schedule
     from mrta_search.lns import rank_parent_mode_changes,select_bottleneck_parents,repair_partial_state_oriented
 
-    started=time.perf_counter()
+    started=time.perf_counter()-initial_seconds
     pilot=shared.pilot
     model=shared.load_model(pilot.MODEL)[0] if method.endswith('GNN') else None
+    if model is not None and not certify:model.eval()
     certificates=0
     initial_events=[]
     def accept_initial(candidate):
@@ -356,8 +367,13 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
         if not initial_events or candidate.schedule.cmax<initial_events[-1][1]:
             initial_events.append([elapsed,candidate.schedule.cmax,'INITIAL'])
         return True
-    current,attempts=pilot.oriented.common_initial_beam(parents,config,seed=seed,
-        deadline=started+budget,accept_candidate=accept_initial,interleave=True)
+    if common_initial is None:
+        current,attempts=pilot.oriented.common_initial_beam(parents,config,seed=seed,
+            deadline=started+budget,accept_candidate=accept_initial,interleave=True)
+    else:
+        current,attempts=common_initial,list(initial_attempts or ())
+        initial_events=[[initial_seconds,current.schedule.cmax,'INITIAL']]
+    initial=current
     calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts)
     init_elapsed=time.perf_counter()-started
     row=dict(method=method,initial_cmax=None if current is None else current.schedule.cmax,
@@ -449,6 +465,12 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
                robot_completion=current.schedule.robot_completion,
                schedule_summary=None if certify else _minchild_metrics(current.solution,current.schedule,config),
                split_count=sum(p.kind.value!='WHOLE' for p in current.solution.patterns))
+    if save_timeline:
+        row['initial_state']=_final_state(initial.solution,initial.directions,initial.schedule,config)
+        row['final_state']=_final_state(current.solution,current.directions,current.schedule,config)
+        row['mode_changes']=row['mode_accepted']
+        row['trace']=[{k:item[k] for k in ('iteration','removed','proposed_modes','before','after','elapsed')}
+                      for item in row['trace'] if item['accepted']]
     return row
 
 
@@ -2970,6 +2992,565 @@ def run_minchild05(workers):
                 stream.flush()
                 print(row['instance'], row['method'], row['seed'], row['status'], row.get('cmax'),
                       row.get('reason',''), flush=True)
+
+
+FINAL_SEEDS=(20261031,20261032,20261033)
+FINAL_ARMS=('FIXED_NEW','FIXED_GNN','MODE_NEW','MODE_GNN','WAG','HGA')
+FINAL_INITIAL=ROOT/'results/gnn_initial_minchild05_final.csv'
+FINAL_ABLATION=ROOT/'results/parent_mode_joint_reconstruction_05.csv'
+FINAL_FORMAL=ROOT/'results/final_parent_mode_joint_reconstruction_05.csv'
+FINAL_FIELDS=('record','instance','tier','N','geometry_seed','seed','method','status','cmax',
+              'b32_calls','runtime_s','loads','travel','wait','mode_changes','payload')
+
+
+def _final_entries():
+    return [dict(r,tier={35:'SMALL',55:'MEDIUM',85:'LARGE'}[r['target_N']]) for r in _study_rows()
+            if r.get('record')=='instance' and r.get('stage')=='INDEPENDENT'
+            and r.get('version')=='parent-mode-v2']
+
+
+def _final_parents(entry):
+    from mrta_reference.model import ParentWeld
+    return tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in entry['parents'])
+
+
+def _final_read(path):
+    if not path.exists():return []
+    csv.field_size_limit(32*1024*1024)
+    with path.open(encoding='utf-8-sig',newline='') as stream:
+        return [json.loads(r['payload']) for r in csv.DictReader(stream)]
+
+
+def _final_append(path,row):
+    exists=path.exists() and path.stat().st_size>0
+    with path.open('a',encoding='utf-8-sig' if not exists else 'utf-8',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=FINAL_FIELDS,extrasaction='ignore')
+        if not exists:writer.writeheader()
+        writer.writerow(dict(row,payload=json.dumps(row,ensure_ascii=False,allow_nan=False)))
+
+
+def _final_state(solution,directions,schedule,config):
+    from dataclasses import asdict
+    from mrta_reference.model import OperationKind
+    metrics=_minchild_metrics(solution,schedule,config)
+    return dict(solution=asdict(solution),directions=directions,**metrics,cmax=schedule.cmax,
+                robot_completion=schedule.robot_completion,
+                travel_by_robot=[sum(o.duration for o in schedule.operations
+                    if o.robot_id==r and o.kind is OperationKind.MOVE) for r in range(4)],
+                wait_by_robot=[sum(o.duration for o in schedule.operations
+                    if o.robot_id==r and o.kind is OperationKind.WAIT) for r in range(4)],
+                operations=[dict(robot=o.robot_id,kind=o.kind.value,block=o.block_id,
+                    t0=o.start_time,t1=o.end_time,start=o.start,end=o.end) for o in schedule.operations])
+
+
+def _final_initial_worker(job):
+    entry,seed=job
+    parents=_final_parents(entry)
+    common={k:entry[k] for k in ('instance','tier','N','geometry_seed')}
+    common.update(record='run',seed=seed)
+    rows=[]
+    for label,path in (('GNN-V2',shared.pilot.MODEL),('GNN-Shared',shared.MODEL)):
+        model=shared.load_model(path)[0].eval()
+        with torch.inference_mode():
+            greedy,multi,_=neural_multi4(parents,model,label,'MINCHILD05_FINAL',entry['instance'],seed,
+                                       config=CONFIG_05)
+        for row in (greedy,multi):
+            row['cmax']=row.pop('best_cmax')
+            rows.append(dict(common,**row))
+    started=time.perf_counter()
+    beam,attempts=shared.pilot.oriented.common_initial_beam(parents,CONFIG_05,seed=seed,
+                                                         max_reference_calls=4)
+    row=dict(common,method='RULE/BEAM',status='FEASIBLE' if beam else 'FAILED',
+        cmax=None if beam is None else beam.schedule.cmax,runtime_s=time.perf_counter()-started,
+        b32_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts))
+    if beam is not None:
+        if beam.solution.patterns!=fixed_split_patterns(parents,CONFIG_05):
+            raise ValueError('RULE and GNN fixed modes differ')
+        row.update(_minchild_metrics(beam.solution,beam.schedule,CONFIG_05))
+    rows.append(row)
+    return rows
+
+
+def _final_initial_decision(rows,label):
+    import math,statistics
+    method=label+'-Multi4'
+    selected=[r for r in rows if r['method']==method]
+    baseline=[r for r in rows if r['method']=='RULE/BEAM']
+    values={};tiers=set()
+    for instance in sorted({r['instance'] for r in rows}):
+        a=[r for r in selected if r['instance']==instance]
+        b=[r for r in baseline if r['instance']==instance]
+        if len(a)==len(b)==3 and all(r['status']=='FEASIBLE' for r in a+b):
+            av=math.exp(statistics.mean(math.log(r['cmax']) for r in a))
+            bv=math.exp(statistics.mean(math.log(r['cmax']) for r in b))
+            values[instance]=100*(bv-av)/bv
+            if values[instance]>1e-8:tiers.add(a[0]['tier'])
+    success=sum(r['status']=='FEASIBLE' for r in selected)
+    reference_success=sum(r['status']=='FEASIBLE' for r in baseline)
+    median=statistics.median(values.values()) if values else None
+    keep=(len(selected)==len(baseline)==27 and success>=reference_success
+          and sum(v>1e-8 for v in values.values())>=5 and median is not None and median>=.5
+          and len(tiers)>=2)
+    return dict(method=method,success=success,total=len(selected),baseline_success=reference_success,
+                geometry_improvement_pct=values,median_improvement_pct=median,winning_tiers=sorted(tiers),keep=keep)
+
+
+def _final_initial_report(rows):
+    import statistics
+    lines=['# 最后一次0.50 m GNN初始构造实验','',
+        '仅使用现有V2和Shared checkpoint；无训练、无网络或权重修改。历史CONFIG=0.20保留，实验显式使用CONFIG_05=ScientificConfig()，min_child_length=0.50。',
+        '两checkpoint均为hidden=64、heads=4、normalize_inputs=True，动态输入41维/父输入12维与现有特征实现一致；checkpoint未存ScientificConfig快照。当前教师脚本默认0.50不能证明历史训练域：V2已有294条轨迹中30条、Shared已有40条中4条含小于0.50 m的子段，最短0.277058 m。因此本次属于冻结既有权重在0.50合法目录上的迁移评价，不能称为0.50域专门训练的模型。没有重训或更新归一化。',
+        '固定父模式、FORMAL_SCOPE_V2、insertion_limit=8、同一B32。Multi4为Greedy及seed+1/+2/+3，温度1，不补采；完整路线和方向去重后最多4次B32。RULE/BEAM保持原Beam宽度并设max_reference_calls=4。Greedy复用Multi4第一候选。',
+        'travel为MOVE总耗时（秒），wait为WAIT总耗时（秒）；负载为PRE+WELD+POST。失败无惩罚Cmax。','',
+        f'已记录{len(rows)}/135行（9×3×5）。','',
+        '|方法|FEASIBLE/总次数|成功Cmax平均|成功Cmax中位|平均耗时秒|B32合计|',
+        '|---|---:|---:|---:|---:|---:|']
+    for method in ('RULE/BEAM','GNN-V2-Greedy','GNN-V2-Multi4','GNN-Shared-Greedy','GNN-Shared-Multi4'):
+        group=[r for r in rows if r['method']==method];ok=[r['cmax'] for r in group if r['status']=='FEASIBLE']
+        if group:lines.append(f"|{method}|{len(ok)}/{len(group)}|{statistics.mean(ok) if ok else None}|{statistics.median(ok) if ok else None}|{statistics.mean(r['runtime_s'] for r in group):.3f}|{sum(r['b32_calls'] for r in group)}|")
+    decisions=[_final_initial_decision(rows,label) for label in ('GNN-V2','GNN-Shared')]
+    for decision in decisions:
+        lines+=['',f"## {decision['method']}",'', '```json',json.dumps(decision,ensure_ascii=False,indent=2),'```']
+    if len(rows)==135:
+        lines+=['','结论：'+('至少一个现有Multi4通过四项条件，仅保留通过者为可选初解；停止训练和调参。' if any(d['keep'] for d in decisions)
+            else '正式淘汰GNN初始分配与排序。停止该方向训练、架构调整、增加采样、温度调整和PPO初始分配；不影响独立评价GNN局部联合修复。')]
+    (ROOT/'docs/GNN_INITIAL_MINCHILD05_FINAL.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    return decisions
+
+
+def _final_initial_run(workers):
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing
+    rows=_final_read(FINAL_INITIAL)
+    done={(r['instance'],r['seed']) for r in rows if r['method']=='RULE/BEAM'}
+    jobs=[(e,s) for e in _final_entries() for s in FINAL_SEEDS if (e['instance'],s) not in done]
+    with ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn'),initializer=_mode_worker_init) as pool:
+        for batch in pool.map(_final_initial_worker,jobs):
+            for row in batch:_final_append(FINAL_INITIAL,row);rows.append(row)
+            print('INITIAL_PROGRESS',len(rows),'/135',flush=True)
+    _final_initial_report(rows)
+
+
+def run_final_stages(args):
+    if args.final_stage in ('initial','all'):_final_initial_run(args.workers)
+    if args.final_stage in ('ablation','all'):_final_ablation_run(args.workers)
+    if args.final_stage in ('diagnosis','all'):_final_diagnosis()
+    if args.final_stage in ('formal','all'):_final_formal_run(args.workers)
+    if args.final_stage in ('report','all'):_final_report()
+
+
+def _final_result_row(entry,seed,method,out):
+    row={k:entry[k] for k in ('instance','tier','N','geometry_seed')}
+    row.update(record='run',seed=seed,method=method,status=out['status'],cmax=out.get('cmax'),
+               b32_calls=out.get('reference_calls',0),runtime_s=out.get('actual_runtime',0.),
+               mode_changes=out.get('mode_changes',out.get('mode_accepted',0)),details=out)
+    row.update(out.get('schedule_summary') or {})
+    if out.get('final_state'):
+        row.update({k:out['final_state'][k] for k in ('loads','travel','wait')})
+    return row
+
+
+def _final_baseline(parents,method,seed,budget):
+    from mrta_baselines.wag_vns import run_adapted_wag_vns_v2,AdaptedWAGConfig
+    from mrta_baselines.hga import run_adapted_hga_v2,AdaptedHGAConfig
+    run,settings=((run_adapted_wag_vns_v2,AdaptedWAGConfig()) if method=='WAG'
+                  else (run_adapted_hga_v2,AdaptedHGAConfig()))
+    out=run(parents,CONFIG_05,settings,seed=seed,time_limit=budget,checkpoints=(budget,),certify=False)
+    best=out.timely_best
+    row=dict(status='FEASIBLE' if best else out.status.value,cmax=None if best is None else best.schedule.cmax,
+             actual_runtime=out.actual_runtime,reference_calls=out.reference_calls,certifier_calls=out.certifier_calls,
+             mode_changes=0,iterations=out.iterations)
+    if best:
+        row['final_state']=_final_state(best.solution,best.directions,best.schedule,CONFIG_05)
+        initial=out.initial_candidate
+        if initial is not None and initial.schedule is not None and initial.schedule.feasible:
+            row['initial_state']=_final_state(initial.solution,initial.directions,initial.schedule,CONFIG_05)
+            before={p.parent_id:p for p in initial.solution.patterns}
+            row['mode_changes']=sum(p!=before[p.parent_id] for p in best.solution.patterns)
+    return row
+
+
+def _final_experiment_worker(job):
+    entry,seed,methods,budget=job
+    parents=_final_parents(entry);rows=[]
+    joint=[m for m in methods if m in FINAL_ARMS[:4]]
+    initial=None;attempts=[];elapsed=0.
+    if joint:
+        started=time.perf_counter()
+        initial,attempts=shared.pilot.oriented.common_initial_beam(parents,CONFIG_05,seed=seed,
+            deadline=started+budget,interleave=True)
+        elapsed=time.perf_counter()-started
+    for method in methods:
+        started=time.perf_counter()
+        try:
+            if method in FINAL_ARMS[:4]:
+                if initial is None or elapsed>budget:
+                    out=dict(status='TIME_LIMIT_NO_FEASIBLE',cmax=None,actual_runtime=elapsed,
+                             reference_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts))
+                else:
+                    with torch.inference_mode():
+                        out=_mode_search(parents,method,seed,budget,1000000,config=CONFIG_05,certify=False,
+                            common_initial=initial,initial_seconds=elapsed,initial_attempts=attempts,save_timeline=True)
+            elif method in ('WAG','HGA'):
+                out=_final_baseline(parents,method,seed,budget)
+            elif method=='REGION_FAST_ROUTE_REORDER':
+                out=_final_region(parents,seed,budget)
+            else:raise ValueError(method)
+            row=_final_result_row(entry,seed,method,out)
+        except Exception as error:
+            import traceback
+            row=_final_result_row(entry,seed,method,dict(status='EXECUTION_ERROR',cmax=None,
+                actual_runtime=time.perf_counter()-started,error=str(error),traceback=traceback.format_exc()))
+        rows.append(row)
+        print('FINAL_RUN',entry['instance'],seed,method,row['status'],row['cmax'],flush=True)
+    return rows
+
+
+def _final_run_jobs(path,jobs,workers):
+    from concurrent.futures import ProcessPoolExecutor,as_completed
+    import multiprocessing
+    with ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn'),initializer=_mode_worker_init) as pool:
+        futures={pool.submit(_final_experiment_worker,job):job for job in jobs}
+        for future in as_completed(futures):
+            try:batch=future.result()
+            except Exception as error:
+                import traceback
+                entry,seed,methods,budget=futures[future]
+                batch=[_final_result_row(entry,seed,method,dict(status='EXECUTION_ERROR',cmax=None,
+                    error=str(error),traceback=traceback.format_exc())) for method in methods]
+            for row in batch:_final_append(path,row)
+            print('SAVED',path.name,len(batch),flush=True)
+
+
+def _final_pair(rows,method,baseline,seeds):
+    import statistics
+    pairs=[];excluded=[]
+    for instance in sorted({r['instance'] for r in rows}):
+        a=[r for r in rows if r['instance']==instance and r['method']==method]
+        b=[r for r in rows if r['instance']==instance and r['method']==baseline]
+        if len(a)!=seeds or len(b)!=seeds or any(r['status']!='FEASIBLE' for r in a+b):
+            excluded.append(instance);continue
+        av=statistics.mean(r['cmax'] for r in a);bv=statistics.mean(r['cmax'] for r in b)
+        pairs.append(dict(instance=instance,tier=a[0]['tier'],method_mean=av,baseline_mean=bv,
+                          improvement_pct=100*(bv-av)/bv))
+    values=[p['improvement_pct'] for p in pairs]
+    return dict(method=method,baseline=baseline,geometries=len(pairs),excluded=excluded,
+                wins=sum(v>1e-8 for v in values),ties=sum(abs(v)<=1e-8 for v in values),
+                losses=sum(v<-1e-8 for v in values),mean_pct=statistics.mean(values) if values else None,
+                median_pct=statistics.median(values) if values else None,pairs=pairs)
+
+
+def _final_stable(rows,method,baseline):
+    pair=_final_pair(rows,method,baseline,3)
+    a=sum(r['status']=='FEASIBLE' for r in rows if r['method']==method)
+    b=sum(r['status']=='FEASIBLE' for r in rows if r['method']==baseline)
+    return (a>=b and pair['wins']>pair['losses'] and pair['median_pct'] is not None
+            and pair['median_pct']>0 and len({p['tier'] for p in pair['pairs'] if p['improvement_pct']>1e-8})>=2)
+
+
+def _final_choice(rows):
+    pairwise_gnn=_final_stable(rows,'MODE_GNN','MODE_NEW') and _final_stable(rows,'FIXED_GNN','FIXED_NEW')
+    # Select the one technical route after development, before new geometry.
+    # A marginal pairwise GNN advantage does not establish a useful combined
+    # method when its own MODE-versus-FIXED ablation goes the other way.
+    gnn=pairwise_gnn and _final_stable(rows,'MODE_GNN','FIXED_GNN')
+    method='MODE_GNN' if gnn else 'MODE_NEW'
+    fixed='FIXED_GNN' if gnn else 'FIXED_NEW'
+    return dict(method=method,fixed=fixed,gnn_stable=gnn,gnn_pairwise_positive=pairwise_gnn,
+                mode_stable=_final_stable(rows,method,fixed),
+                selection_rule='Pairwise checks: no worse feasibility, positive geometry median, wins>losses, wins in >=2 tiers. Final joint method also requires its own MODE-versus-FIXED benefit. This final development selection precedes independent geometry generation; search parameters are unchanged.')
+
+
+def _final_summary_lines(rows,methods,seeds,comparisons):
+    import statistics
+    lines=['|方法|FEASIBLE/总次数|成功Cmax平均|成功Cmax中位|平均运行秒|平均模式变化|',
+           '|---|---:|---:|---:|---:|---:|']
+    for method in methods:
+        group=[r for r in rows if r['method']==method];ok=[r['cmax'] for r in group if r['status']=='FEASIBLE']
+        if not group:continue
+        lines.append(f"|{method}|{len(ok)}/{len(group)}|{statistics.mean(ok) if ok else None}|{statistics.median(ok) if ok else None}|{statistics.mean(r['runtime_s'] for r in group):.3f}|{statistics.mean(r.get('mode_changes',0) for r in group):.3f}|")
+    lines+=['','Cmax均值/中位仅描述成功运行；成功数与失败数必须同时阅读。几何配对先取每个几何各种子Cmax算术平均，仅使用双方全部种子成功的几何；不完整几何单列，不补值。相对改善为(基线−方法)/基线，正值表示改善。','',
+            '|比较|完整几何数|胜/平/负|平均改善%|中位改善%|不完整几何|','|---|---:|---:|---:|---:|---|']
+    for method,baseline in comparisons:
+        p=_final_pair(rows,method,baseline,seeds)
+        lines.append(f"|{method} vs {baseline}|{p['geometries']}|{p['wins']}/{p['ties']}/{p['losses']}|{p['mean_pct']}|{p['median_pct']}|{', '.join(p['excluded']) or '无'}|")
+    lines+=['','|几何|方法|成功/次数|平均Cmax|平均四机器人加工负载/s|平均MOVE/s|平均WAIT/s|','|---|---|---:|---:|---|---:|---:|']
+    for instance in sorted({r['instance'] for r in rows}):
+        for method in methods:
+            group=[r for r in rows if r['instance']==instance and r['method']==method];ok=[r for r in group if r['status']=='FEASIBLE']
+            loads=[json.loads(r['loads']) if isinstance(r['loads'],str) else r['loads'] for r in ok]
+            lines.append(f"|{instance}|{method}|{len(ok)}/{len(group)}|{statistics.mean(r['cmax'] for r in ok) if ok else None}|{[round(statistics.mean(v[i] for v in loads),3) for i in range(4)] if loads else None}|{statistics.mean(r['travel'] for r in ok) if ok else None}|{statistics.mean(r['wait'] for r in ok) if ok else None}|")
+    return lines
+
+
+def _final_ablation_report():
+    rows=_final_read(FINAL_ABLATION)
+    comparisons=(('MODE_NEW','FIXED_NEW'),('MODE_GNN','FIXED_GNN'),('MODE_GNN','MODE_NEW'),
+        ('FIXED_GNN','FIXED_NEW'),('MODE_NEW','WAG'),('MODE_NEW','HGA'),('MODE_GNN','WAG'),('MODE_GNN','HGA'))
+    lines=['# 0.50 m父焊缝模式与方向感知联合重构2×2实验','',f'已记录{len(rows)}/162次运行。',
+        'ScientificConfig()、FORMAL_SCOPE_V2、同一合法WHOLE/Y_SPLIT/X_SPLIT目录、同一B32，30秒截止前结果。四种联合修复复用每个几何/seed同一个确定性共同初解及方向；共同初解实际构造耗时在四种方法中等额计入预算，GNN加载时间计入本方法预算。每次只接受截止前完成且严格改善Cmax的候选。',
+        '六种方法均关闭独立certify_schedule，生产默认认证不变。B32调用可跨截止时间返回，但跨时结果不纳入best；实际运行时间如实记录。模式变化为联合方法的已接受单父模式提案次数；WAG/HGA记录初始到最终不同模式的父数，不等同于搜索接受次数。',
+        '稳定收益判据在比较前固定：可行次数不降低、几何胜数大于负数、几何中位改善为正且至少两个规模有胜例；GNN须同时在MODE和FIXED组满足。','']
+    lines+=_final_summary_lines(rows,FINAL_ARMS,3,comparisons)
+    if len(rows)==162:
+        choice=_final_choice(rows)
+        lines+=['','## 最终算法选择','','```json',json.dumps(choice,ensure_ascii=False,indent=2),'```',
+                '若mode_stable=false，不宣称父模式调整有稳定收益；保留MODE对FIXED正式独立比较以确认负结果，不增加模块。']
+        lines+=['','最终选择也检查所选联合路线自身的模式消融。虽然GNN两项配对的方向检查为正，但不能把它等同于有实际幅度的稳定联合收益：本轮MODE_GNN对MODE_NEW中位改善仅0.00144%，且MODE_GNN对FIXED_GNN为3胜1平5负、中位改善−0.03017%。因此保留模式调整有正收益的MODE_NEW；GNN在固定模式组的局部收益如实保留，不作为主方法模块。该选择发生在独立几何生成之前，没有改动搜索参数。']
+    (ROOT/'docs/PARENT_MODE_JOINT_RECONSTRUCTION_05.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+    return rows
+
+
+def _final_ablation_run(workers):
+    if len(_final_read(FINAL_INITIAL))!=135:raise ValueError('complete stage 1 first')
+    rows=_final_read(FINAL_ABLATION);done={(r['instance'],r['seed'],r['method']) for r in rows}
+    jobs=[]
+    for entry in _final_entries():
+        for seed in FINAL_SEEDS:
+            pending=tuple(m for m in FINAL_ARMS[:4] if (entry['instance'],seed,m) not in done)
+            if pending:jobs.append((entry,seed,pending,30.))
+            for method in FINAL_ARMS[4:]:
+                if (entry['instance'],seed,method) not in done:jobs.append((entry,seed,(method,),30.))
+    _final_run_jobs(FINAL_ABLATION,jobs,workers)
+    _final_ablation_report()
+
+
+def _final_region(parents,seed,budget):
+    from dataclasses import replace
+    from mrta_ranker.ranking import final_coordination_search_config
+    from mrta_search.pipeline import run_sa_oi_alns_v2
+    search=replace(final_coordination_search_config('REGION_FAST_ROUTE_REORDER'),
+                   time_limit=budget,checkpoints=(budget,),certify=False)
+    states={}
+    def observe(event,value):
+        if event!='boundary' or value['elapsed']>budget:return
+        if 'metrics' not in value or value['schedule'].status is not ScheduleStatus.FEASIBLE:return
+        if 'initial' not in states:states['initial']=value
+        if 'best' not in states or value['metrics'].cmax<states['best']['metrics'].cmax:
+            states['best']=value
+    started=time.perf_counter()
+    result=run_sa_oi_alns_v2(parents,CONFIG_05,search,seed=seed,
+        source_provenance=shared.pilot.dataset.provenance(),observer=observe,budget_started_at=started)
+    best=states.get('best')
+    out=dict(status='FEASIBLE' if best else result.status.value,cmax=None if best is None else best['metrics'].cmax,
+             actual_runtime=result.runtime,reference_calls=result.stats.nref+result.stats.init_reference_calls,
+             iterations=result.stats.iterations,mode_changes=0,certifier_seconds=result.stats.certifier_time)
+    if best:
+        initial=states['initial']
+        out['initial_state']=_final_state(initial['solution'],initial['directions'],initial['schedule'],CONFIG_05)
+        out['final_state']=_final_state(best['solution'],best['directions'],best['schedule'],CONFIG_05)
+        before={p.parent_id:p for p in initial['solution'].patterns}
+        out['mode_changes']=sum(p!=before[p.parent_id] for p in best['solution'].patterns)
+    return out
+
+
+def _final_diagnosis():
+    rows=_final_ablation_report()
+    if len(rows)!=162:raise ValueError('complete all 162 ablations before diagnosis')
+    choice=_final_choice(rows);method=choice['method']
+    pairs=_final_pair(rows,method,'WAG',3)['pairs']
+    ranked=sorted((p for p in pairs if p['improvement_pct']<-1e-8),key=lambda p:p['improvement_pct'])
+    preferred=[p for p in ranked if p['instance'] in ('N55_01','N85_01')]
+    selected=(preferred+[p for p in ranked if p not in preferred])[:2]
+    lines=['','## 困难实例路线与B32时间线诊断','',
+        '选择仍落后WAG的N55_01/N85_01；不足两个时按实际落后幅度补充。只读取本轮保留的原始ScheduleResult信息，不二次调度。方向0=start→end，方向1=end→start。完整PRE/WELD/POST/MOVE/WAIT操作及坐标存于CSV payload.details.final_state.operations。','']
+    if not selected:lines+=['没有双方三个种子均成功且主方法落后WAG的几何。']
+    for selected_pair in selected:
+        name=selected_pair['instance']
+        lines +=[f"### {name}（几何平均相对WAG改善 {selected_pair['improvement_pct']:.3f}%）",'']
+        for seed in FINAL_SEEDS:
+            for label in (method,'WAG'):
+                row=next(r for r in rows if r['instance']==name and r['seed']==seed and r['method']==label)
+                state=row['details']['final_state'];loads=json.loads(state['loads'])
+                initial=row['details'].get('initial_state')
+                lines +=[f"#### {label}, seed={seed}",'',f"Cmax={row['cmax']:.3f}s，由R{max(range(4),key=lambda r:state['robot_completion'][r])}决定。",'',
+                    '|机器人|加工/s|MOVE/s|WAIT/s|完成/s|','|---|---:|---:|---:|---:|']
+                for r in range(4):
+                    lines.append(f"|R{r}|{loads[r]:.3f}|{state['travel_by_robot'][r]:.3f}|{state['wait_by_robot'][r]:.3f}|{state['robot_completion'][r]:.3f}|")
+                for route,bits in zip(state['solution']['routes'],state['directions']):
+                    robot=route['robot_id']
+                    lines+=['',f"R{robot}执行顺序（block[方向]）：",'',
+                        ' → '.join(f'{block}[{bit}]' for block,bit in zip(route['block_ids'],bits)) or '空路线','',
+                        f'R{robot} WAIT起止秒：','',
+                        '; '.join(f"{o['t0']:.3f}–{o['t1']:.3f}({o['block']})" for o in state['operations']
+                                  if o['robot']==robot and o['kind']=='WAIT' and o['t1']>o['t0']) or '无正时长WAIT']
+                if initial:
+                    before={p['parent_id']:p for p in initial['solution']['patterns']}
+                    changes=[(p['parent_id'],before[p['parent_id']],p) for p in state['solution']['patterns'] if p!=before[p['parent_id']]]
+                    lines+=['','父模式从共同/原生初解到最终的变化：','','```json',json.dumps(changes,ensure_ascii=False,indent=2),'```']
+                if label==method:
+                    wag=next(r for r in rows if r['instance']==name and r['seed']==seed and r['method']=='WAG')
+                    wagstate=wag['details']['final_state'];wagloads=json.loads(wagstate['loads'])
+                    lines+=['',f"相对WAG：最大加工负载差 {max(loads)-max(wagloads):+.3f}s；MOVE总耗时差 {state['travel']-wagstate['travel']:+.3f}s；WAIT总耗时差 {state['wait']-wagstate['wait']:+.3f}s；Cmax差 {row['cmax']-wag['cmax']:+.3f}s。",'']
+                    critical=max(range(4),key=lambda r:state['robot_completion'][r])
+                    wagcritical=max(range(4),key=lambda r:wagstate['robot_completion'][r])
+                    lines +=[f"决定完工的R{critical}：加工{loads[critical]:.3f}s、MOVE {state['travel_by_robot'][critical]:.3f}s、WAIT {state['wait_by_robot'][critical]:.3f}s；WAG决定完工的R{wagcritical}：加工{wagloads[wagcritical]:.3f}s、MOVE {wagstate['travel_by_robot'][wagcritical]:.3f}s、WAIT {wagstate['wait_by_robot'][wagcritical]:.3f}s。全局最大加工负载不能替代这条实际完成时间线。",'']
+                    waits=sorted((o for o in state['operations'] if o['robot']==critical and o['kind']=='WAIT'),
+                                 key=lambda o:o['t1']-o['t0'],reverse=True)[:3]
+                    for wait in waits:
+                        partner=critical^1
+                        active=[o for o in state['operations'] if o['robot']==partner and o['kind']!='WAIT'
+                                and min(o['t1'],wait['t1'])>max(o['t0'],wait['t0'])]
+                        lines +=[f"R{critical}长WAIT {wait['t0']:.3f}–{wait['t1']:.3f}s，下一块{wait['block']}；同期同轨R{partner}操作："+
+                            '; '.join(f"{o['kind']} {o['block']} {o['t0']:.3f}–{o['t1']:.3f}s" for o in active)+
+                            '。这是同轨操作重叠的时间线证据，不将时间重叠本身当作独立因果证明。','']
+    lines+=['','诊断阶段不新增搜索算子；上述等待与路线差异是观察证据，不能只凭加工负载判定协调效果。未根据本次诊断调参或增加WAIT/CRRR/JRRB。',
+            '', '## 主方法确定（独立几何生成前）','', '```json',json.dumps(choice,ensure_ascii=False,indent=2),'```',
+            '固定沿用既有瓶颈选择轮换、q=4/8、插入限制8、插入评价上限4096、direction_versions=2、严格Cmax接受和B32；不随正式测试结果修改。']
+    report=ROOT/'docs/PARENT_MODE_JOINT_RECONSTRUCTION_05.md'
+    with report.open('a',encoding='utf-8') as stream:stream.write('\n'.join(lines)+'\n')
+    return choice
+
+
+def _final_fresh_entries():
+    """Generate only after selection; use existing PPO generator, no workbooks."""
+    import contextlib,io,importlib.util,sqlite3
+    from types import SimpleNamespace
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_data.ppo_instances import instance_geometry_hash
+    # Reuse the project's existing geometry identity to compare its historical
+    # manifests. No new hash format, manifest or identity file is introduced.
+    dataset=shared.pilot.dataset
+    manifest=json.loads(dataset.DATASET.read_text(encoding='utf-8'))
+    known={r['instance_geometry_hash'] for r in manifest['instances']}
+    prior_seeds=set()
+    db=sqlite3.connect(f'file:{dataset.DATABASE_V05.as_posix()}?mode=ro',uri=True)
+    for (payload,) in db.execute("SELECT payload FROM experiments WHERE item_id='summary'"):
+        value=json.loads(payload)
+        if isinstance(value,dict):
+            for entry in value.get('entries',[]):
+                if not isinstance(entry,dict):continue
+                if 'instance_geometry_hash' in entry:known.add(entry['instance_geometry_hash'])
+                if 'geometry_seed' in entry:prior_seeds.add(entry['geometry_seed'])
+    db.close()
+    def identity(parents):
+        return instance_geometry_hash(SimpleNamespace(rows=[SimpleNamespace(
+            x1=p['start'][0],y1=p['start'][1],z1=.1,x2=p['end'][0],y2=p['end'][1],z2=.1) for p in parents]))
+    for row in _study_rows():
+        if row.get('parents'):
+            known.add(identity(row['parents']))
+            if 'geometry_seed' in row:prior_seeds.add(row['geometry_seed'])
+    entries=_independent_mode_instances(seed_start=2026110401,count=15)
+    for entry in entries:
+        parents=_final_parents(entry);build_legal_pattern_catalog(parents,CONFIG_05,FORMAL_SCOPE_V2)
+        tier={35:'SMALL',55:'MEDIUM',85:'LARGE'}[entry['target_N']]
+        entry.update(record='instance',instance=f"{tier}_{int(entry['instance'].split('_')[-1]):02d}",tier=tier)
+    spec=importlib.util.spec_from_file_location('final_parent_mode_generator',ROOT.parent/'src/generate_welds.py')
+    generator=importlib.util.module_from_spec(spec);sys.modules[spec.name]=generator;spec.loader.exec_module(generator)
+    source=generator.DEFAULT_SOURCE_EXCEL
+    pool=[];rejected=[]
+    for seed in range(2026110501,2026110521):
+        with contextlib.redirect_stdout(io.StringIO()):
+            welds,metadata=generator.generate_weld_instance_from_source(source,45,seed)
+        entry=dict(parents=[dict(parent_id=str(w.id),start=(w.x1,w.y1),end=(w.x2,w.y2)) for w in welds],
+                   geometry_seed=seed,group_count=45,source_excel=source,generator_version=metadata['generator_version'],N=len(welds))
+        parents=_final_parents(entry)
+        try:catalog=build_legal_pattern_catalog(parents,CONFIG_05,FORMAL_SCOPE_V2)
+        except ValueError as error:
+            rejected.append(dict(seed=seed,reason=str(error)));continue
+        entry.update(total_length=sum(p.length for p in parents),
+            mandatory_splits=sum(all(p.kind.value!='WHOLE' for p in options) for options in catalog.values()))
+        pool.append(entry)
+    selected=sorted(pool,key=lambda e:(-e['total_length'],-e['mandatory_splits'],-e['N'],e['geometry_seed']))[:5]
+    if len(selected)!=5:raise ValueError('fewer than five geometrically legal high-workload layouts')
+    for i,entry in enumerate(selected,1):entries.append(dict(entry,record='instance',tier='HIGH_WORKLOAD',instance=f'HIGH_WORKLOAD_{i:02d}'))
+    for entry in entries:
+        key=identity(entry['parents'])
+        if key in known or entry['geometry_seed'] in prior_seeds:
+            raise ValueError(f"geometry duplicates historical data: {entry['geometry_seed']}")
+        known.add(key);prior_seeds.add(entry['geometry_seed'])
+        parents=_final_parents(entry);catalog=build_legal_pattern_catalog(parents,CONFIG_05,FORMAL_SCOPE_V2)
+        entry.update(N=len(parents),total_length=sum(p.length for p in parents),
+            mandatory_splits=sum(all(p.kind.value!='WHOLE' for p in options) for options in catalog.values()))
+    metadata=dict(record='geometry_selection',instance='STATIC_SELECTION',
+        rule='15 count-selected layouts, five per target 35/55/85; HIGH_WORKLOAD top five total length, then mandatory splits and count among 20 new 45-group layouts. No solver outcomes.',
+        high_pool=[{k:e[k] for k in ('geometry_seed','N','total_length','mandatory_splits')} for e in pool],
+        geometric_rejections=rejected,historical_geometry_count=len(known)-len(entries))
+    return entries,metadata
+
+
+def _final_formal_run(workers):
+    ablation=_final_read(FINAL_ABLATION)
+    if len(ablation)!=162:raise ValueError('complete stage 2 before independent testing')
+    saved=_final_read(FINAL_FORMAL)
+    selection=next((r for r in saved if r['record']=='method_selection'),None)
+    if selection is None:
+        choice=_final_diagnosis()
+        selection=dict(record='method_selection',instance='METHOD_SELECTION',choice=choice,
+            seeds=[202611041,202611042,202611043,202611044,202611045],budget=60.)
+        _final_append(FINAL_FORMAL,selection)
+    choice=selection['choice']
+    entries=[r for r in saved if r['record']=='instance']
+    if len(entries)<20:
+        generated,metadata=_final_fresh_entries()
+        if not any(r['record']=='geometry_selection' for r in saved):_final_append(FINAL_FORMAL,metadata)
+        existing={e['instance']:e for e in entries}
+        for entry in generated:
+            if entry['instance'] in existing:
+                if existing[entry['instance']]['parents']!=json.loads(json.dumps(entry['parents'])):
+                    raise ValueError('saved independent geometry differs from regeneration')
+            else:_final_append(FINAL_FORMAL,entry)
+        entries=generated
+    if len(entries)!=20:raise ValueError('expected 20 independent geometries')
+    methods=(choice['method'],choice['fixed'],'WAG','HGA','REGION_FAST_ROUTE_REORDER')
+    done={(r['instance'],r['seed'],r['method']) for r in saved if r['record']=='run'}
+    jobs=[]
+    for entry in entries:
+        for seed in selection['seeds']:
+            pending=tuple(m for m in methods[:2] if (entry['instance'],seed,m) not in done)
+            if pending:jobs.append((entry,seed,pending,60.))
+            for method in methods[2:]:
+                if (entry['instance'],seed,method) not in done:jobs.append((entry,seed,(method,),60.))
+    print('FORMAL_MATRIX',len(entries),'geometries',len(jobs),'pending jobs',methods,flush=True)
+    _final_run_jobs(FINAL_FORMAL,jobs,workers)
+    _final_report()
+
+
+def _final_report():
+    initial=_final_read(FINAL_INITIAL);_final_initial_report(initial)
+    ablation=_final_read(FINAL_ABLATION);formal=_final_read(FINAL_FORMAL)
+    selection=next((r for r in formal if r['record']=='method_selection'),None)
+    choice=selection['choice'] if selection else (_final_choice(ablation) if len(ablation)==162 else None)
+    lines=['# 父焊缝模式调整与方向感知联合重构最终实验报告','',
+        '当前研究配置为ScientificConfig()、最短子段0.50 m、FORMAL_SCOPE_V2和现有B32。历史0.20 m配置、CSV与checkpoint均保留。没有新增训练、搜索模块、独立方向/WAIT优化或独立认证系统。','',
+        '## 1. GNN初始构造终止实验','',f'已完成{len(initial)}/135条方法结果。',
+        '详见[GNN初始构造结果](GNN_INITIAL_MINCHILD05_FINAL.md)。冻结模型训练资料含短于0.50 m的子段；这是既有权重在0.50 m合法目录上的迁移评价。','']
+    if len(initial)==135:
+        keep=any(_final_initial_decision(initial,label)['keep'] for label in ('GNN-V2','GNN-Shared'))
+        lines +=['结论：'+('通过者仅作为可选初解，停止训练调参。' if keep else 'GNN初始分配与排序正式淘汰，停止该方向训练、架构与解码调参。')]
+    lines+=['','## 2. 2×2消融及强基线','',f'已完成{len(ablation)}/162次30秒运行。',
+        '完整结果和原始B32路线诊断见[2×2报告](PARENT_MODE_JOINT_RECONSTRUCTION_05.md)。四联合方法使用同一个确定性初解，全部方法依据B32 FEASIBLE和Cmax，关闭额外认证。','']
+    if choice:
+        lines+=['```json',json.dumps(choice,ensure_ascii=False,indent=2),'```',
+            '稳定性判据在阶段2结果比较前固定；正式测试期间不修改参数。仅保留所选联合修复作为主线，其他候选属于消融/历史研究。']
+        lines+=['','本轮GNN在FIXED组中位改善0.09645%，但MODE_GNN对MODE_NEW仅0.00144%，且其自身MODE对FIXED消融为3胜1平5负、中位−0.03017%。因此不将GNN解释为稳定的联合增益来源，最终选择MODE_NEW。MODE_NEW自身模式消融为5胜1平3负、中位改善0.51696%。最终开发选择同时考虑了自身模式消融；未用正式测试选择算法。']
+    runs=[r for r in formal if r['record']=='run']
+    entries=[r for r in formal if r['record']=='instance']
+    lines+=['','## 3. 独立0.50 m正式实验','',f'已保存{len(entries)}/20个独立几何，已完成{len(runs)}/500次60秒运行。',
+        '几何与生成种子、算法选择和全部运行保存于results/final_parent_mode_joint_reconstruction_05.csv；失败保留，不换实例，不补失败Cmax。该CSV也集中保留必要路线、方向和B32操作时间线。',
+        'REGION_FAST_ROUTE_REORDER显式传入CONFIG_05，未复用历史0.20结果；其原有ALNS/方向规则作为对比方法保留，关闭额外认证。',
+        '所有方法计入初始化和调度；B32跨截止返回的结果不计入最佳解。共同初解在配对联合方法间复用、等额计时。','',
+        '|组别|几何|生成种子|实际父焊缝数|总长度/m|强制拆分父数|','|---|---|---:|---:|---:|---:|']
+    for entry in entries:
+        lines.append(f"|{entry['tier']}|{entry['instance']}|{entry['geometry_seed']}|{entry['N']}|{entry['total_length']:.6f}|{entry['mandatory_splits']}|")
+    if selection and runs:
+        methods=(choice['method'],choice['fixed'],'WAG','HGA','REGION_FAST_ROUTE_REORDER')
+        comparisons=tuple((choice['method'],m) for m in methods[1:])
+        lines+=['','## 4. 独立实验统计','']+_final_summary_lines(runs,methods,5,comparisons)
+        lines+=['','### 分组配对结果','','|组别|比较|几何数|胜/平/负|平均改善%|中位改善%|','|---|---|---:|---:|---:|---:|']
+        for tier in ('SMALL','MEDIUM','LARGE','HIGH_WORKLOAD'):
+            for method,baseline in comparisons:
+                p=_final_pair([r for r in runs if r['tier']==tier],method,baseline,5)
+                lines.append(f"|{tier}|{method} vs {baseline}|{p['geometries']}|{p['wins']}/{p['ties']}/{p['losses']}|{p['mean_pct']}|{p['median_pct']}|")
+        high=_final_pair([r for r in runs if r['tier']=='HIGH_WORKLOAD'],choice['method'],'WAG',5)
+        if high['median_pct'] is not None and high['median_pct']<0:
+            lines+=['','HIGH_WORKLOAD几何中位结果仍落后WAG，不能声称全面优于强基线。']
+    lines+=['','## 5. 项目结论与可复现执行','',
+        '执行入口：指定Python在DRL目录运行scripts/run_gnn_multi_initial.py --final-stage all --workers 4。各阶段可用initial/ablation/diagnosis/formal/report分别执行；已有结果按几何、种子、方法跳过，包括已记录失败。',
+        'travel为MOVE耗时秒，wait为WAIT耗时秒，loads为四机器人PRE+WELD+POST加工时间。模式变化计数含义见2×2报告。完整配对不足时报告排除几何和各方法成功次数，不将其隐藏。',
+        f'论文实验矩阵状态：{"500次已完成；可据真实结果撰写实验，结论须保留失败与分组局限。" if len(runs)==500 else "尚未完成500次，不能把当前结果写成全部完成。"}',
+        '最终完整回归测试结果将在实际执行后补充。']
+    (ROOT/'docs/FINAL_PARENT_MODE_JOINT_RECONSTRUCTION.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
 
 
 if __name__=='__main__':main()

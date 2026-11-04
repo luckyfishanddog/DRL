@@ -726,6 +726,7 @@ def run_adapted_hga(
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
     common_seed: EvaluatedCandidate | None = None,
     method_id: str = METHOD_ID,
+    certify: bool = True,
 ) -> BaselineResult:
     rng = random.Random(seed)
     v2 = scope.x_split_rule_id is not None
@@ -735,6 +736,7 @@ def run_adapted_hga(
         scope,
         time_limit=time_limit,
         checkpoints=checkpoints,
+        certify=certify,
     )
     if v2:
         evaluator.accounting.legal_x_pattern_count = sum(
@@ -919,6 +921,7 @@ def run_adapted_hga_v2(
     seed: int,
     time_limit: float,
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
+    certify: bool = True,
 ) -> BaselineResult:
     return run_adapted_hga(
         parents,
@@ -929,4 +932,5 @@ def run_adapted_hga_v2(
         scope=FORMAL_SCOPE_V2,
         checkpoints=checkpoints,
         method_id=METHOD_ID_V2,
+        certify=certify,
     )

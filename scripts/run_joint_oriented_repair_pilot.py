@@ -150,7 +150,11 @@ def initial_reference(parents, config, scheme):
 
 
 def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
-                        deadline=None, accept_candidate=None, interleave=False,feasible_dispatch_observer=None):
+                        deadline=None, accept_candidate=None, interleave=False,feasible_dispatch_observer=None,
+                        max_reference_calls=None):
+    if max_reference_calls is not None and max_reference_calls < 0:
+        raise ValueError('max_reference_calls must be nonnegative')
+    reference_calls = 0
     attempts = []
     schemes=("REGION_LOCAL", "RULE_X_LOCAL")
     beams={}
@@ -158,6 +162,7 @@ def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
     order=([(scheme,index) for index in range(4) for scheme in schemes] if interleave else
            [(scheme,index) for scheme in schemes for index in range(4)])
     for scheme,index in order:
+        if max_reference_calls is not None and reference_calls >= max_reference_calls:break
         if deadline is not None and time.perf_counter()>=deadline:break
         if scheme not in beams:
             try:
@@ -178,6 +183,7 @@ def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
                                       config,scope=FORMAL_SCOPE_V2)
                 if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
                     raise ValueError('fixed-mode beam candidate changed during canonicalization')
+                reference_calls += 1
                 candidate=schedule_explicit(solution,state.directions,config,
                     **({'feasible_dispatch_observer':feasible_dispatch_observer} if feasible_dispatch_observer is not None else {}))
             except (ValueError,ArithmeticError) as error:

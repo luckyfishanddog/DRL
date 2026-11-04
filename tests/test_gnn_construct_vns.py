@@ -15,6 +15,113 @@ if str(SCRIPT_DIR) not in sys.path:
 import run_gnn_construct_vns_pilot as pilot_script
 
 
+def test_final_geometry_pairs_exclude_failures_and_average_within_geometry():
+    import run_gnn_multi_initial as experiment
+    rows=[]
+    for instance,scale in (('a',1),('b',100)):
+        for seed in range(3):
+            for method,cmax in (('A',90*scale),('B',100*scale)):
+                rows.append(dict(instance=instance,tier='SMALL',seed=seed,method=method,
+                                 status='FEASIBLE',cmax=cmax))
+    pair=experiment._final_pair(rows,'A','B',3)
+    assert pair['wins']==2 and pair['median_pct']==pytest.approx(10.)
+    rows[-1].update(status='FAILED',cmax=None)
+    pair=experiment._final_pair(rows,'A','B',3)
+    assert pair['wins']==1 and pair['excluded']==['b']
+
+
+def test_final_gnn_keep_requires_five_geometry_wins_and_two_tiers():
+    import run_gnn_multi_initial as experiment
+    rows=[]
+    for i in range(9):
+        for seed in range(3):
+            for method,cmax in (('GNN-V2-Multi4',99.),('RULE/BEAM',100.)):
+                rows.append(dict(instance=str(i),tier=('SMALL','MEDIUM','LARGE')[i//3],seed=seed,
+                                 method=method,status='FEASIBLE',cmax=cmax))
+    assert experiment._final_initial_decision(rows,'GNN-V2')['keep']
+    for r in rows:
+        if r['method']=='GNN-V2-Multi4' and int(r['instance'])>=3:r['cmax']=101.
+    assert not experiment._final_initial_decision(rows,'GNN-V2')['keep']
+
+
+def test_final_four_repair_arms_share_one_initial_and_its_elapsed_time(monkeypatch):
+    import run_gnn_multi_initial as experiment
+    initial=object();calls=[];seen=[]
+    def build(*args,**kwargs):
+        calls.append(1)
+        return initial,[]
+    def search(parents,method,seed,budget,iterations,**kwargs):
+        seen.append((method,kwargs))
+        return dict(status='FEASIBLE',cmax=10.,actual_runtime=0.,reference_calls=0)
+    monkeypatch.setattr(experiment.shared.pilot.oriented,'common_initial_beam',build)
+    monkeypatch.setattr(experiment,'_mode_search',search)
+    entry=dict(instance='fixture',tier='SMALL',N=1,geometry_seed=1,
+               parents=[dict(parent_id='p',start=(1.,9.),end=(2.,9.))])
+    rows=experiment._final_experiment_worker((entry,7,experiment.FINAL_ARMS[:4],30.))
+    assert len(calls)==1 and len(rows)==4
+    assert all(k['common_initial'] is initial and k['config'].min_child_length==.5
+               and k['certify'] is False for _,k in seen)
+    assert len({k['initial_seconds'] for _,k in seen})==1
+
+
+def test_final_csv_resume_preserves_failure_and_timeline_payload(tmp_path):
+    import run_gnn_multi_initial as experiment
+    path=tmp_path/'runs.csv'
+    rows=[dict(record='run',instance='p',seed=1,method='MODE_NEW',status='EXECUTION_ERROR',cmax=None),
+          dict(record='run',instance='p',seed=2,method='MODE_NEW',status='FEASIBLE',cmax=10.,
+               details=dict(operations=[dict(kind='WAIT',t0=1.,t1=2.)]))]
+    for row in rows:experiment._final_append(path,row)
+    assert experiment._final_read(path)==rows
+
+
+def test_final_choice_requires_useful_mode_component_for_gnn(monkeypatch):
+    import run_gnn_multi_initial as experiment
+    monkeypatch.setattr(experiment,'_final_stable',lambda rows,a,b:(a,b)!=('MODE_GNN','FIXED_GNN'))
+    choice=experiment._final_choice([])
+    assert choice['gnn_pairwise_positive'] and not choice['gnn_stable']
+    assert choice['method']=='MODE_NEW' and choice['fixed']=='FIXED_NEW'
+
+
+def test_region_formal_comparator_uses_05_and_b32_without_certification(monkeypatch):
+    import run_gnn_multi_initial as experiment
+    from mrta_ranker import ranking
+    from mrta_search import pipeline
+    from mrta_reference import certifier
+    def forbidden(*args,**kwargs):
+        raise AssertionError('experiment performed independent certification')
+    monkeypatch.setattr(pipeline,'certify_schedule',forbidden)
+    monkeypatch.setattr(certifier,'certify_schedule',forbidden)
+    monkeypatch.setattr(ranking,'final_coordination_search_config',lambda method:
+        pipeline.SearchConfig(max_iterations=1,hard_reference_deadline=False))
+    parents=(ParentWeld('p',(1.,9.),(2.,9.)),ParentWeld('q',(14.,3.),(15.,3.)))
+    out=experiment._final_region(parents,1,10.)
+    assert out['status']=='FEASIBLE' and out['cmax']>0
+    assert out['certifier_seconds']==0.
+    assert out['final_state']['robot_completion']
+    assert experiment.CONFIG.min_child_length==.2
+    assert experiment.CONFIG_05.min_child_length==.5
+
+
+@pytest.mark.parametrize('limit,expected', [(0,0),(1,1),(4,4),(None,8)])
+def test_common_beam_optional_reference_limit(monkeypatch,limit,expected):
+    from types import SimpleNamespace
+    import run_joint_oriented_repair_pilot as oriented
+    config=ScientificConfig()
+    parent=ParentWeld('p',(1.,9.),(2.,9.))
+    solution=canonicalize((parent,),(SplitPattern('p',SplitKind.WHOLE),),
+                           {0:('p::whole',)},config,scope=FORMAL_SCOPE_V2)
+    state=SimpleNamespace(routes=(('p::whole',),(),(),()),directions=((0,),(),(),()))
+    monkeypatch.setattr(oriented,'initial_reference',lambda *args:solution)
+    monkeypatch.setattr(oriented,'build_oriented_insertion_beam',lambda *args,**kwargs:((state,()),)*4)
+    calls=[]
+    def schedule(*args,**kwargs):
+        calls.append(1)
+        return oriented.DirectedSolution(solution,state.directions,ScheduleResult(ScheduleStatus.DEADLOCK))
+    monkeypatch.setattr(oriented,'schedule_explicit',schedule)
+    best,attempts=oriented.common_initial_beam((parent,),config,max_reference_calls=limit)
+    assert best is None and len(calls)==expected
+
+
 @pytest.mark.parametrize('late_second', (False,True))
 def test_beam_round_robin_preserves_timely_incumbent(monkeypatch,late_second):
     from types import SimpleNamespace

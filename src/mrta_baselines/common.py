@@ -237,6 +237,7 @@ class CommonBaselineEvaluator:
         *,
         time_limit: float,
         checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
+        certify: bool = True,
     ) -> None:
         if time_limit <= 0.0:
             raise ValueError("time_limit must be positive")
@@ -246,6 +247,7 @@ class CommonBaselineEvaluator:
         self.scope = scope
         self.time_limit = float(time_limit)
         self.checkpoint_deadlines = tuple(float(value) for value in checkpoints)
+        self.certify = certify
         self.started = time.perf_counter()
         self.deadline = self.started + self.time_limit
         self.accounting = BaselineAccounting()
@@ -426,11 +428,13 @@ class CommonBaselineEvaluator:
                 schedule.diagnostics,
             )
 
-        cert_started = time.perf_counter()
-        certification = certify_schedule(solution, schedule, self.config, scope=self.scope)
-        self.accounting.certifier_time += time.perf_counter() - cert_started
-        self.accounting.certifier_calls += 1
-        if not certification.certified:
+        certification = None
+        if self.certify:
+            cert_started = time.perf_counter()
+            certification = certify_schedule(solution, schedule, self.config, scope=self.scope)
+            self.accounting.certifier_time += time.perf_counter() - cert_started
+            self.accounting.certifier_calls += 1
+        if certification is not None and not certification.certified:
             self.accounting.numeric_failure += 1
             schedule = replace(
                 schedule,
@@ -456,8 +460,8 @@ class CommonBaselineEvaluator:
             return result
 
         metrics = official_metrics(solution, schedule, self.config)
-        self.accounting.x_pattern_certified += int(has_x)
-        self.accounting.y_pattern_certified += int(has_y)
+        self.accounting.x_pattern_certified += int(has_x and self.certify)
+        self.accounting.y_pattern_certified += int(has_y and self.certify)
         self.accounting.x_pattern_accepted += int(has_x)
         self.accounting.y_pattern_accepted += int(has_y)
         result = EvaluatedCandidate(

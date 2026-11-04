@@ -60,6 +60,22 @@ def test_checkpoint_semantics_do_not_backfill_late_feasible_solution():
     assert evaluator.checkpoint_values() == {5.0: None, 30.0: 90.0, 60.0: None}
 
 
+def test_experiment_can_use_b32_without_certifier(monkeypatch):
+    import mrta_baselines.common as common
+    config, parents, solution = _solution()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('experiment must not call certify_schedule')
+    monkeypatch.setattr(common, 'certify_schedule', forbidden)
+    evaluator = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V1_1,
+                                        time_limit=2., certify=False)
+    result = evaluator.evaluate(solution, source='B32_ONLY')
+    assert result.status is BaselineStatus.COMPLETED
+    assert result.schedule.feasible and result.certification is None
+    assert evaluator.accounting.reference_calls == 1
+    assert evaluator.accounting.certifier_calls == 0
+    assert evaluator.timely_best == result
+
+
 def test_baseline_keeps_timely_solution_when_late_candidate_updates_native_best():
     from dataclasses import replace
 

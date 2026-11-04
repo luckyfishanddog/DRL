@@ -26,6 +26,21 @@ Q3 = (
 )
 
 
+def test_b32_only_experiment_skips_all_existing_certification(monkeypatch):
+    from mrta_reference import certifier
+    from mrta_search import pipeline
+    def forbidden(*args, **kwargs):
+        raise AssertionError('B32-only experiment called certifier')
+    monkeypatch.setattr(certifier, 'certify_schedule', forbidden)
+    monkeypatch.setattr(pipeline, 'certify_schedule', forbidden)
+    result=run_bounded_sa_oi(Q3,FAST,SearchConfig(max_iterations=2,certify=False),seed=3)
+    assert result.best_schedule.feasible
+    assert result.best_metrics.cmax==result.best_schedule.cmax
+    assert result.initialization.certification is None
+    assert result.final_certification is None
+    assert result.stats.certifier_time == 0.
+
+
 def test_refinement_certification_failure_is_effective_numeric_status(monkeypatch):
     from mrta_reference import certifier
     baseline = run_bounded_sa_oi(Q3, FAST, SearchConfig(max_iterations=0), seed=3)

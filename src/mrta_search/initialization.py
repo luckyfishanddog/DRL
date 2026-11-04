@@ -1520,6 +1520,7 @@ def build_initial_solution(
     reference_evaluator: ReferenceEvaluator | None = None,
     certifier: Certifier = certify_schedule,
     scope: FormalScope | None = None,
+    certify: bool = True,
 ) -> InitializationResult:
     reference_evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     if scope is not None and certifier is not certify_schedule:
@@ -1692,7 +1693,7 @@ def build_initial_solution(
         ref_duration = time.perf_counter() - ref_started
         ref_ended = time.perf_counter()
         certification = None
-        if schedule.status is ScheduleStatus.FEASIBLE:
+        if schedule.status is ScheduleStatus.FEASIBLE and certify:
             cert_started = time.perf_counter()
             certification = (certifier(solution, schedule, config, scope=scope)
                              if scope is not None else certifier(solution, schedule, config))
@@ -1748,7 +1749,7 @@ def build_initial_solution(
                 fallback_duration = time.perf_counter() - fallback_started
                 fallback_ended = time.perf_counter()
                 fallback_certification = None
-                if fallback_schedule.status is ScheduleStatus.FEASIBLE:
+                if fallback_schedule.status is ScheduleStatus.FEASIBLE and certify:
                     cert_started = time.perf_counter()
                     fallback_certification = (
                         certifier(solution, fallback_schedule, config, scope=scope)
@@ -1787,8 +1788,7 @@ def build_initial_solution(
                 certification = fallback_certification
                 if (
                     schedule.status is ScheduleStatus.FEASIBLE
-                    and certification is not None
-                    and certification.certified
+                    and (not certify or (certification is not None and certification.certified))
                 ):
                     direction = ConstrainedDirectionResult(
                         DirectionStatus.FEASIBLE,
@@ -1834,8 +1834,7 @@ def build_initial_solution(
         if (
             direction.status is DirectionStatus.FEASIBLE
             and schedule.status is ScheduleStatus.FEASIBLE
-            and certification is not None
-            and certification.certified
+            and (not certify or (certification is not None and certification.certified))
         ):
             feasible.append((official_metrics(solution, schedule, config), attempt))
 
@@ -1970,7 +1969,7 @@ def build_initial_solution(
                     ref_duration = time.perf_counter() - ref_started
                     ref_ended = time.perf_counter()
                     certification = None
-                    if schedule.status is ScheduleStatus.FEASIBLE:
+                    if schedule.status is ScheduleStatus.FEASIBLE and certify:
                         cert_started = time.perf_counter()
                         certification = (
                             certifier(solution, schedule, config, scope=scope)
@@ -2028,8 +2027,7 @@ def build_initial_solution(
                         )
                     if (
                         schedule.status is ScheduleStatus.FEASIBLE
-                        and certification is not None
-                        and certification.certified
+                        and (not certify or (certification is not None and certification.certified))
                     ):
                         stats.init_time += time.perf_counter() - started
                         stats.initial_strategy_wins[RAIL_SERIAL_BOOTSTRAP] += 1

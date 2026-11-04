@@ -1,14 +1,47 @@
 # Multi-Robot Weld Allocation and Sequencing
 
+## Current conclusion (2026-11-04)
+
+Current research configuration: **minimum child length 0.50 m**, delta_x=delta_y=0.50 m, FORMAL_SCOPE_V2, and the existing B32 scheduler. The selected research method is **MODE_NEW**: common deterministic initialization → scheduling-guided parent selection → legal parent-mode adjustment → direction-aware joint insertion/reconstruction → B32 → accept only a strict Cmax improvement. There is no separate direction or WAIT optimization stage.
+
+The final GNN initialization study completed **135/135 method rows**. RULE/BEAM was feasible 27/27, V2-Multi4 0/27, and Shared-Multi4 6/27. **GNN initial allocation and ordering are retired**. GNN local repair showed a small fixed-mode gain, but the combined MODE_GNN method did not establish a useful stable gain; it is excluded from the main method. No models were retrained or changed.
+
+The complete **162/162** development ablation was feasible throughout. MODE_NEW versus FIXED_NEW was 5/1/3 wins/ties/losses, with median geometry improvement **0.517%**. Selection of MODE_NEW preceded generation of the independent test geometries.
+
+The independent experiment completed **500/500 actual runs**, using 20 new geometries, five seeds, five methods and a 60-second evaluation budget. MODE_NEW and FIXED_NEW were feasible **95/100** each; WAG, HGA and REGION_FAST_ROUTE_REORDER were **100/100** each. All ten failures on HIGH_WORKLOAD_04 remain recorded. On the **19 complete geometry pairs**, relative improvements are positive when MODE_NEW has lower Cmax:
+
+|Comparator|Wins/ties/losses|Median Cmax improvement|
+|---|---:|---:|
+|FIXED_NEW|17/0/2|+0.342%|
+|WAG|9/0/10|−0.128%|
+|HGA|19/0/0|+2.398%|
+|REGION_FAST_ROUTE_REORDER|7/0/12|−0.335%|
+
+Parent-mode adjustment has a modest independent benefit over its fixed-mode ablation. These results **do not establish overall superiority over WAG or REGION**, and the lower feasibility also limits the comparison with HGA. In HIGH_WORKLOAD, two successful geometries still trail WAG, and one geometry fails initialization in all five seeds. The main method and parameters remain fixed; this independent set is now consumed. Next: write the measured contributions and limitations, without further algorithm tuning on these geometries.
+
+Reports: [final report](docs/FINAL_PARENT_MODE_JOINT_RECONSTRUCTION.md), [GNN stopping decision](docs/GNN_INITIAL_MINCHILD05_FINAL.md), [2×2 ablation and actual route timelines](docs/PARENT_MODE_JOINT_RECONSTRUCTION_05.md). Raw independent geometry, results and timelines: [500-run CSV](results/final_parent_mode_joint_reconstruction_05.csv).
+
+Final complete regression across project-root and DRL tests: **555 passed in 74.97 s**. Two historical fixtures now explicitly request their original 0.20 m child minimum; the current 0.50 m rule and all experiment results are unchanged.
+
+From this directory, resume the authorized experiment stages with:
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' scripts/run_gnn_multi_initial.py --final-stage all --workers 4
+```
+
+Existing runs, including failures, are retained and skipped. Historical CONFIG=0.20 is preserved; the new stages explicitly use CONFIG_05=ScientificConfig(). Earlier section titles mentioning 0.50 m can refer to split-window size, and must not be taken as proof of a 0.50 m child minimum. Historical configurations, datasets, checkpoints and results below remain separate from this new minimum-child-0.50 experiment.
+
+## Historical work (preserved)
+
 Historical work and results: [experiment record](docs/DRL已完成工作与实验结果.md).
 
 Parent-mode reconstruction traces are stored as [gzip-compressed JSON Lines](results/parent_mode_reconstruction_20261030.jsonl.gz). The study script reads and appends to this file directly. Historical references to the plain JSONL name refer to the same records.
 
-Current research direction (2026-10-26): [joint graph-policy construction and conflict-related reconstruction](docs/多机器人焊缝分配与排序实验方案.md). The revised plan contains primary literature and official GitHub sources, a concrete joint-insertion/partial-reconstruction design, common-domain comparisons with HGA/WAG, and implementation mapping to existing files. It is a proposed method, not a trained replacement or a superiority claim. A fresh 18-evaluation replay of the existing six DEV instances reproduced the current weakness: RULE+GNN-order has 2 wins/4 losses versus RULE (median Cmax +0.51%); the existing joint model has 1 win/4 losses plus one DEADLOCK (median +2.96% on the five successful pairs). No new files or model weights were created, and solver defaults are unchanged. The historical stages below retain their original scope.
+Historical proposal (2026-10-26): [joint graph-policy construction and conflict-related reconstruction](docs/多机器人焊缝分配与排序实验方案.md). The revised plan contains primary literature and official GitHub sources, a concrete joint-insertion/partial-reconstruction design, common-domain comparisons with HGA/WAG, and implementation mapping to existing files. It is a proposed method, not a trained replacement or a superiority claim. A fresh 18-evaluation replay of the existing six DEV instances reproduced the current weakness: RULE+GNN-order has 2 wins/4 losses versus RULE (median Cmax +0.51%); the existing joint model has 1 win/4 losses plus one DEADLOCK (median +2.96% on the five successful pairs). No new files or model weights were created, and solver defaults are unchanged. The historical stages below retain their original scope.
 
 FORMAL_SCOPE_V2 active: WHOLE / Y_SPLIT / X_SPLIT.
 
-Current split windows: **delta_x=delta_y=0.50 m**, child minimum **0.20 m**, interference_dx/dy **0.50 m**. Old ±0.2 cuts and legal MIDPOINT remain; new ±0.5 cuts use distinct OUTER identities. By=[5.5,6.5] is a task-layer rail coverage assumption; no URDF/IK reachability claim. Current development sensitivity: [Y/X range change](docs/YX_SPLIT_RANGE_05_CHANGE.md).
+Historical expanded-window setting: **delta_x=delta_y=0.50 m**, child minimum **0.20 m**, interference_dx/dy **0.50 m**. Old ±0.2 cuts and legal MIDPOINT remain; new ±0.5 cuts use distinct OUTER identities. By=[5.5,6.5] is a task-layer rail coverage assumption; no URDF/IK reachability claim. Historical development sensitivity: [Y/X range change](docs/YX_SPLIT_RANGE_05_CHANGE.md). The current child minimum is 0.50 m, as stated above.
 
 The Phase3-Z and Phase4-0/0B/1A/1B/1C evidence below is **historical delta_x=delta_y=0.20**, including M192 pool validation and all MLP labels/checkpoints. It does not establish performance in the expanded domain. Historical ranker tools explicitly retain 0.20; do not use those labels for formal 0.50 training.
 

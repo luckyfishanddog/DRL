@@ -129,6 +129,7 @@ class SearchConfig:
     max_iterations: int = 100
     time_limit: float | None = None
     hard_reference_deadline: bool = False
+    certify: bool = True
     checkpoints: tuple[float, ...] = (1.0, 5.0, 30.0)
     enable_two_opt_star: bool = False
     enable_crrr: bool = False
@@ -1074,15 +1075,16 @@ def evaluate_iteration(
         effective_status = schedule.status
         if schedule.status is ScheduleStatus.FEASIBLE:
             cert_started = time.perf_counter()
-            certification = certify_schedule(_solution_of(item.screened), schedule, config, scope=scope)
-            stats.certifier_time += time.perf_counter() - cert_started
-            if certification.certified:
-                funnel["certified"] += 1
+            certification = (certify_schedule(_solution_of(item.screened), schedule, config, scope=scope)
+                             if search_config.certify else None)
+            if search_config.certify:stats.certifier_time += time.perf_counter() - cert_started
+            if not search_config.certify or certification.certified:
+                funnel["certified"] += int(search_config.certify)
                 metrics = official_metrics(_solution_of(item.screened), schedule, config)
                 if has_x:
-                    stats.x_pattern_candidates_certified += 1
+                    stats.x_pattern_candidates_certified += int(search_config.certify)
                 if has_y:
-                    stats.y_pattern_candidates_certified += 1
+                    stats.y_pattern_candidates_certified += int(search_config.certify)
             else:
                 effective_status = ScheduleStatus.NUMERIC_FAILURE
                 schedule = replace(
@@ -1415,6 +1417,7 @@ def _run_bounded_sa_oi_inner(
             ),
             reference_evaluator=reference_evaluator,
             scope=scope,
+            certify=search_config.certify,
         )
     else:
         initialization = initialization_override
@@ -1424,8 +1427,8 @@ def _run_bounded_sa_oi_inner(
             or initialization.solution.parents != tuple(parents)
             or initialization.directions is None
             or initialization.schedule is None
-            or initialization.certification is None
-            or not initialization.certification.certified
+            or (search_config.certify and (initialization.certification is None
+                                          or not initialization.certification.certified))
         ):
             raise ValueError("initialization_override must be a matching certified seed")
     if initialization.status is not InitializationStatus.SUCCESS:
@@ -1597,6 +1600,7 @@ def _run_bounded_sa_oi_inner(
                 reference_evaluator=reference_evaluator,
                 stats=stats,
                 scope=scope,
+                certify=search_config.certify,
             )
             if refined.improved:
                 proposal_refined = True
@@ -1616,7 +1620,7 @@ def _run_bounded_sa_oi_inner(
                     base_candidate.cheap_rank,
                     refined_direction,
                 )
-                certification = certify_schedule(
+                certification = None if not search_config.certify else certify_schedule(
                     _solution_of(base_candidate.screened), refined.schedule, config, scope=scope
                 )
                 proposal = ReferenceEvaluatedCandidate(
@@ -1709,8 +1713,9 @@ def _run_bounded_sa_oi_inner(
         observe_boundary()
 
     cert_started = time.perf_counter()
-    final_certification = certify_schedule(best_solution, best_schedule, config, scope=scope)
-    stats.certifier_time += time.perf_counter() - cert_started
+    final_certification = (certify_schedule(best_solution, best_schedule, config, scope=scope)
+                           if search_config.certify else None)
+    if search_config.certify:stats.certifier_time += time.perf_counter() - cert_started
     runtime = time.perf_counter() - started
     stats.actual_runtime = runtime
     stats.overshoot = (
@@ -1720,7 +1725,7 @@ def _run_bounded_sa_oi_inner(
     )
     status = (
         SearchStatus.COMPLETED
-        if final_certification.certified
+        if not search_config.certify or final_certification.certified
         else SearchStatus.NUMERIC_FAILURE
     )
     if status is SearchStatus.NUMERIC_FAILURE:

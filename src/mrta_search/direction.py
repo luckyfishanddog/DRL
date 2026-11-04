@@ -162,6 +162,7 @@ def refine_directions_bounded(
     reference_evaluator: Callable[..., ScheduleResult],
     stats=None,
     scope: FormalScope | None = None,
+    certify: bool = True,
 ) -> DirectionRefinementResult:
     """Try a deterministic, budgeted set of single direction flips.
 
@@ -234,7 +235,7 @@ def refine_directions_bounded(
         duration = time.perf_counter() - started
         ended = time.perf_counter()
         calls += 1
-        if schedule.status is ScheduleStatus.FEASIBLE:
+        if schedule.status is ScheduleStatus.FEASIBLE and certify:
             cert_started = time.perf_counter()
             certification = certify_schedule(solution, schedule, config, scope=scope)
             if stats is not None:
