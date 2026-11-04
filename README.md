@@ -17,19 +17,23 @@ The independent experiment completed **500/500 actual runs**, using 20 new geome
 |HGA|19/0/0|+2.398%|
 |REGION_FAST_ROUTE_REORDER|7/0/12|−0.335%|
 
-Parent-mode adjustment has a modest independent benefit over its fixed-mode ablation. These results **do not establish overall superiority over WAG or REGION**, and the lower feasibility also limits the comparison with HGA. In HIGH_WORKLOAD, two successful geometries still trail WAG, and one geometry fails initialization in all five seeds. The main method and parameters remain fixed; this independent set is now consumed. Next: write the measured contributions and limitations, without further algorithm tuning on these geometries.
+Parent-mode adjustment has a modest independent benefit over its fixed-mode ablation. These results **do not establish overall superiority over WAG or REGION**, and the lower feasibility also limits the comparison with HGA. In HIGH_WORKLOAD, two successful geometries still trail WAG, and one geometry fails initialization in all five seeds. The main method and parameters remain fixed; this independent set is now consumed. Current follow-up is the HIGH_WORKLOAD_04 diagnosis, consolidation of paper materials, and SCI manuscript writing. The diagnosis and materials below are now available; no new experimental runs or algorithm tuning are recommended.
 
-Reports: [final report](docs/FINAL_PARENT_MODE_JOINT_RECONSTRUCTION.md), [GNN stopping decision](docs/GNN_INITIAL_MINCHILD05_FINAL.md), [2×2 ablation and actual route timelines](docs/PARENT_MODE_JOINT_RECONSTRUCTION_05.md). Raw independent geometry, results and timelines: [500-run CSV](results/final_parent_mode_joint_reconstruction_05.csv).
+Primary report for manuscript preparation: [project final report, 2026-11-04](docs/PROJECT_FINAL_REPORT_20261104.md). Supporting materials: [MODE_NEW technical note, pseudocode and Mermaid flowchart](docs/MODE_NEW_ALGORITHM_TECHNICAL_NOTE.md), [HIGH_WORKLOAD_04 root-cause evidence and limits](docs/HIGH_WORKLOAD_04_ROOT_CAUSE.md), and [the formal median-record schedule timeline](docs/figures/MODE_NEW_typical_schedule_timeline.png).
+
+HIGH_WORKLOAD_04 diagnosis confirms bounded initialization exhaustion before the 60-second deadline. The stored TIME_LIMIT_NO_FEASIBLE label conflates initialization failure with time expiry; no behavior or raw result was changed. Failed candidate routes and blocking traces were not retained, so a specific same-rail deadlock or direction conflict cannot be established from the available records.
+
+Original stage records remain available: [independent experiment report](docs/FINAL_PARENT_MODE_JOINT_RECONSTRUCTION.md), [GNN stopping decision](docs/GNN_INITIAL_MINCHILD05_FINAL.md), [2×2 ablation and development route timelines](docs/PARENT_MODE_JOINT_RECONSTRUCTION_05.md). Raw independent geometry, results and timelines: [500-run CSV](results/final_parent_mode_joint_reconstruction_05.csv).
 
 Final complete regression across project-root and DRL tests: **555 passed in 74.97 s**. Two historical fixtures now explicitly request their original 0.20 m child minimum; the current 0.50 m rule and all experiment results are unchanged.
 
-From this directory, resume the authorized experiment stages with:
+Historical execution command for the completed experiments, retained as a record rather than a current next step. The 135 GNN rows, 162 development runs and 500 formal runs are complete; do not rerun them for diagnosis or manuscript preparation:
 
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' scripts/run_gnn_multi_initial.py --final-stage all --workers 4
 ```
 
-Existing runs, including failures, are retained and skipped. Historical CONFIG=0.20 is preserved; the new stages explicitly use CONFIG_05=ScientificConfig(). Earlier section titles mentioning 0.50 m can refer to split-window size, and must not be taken as proof of a 0.50 m child minimum. Historical configurations, datasets, checkpoints and results below remain separate from this new minimum-child-0.50 experiment.
+All existing runs, including failures, remain preserved. The historical runner's resume support does not imply that another experiment is pending. Historical CONFIG=0.20 is preserved; the completed formal stages explicitly use CONFIG_05=ScientificConfig(). Earlier section titles mentioning 0.50 m can refer to split-window size, and must not be taken as proof of a 0.50 m child minimum. Historical configurations, datasets, checkpoints and results below remain separate from this minimum-child-0.50 experiment.
 
 ## Historical work (preserved)
 
