@@ -34,6 +34,7 @@ OP_CHECKPOINT=ROOT/'models/gnn_coordination_constructor_05.pt'
 OP_CSV=ROOT/'results/gnn_opportunity_cmax.csv'
 OP_REPORT=ROOT/'docs/GNN_INITIAL_MINCHILD05_FINAL.md'
 OP_VARIANT='opportunity_cmax_candidate'
+EARLY_VARIANT='early_cmax_candidate'
 OP_SEED=20261104
 OP_EVAL_SEED=202611041  # Exact existing RULE/WAG/HGA pairs; no formal rerun.
 OP_FIELDS=('phase','instance','seed','method','status','cmax','runtime_s','b32_calls','loads','move','wait','robots','payload')
@@ -113,15 +114,27 @@ def op_pair_labels(outcomes):
     return pairs
 
 
-def op_decision_pool(geometry,state,pending,model,config):
+def op_decision_pool(geometry,state,pending,model,config,*,early=False):
     from mrta_search import gnn_constructor as c
     from mrta_search.lns import joint_block_candidates
     graph,blocks,patterns=c.joint_graph(geometry,config)
     ids,parent_features=c.joint_parent_inputs(state,pending,blocks,patterns,config,include_opportunities=True)
     if not ids:return graph,ids,parent_features,{}
     embeddings=model.encode_static(graph)
+    embeddings=model.contextualize_state(graph,embeddings,state.routes,state.directions)
     parent_logits=model.parent_logits(graph,embeddings,ids,parent_features)
     order=sorted(range(len(ids)),key=lambda i:(-float(parent_logits[i]),i))
+    if early and len(order)>1:
+        # Select ONE different-parent representative using cheap, exact
+        # insertion-existence queries, not complete counterfactual rollouts.
+        from mrta_search.lns import has_joint_block_candidate
+        def priority(index):
+            children=sorted((b for b in blocks.values() if b.parent_id==ids[index]),key=lambda b:b.block_id)
+            robots=sum(has_joint_block_candidate(state,children[0],patterns[ids[index]],blocks,config,
+                insertion_limit=8,robot_id=r) for r in range(4))
+            processing=sum(config.process_time(b.length) for b in children)
+            return (processing/max(1,robots),processing,-robots,float(parent_logits[index]),-index)
+        order=[order[0],max(order[1:],key=priority)]
     pools={}
     for index in order[:2]:
         parent=ids[index]
@@ -134,62 +147,75 @@ def op_decision_pool(geometry,state,pending,model,config):
     return graph,ids,parent_features,pools
 
 
-def op_representative_actions(geometry,state,pending,model,config):
+def op_representative_actions(geometry,state,pending,model,config,*,early=False):
     with torch.inference_mode():
-        _,_,_,pools=op_decision_pool(geometry,state,pending,model,config)
+        _,_,_,pools=op_decision_pool(geometry,state,pending,model,config,early=early)
         if not pools:return []
         first=next(iter(pools.values()));logits=first['logits'];variants=first['variants']
         best=int(logits.argmax());chosen=[variants[best][1]]
         other=[i for i,(_,a) in enumerate(variants) if a.robot!=chosen[0].robot]
-        if other:chosen.append(variants[max(other,key=lambda i:(float(logits[i]),-i))][1])
+        if other:
+            index=(min(other,key=lambda i:(max(variants[i][0].loads),-float(logits[i]),i)) if early else
+                   max(other,key=lambda i:(float(logits[i]),-i)))
+            chosen.append(variants[index][1])
         if len(pools)>1:
             alternative=list(pools.values())[1]
             chosen.append(alternative['variants'][int(alternative['logits'].argmax())][1])
-        else:
+        elif not early:
             alternatives=[i for i,(_,a) in enumerate(variants) if a.position!=chosen[0].position]
             if alternatives:chosen.append(variants[max(alternatives,key=lambda i:(float(logits[i]),-i))][1])
         from mrta_search.lns import joint_action_key
         return list({joint_action_key(a):a for a in chosen}.values())[:3]
 
 
-def op_collect():
+def op_prefix_targets(parent_count,*,early=False):
+    fractions=(0.,.1,.25) if early else (.25,.5,.75)
+    return {f:int(parent_count*f) if early else max(1,int(parent_count*f)) for f in fractions}
+
+
+def op_collect(*,early=False):
     from mrta_search import gnn_constructor as c
     from mrta_search.lns import oriented_route_state
     shared,config,checkpoint,archive,teachers,training,_,_=op_sources()
-    model=shared.expand_opportunity_model(shared._model_from_checkpoint(checkpoint['refinement_candidate'])).eval()
-    saved=op_read();done={(r['instance'],r['payload'].get('fraction')) for r in saved if r['phase']=='counterfactual'}
-    calls=sum(int(r['b32_calls'] or 0) for r in saved if r['phase']=='counterfactual')
+    model=(shared._model_from_checkpoint(checkpoint[OP_VARIANT]) if early else
+           shared.expand_opportunity_model(shared._model_from_checkpoint(checkpoint['refinement_candidate']))).eval()
+    student_phase='early_student' if early else 'student'
+    counter_phase='early_counterfactual' if early else 'counterfactual'
+    saved=op_read();done={(r['instance'],r['payload'].get('fraction')) for r in saved if r['phase']==counter_phase}
+    calls=sum(int(r['b32_calls'] or 0) for r in saved if r['phase']==counter_phase)
     for item in training:
         name=item['instance'];parents=item['solution'].parents
         geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,config),config)
-        existing=next((r for r in saved if r['phase']=='student' and r['instance']==name),None)
+        existing=next((r for r in saved if r['phase']==student_phase and r['instance']==name),None)
         if existing:student=existing['payload']
         else:
-            snapshots={};targets={f:max(1,int(len(parents)*f)) for f in (.25,.5,.75)}
+            snapshots={};targets=op_prefix_targets(len(parents),early=early)
             def observe(state,pending,actions):
                 completed=len(parents)-len(pending)
                 for fraction,target in targets.items():
                     if completed==target:
-                        snapshots[str(fraction)]=dict(routes=state.routes,directions=state.directions,pending=pending,progress=completed/len(parents))
+                        snapshots[str(fraction)]=dict(routes=state.routes,directions=state.directions,pending=pending,
+                            assigned=tuple(sorted(p.parent_id for p in parents if p.parent_id not in pending)),
+                            progress=completed/len(parents))
             result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,tuple(p.parent_id for p in parents),model,config,parent_observer=observe)
             student=dict(parents=[asdict(p) for p in parents],snapshots=snapshots,actions=[asdict(a) for a in result.actions],
                          failure=result.rejection_reason,complete=result.solution is not None)
-            op_save(dict(phase='student',instance=name,seed=OP_SEED,method='INITIAL_STUDENT',
+            op_save(dict(phase=student_phase,instance=name,seed=OP_SEED,method=OP_VARIANT if early else 'INITIAL_STUDENT',
                          status='COMPLETE' if result.solution else 'CONSTRUCTION_FAILED',b32_calls=0,payload=student))
         graph,blocks,patterns=c.joint_graph(geometry,config);cache={}
         def key(raw):return (tuple(tuple(r['block_ids']) for r in raw['solution']['routes']),tuple(tuple(x) for x in raw['directions']))
         for row in saved:
-            if row['phase']=='counterfactual' and row['instance']==name:
+            if row['phase'] in ('counterfactual',counter_phase) and row['instance']==name:
                 for outcome in row['payload']['outcomes']:
                     if outcome.get('complete'):cache[key(outcome['complete'])]=outcome
-        for fraction in (.25,.5,.75):
+        for fraction in op_prefix_targets(len(parents),early=early):
             if (name,fraction) in done:continue
             prefix=student['snapshots'].get(str(fraction))
             if prefix is None:
-                op_save(dict(phase='counterfactual',instance=name,seed=OP_SEED,method='FORCED_GREEDY',status='MISSING_STUDENT_PREFIX',b32_calls=0,
+                op_save(dict(phase=counter_phase,instance=name,seed=OP_SEED,method='FORCED_GREEDY',status='MISSING_STUDENT_PREFIX',b32_calls=0,
                     payload=dict(fraction=fraction,outcomes=[],pairs=[],student_failure=student['failure'])));continue
             state=oriented_route_state(tuple(map(tuple,prefix['routes'])),tuple(map(tuple,prefix['directions'])),blocks,config)
-            choices=op_representative_actions(geometry,state,prefix['pending'],model,config)
+            choices=op_representative_actions(geometry,state,prefix['pending'],model,config,early=early)
             outcomes=[];physical=0;tick=time.perf_counter()
             for action in choices:
                 result=c.construct_or_repair_with_gnn(geometry,state.routes,state.directions,prefix['pending'],model,config,forced_action=action)
@@ -209,7 +235,7 @@ def op_collect():
                                        metrics=op_metrics(scheduled,config) if feasible else None,reused=False)
                         cache[ident]=outcome
                 outcomes.append(outcome)
-            op_save(dict(phase='counterfactual',instance=name,seed=OP_SEED,method='FORCED_GREEDY',status='COLLECTED',
+            op_save(dict(phase=counter_phase,instance=name,seed=OP_SEED,method='FORCED_GREEDY',status='COLLECTED',
                 runtime_s=time.perf_counter()-tick,b32_calls=physical,payload=dict(fraction=fraction,prefix=prefix,parents=student['parents'],
                     outcomes=outcomes,pairs=op_pair_labels(outcomes))))
     print('COUNTERFACTUAL_B32',calls,'maximum',189,flush=True)
@@ -277,13 +303,13 @@ def op_saved_imitation(shared,config,archive,teachers):
         imitation_examples=len(examples),graphs=len(graphs),teacher_b32_calls=0)
 
 
-def op_compile_ranks(records,graphs,config):
+def op_compile_ranks(records,graphs,config,*,phase='counterfactual'):
     from mrta_search import gnn_constructor as c
     from mrta_reference.model import ParentWeld
     from mrta_search.lns import oriented_route_state,joint_block_candidates,joint_action_key
     compiled=[];raw_steps=[]
     for row in records:
-        if row['phase']!='counterfactual' or not row['payload'].get('pairs'):continue
+        if row['phase']!=phase or not row['payload'].get('pairs'):continue
         payload=row['payload'];prefix=payload['prefix']
         parents=tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in payload['parents'])
         reference=c.joint_geometry(parents,c.fixed_split_patterns(parents,config),config)
@@ -307,22 +333,28 @@ def op_compile_ranks(records,graphs,config):
     return compiled,raw_steps
 
 
-def op_train():
+def op_train(*,early=False):
     shared,config,checkpoint,archive,teachers,_,_,_=op_sources()
-    if OP_VARIANT in checkpoint:
-        print('Existing opportunity candidate retained; no second training.',flush=True);return
+    variant=EARLY_VARIANT if early else OP_VARIANT
+    phase='early_' if early else ''
+    counter_phase=phase+'counterfactual'
+    if variant in checkpoint:
+        print('Existing candidate retained; no second training:',variant,flush=True);return
     rows=op_read()
-    if len([r for r in rows if r['phase']=='counterfactual'])!=63:
+    if len([r for r in rows if r['phase']==counter_phase])!=63:
         raise ValueError('collect all requested TRAIN prefix attempts before training')
     tick=time.perf_counter()
     graphs,examples,steps,preparation=op_saved_imitation(shared,config,archive,teachers)
-    ranking,rank_steps=op_compile_ranks(rows,graphs,config)
+    ranking,rank_steps=op_compile_ranks(rows,graphs,config,phase=counter_phase)
     preparation.update(rank_pairs=len(ranking),preparation_seconds=time.perf_counter()-tick,
-        counterfactual_b32_calls=sum(int(r['b32_calls'] or 0) for r in rows if r['phase']=='counterfactual'))
-    op_save(dict(phase='preparation',instance='TRAIN_21',seed=OP_SEED,method='SAVED_ACTIONS',status='PREPARED',b32_calls=0,payload=preparation))
+        counterfactual_b32_calls=sum(int(r['b32_calls'] or 0) for r in rows if r['phase']==counter_phase))
+    op_save(dict(phase=phase+'preparation',instance='TRAIN_21',seed=OP_SEED,method='SAVED_ACTIONS',status='PREPARED',b32_calls=0,payload=preparation))
     if not ranking:raise ValueError('no real same-state Cmax/feasibility pairs were obtained')
-    source=shared._model_from_checkpoint(checkpoint['refinement_candidate'])
-    model=shared.expand_opportunity_model(source);model.fit_opportunity_scaling(steps+rank_steps)
+    source=shared._model_from_checkpoint(checkpoint[OP_VARIANT if early else 'refinement_candidate'])
+    if early:
+        model=shared._model_from_checkpoint(checkpoint[OP_VARIANT])
+    else:
+        model=shared.expand_opportunity_model(source);model.fit_opportunity_scaling(steps+rank_steps)
     torch.manual_seed(OP_SEED);rng=random.Random(OP_SEED)
     optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4)
     grouped={}
@@ -346,25 +378,32 @@ def op_train():
         result=dict(epoch=epoch+1,updates=updates,seconds=time.perf_counter()-started,
                     **{k:v/updates for k,v in totals.items()})
         history.append(result)
-        op_save(dict(phase='training',instance='TRAIN_21',seed=OP_SEED,method='OPPORTUNITY_RANK',status='EPOCH_COMPLETE',runtime_s=result['seconds'],b32_calls=0,payload=result))
+        op_save(dict(phase=phase+'training',instance='TRAIN_21',seed=OP_SEED,method=variant,status='EPOCH_COMPLETE',runtime_s=result['seconds'],b32_calls=0,payload=result))
     for prefix,size in (('joint',41),('parent',12)):
         for suffix in ('mean','scale'):
-            if not torch.equal(getattr(model,prefix+'_'+suffix)[:size],getattr(source,prefix+'_'+suffix)):
+            expected=getattr(source,prefix+'_'+suffix)
+            actual=getattr(model,prefix+'_'+suffix)
+            if not torch.equal(actual if early else actual[:size],expected):
                 raise ValueError('legacy normalization parameters changed')
     metadata=dict(preparation=preparation,epochs=10,learning_rate=1e-4,batch_size=16,gradient_clip=1.,seed=OP_SEED,
         losses=dict(imitation=.5,ranking=1.,load=.1),history=history,training_seconds=time.perf_counter()-started,
         opportunity_definition='Remaining unplaced children, exact current insertion existence per robot, processing normalized by full graph processing.',
         training_geometries=21,development_geometries=8,static_context=True)
-    checkpoint[OP_VARIANT]=dict(model_type='ModeJointInsertionGNN',hidden_dim=64,heads=4,normalize_inputs=True,
+    metadata.update(initialization=OP_VARIANT if early else 'refinement_candidate',
+        prefix_fractions=list(op_prefix_targets(100,early=early)),normalization_refit=not early)
+    checkpoint[variant]=dict(model_type='ModeJointInsertionGNN',hidden_dim=64,heads=4,normalize_inputs=True,
         opportunity_features=True,use_dynamic_context=False,scientific_config=config.scientific_mapping(),state_dict=model.state_dict(),training=metadata)
     old_root={k:v.clone() for k,v in checkpoint['state_dict'].items()}
     old_candidate={k:v.clone() for k,v in checkpoint['refinement_candidate']['state_dict'].items()}
+    old_opportunity={k:v.clone() for k,v in checkpoint[OP_VARIANT]['state_dict'].items()} if early else None
     shared.save_neural_checkpoint(checkpoint,OP_CHECKPOINT)
     saved=shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)
     if not all(torch.equal(v,saved['state_dict'][k]) for k,v in old_root.items()) or not all(
         torch.equal(v,saved['refinement_candidate']['state_dict'][k]) for k,v in old_candidate.items()):
         raise ValueError('protected existing weights changed')
-    op_save(dict(phase='model',instance='TRAIN_21',seed=OP_SEED,method=OP_VARIANT,status='TRAINED',runtime_s=metadata['training_seconds'],b32_calls=0,payload=metadata))
+    if early and not all(torch.equal(v,saved[OP_VARIANT]['state_dict'][k]) for k,v in old_opportunity.items()):
+        raise ValueError('protected opportunity weights changed')
+    op_save(dict(phase=phase+'model',instance='TRAIN_21',seed=OP_SEED,method=variant,status='TRAINED',runtime_s=metadata['training_seconds'],b32_calls=0,payload=metadata))
 
 
 def op_evaluate():
@@ -435,6 +474,357 @@ def op_evaluate():
                 payload=dict(attempts=attempts,model_load_seconds=new_load if method.startswith('NEW') else old_load+(extra_load if method=='CURRENT_PORTFOLIO3' else 0.),
                     complete=None if not valid else dict(solution=asdict(candidate.solution),directions=candidate.directions),
                     timing_shared_schedule='Equal complete proposals reuse one actual B32 result and its measured duration; logical greedy views share the trio first proposal.',**extra)))
+
+
+def op_complete_key(raw):
+    """Existing geometry/pattern/route values identify an exact B32 input."""
+    solution=raw['solution']
+    return (tuple((p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in solution['parents']),
+            tuple(tuple(sorted(p.items())) for p in solution['patterns']),
+            tuple(tuple(r['block_ids']) for r in solution['routes']),tuple(map(tuple,raw['directions'])))
+
+
+def op_route_metrics(raw,config):
+    import run_gnn_shared_construction as shared
+    from mrta_reference.solution import block_map
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search.lns import oriented_route_state,oriented_route_lower_bound
+    solution,bits,_,_,_=shared.research_restore(raw,config)
+    state=oriented_route_state(tuple(r.block_ids for r in solution.routes),bits,
+        block_map(solution,config,scope=FORMAL_SCOPE_V2),config)
+    return dict(loads=state.loads,p_move=[p+sum(a) for p,a in zip(state.loads,state.arc_costs)],
+                max_p_move=oriented_route_lower_bound(state),robots=sum(bool(r) for r in state.routes))
+
+
+def op_measure_decodes(shared,config,parents,variant,decodes,cache):
+    """Measure complete inference, sharing only exact, already measured B32s.
+
+    The charged runtime includes the original measured B32 duration on a cache
+    hit. Physical wall time and reused duration are also retained explicitly.
+    No cache hit creates another scheduler call or another certificate.
+    """
+    from mrta_search import gnn_constructor as c
+    started=time.perf_counter()
+    thin=shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)
+    model=shared._model_from_checkpoint(thin[variant]).eval()
+    load_seconds=time.perf_counter()-started
+    attempts=[];credit=0.;charged=set()
+    for index,decode in enumerate(decodes):
+        seed=OP_EVAL_SEED if index<2 else OP_EVAL_SEED+1
+        tick=time.perf_counter()
+        geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,config),config)
+        result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,
+            tuple(p.parent_id for p in parents),model,config,decode_mode=decode,seed=seed)
+        attempt=dict(proposal_index=index,decode=decode,seed=seed,status='CONSTRUCTION_FAILED',cmax=None,
+            b32_calls=0,reason=result.rejection_reason,actions=[asdict(a) for a in result.actions])
+        if result.solution is not None:
+            raw=dict(solution=asdict(result.solution),directions=result.directions)
+            key=op_complete_key(raw)
+            if key not in cache:
+                clock=time.perf_counter()
+                candidate=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
+                scheduler_seconds=time.perf_counter()-clock
+                valid=candidate.schedule.status is ScheduleStatus.FEASIBLE
+                metrics=op_route_metrics(raw,config)
+                if valid:metrics.update(op_metrics(candidate,config))
+                cache[key]=dict(status=candidate.schedule.status.value,cmax=candidate.schedule.cmax if valid else None,
+                    metrics=metrics,scheduler_seconds=scheduler_seconds,diagnostics=candidate.schedule.diagnostics)
+                attempt['b32_calls']=1
+            elif key not in charged:
+                credit+=cache[key]['scheduler_seconds']
+            charged.add(key)
+            attempt.update(cache[key],**raw)
+        attempt['seconds']=time.perf_counter()-tick
+        attempt['elapsed']=time.perf_counter()-started+credit
+        attempts.append(attempt)
+    actual=time.perf_counter()-started
+    return dict(attempts=attempts,model_load_seconds=load_seconds,runtime_s=actual+credit,
+                actual_runtime_s=actual,reused_b32_seconds=credit,source_variant=variant,
+                b32_calls=sum(a['b32_calls'] for a in attempts))
+
+
+def op_save_measured(phase,name,method,info,*,first_only=False):
+    attempts=info['attempts'][:1] if first_only else info['attempts']
+    feasible=[(i,a) for i,a in enumerate(attempts) if a['status']=='FEASIBLE']
+    winner=min(feasible,key=lambda x:x[1]['cmax']) if feasible else (None,None)
+    selected=winner[1];metrics=selected['metrics'] if selected else {}
+    runtime=attempts[0]['elapsed'] if first_only else info['runtime_s']
+    physical=0 if first_only else info['b32_calls']
+    op_save(dict(phase=phase,instance=name,seed=OP_EVAL_SEED,method=method,
+        status='FEASIBLE' if selected else 'NO_FEASIBLE_CONSTRUCTION',cmax=selected['cmax'] if selected else None,
+        runtime_s=runtime,b32_calls=physical,**metrics,payload=dict(
+            attempts=attempts,selected_proposal=winner[0],metrics=metrics,
+            model_load_seconds=info['model_load_seconds'],source_variant=info['source_variant'],
+            complete=None if selected is None else dict(solution=selected['solution'],directions=selected['directions']),
+            logical_b32_calls=len({op_complete_key(a) for a in attempts if a.get('solution')}),
+            actual_runtime_s=info['actual_runtime_s'] if not first_only else None,
+            reused_b32_seconds=info['reused_b32_seconds'] if not first_only else None,
+            timing='Model loading, graph building, construction and B32; exact schedule cache hits charged their measured B32 duration.')))
+
+
+def op_evaluation_cache(rows):
+    cache={}
+    for row in rows:
+        if row['phase'] not in ('joint_evaluation','early_evaluation'):continue
+        for attempt in row['payload'].get('attempts',[]):
+            if attempt.get('solution') and 'scheduler_seconds' in attempt:
+                cache[op_complete_key(attempt)]={k:attempt[k] for k in
+                    ('status','cmax','metrics','scheduler_seconds','diagnostics')}
+    return cache
+
+
+def op_joint_evaluate():
+    shared,config,_,_,_,_,entries,_=op_sources()
+    saved=op_read();cache=op_evaluation_cache(saved)
+    done={(r['instance'],r['method']) for r in saved if r['phase']=='joint_evaluation'}
+    for name,parents in sorted(entries.items()):
+        # These exact old-weight, same-seed proposals have already been
+        # measured. Reuse them, including the two unchanged sample proposals.
+        originals={method:next(r for r in saved if r['phase']=='evaluation' and r['instance']==name and
+                    r['seed']==str(OP_EVAL_SEED) and r['method']==source)
+                   for method,source in (('OLD_OP_GREEDY','NEW_GNN_GREEDY'),('OLD_OP_MULTI3','NEW_GNN_MULTI3'))}
+        for method,original in originals.items():
+            if (name,method) in done:continue
+            payload=dict(original['payload'],reused=True,source_method=original['method'],source_phase='evaluation')
+            if payload.get('complete'):payload['metrics']=op_route_metrics(payload['complete'],config)
+            op_save(dict(original,phase='joint_evaluation',method=method,b32_calls=0,payload=payload))
+        if (name,'OLD_OP_JOINT_MULTI3') in done:continue
+        info=op_measure_decodes(shared,config,parents,OP_VARIANT,('joint_greedy',),cache)
+        op_save_measured('joint_evaluation',name,'OLD_OP_JOINT',info,first_only=True)
+        old_attempts=originals['OLD_OP_MULTI3']['payload']['attempts']
+        sample_seconds=old_attempts[-1]['elapsed']-old_attempts[0]['elapsed']
+        for i,old in enumerate(old_attempts[1:],1):
+            attempt=dict(old,proposal_index=i,b32_calls=0,reused=True)
+            if attempt.get('solution'):
+                attempt['metrics']=op_route_metrics(attempt,config)
+                if old['status']=='FEASIBLE':
+                    # Saved proposal metrics were not columns; recover MOVE
+                    # from the exact route, and WAIT from Cmax only when saved.
+                    # Returned sample metrics are taken from its saved result
+                    # below rather than inventing an operation timeline.
+                    attempt['metrics'].update(move=sum(attempt['metrics']['p_move'])-sum(attempt['metrics']['loads']))
+            info['attempts'].append(attempt)
+        info['runtime_s']+=sample_seconds
+        info['actual_runtime_s']=None
+        info['reused_b32_seconds']=None
+        # The selected saved sample's WAIT/MOVE are available in the original
+        # returned row whenever that sample wins this new three-proposal set.
+        valid=[a for a in info['attempts'] if a['status']=='FEASIBLE']
+        if valid:
+            winner=min(valid,key=lambda a:a['cmax'])
+            if winner['proposal_index']>0:
+                original=originals['OLD_OP_MULTI3']
+                if not math.isclose(float(original['cmax']),winner['cmax'],rel_tol=1e-9):
+                    raise ValueError('an unselected historical sample needs its saved operation metrics')
+                winner['metrics'].update(move=float(original['move']),wait=float(original['wait']))
+        op_save_measured('joint_evaluation',name,'OLD_OP_JOINT_MULTI3',info)
+
+
+def op_choose_early_decoder(rows):
+    """Development selection after BOTH fixed single-proposal evaluations.
+
+    Feasibility wins first, then same-geometry Cmax wins; conditional medians
+    only break a tie. This is disclosed development selection, not validation.
+    """
+    selected={m:{r['instance']:r for r in rows if r['phase']=='early_evaluation' and r['method']==m}
+              for m in ('EARLY_GREEDY','EARLY_JOINT')}
+    if any(len(v)!=8 for v in selected.values()):raise ValueError('finish both eight-geometry early evaluations')
+    wins=Counter()
+    for name in selected['EARLY_GREEDY']:
+        a,b=(selected[m][name] for m in ('EARLY_GREEDY','EARLY_JOINT'))
+        fa,fb=a['status']=='FEASIBLE',b['status']=='FEASIBLE'
+        if fa!=fb:wins['EARLY_GREEDY' if fa else 'EARLY_JOINT']+=1
+        elif fa and not math.isclose(float(a['cmax']),float(b['cmax']),rel_tol=1e-9,abs_tol=1e-9):
+            wins['EARLY_GREEDY' if float(a['cmax'])<float(b['cmax']) else 'EARLY_JOINT']+=1
+    def key(method):
+        good=[float(r['cmax']) for r in selected[method].values() if r['status']=='FEASIBLE']
+        return (len(good),wins[method],-statistics.median(good) if good else -math.inf,method=='EARLY_GREEDY')
+    return 'greedy' if max(selected,key=key)=='EARLY_GREEDY' else 'joint_greedy'
+
+
+def op_early_evaluate():
+    shared,config,_,_,_,_,entries,_=op_sources()
+    saved=op_read();cache=op_evaluation_cache(saved)
+    done={(r['instance'],r['method']) for r in saved if r['phase']=='early_evaluation'}
+    for name,parents in sorted(entries.items()):
+        for decode,method in (('greedy','EARLY_GREEDY'),('joint_greedy','EARLY_JOINT')):
+            if (name,method) in done:continue
+            info=op_measure_decodes(shared,config,parents,EARLY_VARIANT,(decode,),cache)
+            op_save_measured('early_evaluation',name,method,info)
+    decode=op_choose_early_decoder(op_read())
+    for name,parents in sorted(entries.items()):
+        if (name,'EARLY_BEST_MULTI3') in done:continue
+        info=op_measure_decodes(shared,config,parents,EARLY_VARIANT,(decode,'sample','sample'),cache)
+        op_save_measured('early_evaluation',name,'EARLY_BEST_MULTI3',info)
+
+
+def op_early_report():
+    import run_gnn_shared_construction as shared
+    from mrta_reference.model import ScientificConfig
+    config=ScientificConfig();rows=op_read()
+    heading='## 2026-11-05 早期Cmax反馈与Top-2联合构造'
+    original=OP_REPORT.read_text(encoding='utf-8')
+    if heading in original:
+        print('Existing early Cmax report section retained.',flush=True);return
+    table={(r['instance'],r['method']):r for r in rows
+           if r['phase'] in ('evaluation','joint_evaluation','early_evaluation')}
+    names=sorted({r['instance'] for r in rows if r['phase']=='early_evaluation'})
+    methods=('OLD_OP_GREEDY','OLD_OP_JOINT','OLD_OP_MULTI3','OLD_OP_JOINT_MULTI3',
+             'EARLY_GREEDY','EARLY_JOINT','EARLY_BEST_MULTI3')
+    if len(names)!=8 or any((n,m) not in table for n in names for m in methods):
+        raise ValueError('finish all eight paired development geometries before reporting')
+    metadata=shared.read_neural_checkpoint(OP_CHECKPOINT)[EARLY_VARIANT]['training']
+    data=[r for r in rows if r['phase']=='early_counterfactual']
+    outcomes=[o for r in data for o in r['payload']['outcomes']]
+    def num(v):return '—' if v is None or v=='' else f'{float(v):.3f}'
+    def good(r):return r['status']=='FEASIBLE' and r['cmax'] not in ('',None)
+    def compare(method,comparator):
+        wins=ties=losses=both_failed=0;changes=[]
+        for name in names:
+            a,b=table[name,method],table[name,comparator];fa,fb=good(a),good(b)
+            if fa and fb:
+                change=100.*(float(b['cmax'])-float(a['cmax']))/float(b['cmax']);changes.append(change)
+                if abs(change)<=1e-8:ties+=1
+                elif change>0:wins+=1
+                else:losses+=1
+            elif fa:wins+=1
+            elif fb:losses+=1
+            else:both_failed+=1
+        return f'{wins}/{ties}/{losses}',both_failed,len(changes),statistics.median(changes) if changes else None
+    calls=sum(int(r['b32_calls'] or 0) for r in data)
+    lines=['',heading,'',
+        '**实测结论：早期训练未取得稳定改善。** '
+        f'旧机会模型原贪心/联合贪心分别{sum(good(table[n,"OLD_OP_GREEDY"]) for n in names)}/8、'
+        f'{sum(good(table[n,"OLD_OP_JOINT"]) for n in names)}/8可行；'
+        f'早期模型分别{sum(good(table[n,"EARLY_GREEDY"]) for n in names)}/8、'
+        f'{sum(good(table[n,"EARLY_JOINT"]) for n in names)}/8。'
+        f'早期三候选{sum(good(table[n,"EARLY_BEST_MULTI3"]) for n in names)}/8，'
+        f'旧机会联合三候选{sum(good(table[n,"OLD_OP_JOINT_MULTI3"]) for n in names)}/8。'
+        '保留新权重和负结果，不将early模型升级为默认模型；本轮仍未达到SCI主算法要求。', '',
+        '本轮只改推理联合选择和早期反馈位置。两层GAT、hidden=64、heads=4、20维父输入、49维插入输入及全部归一化缓冲保持原维度；'
+        'CONFIG_05、FORMAL_SCOPE_V2、min_child_length=0.50m、B32预算、加工时间和合法动作约束不变。'
+        '未使用MODE_NEW、VNS、ALNS、RULE或旧模型回退，未训练独立方向头或模式头。',
+        '全部推理使用fixed_split_patterns()：当前GNN只搜索固定合法拆分模式下的分配、顺序和方向，'
+        '不能声称联合搜索全部WHOLE/Y_SPLIT/X_SPLIT组合。这是当前搜索空间限制。', '',
+        '### 实验一：冻结旧机会权重', '',
+        'joint_greedy在完整合法父集合上计算log_softmax，取概率Top-2；每个父的首子段在其完整合法插入池上单独归一化，'
+        '按log P(parent)+log P(insertion|parent)选动作。第二子段仍按原贪心合法插入，失败不返回不完整方案。'
+        'Top-2是新增有限前瞻策略，与原分层贪心的搜索策略不等价，未扩大到Top-5/10。',
+        '原贪心和原三候选直接复用上一轮相同opportunity_cmax_candidate、相同种子的完整记录；'
+        '两次采样及其B32结果、构造时间原样复用，只新运行联合贪心首提案。联合三候选时间为新首提案实测时间加旧两次采样的实测增量，'
+        '不是一次连续墙钟测量。未重调度采样或增加认证。', '',
+        '|几何|旧贪心|联合贪心|旧三候选|联合+原两采样|', '|---|---:|---:|---:|---:|']
+    for name in names:lines.append('|'+name+'|'+'|'.join(num(table[name,m]['cmax']) for m in methods[:4])+'|')
+    lines += ['', '### 实验二：真实早期状态与训练', '',
+        f'冻结旧机会模型生成21条学生轨迹，保存{len(data)}个0%/10%/25%真实部分路线、方向、已分配父ID和剩余父ID。'
+        '0%在第一条父任务插入前观察，路线与已分配集合为空；10%/25%按int(N*f)取整，并保存实际进度。',
+        'A为原分层GNN首选；B来自同父首子段的不同合法机器人，优先最小化动作后的最大纯加工负载，以网络分数打破平局；'
+        'C为不同合法父任务，按总加工量/首子段当前合法机器人数量选择代表，再用原网络选择其插入动作。'
+        '没有合法替代就减少数量，不用RULE覆盖推理。候选选择仅用于TRAIN反事实数据。',
+        f'最多189个候选，实际{len(outcomes)}个；新增B32 {calls}/189次。其余相同完整路线和方向复用既有调度结果。'
+        f'可行{sum(o["status"]=="FEASIBLE" for o in outcomes)}，DEADLOCK {sum(o["status"]=="DEADLOCK" for o in outcomes)}，'
+        f'同状态排序对{sum(len(r["payload"]["pairs"]) for r in data)}。两个失败不排序，失败Cmax为空。'
+        '每个分支从同一完整前缀强制一步，随后由同一冻结旧机会模型原贪心补全。',
+        f"复用{metadata['preparation']['teachers_reused']}个完整教师动作和{metadata['preparation']['prefix_continuations_reused']}个历史前缀延续，"
+        f"共{metadata['preparation']['imitation_examples']}个IL样本；未重新生成或调度教师。",
+        f"early_cmax_candidate从opportunity_cmax_candidate初始化，未重拟合归一化。固定seed={OP_SEED}，"
+        'AdamW lr=1e-4，batch=16，clip=1，10轮，L=0.5 IL+rank+0.1 load；'
+        f"训练{num(metadata['training_seconds'])}秒，总损失{num(metadata['history'][0]['loss'])}→{num(metadata['history'][-1]['loss'])}。"
+        '未按开发性能选择epoch或重复加训，损失下降不等同于Cmax改善。',
+        '权重保存在既有models/gnn_coordination_constructor_05.pt的独立early_cmax_candidate中；'
+        '顶层、refinement_candidate与opportunity_cmax_candidate逐tensor核对保留，旧实验CSV记录未覆盖。', '',
+        '|前缀|状态数|候选数|新增B32|排序对|', '|---:|---:|---:|---:|---:|']
+    for fraction in (0.,.1,.25):
+        subset=[r for r in data if r['payload']['fraction']==fraction]
+        lines.append(f'|{fraction:.0%}|{len(subset)}|{sum(len(r["payload"]["outcomes"]) for r in subset)}|'
+            f'{sum(int(r["b32_calls"]) for r in subset)}|{sum(len(r["payload"]["pairs"]) for r in subset)}|')
+    lines += ['', '### 实验三：同几何、同种子配对', '',
+        f'仅使用已消费的8个开发几何，seed={OP_EVAL_SEED}。RULE/BEAM取保存初始状态，WAG/HGA取原60秒完整结果；'
+        'CURRENT_PORTFOLIO3及所有对照直接复用同配置记录，未重跑500次正式实验，未访问未打开测试数据。',
+        '先比较四个核心单提案方法，再仅为early模型中开发表现较好的解码方式运行单模型三候选。'
+        f'所选首提案为{op_choose_early_decoder(rows)}，后两个仍为seed和seed+1的原采样，选择规则先看可行数、再看配对胜数。'
+        '这是开发集选择，不能当作独立验证。', '',
+        '|几何|OLD_OP_GREEDY|OLD_OP_JOINT|EARLY_GREEDY|EARLY_JOINT|EARLY_BEST_MULTI3|RULE/BEAM|WAG|HGA|CURRENT_PORTFOLIO3|',
+        '|---|'+'---:|'*9]
+    final_methods=('OLD_OP_GREEDY','OLD_OP_JOINT','EARLY_GREEDY','EARLY_JOINT','EARLY_BEST_MULTI3','RULE/BEAM','WAG','HGA','CURRENT_PORTFOLIO3')
+    for name in names:lines.append('|'+name+'|'+'|'.join(num(table[name,m]['cmax']) for m in final_methods)+'|')
+    lines += ['', '—为失败，未填0或惩罚Cmax。时间含文件读取、模型实例化、图构建、完整构造、采样和B32。'
+        '新early方法保存连续物理墙钟时间与缓存复用时间；表中含缓存原B32实测时长，避免缓存命中造成虚假加速。'
+        '旧联合三候选按上一段的实测组成时间报告。', '',
+        '|方法|可行/8|含B32计费秒中位|含B32计费秒最大|物理墙钟秒中位|', '|---|---:|---:|---:|---:|']
+    for method in methods+('RULE/BEAM','WAG','HGA','CURRENT_PORTFOLIO3'):
+        selected=[table[n,method] for n in names];times=[float(r['runtime_s']) for r in selected]
+        physical=([r['payload']['actual_runtime_s'] for r in selected] if method.startswith('EARLY') else
+                  [] if method=='OLD_OP_JOINT_MULTI3' else times)
+        lines.append(f'|{method}|{sum(good(r) for r in selected)}/8|{num(statistics.median(times))}|{num(max(times))}|'
+                     f'{num(statistics.median(physical) if physical else None)}|')
+    lines += ['', '胜负包含“可行胜失败”，双失败单列；改善中位只对双方可行配对计算，并列明分母。', '',
+        '|方法|对照|胜/平/负|双失败|双方可行/8|条件中位改善/%|', '|---|---|---:|---:|---:|---:|']
+    for method,comparators in (
+        ('OLD_OP_JOINT',('OLD_OP_GREEDY',)),('OLD_OP_JOINT_MULTI3',('OLD_OP_MULTI3',)),
+        *((m,('OLD_OP_GREEDY','OLD_OP_JOINT','OLD_OP_MULTI3','CURRENT_PORTFOLIO3','RULE/BEAM','WAG','HGA'))
+          for m in ('EARLY_GREEDY','EARLY_JOINT','EARLY_BEST_MULTI3'))):
+        for comparator in comparators:
+            counts,failed,paired,change=compare(method,comparator)
+            lines.append(f'|{method}|{comparator}|{counts}|{failed}|{paired}/8|{num(change)}|')
+    lines += ['', '### 加工负载、空走、等待和错误定位', '',
+        '单提案DEADLOCK行仍显示其完整构造的加工负载与路线P+MOVE下界，Cmax/MOVE/WAIT保持空值；'
+        '三候选整组失败时不挑一个失败方案冒充返回值。加工负载为PRE+WELD+POST，MOVE/WAIT只取成功B32完整时间线。', '',
+        '|几何|方法|状态|R0/R1/R2/R3加工负载|max(P+MOVE)|MOVE|WAIT|', '|---|---|---|---|---:|---:|---:|']
+    categories=Counter();errors=[]
+    for name in names:
+        target=min(float(table[name,m]['cmax']) for m in ('RULE/BEAM','WAG','HGA') if good(table[name,m]))
+        for method in ('OLD_OP_GREEDY','OLD_OP_JOINT','EARLY_GREEDY','EARLY_JOINT','EARLY_BEST_MULTI3'):
+            row=table[name,method];payload=row['payload'];attempts=payload.get('attempts',[])
+            raw=payload.get('complete') or (attempts[0] if len(attempts)==1 and attempts[0].get('solution') else None)
+            metrics=op_route_metrics(raw,config) if raw else {}
+            loads=metrics.get('loads',[])
+            lines.append(f'|{name}|{method}|{row["status"]}|'+(' / '.join(num(v) for v in loads) or '—')+
+                f'|{num(metrics.get("max_p_move"))}|{num(row.get("move"))}|{num(row.get("wait"))}|')
+            if method=='EARLY_BEST_MULTI3':
+                category=('B32 DEADLOCK/构造失败' if not good(row) else '加工分配下界过大' if max(loads)>target else
+                          '插入顺序/方向空走' if metrics['max_p_move']>target else
+                          '协调等待' if float(row['cmax'])>target+1e-8 else '不劣于最佳对照')
+                categories[category]+=1
+            if method in ('EARLY_GREEDY','EARLY_JOINT') and not good(row):
+                errors.append(f'{name}/{method}: '+', '.join(a['status'] for a in attempts)+
+                    f'，max P={num(max(loads) if loads else None)}，max(P+MOVE)={num(metrics.get("max_p_move"))}，最佳对照={num(target)}。')
+    lines += ['', 'early三候选返回方案分类：'+str(dict(categories))+'。', '', '代表性失败（完整原始提案保存在CSV）：', '']
+    lines.extend('- '+e for e in errors[:4])
+    lines += ['', '机器人分配造成的max P超额是插入位置、方向或WAIT优化无法消除的下界；'
+        'max(P+MOVE)与Cmax的差才用于判断协调增量。DEADLOCK是当前B32预算未找到可行协调调度，'
+        '不能据此断言几何绝对不可调度，也不能在没有方向消融时把失败全部归于方向。', '',
+        '六个early可行返回方案的Cmax均等于最大P+MOVE；其中SMALL_02虽有2306.176秒总WAIT，'
+        '等待发生在非关键路径上，未增加整体Cmax。五例主要差距来自加工量分配；'
+        'HIGH_WORKLOAD_04的最大P为4697.530秒，对照4659.421秒，仅超38.109秒，'
+        '而P+MOVE额外增加328.250秒，因此该例的剩余主要差距是路线插入顺序/方向造成的空走。'
+        '这两项没有独立消融，不能进一步假定全部来自插入位置或全部来自方向。', '',
+        'LARGE_02、LARGE_04的early联合三候选均为DEADLOCK。LARGE_02第二次采样的max(P+MOVE)为4180.368秒，'
+        '仍未得到B32可行调度，显示负载较低也不足以保证同轨协调可行。'
+        '同几何EARLY_GREEDY有4660.517秒可行解，但选定的联合三候选失败；没有把这个额外贪心加入三候选回退。'
+        '父任务联合评分改变了完整路线及可调度性，这与加工负载倾斜是两个问题；仅凭路径差异不能把失败唯一归因于父头、位置或方向。', '',
+        '### 保留结论与下一步', '',
+        f'联合解码对旧机会三候选的失败计入胜/平/负为{compare("OLD_OP_JOINT_MULTI3","OLD_OP_MULTI3")[0]}，'
+        f'另有{compare("OLD_OP_JOINT_MULTI3","OLD_OP_MULTI3")[1]}个双失败；有有限正贡献但不稳定。'
+        f'early三候选相对旧机会三候选为{compare("EARLY_BEST_MULTI3","OLD_OP_MULTI3")[0]}，'
+        f'相对CURRENT_PORTFOLIO3为{compare("EARLY_BEST_MULTI3","CURRENT_PORTFOLIO3")[0]}，'
+        f'相对WAG、HGA分别为{compare("EARLY_BEST_MULTI3","WAG")[0]}、{compare("EARLY_BEST_MULTI3","HGA")[0]}。'
+        '训练反馈前移未解决独立构造质量，不再追加轮次或采样。',
+        '**下一轮有必要优先检验动作后的机会变化ΔO(a)=O(T(s,a))−O(s)。** '
+        '当前机会特征在同状态各候选间相同，无法直接反映一次分配对后续可服务任务集合的损失；'
+        '早期同状态真实Cmax反馈仍未消除分配下界和DEADLOCK问题。'
+        '应利用已有候选状态、首点及可达性信息计算受影响机器人/任务的增量，避免逐候选重新枚举全部剩余焊缝。'
+        '这只是下一轮待验证假设，本轮未实现，也不宣称其必然有效。', '',
+        '### 测试与复现', '']
+    for row in rows:
+        if row['phase']=='early_verification':lines += [row['payload']['summary'],'','```powershell',row['payload']['command'],'```','']
+        if row['phase']=='early_execution':lines += [row['payload']['summary'],'']
+    lines += ['```powershell',"Set-Location 'D:\\pybullet_test\\MRTA_GA'",
+        "$env:PYTHONPATH = (Join-Path (Get-Location) 'DRL\\src')",
+        "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase early-all",'```','',
+        '本轮未新增文件；代码、测试、结果CSV、模型容器和报告均复用既有文件。']
+    OP_REPORT.write_text(original+'\n'.join(lines)+'\n',encoding='utf-8')
+    print('APPENDED',OP_REPORT,flush=True)
 
 
 def op_report():
@@ -958,10 +1348,19 @@ def write_report(rows, metadata):
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report'),default='op-all')
+    parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
+        'joint-eval','early-all','early-data','early-train','early-eval','early-report'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
+    if args.phase=='joint-eval' or args.phase.startswith('early-'):
+        torch.manual_seed(OP_SEED);random.seed(OP_SEED)
+        if args.phase in ('joint-eval','early-all'):op_joint_evaluate()
+        if args.phase in ('early-all','early-data'):op_collect(early=True)
+        if args.phase in ('early-all','early-train'):op_train(early=True)
+        if args.phase in ('early-all','early-eval'):op_early_evaluate()
+        if args.phase in ('early-all','early-report'):op_early_report()
+        return
     if args.phase.startswith('op-'):
         torch.manual_seed(OP_SEED);random.seed(OP_SEED)
         if args.phase in ('op-all','op-data'):op_collect()

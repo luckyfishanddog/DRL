@@ -497,3 +497,190 @@ $env:PYTHONPATH = (Join-Path (Get-Location) 'src')
 ```
 
 唯一新增文件为results/gnn_opportunity_cmax.csv；op-*入口保留已有数据和既有独立候选，不重复训练。
+
+## 2026-11-05 早期Cmax反馈与Top-2联合构造
+
+**实测结论：早期训练未取得稳定改善。** 旧机会模型原贪心/联合贪心分别3/8、5/8可行；早期模型分别2/8、4/8。早期三候选6/8，旧机会联合三候选7/8。保留新权重和负结果，不将early模型升级为默认模型；本轮仍未达到SCI主算法要求。
+
+本轮只改推理联合选择和早期反馈位置。两层GAT、hidden=64、heads=4、20维父输入、49维插入输入及全部归一化缓冲保持原维度；CONFIG_05、FORMAL_SCOPE_V2、min_child_length=0.50m、B32预算、加工时间和合法动作约束不变。未使用MODE_NEW、VNS、ALNS、RULE或旧模型回退，未训练独立方向头或模式头。
+全部推理使用fixed_split_patterns()：当前GNN只搜索固定合法拆分模式下的分配、顺序和方向，不能声称联合搜索全部WHOLE/Y_SPLIT/X_SPLIT组合。这是当前搜索空间限制。
+
+### 实验一：冻结旧机会权重
+
+joint_greedy在完整合法父集合上计算log_softmax，取概率Top-2；每个父的首子段在其完整合法插入池上单独归一化，按log P(parent)+log P(insertion|parent)选动作。第二子段仍按原贪心合法插入，失败不返回不完整方案。Top-2是新增有限前瞻策略，与原分层贪心的搜索策略不等价，未扩大到Top-5/10。
+原贪心和原三候选直接复用上一轮相同opportunity_cmax_candidate、相同种子的完整记录；两次采样及其B32结果、构造时间原样复用，只新运行联合贪心首提案。联合三候选时间为新首提案实测时间加旧两次采样的实测增量，不是一次连续墙钟测量。未重调度采样或增加认证。
+
+|几何|旧贪心|联合贪心|旧三候选|联合+原两采样|
+|---|---:|---:|---:|---:|
+|HIGH_WORKLOAD_02|—|6877.843|6295.488|6295.488|
+|HIGH_WORKLOAD_04|7049.263|6841.816|7049.263|6841.816|
+|LARGE_02|—|4225.425|5079.267|4225.425|
+|LARGE_04|—|6705.094|—|6705.094|
+|MEDIUM_02|—|—|—|—|
+|MEDIUM_04|3029.686|3591.437|3029.686|3591.437|
+|SMALL_02|—|—|4481.393|4481.393|
+|SMALL_04|3394.365|—|2826.180|2826.180|
+
+### 实验二：真实早期状态与训练
+
+冻结旧机会模型生成21条学生轨迹，保存63个0%/10%/25%真实部分路线、方向、已分配父ID和剩余父ID。0%在第一条父任务插入前观察，路线与已分配集合为空；10%/25%按int(N*f)取整，并保存实际进度。
+A为原分层GNN首选；B来自同父首子段的不同合法机器人，优先最小化动作后的最大纯加工负载，以网络分数打破平局；C为不同合法父任务，按总加工量/首子段当前合法机器人数量选择代表，再用原网络选择其插入动作。没有合法替代就减少数量，不用RULE覆盖推理。候选选择仅用于TRAIN反事实数据。
+最多189个候选，实际186个；新增B32 141/189次。其余相同完整路线和方向复用既有调度结果。可行80，DEADLOCK 106，同状态排序对115。两个失败不排序，失败Cmax为空。每个分支从同一完整前缀强制一步，随后由同一冻结旧机会模型原贪心补全。
+复用76个完整教师动作和27个历史前缀延续，共9654个IL样本；未重新生成或调度教师。
+early_cmax_candidate从opportunity_cmax_candidate初始化，未重拟合归一化。固定seed=20261104，AdamW lr=1e-4，batch=16，clip=1，10轮，L=0.5 IL+rank+0.1 load；训练526.169秒，总损失1.696→0.796。未按开发性能选择epoch或重复加训，损失下降不等同于Cmax改善。
+权重保存在既有models/gnn_coordination_constructor_05.pt的独立early_cmax_candidate中；顶层、refinement_candidate与opportunity_cmax_candidate逐tensor核对保留，旧实验CSV记录未覆盖。
+
+|前缀|状态数|候选数|新增B32|排序对|
+|---:|---:|---:|---:|---:|
+|0%|21|63|63|44|
+|10%|21|61|38|32|
+|25%|21|62|40|39|
+
+### 实验三：同几何、同种子配对
+
+仅使用已消费的8个开发几何，seed=202611041。RULE/BEAM取保存初始状态，WAG/HGA取原60秒完整结果；CURRENT_PORTFOLIO3及所有对照直接复用同配置记录，未重跑500次正式实验，未访问未打开测试数据。
+先比较四个核心单提案方法，再仅为early模型中开发表现较好的解码方式运行单模型三候选。所选首提案为joint_greedy，后两个仍为seed和seed+1的原采样，选择规则先看可行数、再看配对胜数。这是开发集选择，不能当作独立验证。
+
+|几何|OLD_OP_GREEDY|OLD_OP_JOINT|EARLY_GREEDY|EARLY_JOINT|EARLY_BEST_MULTI3|RULE/BEAM|WAG|HGA|CURRENT_PORTFOLIO3|
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+|HIGH_WORKLOAD_02|—|6877.843|—|—|6176.247|4581.210|4557.801|5720.071|5275.283|
+|HIGH_WORKLOAD_04|7049.263|6841.816|5384.538|5025.780|5025.780|—|4659.421|4778.338|5208.731|
+|LARGE_02|—|4225.425|4660.517|—|—|4102.925|4058.676|4141.887|5224.745|
+|LARGE_04|—|6705.094|—|—|—|4365.425|4291.540|4429.247|7934.116|
+|MEDIUM_02|—|—|—|5045.523|5045.523|2963.857|2864.031|3318.741|4697.496|
+|MEDIUM_04|3029.686|3591.437|—|—|3606.893|2811.073|2744.846|2901.421|3002.346|
+|SMALL_02|—|—|—|3903.470|3903.470|2820.353|2757.062|2855.336|3404.466|
+|SMALL_04|3394.365|—|—|2962.171|2962.171|2308.269|2230.098|2268.722|3577.497|
+
+—为失败，未填0或惩罚Cmax。时间含文件读取、模型实例化、图构建、完整构造、采样和B32。新early方法保存连续物理墙钟时间与缓存复用时间；表中含缓存原B32实测时长，避免缓存命中造成虚假加速。旧联合三候选按上一段的实测组成时间报告。
+
+|方法|可行/8|含B32计费秒中位|含B32计费秒最大|物理墙钟秒中位|
+|---|---:|---:|---:|---:|
+|OLD_OP_GREEDY|3/8|1.082|3.946|1.082|
+|OLD_OP_JOINT|5/8|0.923|2.311|0.923|
+|OLD_OP_MULTI3|6/8|4.195|6.468|4.195|
+|OLD_OP_JOINT_MULTI3|7/8|3.385|5.872|—|
+|EARLY_GREEDY|2/8|0.855|2.528|0.855|
+|EARLY_JOINT|4/8|1.306|2.743|1.306|
+|EARLY_BEST_MULTI3|6/8|2.911|5.777|2.606|
+|RULE/BEAM|7/8|3.213|27.756|3.213|
+|WAG|8/8|60.400|61.410|60.400|
+|HGA|8/8|60.051|62.205|60.051|
+|CURRENT_PORTFOLIO3|8/8|1.711|3.258|1.711|
+
+胜负包含“可行胜失败”，双失败单列；改善中位只对双方可行配对计算，并列明分母。
+
+|方法|对照|胜/平/负|双失败|双方可行/8|条件中位改善/%|
+|---|---|---:|---:|---:|---:|
+|OLD_OP_JOINT|OLD_OP_GREEDY|4/0/2|2|2/8|-7.799|
+|OLD_OP_JOINT_MULTI3|OLD_OP_MULTI3|3/3/1|1|6/8|0.000|
+|EARLY_GREEDY|OLD_OP_GREEDY|2/0/2|4|1/8|23.616|
+|EARLY_GREEDY|OLD_OP_JOINT|1/0/4|3|2/8|5.501|
+|EARLY_GREEDY|OLD_OP_MULTI3|2/0/4|2|2/8|15.930|
+|EARLY_GREEDY|CURRENT_PORTFOLIO3|1/0/7|0|2/8|3.712|
+|EARLY_GREEDY|RULE/BEAM|1/0/7|0|1/8|-13.590|
+|EARLY_GREEDY|WAG|0/0/8|0|2/8|-15.195|
+|EARLY_GREEDY|HGA|0/0/8|0|2/8|-12.604|
+|EARLY_JOINT|OLD_OP_GREEDY|4/0/1|3|2/8|20.719|
+|EARLY_JOINT|OLD_OP_JOINT|4/0/4|0|1/8|26.543|
+|EARLY_JOINT|OLD_OP_MULTI3|3/0/4|1|3/8|12.896|
+|EARLY_JOINT|CURRENT_PORTFOLIO3|2/0/6|0|4/8|-1.948|
+|EARLY_JOINT|RULE/BEAM|1/0/7|0|3/8|-38.404|
+|EARLY_JOINT|WAG|0/0/8|0|4/8|-37.204|
+|EARLY_JOINT|HGA|0/0/8|0|4/8|-33.637|
+|EARLY_BEST_MULTI3|OLD_OP_GREEDY|5/0/1|2|3/8|12.733|
+|EARLY_BEST_MULTI3|OLD_OP_JOINT|5/0/3|0|3/8|10.201|
+|EARLY_BEST_MULTI3|OLD_OP_MULTI3|4/0/3|1|5/8|1.894|
+|EARLY_BEST_MULTI3|CURRENT_PORTFOLIO3|2/0/6|0|6/8|-11.033|
+|EARLY_BEST_MULTI3|RULE/BEAM|1/0/7|0|5/8|-34.817|
+|EARLY_BEST_MULTI3|WAG|0/0/8|0|6/8|-34.168|
+|EARLY_BEST_MULTI3|HGA|0/0/8|0|6/8|-27.440|
+
+### 加工负载、空走、等待和错误定位
+
+单提案DEADLOCK行仍显示其完整构造的加工负载与路线P+MOVE下界，Cmax/MOVE/WAIT保持空值；三候选整组失败时不挑一个失败方案冒充返回值。加工负载为PRE+WELD+POST，MOVE/WAIT只取成功B32完整时间线。
+
+|几何|方法|状态|R0/R1/R2/R3加工负载|max(P+MOVE)|MOVE|WAIT|
+|---|---|---|---|---:|---:|---:|
+|HIGH_WORKLOAD_02|OLD_OP_GREEDY|NO_FEASIBLE_CONSTRUCTION|2449.683 / 4950.892 / 8257.440 / 1031.420|8594.581|—|—|
+|HIGH_WORKLOAD_02|OLD_OP_JOINT|FEASIBLE|4131.439 / 3269.136 / 2643.336 / 6645.524|6877.843|685.624|117.141|
+|HIGH_WORKLOAD_02|EARLY_GREEDY|NO_FEASIBLE_CONSTRUCTION|1684.194 / 5716.380 / 7976.568 / 1312.291|8467.544|—|—|
+|HIGH_WORKLOAD_02|EARLY_JOINT|NO_FEASIBLE_CONSTRUCTION|1416.925 / 5983.650 / 4224.034 / 5064.825|6268.565|—|—|
+|HIGH_WORKLOAD_02|EARLY_BEST_MULTI3|FEASIBLE|1766.037 / 5937.778 / 4800.336 / 4185.283|6176.247|944.223|0.000|
+|HIGH_WORKLOAD_04|OLD_OP_GREEDY|FEASIBLE|6472.019 / 1368.485 / 4559.594 / 4770.505|7049.263|1084.997|0.000|
+|HIGH_WORKLOAD_04|OLD_OP_JOINT|FEASIBLE|6275.261 / 1565.243 / 5620.800 / 3709.299|6841.816|1019.834|0.000|
+|HIGH_WORKLOAD_04|EARLY_GREEDY|FEASIBLE|3273.121 / 4567.384 / 5168.125 / 4161.974|5384.538|954.536|0.000|
+|HIGH_WORKLOAD_04|EARLY_JOINT|FEASIBLE|3369.910 / 4470.594 / 4632.569 / 4697.530|5025.780|936.511|0.000|
+|HIGH_WORKLOAD_04|EARLY_BEST_MULTI3|FEASIBLE|3369.910 / 4470.594 / 4632.569 / 4697.530|5025.780|936.511|0.000|
+|LARGE_02|OLD_OP_GREEDY|NO_FEASIBLE_CONSTRUCTION|2150.033 / 4278.684 / 3418.161 / 4415.050|4620.316|—|—|
+|LARGE_02|OLD_OP_JOINT|FEASIBLE|3030.257 / 3398.460 / 3911.835 / 3921.376|4151.251|818.355|106.293|
+|LARGE_02|EARLY_GREEDY|FEASIBLE|2094.620 / 4334.096 / 3996.570 / 3836.642|4630.803|883.835|429.887|
+|LARGE_02|EARLY_JOINT|NO_FEASIBLE_CONSTRUCTION|4832.128 / 1596.588 / 4396.157 / 3437.054|5192.089|—|—|
+|LARGE_02|EARLY_BEST_MULTI3|NO_FEASIBLE_CONSTRUCTION|—|—|—|—|
+|LARGE_04|OLD_OP_GREEDY|NO_FEASIBLE_CONSTRUCTION|3432.126 / 2731.344 / 5279.166 / 3180.946|5708.029|—|—|
+|LARGE_04|OLD_OP_JOINT|FEASIBLE|2648.034 / 3630.251 / 6218.728 / 2126.569|6705.094|912.457|0.000|
+|LARGE_04|EARLY_GREEDY|NO_FEASIBLE_CONSTRUCTION|3253.644 / 3024.642 / 3850.964 / 4494.333|4781.607|—|—|
+|LARGE_04|EARLY_JOINT|NO_FEASIBLE_CONSTRUCTION|4712.390 / 1565.895 / 3865.702 / 4479.595|5071.981|—|—|
+|LARGE_04|EARLY_BEST_MULTI3|NO_FEASIBLE_CONSTRUCTION|—|—|—|—|
+|MEDIUM_02|OLD_OP_GREEDY|NO_FEASIBLE_CONSTRUCTION|1930.802 / 3132.077 / 4097.499 / 1546.243|4278.794|—|—|
+|MEDIUM_02|OLD_OP_JOINT|NO_FEASIBLE_CONSTRUCTION|2882.601 / 1887.601 / 2882.978 / 3053.441|3253.139|—|—|
+|MEDIUM_02|EARLY_GREEDY|NO_FEASIBLE_CONSTRUCTION|3104.534 / 1958.345 / 3528.372 / 2115.369|3855.316|—|—|
+|MEDIUM_02|EARLY_JOINT|FEASIBLE|1116.056 / 3946.823 / 4776.815 / 866.927|5045.523|594.300|0.000|
+|MEDIUM_02|EARLY_BEST_MULTI3|FEASIBLE|1116.056 / 3946.823 / 4776.815 / 866.927|5045.523|594.300|0.000|
+|MEDIUM_04|OLD_OP_GREEDY|FEASIBLE|1822.495 / 2053.736 / 2875.024 / 2437.334|3015.892|603.799|13.795|
+|MEDIUM_04|OLD_OP_JOINT|FEASIBLE|1523.170 / 2353.061 / 3391.069 / 1921.288|3591.437|593.233|0.000|
+|MEDIUM_04|EARLY_GREEDY|NO_FEASIBLE_CONSTRUCTION|1058.798 / 2817.432 / 4003.165 / 1309.192|4210.225|—|—|
+|MEDIUM_04|EARLY_JOINT|NO_FEASIBLE_CONSTRUCTION|462.669 / 3413.561 / 4219.976 / 1092.382|4398.077|—|—|
+|MEDIUM_04|EARLY_BEST_MULTI3|FEASIBLE|992.395 / 2883.835 / 3391.069 / 1921.288|3606.893|606.220|0.000|
+|SMALL_02|OLD_OP_GREEDY|NO_FEASIBLE_CONSTRUCTION|802.509 / 1905.485 / 4225.667 / 1795.089|4360.829|—|—|
+|SMALL_02|OLD_OP_JOINT|NO_FEASIBLE_CONSTRUCTION|440.136 / 1964.314 / 3979.551 / 2344.750|4119.000|—|—|
+|SMALL_02|EARLY_GREEDY|NO_FEASIBLE_CONSTRUCTION|2441.040 / 640.006 / 3431.689 / 2216.014|3545.850|—|—|
+|SMALL_02|EARLY_JOINT|FEASIBLE|2603.543 / 640.006 / 3805.668 / 1679.533|3903.470|330.486|2306.176|
+|SMALL_02|EARLY_BEST_MULTI3|FEASIBLE|2603.543 / 640.006 / 3805.668 / 1679.533|3903.470|330.486|2306.176|
+|SMALL_04|OLD_OP_GREEDY|FEASIBLE|1075.682 / 3244.205 / 807.573 / 1592.989|3394.365|375.056|0.000|
+|SMALL_04|OLD_OP_JOINT|NO_FEASIBLE_CONSTRUCTION|1111.747 / 3208.140 / 1383.563 / 1016.999|3398.816|—|—|
+|SMALL_04|EARLY_GREEDY|NO_FEASIBLE_CONSTRUCTION|3420.742 / 899.145 / 1269.702 / 1130.861|3610.224|—|—|
+|SMALL_04|EARLY_JOINT|FEASIBLE|1459.603 / 2860.284 / 1824.572 / 575.990|2962.171|370.936|0.000|
+|SMALL_04|EARLY_BEST_MULTI3|FEASIBLE|1459.603 / 2860.284 / 1824.572 / 575.990|2962.171|370.936|0.000|
+
+early三候选返回方案分类：{'加工分配下界过大': 6, 'B32 DEADLOCK/构造失败': 2}。
+
+代表性失败（完整原始提案保存在CSV）：
+
+- HIGH_WORKLOAD_02/EARLY_GREEDY: DEADLOCK，max P=7976.568，max(P+MOVE)=8467.544，最佳对照=4557.801。
+- HIGH_WORKLOAD_02/EARLY_JOINT: DEADLOCK，max P=5983.650，max(P+MOVE)=6268.565，最佳对照=4557.801。
+- LARGE_02/EARLY_JOINT: DEADLOCK，max P=4832.128，max(P+MOVE)=5192.089，最佳对照=4058.676。
+- LARGE_04/EARLY_GREEDY: DEADLOCK，max P=4494.333，max(P+MOVE)=4781.607，最佳对照=4291.540。
+
+机器人分配造成的max P超额是插入位置、方向或WAIT优化无法消除的下界；max(P+MOVE)与Cmax的差才用于判断协调增量。DEADLOCK是当前B32预算未找到可行协调调度，不能据此断言几何绝对不可调度，也不能在没有方向消融时把失败全部归于方向。
+
+六个early可行返回方案的Cmax均等于最大P+MOVE；其中SMALL_02虽有2306.176秒总WAIT，等待发生在非关键路径上，未增加整体Cmax。五例主要差距来自加工量分配；HIGH_WORKLOAD_04的最大P为4697.530秒，对照4659.421秒，仅超38.109秒，而P+MOVE额外增加328.250秒，因此该例的剩余主要差距是路线插入顺序/方向造成的空走。这两项没有独立消融，不能进一步假定全部来自插入位置或全部来自方向。
+
+LARGE_02、LARGE_04的early联合三候选均为DEADLOCK。LARGE_02第二次采样的max(P+MOVE)为4180.368秒，仍未得到B32可行调度，显示负载较低也不足以保证同轨协调可行。同几何EARLY_GREEDY有4660.517秒可行解，但选定的联合三候选失败；没有把这个额外贪心加入三候选回退。父任务联合评分改变了完整路线及可调度性，这与加工负载倾斜是两个问题；仅凭路径差异不能把失败唯一归因于父头、位置或方向。
+
+### 保留结论与下一步
+
+联合解码对旧机会三候选的失败计入胜/平/负为3/3/1，另有1个双失败；有有限正贡献但不稳定。early三候选相对旧机会三候选为4/0/3，相对CURRENT_PORTFOLIO3为2/0/6，相对WAG、HGA分别为0/0/8、0/0/8。训练反馈前移未解决独立构造质量，不再追加轮次或采样。
+**下一轮有必要优先检验动作后的机会变化ΔO(a)=O(T(s,a))−O(s)。** 当前机会特征在同状态各候选间相同，无法直接反映一次分配对后续可服务任务集合的损失；早期同状态真实Cmax反馈仍未消除分配下界和DEADLOCK问题。应利用已有候选状态、首点及可达性信息计算受影响机器人/任务的增量，避免逐候选重新枚举全部剩余焊缝。这只是下一轮待验证假设，本轮未实现，也不宣称其必然有效。
+
+### 测试与复现
+
+针对性测试134 passed；按指定命令执行根目录与DRL完整回归：665 passed in 59.03s。另核对23个历史可行对照的几何、加工负载、MOVE与Cmax，保留1个RULE初始化失败，未新增B32。
+
+```powershell
+Set-Location 'D:\pybullet_test\MRTA_GA'
+$env:PYTHONPATH = (Join-Path (Get-Location) 'DRL\src')
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -m pytest -q -p no:cacheprovider tests DRL\tests
+```
+
+执行异常开销另计：首次原机会模型测量在CSV追加时因沙箱写权限被拒绝而退出，之前已耗用3次开发B32，内存结果未落盘且未用于选择。确认授权执行环境可写后，原贪心和原两次采样均改为复用已有同权重、同种子记录，后续未重复调度这些提案；新联合首提案仅8次B32。此3次不属于141次TRAIN标签调用，也没有隐藏在有效结果中。
+
+```powershell
+Set-Location 'D:\pybullet_test\MRTA_GA'
+$env:PYTHONPATH = (Join-Path (Get-Location) 'DRL\src')
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase early-all
+```
+
+本轮未新增文件；代码、测试、结果CSV、模型容器和报告均复用既有文件。
+
+最终代码与报告完成后，再次执行指定完整测试命令：665 passed in 50.25s。early模型strict加载通过；hidden=64、heads=4、父输入20维、联合插入49维。实际新增B32：TRAIN反事实141次、旧权重联合评价8次、early评价32次、输出失败中断开销3次，共184次；无重复认证。

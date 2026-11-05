@@ -59,6 +59,8 @@ def _expand_neural_checkpoint(payload):
         full['refinement_candidate']=dict(full['refinement_candidate'],**metadata['candidate'])
     if 'opportunity_candidate' in metadata:
         full['opportunity_cmax_candidate']=dict(full['opportunity_cmax_candidate'],**metadata['opportunity_candidate'])
+    if 'early_candidate' in metadata:
+        full['early_cmax_candidate']=dict(full['early_cmax_candidate'],**metadata['early_candidate'])
     return full
 
 
@@ -75,12 +77,14 @@ def save_neural_checkpoint(checkpoint,path):
           'scientific_config','mode_head_before_calibration','opportunity_features')
     def split(part):
         return ({k:v for k,v in part.items() if k in keep},
-                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate')})
+                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate','early_cmax_candidate')})
     thin,main=split(checkpoint);metadata=dict(main=main)
     if 'refinement_candidate' in checkpoint:
         thin['refinement_candidate'],metadata['candidate']=split(checkpoint['refinement_candidate'])
     if 'opportunity_cmax_candidate' in checkpoint:
         thin['opportunity_cmax_candidate'],metadata['opportunity_candidate']=split(checkpoint['opportunity_cmax_candidate'])
+    if 'early_cmax_candidate' in checkpoint:
+        thin['early_cmax_candidate'],metadata['early_candidate']=split(checkpoint['early_cmax_candidate'])
     thin['research_archive']=zlib.compress(json.dumps(metadata,ensure_ascii=False,allow_nan=False,
                                                     separators=(',',':')).encode('utf-8'))
     thin['research_archive_format']='zlib-json'
@@ -1092,7 +1096,7 @@ def expand_opportunity_model(source):
     return model
 
 
-def neural_single_model_portfolio(parents,model,config,*,seed=20261104,proposals=3,scheduled_cache=None):
+def neural_single_model_portfolio(parents,model,config,*,seed=20261104,proposals=3,scheduled_cache=None,greedy_decode='greedy'):
     """Independent construction: one model, fixed patterns, no repair or fallback.
 
     Only the complete greedy/seeded-sample proposals are scheduled. Identical
@@ -1100,10 +1104,11 @@ def neural_single_model_portfolio(parents,model,config,*,seed=20261104,proposals
     Returned candidate objects support reporting greedy and trio from one run.
     """
     if proposals not in (1,2,3):raise ValueError('at most three proposals required')
+    if greedy_decode not in ('greedy','joint_greedy'):raise ValueError('unknown first-proposal greedy decoder')
     started=time.perf_counter();attempts=[];candidates=[]
     seen={} if scheduled_cache is None else scheduled_cache
     external=set(seen);charged=set();credit=0.;best=None;selected=None
-    for index,(decode,draw_seed) in enumerate((('greedy',seed),('sample',seed),('sample',seed+1))[:proposals]):
+    for index,(decode,draw_seed) in enumerate(((greedy_decode,seed),('sample',seed),('sample',seed+1))[:proposals]):
         tick=time.perf_counter()
         geometry=joint_geometry(parents,fixed_split_patterns(parents,config),config)
         result=construct_or_repair_with_gnn(geometry,EMPTY,EMPTY,tuple(p.parent_id for p in parents),model,config,

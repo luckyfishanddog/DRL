@@ -109,7 +109,8 @@ def test_cmax_rank_loss_backpropagates_through_both_existing_policy_heads():
         assert sum(float(p.grad.abs().sum()) for n,p in model.named_parameters() if n.startswith(name+'.') and p.grad is not None)>0.
 
 
-def test_single_model_three_proposals_have_no_old_model_or_rule_fallback(monkeypatch):
+@pytest.mark.parametrize('first_decode',('greedy','joint_greedy'))
+def test_single_model_three_proposals_have_no_old_model_or_rule_fallback(monkeypatch,first_decode):
     from types import SimpleNamespace
     import run_gnn_shared_construction as shared
     reference=_joint_simple_reference();model=object();seen=[]
@@ -120,9 +121,123 @@ def test_single_model_three_proposals_have_no_old_model_or_rule_fallback(monkeyp
     def forbidden(*a,**k):raise AssertionError('fallback or independent certification')
     monkeypatch.setattr(shared.pilot.oriented,'common_initial_beam',forbidden)
     monkeypatch.setattr(shared,'research_certify',forbidden)
-    best,info=shared.neural_single_model_portfolio(reference.parents,model,CONFIG,seed=7)
+    best,info=shared.neural_single_model_portfolio(reference.parents,model,CONFIG,seed=7,greedy_decode=first_decode)
     assert best is None and info['b32_calls']==0
-    assert seen==[(model,'greedy',7),(model,'sample',7),(model,'sample',8)]
+    assert seen==[(model,first_decode,7),(model,'sample',7),(model,'sample',8)]
+
+
+def test_joint_greedy_normalizes_full_parent_pool_and_each_conditional_pool(monkeypatch):
+    from mrta_search import gnn_constructor as c
+    parents=tuple(ParentWeld(p,(x,9.),(x+1.,9.)) for p,x in (('a',1.),('b',6.),('c',12.)))
+    geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+    graph,_,_=c.joint_graph(geometry,CONFIG)
+    by_index={graph.block_index[b.block_id]:b.parent_id for b in graph.blocks}
+    model=c.ModeJointInsertionGNN(16,4)
+    normalized=[];original=torch.log_softmax
+    def logsoftmax(logits,*args,**kwargs):
+        normalized.append(logits.clone());return original(logits,*args,**kwargs)
+    monkeypatch.setattr(torch,'log_softmax',logsoftmax)
+    monkeypatch.setattr(model,'parent_logits',lambda g,e,ids,f:torch.tensor([{'a':.4,'b':0.,'c':-1.}[p] for p in ids]))
+    def insertion(emb,indices,features):
+        parent=by_index[int(indices[0,0])]
+        # A raw-logit sum would incorrectly choose a; its normalized action
+        # probability is diffuse. Parent c is outside the finite top-two set.
+        logits=torch.full((len(indices),),1000. if parent=='a' else 0.)
+        if parent!='a':logits[0]=100.
+        return logits
+    monkeypatch.setattr(model,'joint_action_logits',insertion)
+    result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,('a','b','c'),model,CONFIG,decode_mode='joint_greedy')
+    assert result.solution is not None and result.actions[0].block_id.startswith('b::')
+    assert normalized[0].tolist()==pytest.approx([.4,0.,-1.])
+    assert len(normalized[1])>1 and len(normalized[2])>1
+    assert torch.all(normalized[1]==1000.) and normalized[2].max()==100.
+
+
+def test_early_prefix_targets_include_real_empty_routes_before_any_action():
+    from mrta_search import gnn_constructor as c
+    from run_gnn_cmax_finetune import op_prefix_targets
+    reference=_joint_simple_reference()
+    geometry=c.joint_geometry(reference.parents,reference.patterns,CONFIG)
+    pending=tuple(p.parent_id for p in reference.parents);model=c.ModeJointInsertionGNN(16,4)
+    seen=[]
+    c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,pending,model,CONFIG,
+        parent_observer=lambda s,p,a:seen.append((s.routes,p,a)))
+    targets=op_prefix_targets(21,early=True)
+    assert targets=={0.:0,.1:2,.25:5}
+    routes,remaining,actions=seen[targets[0.]]
+    assert routes==((),)*4 and set(remaining)==set(pending) and not actions
+
+
+def test_early_representatives_use_load_for_robot_and_scarcity_for_other_parent(monkeypatch):
+    import run_gnn_cmax_finetune as study
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates,has_joint_block_candidate
+    parents=tuple(ParentWeld(p,(x,9.),(x+length,9.)) for p,x,length in
+                  (('a',1.,1.),('b',6.,1.),('c',12.,4.)))
+    geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+    _,blocks,patterns=c.joint_graph(geometry,CONFIG)
+    pending=tuple(p.parent_id for p in parents)
+    state=c.joint_start_state(geometry,((),)*4,((),)*4,pending,blocks,CONFIG)
+    model=c.ModeJointInsertionGNN(16,4,opportunity_features=True)
+    monkeypatch.setattr(model,'parent_logits',lambda g,e,ids,f:torch.tensor([3.,2.,1.]))
+    monkeypatch.setattr(model,'joint_action_logits',lambda e,i,f:torch.arange(len(i),dtype=torch.float))
+    actions=study.op_representative_actions(geometry,state,pending,model,CONFIG,early=True)
+    assert len(actions)==3 and blocks[actions[0].block_id].parent_id=='a'
+    assert actions[1].robot!=actions[0].robot and blocks[actions[2].block_id].parent_id=='c'
+    child=blocks[actions[0].block_id]
+    variants=joint_block_candidates(state,child,patterns['a'],blocks,CONFIG)
+    alternatives=[s for s,a in variants if a.robot!=actions[0].robot]
+    selected=next(s for s,a in variants if a==actions[1])
+    assert max(selected.loads)==min(max(s.loads) for s in alternatives)
+    for action in actions:
+        child=blocks[action.block_id]
+        assert has_joint_block_candidate(state,child,patterns[child.parent_id],blocks,CONFIG,robot_id=action.robot)
+        assert action in [a for _,a in joint_block_candidates(state,child,patterns[child.parent_id],blocks,CONFIG)]
+
+
+def test_counterfactual_evaluation_reuses_exact_complete_schedule_once(monkeypatch):
+    from types import SimpleNamespace as NS
+    import run_gnn_cmax_finetune as study
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    reference=_joint_simple_reference();model=c.ModeJointInsertionGNN(16,4)
+    geometry=c.joint_geometry(reference.parents,reference.patterns,CONFIG)
+    completion=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,
+        tuple(p.parent_id for p in reference.parents),model,CONFIG)
+    assert completion.solution is not None
+    monkeypatch.setattr(c,'construct_or_repair_with_gnn',lambda *a,**k:completion)
+    monkeypatch.setattr(shared,'read_neural_checkpoint',lambda *a,**k:{study.OP_VARIANT:{}})
+    monkeypatch.setattr(shared,'_model_from_checkpoint',lambda *a:model)
+    calls=[]
+    def schedule(solution,directions,config):
+        calls.append((solution,directions))
+        return NS(solution=solution,directions=directions,
+            schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100.,operations=(),diagnostics=()))
+    monkeypatch.setattr(study.pilot.oriented,'schedule_explicit',schedule)
+    cache={}
+    info=study.op_measure_decodes(shared,CONFIG,reference.parents,study.OP_VARIANT,('greedy','sample','sample'),cache)
+    assert len(calls)==1 and info['b32_calls']==1
+    assert [a['b32_calls'] for a in info['attempts']]==[1,0,0]
+    again=study.op_measure_decodes(shared,CONFIG,reference.parents,study.OP_VARIANT,('joint_greedy',),cache)
+    assert len(calls)==1 and again['b32_calls']==0 and again['reused_b32_seconds']>0.
+    raw=again['attempts'][0]
+    reversed_raw=dict(raw,directions=tuple(tuple(1-d for d in route) for route in raw['directions']))
+    assert study.op_complete_key(raw)!=study.op_complete_key(reversed_raw)
+
+
+def test_joint_greedy_rejects_a_split_when_second_child_cannot_be_inserted(monkeypatch):
+    from mrta_search import gnn_constructor as c,lns
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    parent=ParentWeld('split',(0.,8.),(4.,8.))
+    pattern=next(p for p in build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)['split']
+                 if p.kind is SplitKind.X_SPLIT and p.point_id=='BX_CENTER')
+    geometry=c.joint_geometry((parent,),(pattern,),CONFIG)
+    original=lns.joint_block_candidates
+    monkeypatch.setattr(lns,'joint_block_candidates',lambda s,b,*a,**k:[] if b.block_id.endswith('::1') else original(s,b,*a,**k))
+    result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,('split',),c.ModeJointInsertionGNN(16,4),CONFIG,
+        decode_mode='joint_greedy')
+    assert result.solution is None and len(result.actions)==1
+    assert result.rejection_reason=='NO_LEGAL_CHILD_INSERTION'
 
 
 def test_final_geometry_pairs_exclude_failures_and_average_within_geometry():
@@ -516,8 +631,8 @@ def test_joint_neural_logits_control_robot_choice_and_complete_real_b32(monkeypa
         assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
 
 
-@pytest.mark.parametrize('parent_selection_mode',('learned','mrv'))
-@pytest.mark.parametrize('decode_mode',('greedy','sample'))
+@pytest.mark.parametrize('parent_selection_mode,decode_mode',
+    (('learned','greedy'),('learned','sample'),('mrv','greedy'),('mrv','sample'),('learned','joint_greedy')))
 def test_joint_empty_routes_and_fixed_x_children_use_the_same_neural_decoder(decode_mode,parent_selection_mode):
     from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
     from mrta_reference.geometry import build_legal_pattern_catalog
@@ -1966,13 +2081,23 @@ def test_neural_archive_retains_exact_weights_and_skips_diagnostics_at_inference
         normalize_inputs=True,use_dynamic_context=False,training=dict(loss=[2.,1.],failures=[None,'DEADLOCK']),
         refinement_candidate=dict(model_type='ModeJointInsertionGNN',state_dict=new.state_dict(),
             normalize_inputs=True,use_dynamic_context=False,refinement=dict(methods=['REGION','MODE_NEW'],cmax=123.45)))
+    opportunity=shared.expand_opportunity_model(new)
+    payload['opportunity_cmax_candidate']=dict(model_type='ModeJointInsertionGNN',state_dict=opportunity.state_dict(),
+        opportunity_features=True,normalize_inputs=True,use_dynamic_context=False,training=dict(prefixes=[.25,.5,.75]))
+    payload['early_cmax_candidate']=dict(payload['opportunity_cmax_candidate'],training=dict(prefixes=[0.,.1,.25]))
     stream=io.BytesIO();shared.save_neural_checkpoint(payload,stream)
     stream.seek(0);full=shared.read_neural_checkpoint(stream)
     assert full['training']==payload['training']
     assert full['refinement_candidate']['refinement']==payload['refinement_candidate']['refinement']
+    assert full['early_cmax_candidate']['training']==dict(prefixes=[0.,.1,.25])
+    assert full['opportunity_cmax_candidate']['training']==dict(prefixes=[.25,.5,.75])
     for a,b in ((payload['state_dict'],full['state_dict']),
                 (payload['refinement_candidate']['state_dict'],full['refinement_candidate']['state_dict'])):
         assert all(torch.equal(a[k],b[k]) for k in a)
+    stream.seek(0);thin=shared.read_neural_checkpoint(stream,include_research=False)
+    early=shared._model_from_checkpoint(thin['early_cmax_candidate'])
+    assert 'training' not in thin['early_cmax_candidate']
+    assert all(torch.equal(v,early.state_dict()[k]) for k,v in opportunity.state_dict().items())
     monkeypatch.setattr(shared,'_expand_neural_checkpoint',lambda *args:
         (_ for _ in ()).throw(AssertionError('inference expanded research diagnostics')))
     stream.seek(0);loaded_old,loaded_new=shared.load_neural_initial_models(stream)

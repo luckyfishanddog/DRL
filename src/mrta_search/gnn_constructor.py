@@ -856,7 +856,7 @@ def rule_anchored_action_logits(logits,variants,preferred_owners):
 def _decode_joint(reference, routes, directions, pending_parent_ids, model, config,
                   *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
                   parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None,
-                  forced_action=None,parent_observer=None):
+                  forced_action=None,parent_observer=None,joint_greedy=False):
     """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
     from .direction import _initial_error
@@ -889,6 +889,7 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
             if not ids:
                 raise _JointActionUnavailable('NO_LEGAL_PARENT_ACTION')
             forcing=forced_action is not None
+            joint_first=None
             if forcing:
                 parent=blocks[forced_action.block_id].parent_id
                 if parent not in ids:raise ValueError('forced parent is not a current legal action')
@@ -898,11 +899,46 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                 parent_logits = model.parent_logits(graph,current_embeddings,ids,features)
                 if not torch.isfinite(parent_logits).all():
                     raise ValueError('NONFINITE_PARENT_LOGITS')
-                parent = ids[choose(parent_logits,'parent')]
+                if joint_greedy:
+                    # Normalize over ALL currently legal parents. Each of the
+                    # two examined parents retains its own full conditional
+                    # insertion pool, including neighbour direction changes.
+                    parent_logp=torch.log_softmax(parent_logits,dim=0)
+                    order=sorted(range(len(ids)),key=lambda i:(-float(parent_logits[i]),i))[:2]
+                    best_score=None
+                    for index in order:
+                        candidate_parent=ids[index]
+                        child=min((b for b in blocks.values() if b.parent_id==candidate_parent),key=lambda b:b.block_id)
+                        variants=joint_block_candidates(state,child,patterns[candidate_parent],blocks,config,
+                            insertion_limit=insertion_limit,check_initial_feasibility=check_start(state),
+                            prefer_legal_start_recovery=prefer_legal_start_recovery)
+                        if not variants:continue
+                        indices,dynamic=joint_candidate_inputs(graph,state,variants,blocks,config,
+                            include_opportunities=opportunities,patterns=patterns,insertion_limit=insertion_limit,
+                            check_initial_feasibility=check_start(state))
+                        logits=model.joint_action_logits(current_embeddings,indices,dynamic)
+                        if not torch.isfinite(logits).all():raise ValueError('NONFINITE_INSERTION_LOGITS')
+                        conditional=torch.log_softmax(logits,dim=0)
+                        selected=int(torch.argmax(conditional))
+                        score=float(parent_logp[index]+conditional[selected])
+                        if best_score is None or score>best_score:
+                            best_score=score
+                            joint_first=(candidate_parent,variants,logits,selected)
+                    if joint_first is None:raise _JointActionUnavailable('NO_LEGAL_CHILD_INSERTION')
+                    parent=joint_first[0]
+                else:
+                    parent = ids[choose(parent_logits,'parent')]
             else:
                 parent = mrv_parent(state,ids,blocks,patterns,config,insertion_limit=insertion_limit)
             children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
             for child_index,child in enumerate(children):
+                if child_index==0 and joint_first is not None:
+                    _,variants,logits,selected=joint_first
+                    if action_observer is not None:
+                        action_observer(graph,state,variants,logits,selected,preferred_owners)
+                    state,action=variants[selected]
+                    actions.append(action)
+                    continue
                 variants = joint_block_candidates(state,child,patterns[parent],blocks,config,insertion_limit=insertion_limit,
                                                    check_initial_feasibility=check_start(state),
                                                    prefer_legal_start_recovery=prefer_legal_start_recovery)
@@ -984,14 +1020,19 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
     negative ordinal sampling scale and the complete original candidate pool.
     'rule_anchored' tests neural tie-breaking within the original rule costs.
     action_observer reads a pool before transition; it does not choose actions.
+    'joint_greedy' adds finite lookahead over the top two learned parents and
+    maximizes log P(parent) + log P(first-child insertion). It changes the
+    search strategy; subsequent split children still use legal greedy insertion.
     """
-    if decode_mode not in ('greedy','sample'):
-        raise ValueError('decode_mode must be greedy or sample')
+    if decode_mode not in ('greedy','sample','joint_greedy'):
+        raise ValueError('decode_mode must be greedy, sample or joint_greedy')
+    if decode_mode=='joint_greedy' and (parent_selection_mode!='learned' or action_selection_mode!='gnn'):
+        raise ValueError('joint_greedy requires the learned parent and GNN insertion heads')
     generator=None
     if decode_mode=='sample':
         generator=torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
     def choose(logits,kind):
-        if decode_mode=='greedy':
+        if decode_mode in ('greedy','joint_greedy'):
             return int(torch.argmax(logits))
         return int(torch.multinomial(torch.softmax(logits,dim=0),1,generator=generator).item())
     model.eval()
@@ -1001,7 +1042,8 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                              allow_partial_start_conflicts=allow_partial_start_conflicts,
                              prefer_legal_start_recovery=prefer_legal_start_recovery,
                              parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode,
-                             action_observer=action_observer,forced_action=forced_action,parent_observer=parent_observer)
+                             action_observer=action_observer,forced_action=forced_action,parent_observer=parent_observer,
+                             joint_greedy=decode_mode=='joint_greedy')
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,
