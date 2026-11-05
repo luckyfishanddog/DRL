@@ -548,6 +548,7 @@ class JointCompletionResult:
     actions: tuple
     inference_seconds: float
     rejection_reason: str | None = None
+    oriented_state: object | None = None
 
 
 @dataclass(frozen=True)
@@ -768,19 +769,43 @@ def mrv_parent(state, parent_ids, blocks, patterns, config, *, insertion_limit=8
     return min(parent_ids,key=priority)
 
 
+def rule_guided_action_logits(logits, variants, preferred_owners):
+    """Parameter-free rank fusion over the unchanged legal insertion pool.
+
+    A rule owner is only a preference. Every supplied action receives a score;
+    rank fusion neither removes actions nor fixes a robot or direction. The
+    existing greedy/sample decoder operates on the resulting negative ranks.
+    """
+    values=logits.detach().cpu().tolist()
+    costs=[]
+    for after,action in variants:
+        completion=tuple(p+sum(arcs) for p,arcs in zip(after.loads,after.arc_costs))
+        costs.append((int(action.robot!=preferred_owners[action.block_id]),max(completion),sum(completion)))
+    neural_order=sorted(range(len(values)),key=lambda i:(-values[i],i))
+    rule_order=sorted(range(len(values)),key=lambda i:(costs[i],i))
+    neural_rank={i:r for r,i in enumerate(neural_order)}
+    rule_rank={i:r for r,i in enumerate(rule_order)}
+    fused_order=sorted(range(len(values)),key=lambda i:(neural_rank[i]+rule_rank[i],costs[i],-values[i],i))
+    fused_rank={i:r for r,i in enumerate(fused_order)}
+    return logits.new_tensor([-fused_rank[i] for i in range(len(values))])
+
+
 def _decode_joint(reference, routes, directions, pending_parent_ids, model, config,
                   *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
-                  parent_selection_mode='learned'):
+                  parent_selection_mode='learned',action_selection_mode='gnn'):
     """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
     from .direction import _initial_error
     from mrta_reference.geometry import oriented_endpoints
     if parent_selection_mode not in ('learned','mrv'):
         raise ValueError('parent_selection_mode must be learned or mrv')
+    if action_selection_mode not in ('gnn','rule_guided'):
+        raise ValueError('action_selection_mode must be gnn or rule_guided')
     started = time.perf_counter()
     actions = []
     try:
         graph,blocks,patterns = joint_graph(reference,config)
+        preferred_owners=dict(rule_assignment(graph.blocks,config)) if action_selection_mode=='rule_guided' else None
         state = joint_start_state(reference,routes,directions,pending_parent_ids,blocks,config)
         pending = set(pending_parent_ids)
         embeddings = model.encode_static(graph)
@@ -821,6 +846,8 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                 logits = model.joint_action_logits(current_embeddings,indices,dynamic)
                 if not torch.isfinite(logits).all():
                     raise ValueError('NONFINITE_INSERTION_LOGITS')
+                if preferred_owners is not None:
+                    logits=rule_guided_action_logits(logits,variants,preferred_owners)
                 state,action = variants[choose(logits,'insertion')]
                 actions.append(action)
             pending.remove(parent)
@@ -836,7 +863,8 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
             # Reject this ordinary action-path dead end, as the rule repairer
             # does; do not abort the entire solver or silently reuse directions.
             raise _JointActionUnavailable('FIXED_PATTERN_CHANGED')
-        return JointCompletionResult(solution,state.directions,tuple(actions),time.perf_counter()-started)
+        return JointCompletionResult(solution,state.directions,tuple(actions),time.perf_counter()-started,
+                                     oriented_state=state)
     except _JointActionUnavailable as error:
         return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,str(error))
 
@@ -844,7 +872,7 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
 def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
                                  model: JointInsertionGNN, config, *, insertion_limit=8,
                                  decode_mode='greedy', seed=0,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
-                                 parent_selection_mode='learned'):
+                                 parent_selection_mode='learned',action_selection_mode='gnn'):
     """No-gradient decoding; complete results are scheduled outside.
 
     The opt-in partial-start repair can restore heads exposed by destruction.
@@ -854,6 +882,8 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
     it to staying in conflict; the preference can be disabled for ablation.
     parent_selection_mode changes only parent ordering: learned head or cheap
     deterministic MRV-LPT. Both retain the same insertion head and action pool.
+    action_selection_mode='rule_guided' fuses neural/rule ranks at inference;
+    the default gnn path and differentiable training rollout stay unchanged.
     """
     if decode_mode not in ('greedy','sample'):
         raise ValueError('decode_mode must be greedy or sample')
@@ -870,7 +900,7 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                              insertion_limit=insertion_limit,choose=choose,
                              allow_partial_start_conflicts=allow_partial_start_conflicts,
                              prefer_legal_start_recovery=prefer_legal_start_recovery,
-                             parent_selection_mode=parent_selection_mode)
+                             parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode)
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,

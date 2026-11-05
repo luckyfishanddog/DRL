@@ -79,6 +79,8 @@ class SchedulerProfile:
     route_build_time: float = 0.0
     operation_template_time: float = 0.0
     scheduler_main_loop_time: float = 0.0
+    baseline_dispatch_time: float = 0.0
+    recovery_time: float = 0.0
     ess_time: float = 0.0
     forbidden_interval_time: float = 0.0
     interval_sort_sweep_time: float = 0.0
@@ -142,6 +144,8 @@ class SchedulerProfile:
             "route_build": self.route_build_time,
             "operation_template": self.operation_template_time,
             "scheduler_main_loop": self.scheduler_main_loop_time,
+            "baseline_dispatch": self.baseline_dispatch_time,
+            "recovery": self.recovery_time,
             "ESS": self.ess_time,
             "forbidden_interval": self.forbidden_interval_time,
             "interval_sort_sweep": self.interval_sort_sweep_time,
@@ -1729,19 +1733,24 @@ def reference_schedule_from_templates_formal(
             profile=profile,
         )
         prepared.feasible_dispatch_observer=feasible_dispatch_observer
+        baseline_started = time.perf_counter()
         baseline_outcome = _prepared_dispatch_outcome(
             prepared, profile=profile, collect_trace=True
         )
-        result = (
-            _limited_discrepancy_dispatch_recovery_optimized(
+        if profile is not None:
+            profile.baseline_dispatch_time += time.perf_counter() - baseline_started
+        if baseline_outcome.result.status is ScheduleStatus.DEADLOCK:
+            recovery_started = time.perf_counter()
+            result = _limited_discrepancy_dispatch_recovery_optimized(
                 prepared,
                 baseline_outcome,
                 rollout_budget=scope.deadlock_rollout_budget,
                 profile=profile,
             )
-            if baseline_outcome.result.status is ScheduleStatus.DEADLOCK
-            else baseline_outcome.result
-        )
+            if profile is not None:
+                profile.recovery_time += time.perf_counter() - recovery_started
+        else:
+            result = baseline_outcome.result
         return replace(
             result,
             reference_policy_id=scope.reference_scheduler_policy_id,

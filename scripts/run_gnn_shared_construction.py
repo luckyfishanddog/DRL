@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import asdict
 import csv
 import json
+import math
 from pathlib import Path
 import random
 import sys
@@ -621,8 +622,13 @@ def research_certify(scheduled,config):
                             x_split_validator=validator).certified
 
 
-def research_prepare(teachers,config):
-    """Replay executable labels; merge parent and insertion distributions separately."""
+def research_prepare(teachers,config,*,certify=True):
+    """Replay executable labels; merge parent and insertion distributions separately.
+
+    The noncertifying path consumes retained FEASIBLE B32 teacher records. It
+    does not schedule them a second time or introduce an independent certifier.
+    Historical callers retain their original B32/certification replay by default.
+    """
     from mrta_search.lns import joint_action_key
     graphs={};merged={};raw_steps=[];diagnostics=[]
     best_cmax={}
@@ -630,9 +636,12 @@ def research_prepare(teachers,config):
         key=item['geometry_key'];best_cmax[key]=min(best_cmax.get(key,float('inf')),item['cmax'])
     for index,item in enumerate(teachers):
         solution=item['solution'];bits=item['directions'];started=time.perf_counter()
-        scheduled=pilot.oriented.schedule_explicit(solution,bits,config)
-        if not research_certify(scheduled,config) or abs(scheduled.schedule.cmax-item['cmax'])>1e-6:
-            raise ValueError('research teacher failed current B32/certification/Cmax replay: '+item['instance'])
+        if certify:
+            scheduled=pilot.oriented.schedule_explicit(solution,bits,config)
+            if not research_certify(scheduled,config) or abs(scheduled.schedule.cmax-item['cmax'])>1e-6:
+                raise ValueError('research teacher failed current B32/certification/Cmax replay: '+item['instance'])
+        elif item.get('b32_status')!=ScheduleStatus.FEASIBLE.value or not math.isfinite(item['cmax']) or item['cmax']<=0:
+            raise ValueError('retained teacher has no FEASIBLE B32 record: '+item['instance'])
         replay,info=construction_replay(solution,bits,max_nodes=128,max_seconds=2,config=config)
         diag=dict(instance=item['instance'],teachers=item['teachers'],cmax=item['cmax'],
                   source_state=item['source_state'],source_seed=item['seed'],**info)
@@ -1022,7 +1031,8 @@ def refinement_evaluate(model,previous_model,rows,config,training_keys):
 
 
 def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=False,seed=20261104,
-                             reference_calls=3,use_learned_modes=False,certify=True,deadline=None):
+                             reference_calls=3,use_learned_modes=False,certify=True,deadline=None,
+                             prune_cmax_lb=False,parent_selection_mode='learned',action_selection_mode='gnn'):
     """Bounded neural proposals; return the smallest timely feasible Cmax.
 
     The robust old policy is retained explicitly. No rule solution or teacher
@@ -1031,6 +1041,8 @@ def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=
     is absolute perf_counter time; late proposals never replace a timely best.
     """
     from mrta_search.gnn_constructor import select_gnn_patterns
+    from mrta_search.lns import oriented_route_state,oriented_route_lower_bound
+    from mrta_reference.solution import block_map
     if reference_calls not in (2,3):raise ValueError('portfolio supports two or three proposals')
     started=time.perf_counter();best=None;attempts=[];seen=set();selected_seconds=None
     policies=[(previous_model,False,'greedy',seed)]
@@ -1041,19 +1053,35 @@ def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=
         if deadline is not None and time.perf_counter()>=deadline:break
         patterns=select_gnn_patterns(parents,policy,config) if use_modes else fixed_split_patterns(parents,config)
         geometry=joint_geometry(parents,patterns,config)
-        result=construct_or_repair_with_gnn(geometry,EMPTY,EMPTY,tuple(p.parent_id for p in parents),policy,config,
-                                          decode_mode=decode,seed=proposal_seed)
+        options=dict(decode_mode=decode,seed=proposal_seed)
+        if parent_selection_mode!='learned':options['parent_selection_mode']=parent_selection_mode
+        if action_selection_mode!='gnn':options['action_selection_mode']=action_selection_mode
+        result=construct_or_repair_with_gnn(geometry,EMPTY,EMPTY,tuple(p.parent_id for p in parents),policy,config,**options)
         attempt=dict(policy='previous' if policy is previous_model else 'refinement',decode=decode,
                      use_learned_modes=use_modes,seed=proposal_seed,
                      status='CONSTRUCTION_FAILED',cmax=None,b32_calls=0,reason=result.rejection_reason,
                      admitted=False)
+        attempt.update(parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode)
         if deadline is not None and time.perf_counter()>=deadline:
             attempt['status']='CONSTRUCTION_FINISHED_AFTER_DEADLINE'
         elif result.solution is not None:
             key=(result.solution.patterns,tuple(r.block_ids for r in result.solution.routes),result.directions)
             if key in seen:attempt['status']='DUPLICATE'
             else:
-                seen.add(key);scheduled=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
+                seen.add(key)
+                if prune_cmax_lb and best is not None:
+                    state=getattr(result,'oriented_state',None)
+                    if state is None:
+                        state=oriented_route_state(tuple(r.block_ids for r in result.solution.routes),
+                                                   result.directions,block_map(result.solution,config),config)
+                    bound=oriented_route_lower_bound(state)
+                    attempt['lower_bound']=bound
+                    if bound>=best.schedule.cmax:
+                        attempt.update(status='PRUNED_BY_CMAX_LB',elapsed=time.perf_counter()-started,
+                                       late=deadline is not None and time.perf_counter()>deadline)
+                        attempts.append(attempt)
+                        continue
+                scheduled=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
                 attempt.update(status=scheduled.schedule.status.value,b32_calls=1)
                 timely=deadline is None or time.perf_counter()<=deadline
                 valid=(scheduled.schedule.status is ScheduleStatus.FEASIBLE and timely and

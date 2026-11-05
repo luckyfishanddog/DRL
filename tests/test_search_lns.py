@@ -44,6 +44,17 @@ FAST = ScientificConfig(
 )
 
 
+def test_cmax_route_bound_keeps_unrounded_cost_and_empty_routes():
+    from mrta_search.lns import OrientedRouteState, oriented_route_lower_bound, oriented_time_score
+    state = OrientedRouteState(((), (), (), ()), ((), (), (), ()),
+                               (1.000000004, 0., 0., 0.), ((2.,), (), (), ()))
+    assert oriented_route_lower_bound(state) == pytest.approx(3.000000004, rel=0., abs=1e-15)
+    assert oriented_time_score(state)[0] == 3.
+    assert oriented_route_lower_bound(state) > oriented_time_score(state)[0]
+    empty = OrientedRouteState(((),)*4, ((),)*4, (0.,)*4, ((),)*4)
+    assert oriented_route_lower_bound(empty) == 0.
+
+
 @pytest.mark.parametrize('kind', (SplitKind.Y_SPLIT, SplitKind.X_SPLIT))
 def test_oriented_mode_repair_rebuilds_children_and_charges_setup(kind,monkeypatch):
     from mrta_reference.geometry import build_legal_pattern_catalog

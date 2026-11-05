@@ -120,6 +120,7 @@ class RepairResult:
     directions: DirectionVectors | None = None
     actions: tuple[OrientedInsertionAction, ...] = ()
     direction_candidates: tuple[DirectionVectors, ...] = ()
+    oriented_state: OrientedRouteState | None = None
 
 
 @dataclass(frozen=True)
@@ -854,6 +855,16 @@ def oriented_time_score(state: OrientedRouteState) -> tuple[float, float]:
     return round(max(estimated, default=0.0), 8), sum(estimated)
 
 
+def oriented_route_lower_bound(state: OrientedRouteState) -> float:
+    """Unrounded P+MOVE bound for these exact routes and directions.
+
+    Routes start at their first weld and do not return home. Processing includes
+    SETUP/WELD/POST through config.process_time; B32 can only add nonnegative
+    coordination waits. The rounded construction score is deliberately unused.
+    """
+    return max((p + sum(arcs) for p, arcs in zip(state.loads, state.arc_costs)), default=0.0)
+
+
 def nominal_coordination_features(solution, directions, config):
     """Score a complete candidate before B32, without dispatching or delaying it.
 
@@ -1443,7 +1454,9 @@ def repair_partial_state(
     return RepairResult(candidate, evaluations, directions=(final_hints if direction_mode is not None else None),
                         actions=tuple(actions), direction_candidates=(
                             tuple(p[0].directions for p in direction_paths) if direction_versions == 2
-                            else ((final_hints,) if direction_mode is not None else ())))
+                            else ((final_hints,) if direction_mode is not None else ())),
+                        oriented_state=(oriented_state if oriented_state is not None
+                            and oriented_state.routes == final_routes and oriented_state.directions == final_hints else None))
 
 
 def repair_partial_state_oriented(

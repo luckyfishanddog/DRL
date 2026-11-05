@@ -1496,6 +1496,151 @@ def test_neural_portfolio_preserves_both_robust_proposals_when_new_policy_fails(
     assert len(info['attempts'])==3 and info['attempts'][-1]['status']=='CONSTRUCTION_FAILED'
 
 
+def test_neural_lb_pruning_never_skips_feasibility_search_and_labels_skips(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_shared_construction as shared
+    from mrta_search.lns import oriented_route_state, oriented_route_lower_bound
+    reference=_joint_simple_reference();proposals=[];scheduled=[]
+    def construct(*args,**kwargs):
+        bits=(((0,),(0,),(),()),((1,),(0,),(),()),((0,),(1,),(),()))[len(proposals)]
+        proposals.append(bits)
+        state=oriented_route_state(tuple(r.block_ids for r in reference.routes),bits,block_map(reference,CONFIG),CONFIG)
+        return SimpleNamespace(solution=reference,directions=bits,rejection_reason=None,oriented_state=state)
+    def schedule(solution,bits,config):
+        scheduled.append(bits)
+        state=oriented_route_state(tuple(r.block_ids for r in reference.routes),bits,block_map(reference,CONFIG),CONFIG)
+        return shared.pilot.oriented.DirectedSolution(solution,bits,ScheduleResult(
+            ScheduleStatus.FEASIBLE,cmax=oriented_route_lower_bound(state)))
+    monkeypatch.setattr(shared,'construct_or_repair_with_gnn',construct)
+    monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',schedule)
+    best,info=shared.neural_initial_portfolio(reference.parents,object(),object(),CONFIG,
+                                            certify=False,prune_cmax_lb=True)
+    assert best is not None and len(proposals)==3 and len(scheduled)==info['b32_calls']==1
+    assert [a['status'] for a in info['attempts']]==['FEASIBLE','PRUNED_BY_CMAX_LB','PRUNED_BY_CMAX_LB']
+    scheduled.clear();proposals.clear()
+    def deadlock(solution,bits,config):
+        scheduled.append(bits)
+        return shared.pilot.oriented.DirectedSolution(solution,bits,ScheduleResult(ScheduleStatus.DEADLOCK))
+    monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',deadlock)
+    best,info=shared.neural_initial_portfolio(reference.parents,object(),object(),CONFIG,
+                                            certify=False,prune_cmax_lb=True)
+    assert best is None and len(scheduled)==info['b32_calls']==3
+
+
+def test_rule_guided_rank_ties_use_rule_cost_and_keep_all_actions():
+    from types import SimpleNamespace
+    from mrta_search.gnn_constructor import rule_guided_action_logits
+    variants=[]
+    for robot,load in ((1,0.),(0,3.),(0,2.)):
+        state=SimpleNamespace(loads=(load,0.,0.,0.),arc_costs=((),)*4)
+        variants.append((state,SimpleNamespace(robot=robot,block_id='b')))
+    scores=rule_guided_action_logits(torch.tensor([9.,1.,0.]),variants,{'b':0})
+    assert scores.shape==(3,) and torch.isfinite(scores).all()
+    assert int(scores.argmax())==2
+    assert sorted(scores.tolist())==[-2.,-1.,0.]
+
+
+def test_rule_assignment_is_a_soft_preference_in_rank_fusion():
+    from types import SimpleNamespace
+    from mrta_search.gnn_constructor import rule_guided_action_logits
+    variants=[]
+    for i in range(5):
+        state=SimpleNamespace(loads=(float(i),0.,0.,0.),arc_costs=((),)*4)
+        variants.append((state,SimpleNamespace(robot=0 if i==4 else 1,block_id='b')))
+    scores=rule_guided_action_logits(torch.tensor([5.,4.,3.,2.,1.]),variants,{'b':0})
+    assert len(scores)==len(variants) and variants[int(scores.argmax())][1].robot==1
+
+
+@pytest.mark.parametrize('parent,action', [('learned','gnn'),('mrv','gnn'),('mrv','rule_guided')])
+def test_portfolio_passes_rule_guidance_without_extra_proposals(monkeypatch,parent,action):
+    from types import SimpleNamespace
+    import run_gnn_shared_construction as shared
+    reference=_joint_simple_reference();calls=[]
+    def construct(*args,**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(solution=None,rejection_reason='FIXTURE')
+    monkeypatch.setattr(shared,'construct_or_repair_with_gnn',construct)
+    _,info=shared.neural_initial_portfolio(reference.parents,object(),object(),CONFIG,certify=False,
+        parent_selection_mode=parent,action_selection_mode=action)
+    assert len(calls)==len(info['attempts'])==3
+    for options in calls:
+        assert options.get('parent_selection_mode','learned')==parent
+        assert options.get('action_selection_mode','gnn')==action
+        if parent=='learned':assert set(options)=={'decode_mode','seed'}
+
+
+def test_real_mrv_rule_guided_decode_bypasses_parent_head_and_preserves_legal_pool(monkeypatch):
+    import mrta_search.gnn_constructor as constructor
+    from mrta_search.lns import joint_action_key
+    reference=_joint_simple_reference();torch.manual_seed(9)
+    model=constructor.JointInsertionGNN()
+    def forbidden(*args,**kwargs):raise AssertionError('MRV called the learned parent head')
+    monkeypatch.setattr(model,'parent_logits',forbidden)
+    original=constructor.rule_guided_action_logits;pool_sizes=[]
+    def fusion(logits,variants,owners):
+        before=tuple(joint_action_key(a) for _,a in variants)
+        out=original(logits,variants,owners)
+        assert before==tuple(joint_action_key(a) for _,a in variants) and len(out)==len(variants)
+        pool_sizes.append(len(variants));return out
+    monkeypatch.setattr(constructor,'rule_guided_action_logits',fusion)
+    geometry=constructor.joint_geometry(reference.parents,reference.patterns,CONFIG)
+    result=constructor.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,
+        tuple(p.parent_id for p in reference.parents),model,CONFIG,
+        parent_selection_mode='mrv',action_selection_mode='rule_guided')
+    assert result.solution is not None and len(result.actions)==len(pool_sizes)==2
+    assert result.solution.patterns==reference.patterns
+
+
+def test_rule_guided_dataset_loader_never_opens_reserved_holdout(monkeypatch):
+    import run_rule_guided_gnn as experiment
+    def forbidden(*args,**kwargs):raise AssertionError('reserved workbook was opened')
+    monkeypatch.setattr(experiment,'load_ppo_platform_instance',forbidden)
+    with pytest.raises(ValueError,match='not development inputs'):
+        experiment.load_entry(dict(purpose='holdout',role='V2_TRAIN_POOL'))
+    with pytest.raises(ValueError,match='not development inputs'):
+        experiment.load_entry(dict(purpose='train',role='ID_TEST_SEALED'))
+
+
+def test_retained_b32_teacher_replay_needs_no_second_schedule_or_certifier(monkeypatch):
+    import run_gnn_shared_construction as shared
+    reference=_joint_simple_reference();bits=((0,),(0,),(),())
+    initial=shared.pilot.oriented.schedule_explicit(reference,bits,CONFIG)
+    row=dict(instance='TRAIN_fixture',method='RULE',seed=1,
+        details=dict(final_state=_research_retained_state(reference,bits,initial.schedule.cmax)))
+    teachers,_=shared.research_teachers([row],CONFIG,deployment_only=False)
+    for teacher in teachers:teacher['b32_status']='FEASIBLE'
+    def forbidden(*args,**kwargs):raise AssertionError('duplicate schedule or independent certifier')
+    monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',forbidden)
+    monkeypatch.setattr(shared,'research_certify',forbidden)
+    graphs,examples,steps,replays=shared.research_prepare(teachers,CONFIG,certify=False)
+    assert graphs and examples and steps and replays[0]['replay_status']=='REPLAYED'
+    teachers[0]['b32_status']='DEADLOCK'
+    with pytest.raises(ValueError,match='no FEASIBLE B32 record'):
+        shared.research_prepare(teachers,CONFIG,certify=False)
+
+
+@pytest.mark.parametrize('prune', [False, True])
+def test_mode_search_bound_keeps_fixed_iterations_and_strict_incumbent(monkeypatch, prune):
+    from types import SimpleNamespace
+    import run_gnn_multi_initial as experiment
+    import mrta_search.lns as lns
+    reference=_joint_simple_reference();bits=((0,),(0,),(),())
+    initial=experiment.shared.pilot.oriented.schedule_explicit(reference,bits,CONFIG)
+    state=lns.oriented_route_state(tuple(r.block_ids for r in reference.routes),bits,block_map(reference,CONFIG),CONFIG)
+    assert initial.schedule.cmax==pytest.approx(lns.oriented_route_lower_bound(state))
+    monkeypatch.setattr(lns,'repair_partial_state_oriented',lambda *a,**k:SimpleNamespace(
+        candidate=SimpleNamespace(solution=reference),directions=bits,oriented_state=state))
+    scheduled=[]
+    def schedule(*args):scheduled.append(1);return initial
+    monkeypatch.setattr(experiment.shared.pilot.oriented,'schedule_explicit',schedule)
+    out=experiment._mode_search(reference.parents,'MODE_NEW',1,float('inf'),4,
+        config=CONFIG,certify=False,common_initial=initial,prune_cmax_lb=prune)
+    assert out['iterations']==4 and out['accepted']==0 and out['cmax']==initial.schedule.cmax
+    assert len(scheduled)==out['reference_calls']==(0 if prune else 4)
+    assert out['pruned_by_cmax_lb']==(4 if prune else 0)
+    if prune:assert all(t['status']=='PRUNED_BY_CMAX_LB' for t in out['trace'])
+
+
 @pytest.mark.parametrize('old_sampling', [False, True])
 def test_neural_portfolio_can_use_b32_only_and_preserves_comparator_proposals(monkeypatch, old_sampling):
     from types import SimpleNamespace

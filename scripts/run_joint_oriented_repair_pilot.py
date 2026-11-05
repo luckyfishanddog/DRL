@@ -151,7 +151,8 @@ def initial_reference(parents, config, scheme):
 
 def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
                         deadline=None, accept_candidate=None, interleave=False,feasible_dispatch_observer=None,
-                        max_reference_calls=None):
+                        max_reference_calls=None,prune_cmax_lb=False):
+    from mrta_search.lns import oriented_route_lower_bound
     if max_reference_calls is not None and max_reference_calls < 0:
         raise ValueError('max_reference_calls must be nonnegative')
     reference_calls = 0
@@ -183,6 +184,15 @@ def common_initial_beam(parents, config, *, seed=20261027, insertion_limit=8,
                                       config,scope=FORMAL_SCOPE_V2)
                 if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
                     raise ValueError('fixed-mode beam candidate changed during canonicalization')
+                # Initialization historically selects the exact minimum Cmax,
+                # without the search's strict-improvement epsilon. Use that
+                # exact ceiling to preserve even sub-epsilon initial gains.
+                bound=oriented_route_lower_bound(state) if prune_cmax_lb and successful else None
+                if bound is not None and bound>=min(c.schedule.cmax for c in successful):
+                    attempts.append(dict(scheme=scheme,status='PRUNED_BY_CMAX_LB',
+                                         lower_bound=bound,admitted=False))
+                    if (interleave and scheme==schemes[-1]) or (not interleave and index==3):break
+                    continue
                 reference_calls += 1
                 candidate=schedule_explicit(solution,state.directions,config,
                     **({'feasible_dispatch_observer':feasible_dispatch_observer} if feasible_dispatch_observer is not None else {}))

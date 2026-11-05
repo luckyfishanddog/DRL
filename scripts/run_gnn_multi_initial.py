@@ -345,10 +345,12 @@ def _mode_worker_init():
 
 
 def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, certify=True,
-                 common_initial=None,initial_seconds=0.,initial_attempts=None,save_timeline=False):
+                 common_initial=None,initial_seconds=0.,initial_attempts=None,save_timeline=False,
+                 prune_cmax_lb=True):
     from dataclasses import asdict,replace
     from mrta_reference.certifier import certify_schedule
-    from mrta_search.lns import rank_parent_mode_changes,select_bottleneck_parents,repair_partial_state_oriented
+    from mrta_search.lns import (rank_parent_mode_changes,select_bottleneck_parents,repair_partial_state_oriented,
+                                 oriented_route_state,oriented_route_lower_bound)
 
     started=time.perf_counter()-initial_seconds
     pilot=shared.pilot
@@ -369,7 +371,7 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
         return True
     if common_initial is None:
         current,attempts=pilot.oriented.common_initial_beam(parents,config,seed=seed,
-            deadline=started+budget,accept_candidate=accept_initial,interleave=True)
+            deadline=started+budget,accept_candidate=accept_initial,interleave=True,prune_cmax_lb=prune_cmax_lb)
     else:
         current,attempts=common_initial,list(initial_attempts or ())
         initial_events=[[initial_seconds,current.schedule.cmax,'INITIAL']]
@@ -379,7 +381,8 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
     row=dict(method=method,initial_cmax=None if current is None else current.schedule.cmax,
              initial_attempts=attempts,
              initialization_seconds=init_elapsed,initial_reference_calls=calls,reference_calls=calls,
-             certifier_calls=certificates,accepted=0,mode_accepted=0,iterations=0,trace=[],best_events=initial_events)
+             certifier_calls=certificates,accepted=0,mode_accepted=0,iterations=0,trace=[],best_events=initial_events,
+             pruned_by_cmax_lb=sum(a['status']=='PRUNED_BY_CMAX_LB' for a in attempts))
     if current is None:
         return dict(row,status='TIME_LIMIT_NO_FEASIBLE' if init_elapsed>budget else 'INITIALIZATION_FAILED',
                     cmax=None,actual_runtime=init_elapsed,overshoot=max(0.,init_elapsed-budget),solution=None)
@@ -423,28 +426,39 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
         if solution is None:
             item['reason']=result.rejection_reason
         elif time.perf_counter()-started<budget:
-            candidate=pilot.oriented.schedule_explicit(solution,result.directions,config)
-            row['reference_calls']+=1
-            item['status']=candidate.schedule.status.value
             item.update(patterns=[asdict(p) for p in solution.patterns],
-                        routes=[r.block_ids for r in solution.routes],directions=result.directions,
-                        recovery_rollouts=candidate.schedule.recovery_rollouts,
-                        recovery_exhausted=candidate.schedule.recovery_exhausted,
-                        frontier_exhausted=candidate.schedule.frontier_exhausted)
-            if candidate.schedule.status is ScheduleStatus.FEASIBLE:
-                if certify:
-                    check=certify_schedule(solution,candidate.schedule,config,scope=FORMAL_SCOPE_V2)
-                    row['certifier_calls']+=1
-                    item['certified']=check.certified
-                    if not check.certified:raise ValueError(check.errors)
-                item['cmax']=candidate.schedule.cmax
-                elapsed=time.perf_counter()-started
-                if elapsed<=budget and candidate.schedule.cmax<current.schedule.cmax-1e-9*max(1.,current.schedule.cmax):
-                    current=candidate
-                    row['accepted']+=1;row['mode_accepted']+=bool(changed)
-                    item['accepted']=True
-                    row['best_events'].append([elapsed,current.schedule.cmax,'MODE' if changed else 'FIXED'])
-            if time.perf_counter()-started>budget:item['late']=True
+                        routes=[r.block_ids for r in solution.routes],directions=result.directions)
+            if prune_cmax_lb:
+                state=getattr(result,'oriented_state',None)
+                if state is None:
+                    state=oriented_route_state(tuple(r.block_ids for r in solution.routes),result.directions,
+                                               block_map(solution,config,scope=FORMAL_SCOPE_V2),config)
+                item['lower_bound']=oriented_route_lower_bound(state)
+                ceiling=current.schedule.cmax-1e-9*max(1.,current.schedule.cmax)
+                if item['lower_bound']>=ceiling:
+                    item['status']='PRUNED_BY_CMAX_LB'
+                    row['pruned_by_cmax_lb']+=1
+            if item['status']!='PRUNED_BY_CMAX_LB':
+                candidate=pilot.oriented.schedule_explicit(solution,result.directions,config)
+                row['reference_calls']+=1
+                item['status']=candidate.schedule.status.value
+                item.update(recovery_rollouts=candidate.schedule.recovery_rollouts,
+                            recovery_exhausted=candidate.schedule.recovery_exhausted,
+                            frontier_exhausted=candidate.schedule.frontier_exhausted)
+                if candidate.schedule.status is ScheduleStatus.FEASIBLE:
+                    if certify:
+                        check=certify_schedule(solution,candidate.schedule,config,scope=FORMAL_SCOPE_V2)
+                        row['certifier_calls']+=1
+                        item['certified']=check.certified
+                        if not check.certified:raise ValueError(check.errors)
+                    item['cmax']=candidate.schedule.cmax
+                    elapsed=time.perf_counter()-started
+                    if elapsed<=budget and candidate.schedule.cmax<current.schedule.cmax-1e-9*max(1.,current.schedule.cmax):
+                        current=candidate
+                        row['accepted']+=1;row['mode_accepted']+=bool(changed)
+                        item['accepted']=True
+                        row['best_events'].append([elapsed,current.schedule.cmax,'MODE' if changed else 'FIXED'])
+                if time.perf_counter()-started>budget:item['late']=True
         else:
             item['status']='CONSTRUCTION_FINISHED_AFTER_DEADLINE'
         item.update(after=current.schedule.cmax,elapsed=time.perf_counter()-started)
