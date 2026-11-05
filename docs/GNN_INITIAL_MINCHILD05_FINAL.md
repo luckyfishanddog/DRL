@@ -770,3 +770,138 @@ $env:PYTHONPATH = (Join-Path (Get-Location) 'DRL\src')
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase delta-data
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase delta-report
 ```
+
+## 2026-11-06 冻结GNN父级完整联合动作与真实Cmax
+
+**结论：完整父级联合解码提高了开发可行率，但没有建立稳定Cmax优势。** 冻结机会模型单提案从3/8变为5/8，保持原两次采样后从6/8变为7/8；三候选对原三候选为2胜4平1负、1个双失败，双方可行配对Cmax中位改善0%。保留parent_joint为可选解码，不替换默认greedy，不据此宣称论文主算法已成立。
+
+### 从原始数据核实Top-K，而非复用ΔO报告结论
+
+恢复原counterfactual和early_counterfactual的126个真实状态，以各自实际冻结源模型重新前向父头，在同状态比较已保存动作及B32结果。47个优于首选A的比较中确有19个位于Top-2之外。但47混合了双方可行且Cmax更小、以及可行胜失败；严格Cmax优质动作只有31个。原25%/50%/75%数据来自扩展refinement，早期0%/10%/25%来自本轮opportunity_cmax_candidate，不能把两种父头混为当前模型。
+
+|原始样本口径|Recall@2|Recall@4|Recall@8|
+|---|---:|---:|---:|
+|两源、严格Cmax|16/31 (51.6%)|20/31 (64.5%)|21/31 (67.7%)|
+|当前OP、严格Cmax|3/18 (16.7%)|7/18 (38.9%)|8/18 (44.4%)|
+|两源、含可行胜失败|28/47 (59.6%)|33/47 (70.2%)|34/47 (72.3%)|
+|当前OP、含可行胜失败|12/31 (38.7%)|17/31 (54.8%)|18/31 (58.1%)|
+
+旧counterfactual的替代父本来就只从Top-2选取，不能据此声称旧父头召回完美。所有召回率仅针对已保存最多三个代表动作中的已知优质替代，不是完整未知动作空间的召回率。当前OP严格优质替代有10/18落在Top-8之外，父头本身排序不足；不以无限增大K掩盖。
+
+以下保留当前OP严格Cmax优质动作的逐几何/真实前缀统计；无优质动作的状态分母为0，不制造标签。全部126个状态（含分母为0者）在CSV的parent_recall中按source_phase、instance、fraction保存。
+
+|几何/前缀|优质替代数|Top-2覆盖|Top-4覆盖|Top-8覆盖|
+|---|---:|---:|---:|---:|
+|SMALL_03/0%|2|1|2|2|
+|SMALL_03/10%|2|1|2|2|
+|SMALL_03/25%|1|0|1|1|
+|SMALL_05/0%|1|0|1|1|
+|SMALL_05/25%|1|1|1|1|
+|N35_02/0%|1|0|0|0|
+|N35_02/10%|1|0|0|0|
+|MEDIUM_03/0%|1|0|0|0|
+|N55_02/0%|1|0|0|0|
+|MEDIUM_05/0%|1|0|0|0|
+|MEDIUM_05/10%|1|0|0|0|
+|MEDIUM_05/25%|1|0|0|1|
+|HIGH_WORKLOAD_01/0%|1|0|0|0|
+|HIGH_WORKLOAD_01/10%|1|0|0|0|
+|LARGE_03/10%|1|0|0|0|
+|N85_01/25%|1|0|0|0|
+
+### K选择、完整父动作与时间
+
+|K|完整父动作生成+评分/ms中位|候选生成/ms中位|特征/ms中位|网络/ms中位|
+|---:|---:|---:|---:|---:|
+|2|11.364|2.020|7.627|0.710|
+|4|23.300|3.825|15.947|1.107|
+|8|40.563|7.338|27.829|2.230|
+
+计时来自六个既有真实状态，含34/85父任务和0%/10%/25%/50%/75%前缀；不调用B32。选择K=4：两源严格Cmax覆盖20/31，已覆盖Top-8所能恢复的21个中的20个，K=8仅多1个而成本明显上升。K<=8没有达到绝大多数覆盖，K=4只是本轮受控成本选择，不宣称截断问题已解决。
+gnn_constructor.py新增joint_parent_action_candidates及decode_mode="parent_joint"。父概率在所有合法未分配父池上log_softmax，子概率在该分支完整合法插入池上log_softmax，再分别截取Top-2。WHOLE一个动作；拆分保留首子Top-2，在各自不可变临时状态中评分第二子Top-2，最多每父4个完整组合。完整分数为log P(parent)+所有子动作的条件log概率和；无完整组合的分支丢弃，最后一次提交整父。未相加原logits，也未在Top-K/Top-2内部重新归一化。
+两层GAT、64维、4头、20/49维输入及权重完全不改；使用opportunity_cmax_candidate，未加入ΔO或独立模式头，固定fixed_split_patterns()仍限制拆分搜索空间。没有后处理、RULE/旧模型回退或额外认证。
+
+### 8个原开发几何、固定seed=202611041的真实B32
+
+NEW_GNN_GREEDY/MULTI3复用保存的同权重结果，并新测模型加载、图构建与构造；24个提案完整路线及方向精确复现。GNN_PARENT_JOINT是确定性单提案；MULTI3额外视图仅将它与原两个不变采样组合，不增加调度。RULE原7例各2次调度可直接复用；HIGH_WORKLOAD_04原有8次超出预算，仅补跑该例，保持interleave和Beam宽度4，只设现有max_reference_calls=3，三个均DEADLOCK。每个方法每几何实际最多3次调度。
+
+|几何|NEW_GNN_GREEDY|NEW_GNN_MULTI3|GNN_PARENT_JOINT|GNN_PARENT_JOINT_MULTI3|RULE/BEAM|
+|---|---:|---:|---:|---:|---:|
+|HIGH_WORKLOAD_02|—|6295.488|—|6295.488|4581.210|
+|HIGH_WORKLOAD_04|7049.263|7049.263|5107.321|5107.321|—|
+|LARGE_02|—|5079.267|6155.150|5079.267|4102.925|
+|LARGE_04|—|—|6689.568|6689.568|4365.425|
+|MEDIUM_02|—|—|—|—|2963.857|
+|MEDIUM_04|3029.686|3029.686|3767.680|3767.680|2811.073|
+|SMALL_02|—|4481.393|—|4481.393|2820.353|
+|SMALL_04|3394.365|2826.180|3903.998|2826.180|2308.269|
+
+—为失败，未赋惩罚Cmax。8个几何均已消费，只能称为开发验证。
+
+|方法|可行/8|总时间中位/s|逻辑B32/8例|本轮新增B32|
+|---|---:|---:|---:|---:|
+|NEW_GNN_GREEDY|3/8|1.082|8|0|
+|NEW_GNN_MULTI3|6/8|4.195|24|0|
+|GNN_PARENT_JOINT|5/8|1.672|8|8|
+|GNN_PARENT_JOINT_MULTI3|7/8|3.850|24|0|
+|RULE/BEAM|7/8|3.213|17|3|
+
+新单提案总时间是连续实测；新三候选总时间为新首提案实测加旧两次采样的实测增量，并非一次连续墙钟。旧基线B32当时未单独计时，不能虚构拆分；旧总时间继续用原实测。因此三候选总时间下降不应解释成构造加速。
+
+|比较|含可行性差异胜/平/负|双失败|双方可行/8|条件Cmax中位改善/%|
+|---|---:|---:|---:|---:|
+|GNN_PARENT_JOINT 对 NEW_GNN_GREEDY|3/0/2|3|3/8|-15.014|
+|GNN_PARENT_JOINT 对 NEW_GNN_MULTI3|2/0/5|1|4/8|-22.770|
+|GNN_PARENT_JOINT_MULTI3 对 NEW_GNN_MULTI3|2/4/1|1|6/8|0.000|
+|GNN_PARENT_JOINT 对 RULE/BEAM|1/0/7|0|4/8|-51.629|
+|GNN_PARENT_JOINT_MULTI3 对 RULE/BEAM|1/0/7|0|6/8|-35.725|
+
+改善统一为100×(baseline−GNN)/baseline；仅双方可行时有数值改善率，失败仍计入胜负和可行率分母。
+
+|几何|旧贪心新测构造/s|父级联合构造/s|父级联合B32/s|父级联合总/s|
+|---|---:|---:|---:|---:|
+|HIGH_WORKLOAD_02|0.532|1.592|0.589|2.203|
+|HIGH_WORKLOAD_04|0.696|2.134|0.076|2.237|
+|LARGE_02|0.601|1.814|0.062|1.902|
+|LARGE_04|0.778|1.963|0.057|2.045|
+|MEDIUM_02|0.316|0.878|0.543|1.443|
+|MEDIUM_04|0.305|0.805|0.101|0.929|
+|SMALL_02|0.151|0.420|0.112|0.552|
+|SMALL_04|0.152|0.499|0.121|0.646|
+
+中位构造0.424→1.235秒，增加0.811秒、191.478%。构造含固定模式几何/图与全部网络决策；模型读取单列在CSV，已计入总时间。分项中位数不能相加。
+
+|新单提案几何|状态|max P|max(P+MOVE)|Cmax−max(P+MOVE)|WAIT总量|
+|---|---|---:|---:|---:|---:|
+|HIGH_WORKLOAD_02|DEADLOCK|5536.290|5806.903|—|—|
+|HIGH_WORKLOAD_04|FEASIBLE|4885.411|5107.321|0.000|0.000|
+|LARGE_02|FEASIBLE|5843.427|6155.150|-0.000|0.000|
+|LARGE_04|FEASIBLE|6218.728|6689.568|-0.000|0.000|
+|MEDIUM_02|DEADLOCK|3309.480|3539.142|—|—|
+|MEDIUM_04|FEASIBLE|3491.069|3698.018|69.662|69.662|
+|SMALL_02|DEADLOCK|2823.837|2903.566|—|—|
+|SMALL_04|FEASIBLE|2409.602|2565.582|1338.416|1338.416|
+
+### 瓶颈与下一轮判断
+
+已评价动作重放到真实末状态逐项一致，WHOLE与拆分两个子段的条件分数及一次提交测试通过，因此不是状态污染、漏插第二子段或归一化实现错误。当前实际509个父任务中仅13个为固定Y_SPLIT；新旧解码同时改变父池2→4和完整父评分，没有单独消融，不能把收益全部归给拆分前瞻。
+父头：当前18个严格Cmax优质替代只有7个父进入Top-4；再要求首子动作Top-2仅剩4个。即使完整父评分正确，真正优质的已知动作仍常在预筛选时被丢弃。
+分支：实际86个拆分父首分支池中72个Top-2动作机器人和位置相同，仅方向/邻接翻转不同；完整构造只有1次选中首子排名2。因此Top-2概率动作不等于两个有代表性的分配结构，本轮没有擅自添加规则补充。
+评分：75个WHOLE/拆分共存状态中62次选WHOLE，其中44次是父头本来更偏好拆分，加入两个条件概率后改选WHOLE。变长概率乘积增加非正项，且已有Cmax排序训练主要监督首子动作，未经完整父级Cmax校准；这提示长度/条件概率错配，不能仅凭该比例证明WHOLE选择必然错误。
+结果：HIGH_WORKLOAD_04改善，但MEDIUM_04、SMALL_04单提案Cmax变差。HIGH_WORKLOAD_02、MEDIUM_02、SMALL_02新单提案仍DEADLOCK；MEDIUM_02三提案全失败。完整父动作局部合法不等于全局可调度；不能靠均衡使用四机证明成功。
+SMALL_04是明确反例：max P从旧贪心3244.205降至2409.602，max(P+MOVE)降至2565.582，Cmax却从3394.365升至3903.998。新路线相对自身P+MOVE增加1338.416秒协调等待，抵消负载收益后Cmax净增509.633秒；B32按原机制恢复18次后取得该可行时间线。LARGE_02/LARGE_04的Cmax则等于P+MOVE，且max P分别5843.427/6218.728，主要限制是机器人加工分配。因此剩余瓶颈同时包含加工分配与全局同轨协调，不能统称泛化不好或仅归因独立方向。
+保留该有界解码作为下一轮针对性训练候选，有可行率与个别Cmax改善的价值；尚不足以替换默认构造或开展大规模训练。下一轮应优先训练父级完整动作的真实Cmax排名与父头召回，复核WHOLE/拆分分数校准，沿用现有网络；不直接增加层数、K或随机采样。本轮未训练任何模型。
+WAG/HGA保存的是60秒搜索终解，与数秒GNN初解预算不同；本轮不把它们列为等预算胜负。
+
+最终相关回归：147 passed in 4.85s（DRL/tests/test_gnn_construct_vns.py）。覆盖WHOLE完整父动作、全合法池概率归一化、首子次优分支胜出、第二子状态更新、分支独立、失败无部分提交、精确动作重放及原greedy/sample兼容。另核对40个方法×几何记录唯一、各方法每几何逻辑B32<=3、实际新增11次；失败Cmax为空。
+
+修改复用gnn_constructor.py、run_gnn_cmax_finetune.py、run_gnn_shared_construction.py、test_gnn_construct_vns.py、既有CSV和本报告。没有新增文件，历史权重不写入；本轮新增B32合计11次（新GNN8、RULE补跑3）。
+
+```powershell
+Set-Location 'D:\pybullet_test\MRTA_GA'
+$env:PYTHONPATH = (Join-Path (Get-Location) 'DRL\src')
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-diagnose
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-eval
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-audit
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-report
+```

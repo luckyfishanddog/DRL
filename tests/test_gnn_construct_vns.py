@@ -172,7 +172,7 @@ def test_cmax_rank_loss_backpropagates_through_both_existing_policy_heads():
         assert sum(float(p.grad.abs().sum()) for n,p in model.named_parameters() if n.startswith(name+'.') and p.grad is not None)>0.
 
 
-@pytest.mark.parametrize('first_decode',('greedy','joint_greedy'))
+@pytest.mark.parametrize('first_decode',('greedy','joint_greedy','parent_joint'))
 def test_single_model_three_proposals_have_no_old_model_or_rule_fallback(monkeypatch,first_decode):
     from types import SimpleNamespace
     import run_gnn_shared_construction as shared
@@ -189,7 +189,8 @@ def test_single_model_three_proposals_have_no_old_model_or_rule_fallback(monkeyp
     assert seen==[(model,first_decode,7),(model,'sample',7),(model,'sample',8)]
 
 
-def test_joint_greedy_normalizes_full_parent_pool_and_each_conditional_pool(monkeypatch):
+@pytest.mark.parametrize('decode',('joint_greedy','parent_joint'))
+def test_joint_greedy_normalizes_full_parent_pool_and_each_conditional_pool(monkeypatch,decode):
     from mrta_search import gnn_constructor as c
     parents=tuple(ParentWeld(p,(x,9.),(x+1.,9.)) for p,x in (('a',1.),('b',6.),('c',12.)))
     geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
@@ -209,11 +210,74 @@ def test_joint_greedy_normalizes_full_parent_pool_and_each_conditional_pool(monk
         if parent!='a':logits[0]=100.
         return logits
     monkeypatch.setattr(model,'joint_action_logits',insertion)
-    result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,('a','b','c'),model,CONFIG,decode_mode='joint_greedy')
+    result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,('a','b','c'),model,CONFIG,
+        decode_mode=decode,parent_candidate_limit=2)
     assert result.solution is not None and result.actions[0].block_id.startswith('b::')
     assert normalized[0].tolist()==pytest.approx([.4,0.,-1.])
     assert len(normalized[1])>1 and len(normalized[2])>1
     assert torch.all(normalized[1]==1000.) and normalized[2].max()==100.
+
+
+def test_parent_joint_scores_second_child_in_each_actual_branch_and_commits_once(monkeypatch):
+    from mrta_search import gnn_constructor as c,lns
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    parent=ParentWeld('split',(0.,8.),(4.,8.))
+    pattern=next(p for p in build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)['split']
+                 if p.kind is SplitKind.X_SPLIT and p.point_id=='BX_CENTER')
+    geometry=c.joint_geometry((parent,),(pattern,),CONFIG)
+    graph,blocks,patterns=c.joint_graph(geometry,CONFIG)
+    empty=c.joint_start_state(geometry,((),)*4,((),)*4,('split',),blocks,CONFIG)
+    model=c.ModeJointInsertionGNN(16,4);second_prefixes=[]
+    def logits(embedding,indices,features):
+        if int(indices[0,0])==graph.block_index['split::0']:
+            return -.2*features[:,19]  # Prefer first-child direction 0 slightly.
+        second_prefixes.append(features[:,:4].clone())
+        return torch.zeros(len(indices))
+    monkeypatch.setattr(model,'joint_action_logits',logits)
+    with torch.inference_mode():
+        emb=model.encode_static(graph)
+        plans=c.joint_parent_action_candidates(graph,empty,('split',),torch.zeros(1),emb,model,blocks,patterns,CONFIG)
+    assert len(plans)==3  # First branch has 2 legal seconds; second has 1.
+    best=max(plans,key=lambda p:p['score'])
+    assert best['child_ranks'][0]==2 and best['actions'][0].direction==1
+    assert best['child_pool_sizes']==(2,1)
+    assert best['score']==pytest.approx(best['parent_log_probability']+sum(best['child_log_probabilities']))
+    assert all(torch.all(f[:,0]>0) and torch.all(f[:,1:]==0) for f in second_prefixes)
+    for plan in plans:
+        state=empty
+        for action in plan['actions']:
+            variants=lns.joint_block_candidates(state,blocks[action.block_id],patterns['split'],blocks,CONFIG)
+            state=next(s for s,a in variants if a==action)
+            assert action.direction in (0,1) and len([b for route in state.routes for b in route])==len(set(b for route in state.routes for b in route))
+        assert state==plan['state'] and len(plan['actions'])==2
+    assert empty.routes==((),)*4 and empty.directions==((),)*4 and empty.loads==(0.,)*4
+    result=c.construct_or_repair_with_gnn(geometry,empty.routes,empty.directions,('split',),model,CONFIG,
+        decode_mode='parent_joint')
+    assert result.solution is not None and len(result.actions)==2
+    assert result.actions[0].direction==1
+    assert {b for route in result.solution.routes for b in route.block_ids}=={'split::0','split::1'}
+
+
+@pytest.mark.parametrize('all_branches_fail',(False,True))
+def test_parent_joint_discards_failed_child_branch_without_partial_commit(monkeypatch,all_branches_fail):
+    from mrta_search import gnn_constructor as c,lns
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    parent=ParentWeld('split',(0.,8.),(4.,8.))
+    pattern=next(p for p in build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)['split']
+                 if p.kind is SplitKind.X_SPLIT and p.point_id=='BX_CENTER')
+    geometry=c.joint_geometry((parent,),(pattern,),CONFIG)
+    original=lns.joint_block_candidates
+    def candidates(state,child,*args,**kwargs):
+        if child.block_id=='split::1' and (all_branches_fail or state.directions[0][0]==1):return ()
+        return original(state,child,*args,**kwargs)
+    monkeypatch.setattr(lns,'joint_block_candidates',candidates)
+    result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,('split',),c.ModeJointInsertionGNN(16,4),CONFIG,
+        decode_mode='parent_joint')
+    if all_branches_fail:
+        assert result.solution is None and not result.actions
+        assert result.rejection_reason=='NO_LEGAL_PARENT_COMPLETION'
+    else:
+        assert result.solution is not None and len(result.actions)==2 and result.actions[0].direction==0
 
 
 def test_early_prefix_targets_include_real_empty_routes_before_any_action():

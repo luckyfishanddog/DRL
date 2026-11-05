@@ -1104,7 +1104,7 @@ def neural_single_model_portfolio(parents,model,config,*,seed=20261104,proposals
     Returned candidate objects support reporting greedy and trio from one run.
     """
     if proposals not in (1,2,3):raise ValueError('at most three proposals required')
-    if greedy_decode not in ('greedy','joint_greedy'):raise ValueError('unknown first-proposal greedy decoder')
+    if greedy_decode not in ('greedy','joint_greedy','parent_joint'):raise ValueError('unknown first-proposal greedy decoder')
     started=time.perf_counter();attempts=[];candidates=[]
     seen={} if scheduled_cache is None else scheduled_cache
     external=set(seen);charged=set();credit=0.;best=None;selected=None
