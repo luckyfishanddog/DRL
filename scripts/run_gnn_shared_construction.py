@@ -1022,38 +1022,53 @@ def refinement_evaluate(model,previous_model,rows,config,training_keys):
 
 
 def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=False,seed=20261104,
-                             reference_calls=3,use_learned_modes=False):
-    """Bounded neural proposals; return the smallest certified Cmax.
+                             reference_calls=3,use_learned_modes=False,certify=True,deadline=None):
+    """Bounded neural proposals; return the smallest timely feasible Cmax.
 
     The robust old policy is retained explicitly. No rule solution or teacher
     route is supplied at inference. old_sampling is the equal-call comparator.
+    Certification remains enabled by default for historical callers. A deadline
+    is absolute perf_counter time; late proposals never replace a timely best.
     """
     from mrta_search.gnn_constructor import select_gnn_patterns
     if reference_calls not in (2,3):raise ValueError('portfolio supports two or three proposals')
-    started=time.perf_counter();best=None;attempts=[];seen=set()
+    started=time.perf_counter();best=None;attempts=[];seen=set();selected_seconds=None
     policies=[(previous_model,False,'greedy',seed)]
     if reference_calls==3:policies.append((previous_model,False,'sample',seed))
     policies.append((previous_model,False,'sample',seed+reference_calls-2) if old_sampling else
                     (model,use_learned_modes,'greedy',seed))
     for policy,use_modes,decode,proposal_seed in policies:
+        if deadline is not None and time.perf_counter()>=deadline:break
         patterns=select_gnn_patterns(parents,policy,config) if use_modes else fixed_split_patterns(parents,config)
         geometry=joint_geometry(parents,patterns,config)
         result=construct_or_repair_with_gnn(geometry,EMPTY,EMPTY,tuple(p.parent_id for p in parents),policy,config,
                                           decode_mode=decode,seed=proposal_seed)
         attempt=dict(policy='previous' if policy is previous_model else 'refinement',decode=decode,
                      use_learned_modes=use_modes,seed=proposal_seed,
-                     status='CONSTRUCTION_FAILED',cmax=None,b32_calls=0,reason=result.rejection_reason)
-        if result.solution is not None:
+                     status='CONSTRUCTION_FAILED',cmax=None,b32_calls=0,reason=result.rejection_reason,
+                     admitted=False)
+        if deadline is not None and time.perf_counter()>=deadline:
+            attempt['status']='CONSTRUCTION_FINISHED_AFTER_DEADLINE'
+        elif result.solution is not None:
             key=(result.solution.patterns,tuple(r.block_ids for r in result.solution.routes),result.directions)
             if key in seen:attempt['status']='DUPLICATE'
             else:
                 seen.add(key);scheduled=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
                 attempt.update(status=scheduled.schedule.status.value,b32_calls=1)
-                if research_certify(scheduled,config):
+                timely=deadline is None or time.perf_counter()<=deadline
+                valid=(scheduled.schedule.status is ScheduleStatus.FEASIBLE and timely and
+                       (not certify or research_certify(scheduled,config)))
+                completed=time.perf_counter()
+                if valid and (deadline is None or completed<=deadline):
+                    attempt['admitted']=True
                     attempt['cmax']=scheduled.schedule.cmax
-                    if best is None or scheduled.schedule.cmax<best.schedule.cmax:best=scheduled
+                    if best is None or scheduled.schedule.cmax<best.schedule.cmax:
+                        best=scheduled;selected_seconds=completed-started
+        attempt['elapsed']=time.perf_counter()-started
+        attempt['late']=deadline is not None and time.perf_counter()>deadline
         attempts.append(attempt)
-    return best,dict(attempts=attempts,b32_calls=sum(a['b32_calls'] for a in attempts),runtime_s=time.perf_counter()-started)
+    return best,dict(attempts=attempts,b32_calls=sum(a['b32_calls'] for a in attempts),
+                     runtime_s=time.perf_counter()-started,selected_seconds=selected_seconds)
 
 
 def refinement_portfolio_evaluate(model,previous,rows,config,*,reference_calls=3,use_learned_modes=False):

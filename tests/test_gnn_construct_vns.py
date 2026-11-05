@@ -1496,6 +1496,150 @@ def test_neural_portfolio_preserves_both_robust_proposals_when_new_policy_fails(
     assert len(info['attempts'])==3 and info['attempts'][-1]['status']=='CONSTRUCTION_FAILED'
 
 
+@pytest.mark.parametrize('old_sampling', [False, True])
+def test_neural_portfolio_can_use_b32_only_and_preserves_comparator_proposals(monkeypatch, old_sampling):
+    from types import SimpleNamespace
+    import run_gnn_shared_construction as shared
+    reference=_joint_simple_reference();old=object();new=object();proposals=[]
+    def construct(geometry,routes,directions,pending,model,config,**options):
+        proposals.append((model,options['decode_mode'],options['seed']))
+        bits=(((0,),(0,),(),()),((1,),(0,),(),()),((0,),(1,),(),()))[len(proposals)-1]
+        return SimpleNamespace(solution=reference,directions=bits,rejection_reason=None)
+    def schedule(solution,bits,config):
+        return shared.pilot.oriented.DirectedSolution(solution,bits,ScheduleResult(
+            ScheduleStatus.FEASIBLE,cmax=400.-len(proposals)*100.))
+    def forbidden(*args,**kwargs):raise AssertionError('independent certification was called')
+    monkeypatch.setattr(shared,'construct_or_repair_with_gnn',construct)
+    monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',schedule)
+    monkeypatch.setattr(shared,'research_certify',forbidden)
+    best,info=shared.neural_initial_portfolio(reference.parents,old,new,CONFIG,seed=7,
+                                            old_sampling=old_sampling,certify=False)
+    assert proposals==[(old,'greedy',7),(old,'sample',7),
+                       (old,'sample',8) if old_sampling else (new,'greedy',7)]
+    assert info['b32_calls']==3 and best.schedule.cmax==100.
+
+
+@pytest.mark.parametrize('late_construction', [False, True])
+def test_neural_portfolio_deadline_rejects_late_b32_or_construction(monkeypatch, late_construction):
+    from types import SimpleNamespace
+    import run_gnn_shared_construction as shared
+    reference=_joint_simple_reference();clock=[100.];proposals=[];schedules=[]
+    monkeypatch.setattr(shared,'time',SimpleNamespace(perf_counter=lambda:clock[0]))
+    def construct(*args,**kwargs):
+        proposals.append(1)
+        if late_construction:clock[0]=161.
+        bits=((len(proposals)-1,),(0,),(),())
+        return SimpleNamespace(solution=reference,directions=bits,rejection_reason=None)
+    def schedule(solution,bits,config):
+        schedules.append(1);clock[0]=110. if len(schedules)==1 else 161.
+        return shared.pilot.oriented.DirectedSolution(solution,bits,ScheduleResult(
+            ScheduleStatus.FEASIBLE,cmax=300.-len(schedules)*100.))
+    monkeypatch.setattr(shared,'construct_or_repair_with_gnn',construct)
+    monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',schedule)
+    best,info=shared.neural_initial_portfolio(reference.parents,object(),object(),CONFIG,
+                                            certify=False,deadline=160.)
+    if late_construction:
+        assert best is None and not schedules and len(proposals)==1
+        assert info['attempts'][0]['status']=='CONSTRUCTION_FINISHED_AFTER_DEADLINE'
+    else:
+        assert best.schedule.cmax==200. and info['selected_seconds']==10.
+        assert len(schedules)==2 and info['attempts'][-1]['cmax'] is None
+        assert not info['attempts'][-1]['admitted'] and info['attempts'][-1]['late']
+
+
+def test_initial_mode_new_failure_never_falls_back_and_charges_model_load(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_initial_mode_new as study
+    clock=[100.]
+    monkeypatch.setattr(study,'time',SimpleNamespace(perf_counter=lambda:clock[0]))
+    def load(*args):clock[0]+=5.;return object(),object()
+    def portfolio(*args,**options):
+        assert options['deadline']==160. and options['certify'] is False
+        assert options['reference_calls']==3 and options['use_learned_modes'] is False
+        clock[0]+=1.
+        return None,dict(attempts=[dict(status='DEADLOCK',b32_calls=1)]*3,b32_calls=3,selected_seconds=None)
+    def forbidden(*args,**kwargs):raise AssertionError('hidden rule initialization/search after GNN failure')
+    monkeypatch.setattr(study.shared,'load_neural_initial_models',load)
+    monkeypatch.setattr(study.shared,'neural_initial_portfolio',portfolio)
+    monkeypatch.setattr(study,'_mode_search',forbidden)
+    monkeypatch.setattr(study.shared.pilot.oriented,'common_initial_beam',forbidden)
+    entry=dict(instance='fixture',tier='SMALL',N=1,geometry_seed=1,workbook='fixture.xlsx',sheet='raw',
+               parents=[dict(parent_id='p',start=(1.,9.),end=(2.,9.))])
+    row=study.run_job((entry,'NEW_GNN_PORTFOLIO',7,'smoke'))
+    assert row['status']=='INITIALIZATION_FAILED' and row['final_cmax'] is None
+    assert row['model_load_seconds']==5. and row['actual_runtime']==6. and row['b32_calls']==3
+
+
+def test_initial_mode_new_passes_full_initialization_cost_to_unchanged_backend(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_initial_mode_new as study
+    clock=[100.];initial=SimpleNamespace(schedule=SimpleNamespace(cmax=123.));calls=[]
+    monkeypatch.setattr(study,'time',SimpleNamespace(perf_counter=lambda:clock[0]))
+    def load(*args):clock[0]+=5.;return object(),object()
+    def portfolio(*args,**kwargs):
+        clock[0]+=2.
+        return initial,dict(attempts=[dict(status='FEASIBLE',b32_calls=1)],b32_calls=1,selected_seconds=1.)
+    def search(*args,**kwargs):
+        calls.append(kwargs)
+        assert kwargs['common_initial'] is initial and kwargs['initial_seconds']==7.
+        assert kwargs['method']=='MODE_NEW' and kwargs['budget']==60. and kwargs['certify'] is False
+        assert kwargs['config'] is study.CONFIG_05 and kwargs['max_iterations']==1_000_000
+        clock[0]=160.5
+        return dict(status='FEASIBLE',cmax=100.,reference_calls=4,iterations=3,accepted=1,mode_accepted=1,
+                    best_events=[[7.,123.,'INITIAL'],[59.,100.,'MODE']],trace=[dict(late=True)])
+    monkeypatch.setattr(study.shared,'load_neural_initial_models',load)
+    monkeypatch.setattr(study.shared,'neural_initial_portfolio',portfolio)
+    monkeypatch.setattr(study,'_mode_search',search)
+    entry=dict(instance='fixture',tier='SMALL',N=1,geometry_seed=1,workbook='fixture.xlsx',sheet='raw',
+               parents=[dict(parent_id='p',start=(1.,9.),end=(2.,9.))])
+    row=study.run_job((entry,'NEW_GNN_PORTFOLIO',7,'smoke'))
+    assert len(calls)==1 and row['actual_runtime']==60.5 and row['initial_found_seconds']==6.
+    assert row['last_improvement_seconds']==59. and row['b32_calls']==4 and row['search_b32_calls']==3
+
+
+def test_initial_mode_new_pairs_use_geometry_medians_and_keep_missing_pairs_out():
+    import run_gnn_initial_mode_new as study
+    rows=[]
+    for i,(rule,new) in enumerate(((100.,90.),(100.,90.),(1000.,1100.),(None,None),(None,None))):
+        rows.extend([dict(instance='a',method='RULE',final_cmax=rule),
+                     dict(instance='a',method='NEW_GNN_PORTFOLIO',final_cmax=new)])
+    rows.extend([dict(instance='b',method='RULE',final_cmax=100.),
+                 dict(instance='b',method='NEW_GNN_PORTFOLIO',final_cmax=None)])
+    counts,change,pairs=study.pair_summary(rows,'final_cmax','RULE')
+    assert counts==[1,0,0] and change==pytest.approx(10.)
+    assert len(pairs)==1 and pairs[0][1:3]==(100.,90.)
+    assert len(rows)==12
+
+
+def test_initial_mode_new_resume_keeps_saved_failures_and_separates_smoke(monkeypatch):
+    import run_gnn_initial_mode_new as study
+    entries=[dict(instance=tier+'_01',tier=tier) for tier in ('SMALL','LARGE','HIGH_WORKLOAD')]
+    saved=[dict(phase='smoke',instance='SMALL_01',solver_seed='20261900',method='OLD_GNN_PORTFOLIO',
+                status='INITIALIZATION_FAILED'),
+           dict(phase='formal',instance='SMALL_01',solver_seed='20261900',method='NEW_GNN_PORTFOLIO',
+                status='FEASIBLE')]
+    submitted=[];written=[]
+    class Future:
+        def __init__(self,job):self.job=job
+        def result(self):
+            entry,method,seed,phase=self.job
+            return dict(instance=entry['instance'],method=method,solver_seed=seed,phase=phase,status='FEASIBLE',
+                        initial_cmax=100.,final_cmax=90.,actual_runtime=60.,b32_calls=3)
+    class Executor:
+        def __init__(self,**kwargs):assert kwargs['max_workers']==4
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def submit(self,fn,job):submitted.append(job);return Future(job)
+    monkeypatch.setattr(study,'read_rows',lambda:saved)
+    monkeypatch.setattr(study,'ProcessPoolExecutor',Executor)
+    monkeypatch.setattr(study,'as_completed',lambda futures:iter(futures))
+    monkeypatch.setattr(study,'append_row',written.append)
+    study.run_phase(entries,'smoke',4)
+    assert len(submitted)==len(written)==8
+    assert not any(e['instance']=='SMALL_01' and m=='OLD_GNN_PORTFOLIO' for e,m,s,p in submitted)
+    assert any(e['instance']=='SMALL_01' and m=='NEW_GNN_PORTFOLIO' for e,m,s,p in submitted)
+
+
 def test_neural_archive_retains_exact_weights_and_skips_diagnostics_at_inference(monkeypatch):
     import io
     import run_gnn_shared_construction as shared

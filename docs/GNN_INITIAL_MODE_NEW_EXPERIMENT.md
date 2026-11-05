@@ -1,0 +1,193 @@
+# GNN初始化 + MODE_NEW真实运行实验
+
+正式运行：300/300；冒烟：9/9，冒烟不计入正式统计。
+
+## 数据与训练重叠核查
+
+已核对本地代码与GitHub luckyfishanddog/DRL README；本地实际代码为执行依据。
+当前checkpoint旧模型来源：Development 162 rows only; no formal-500, historical-domain or scalar-only supervision.
+新模型训练记录：21个训练几何，8个已消费开发验证几何。
+逐段坐标比较覆盖当前两份CSV的29个几何，连同历史GNN数据共87个几何、17个历史GNN工作簿；选中20个均无重叠。
+15个upgraded_grc工作簿已用于其他算法的375次实验，本轮仅称GNN未见几何，不称整个项目未用数据。
+高工作量从排除历史GNN工作簿后的51个PPO_TRAIN原有45组布局中，按总长度降序、数量降序、文件名升序，检查现有0.50m合法拆分并选前5个不同工作簿。
+筛选在任何本轮算法运行前完成；无新几何、无裁剪、无端点修改、无新Excel。
+
+|实例|组别|工作簿 / sheet|N|生成种子|总长度/m|
+|---|---|---|---:|---:|---:|
+|SMALL_01|SMALL|data/independent/upgraded_grc/seed_0020262001.xlsx / g21_w035|35|20262001|70.237|
+|SMALL_02|SMALL|data/independent/upgraded_grc/seed_0020262002.xlsx / g17_w035|35|20262002|57.642|
+|SMALL_03|SMALL|data/independent/upgraded_grc/seed_0020262003.xlsx / g15_w035|35|20262003|47.120|
+|SMALL_04|SMALL|data/independent/upgraded_grc/seed_0020262004.xlsx / g23_w035|35|20262004|57.676|
+|SMALL_05|SMALL|data/independent/upgraded_grc/seed_0020262007.xlsx / g19_w035|35|20262007|54.655|
+|MEDIUM_01|MEDIUM|data/independent/upgraded_grc/seed_0020262005.xlsx / g27_w055|55|20262005|80.485|
+|MEDIUM_02|MEDIUM|data/independent/upgraded_grc/seed_0020262008.xlsx / g35_w055|55|20262008|90.289|
+|MEDIUM_03|MEDIUM|data/independent/upgraded_grc/seed_0020262010.xlsx / g28_w055|55|20262010|107.156|
+|MEDIUM_04|MEDIUM|data/independent/upgraded_grc/seed_0020262012.xlsx / g33_w055|55|20262012|87.321|
+|MEDIUM_05|MEDIUM|data/independent/upgraded_grc/seed_0020262013.xlsx / g35_w055|55|20262013|78.988|
+|LARGE_01|LARGE|data/independent/upgraded_grc/seed_0020262006.xlsx / g40_w085|85|20262006|94.543|
+|LARGE_02|LARGE|data/independent/upgraded_grc/seed_0020262009.xlsx / g45_w083|83|20262009|121.941|
+|LARGE_03|LARGE|data/independent/upgraded_grc/seed_0020262011.xlsx / g45_w077|77|20262011|94.266|
+|LARGE_04|LARGE|data/independent/upgraded_grc/seed_0020262014.xlsx / g41_w085|85|20262014|191.949|
+|LARGE_05|LARGE|data/independent/upgraded_grc/seed_0020262015.xlsx / g38_w085|85|20262015|115.450|
+|HIGH_WORKLOAD_01|HIGH_WORKLOAD|../ppo/data/PPO_TRAIN/seed_2095476608.xlsx / g45_w086|86|2095476608|176.225|
+|HIGH_WORKLOAD_02|HIGH_WORKLOAD|../ppo/data/PPO_TRAIN/seed_0211781140.xlsx / g45_w100|100|211781140|158.392|
+|HIGH_WORKLOAD_03|HIGH_WORKLOAD|../ppo/data/PPO_TRAIN/seed_1636194744.xlsx / g45_w088|88|1636194744|153.878|
+|HIGH_WORKLOAD_04|HIGH_WORKLOAD|../ppo/data/PPO_TRAIN/seed_0450139711.xlsx / g45_w093|93|450139711|149.946|
+|HIGH_WORKLOAD_05|HIGH_WORKLOAD|../ppo/data/PPO_TRAIN/seed_1702002874.xlsx / g45_w079|79|1702002874|144.373|
+
+## 执行口径
+
+固定CONFIG_05、FORMAL_SCOPE_V2、B32和原MODE_NEW。无训练、权重修改、方向/WAIT独立阶段。
+RULE使用common_initial_beam；OLD为旧模型greedy/sample(seed)/sample(seed+1)；NEW只将第三候选换成新模型固定模式greedy。两个GNN臂各最多3次初始B32，均certify=False。
+每次60秒包括本次模型文件读取、两模型实例化、初始化和B32；模块导入、静态Excel读取与CSV写入在计时外。4个spawn工作进程，PyTorch及BLAS单线程，方法次序循环交替。
+首次冒烟批次在保存首条结果时遭沙箱拒绝写CSV，未留存结果；修复写入权限后重新执行，现存9条冒烟才是接口验证记录。正式300条没有因此重跑，既有375次实验没有重跑。
+初始化无可行解直接记失败，绝不传None给_mode_search触发规则回退。截止后完成的初始候选不接纳；截止前已取得的初解保留。后续搜索沿用严格截止及严格Cmax改善接受，实际耗时保留跨截止返回的开销。
+正式种子：20261901, 20261902, 20261903, 20261904, 20261905。冒烟种子20261900。
+
+几何为统计单位，先取该几何有效种子的Cmax中位数。失败保留在可行率分母，没有有效Cmax的几何配对不比较；部分种子失败的几何仍用有效种子中位数，以下逐几何表显示样本量。相对改善=(对照−NEW)/对照，正值为NEW更好；胜平负容差1e−8个百分点。
+
+## 方法汇总
+
+|组别|方法|运行数|初始可行|最终可行|初始几何中位数均值/s|最终几何中位数均值/s|平均运行/s|平均B32|
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+|ALL|RULE|100|100/100|100/100|4091.017|3799.267|60.545|117.720|
+|ALL|OLD_GNN_PORTFOLIO|100|92/100|92/100|7311.189|5986.193|56.531|77.050|
+|ALL|NEW_GNN_PORTFOLIO|100|89/100|89/100|6852.453|5720.299|54.501|78.670|
+|SMALL|RULE|25|25/25|25/25|2799.093|2127.261|60.145|207.040|
+|SMALL|OLD_GNN_PORTFOLIO|25|24/25|24/25|3191.322|2172.470|57.823|179.200|
+|SMALL|NEW_GNN_PORTFOLIO|25|23/25|23/25|3171.579|2128.735|55.451|182.400|
+|MEDIUM|RULE|25|25/25|25/25|3780.622|3469.863|60.492|109.240|
+|MEDIUM|OLD_GNN_PORTFOLIO|25|23/25|23/25|6224.266|4499.531|55.846|65.520|
+|MEDIUM|NEW_GNN_PORTFOLIO|25|22/25|22/25|6205.934|4397.066|53.350|65.000|
+|LARGE|RULE|25|25/25|25/25|4547.403|4382.691|60.631|92.040|
+|LARGE|OLD_GNN_PORTFOLIO|25|21/25|21/25|9033.806|7665.619|52.813|36.120|
+|LARGE|NEW_GNN_PORTFOLIO|25|21/25|21/25|8231.753|7348.793|52.461|34.240|
+|HIGH_WORKLOAD|RULE|25|25/25|25/25|5236.947|5217.255|60.914|62.560|
+|HIGH_WORKLOAD|OLD_GNN_PORTFOLIO|25|24/25|24/25|10795.361|9607.153|59.642|27.360|
+|HIGH_WORKLOAD|NEW_GNN_PORTFOLIO|25|23/25|23/25|9800.545|9006.602|56.743|33.040|
+
+## NEW的几何配对
+
+|组别|阶段|对照|有效几何配对|胜/平/负|中位相对改善/%|
+|---|---|---|---:|---|---:|
+|ALL|初始|RULE|20|1/0/19|-66.291|
+|ALL|初始|OLD_GNN_PORTFOLIO|20|6/6/8|0.000|
+|ALL|最终|RULE|20|1/0/19|-35.280|
+|ALL|最终|OLD_GNN_PORTFOLIO|20|11/3/6|0.056|
+|SMALL|初始|RULE|5|1/0/4|-30.630|
+|SMALL|初始|OLD_GNN_PORTFOLIO|5|2/1/2|0.000|
+|SMALL|最终|RULE|5|1/0/4|-1.407|
+|SMALL|最终|OLD_GNN_PORTFOLIO|5|5/0/0|0.846|
+|MEDIUM|初始|RULE|5|0/0/5|-96.389|
+|MEDIUM|初始|OLD_GNN_PORTFOLIO|5|1/1/3|-1.500|
+|MEDIUM|最终|RULE|5|0/0/5|-23.419|
+|MEDIUM|最终|OLD_GNN_PORTFOLIO|5|2/1/2|0.000|
+|LARGE|初始|RULE|5|0/0/5|-90.042|
+|LARGE|初始|OLD_GNN_PORTFOLIO|5|2/1/2|0.000|
+|LARGE|最终|RULE|5|0/0/5|-68.149|
+|LARGE|最终|OLD_GNN_PORTFOLIO|5|3/0/2|0.089|
+|HIGH_WORKLOAD|初始|RULE|5|0/0/5|-110.955|
+|HIGH_WORKLOAD|初始|OLD_GNN_PORTFOLIO|5|1/3/1|0.000|
+|HIGH_WORKLOAD|最终|RULE|5|0/0/5|-92.540|
+|HIGH_WORKLOAD|最终|OLD_GNN_PORTFOLIO|5|1/2/2|0.000|
+
+## 逐几何原始结果核查
+
+|实例|方法|初始有效/5|最终有效/5|初始中位Cmax/s|最终中位Cmax/s|
+|---|---|---:|---:|---:|---:|
+|SMALL_01|RULE|5/5|5/5|5360.716|2966.314|
+|SMALL_01|OLD_GNN_PORTFOLIO|4/5|4/5|4330.374|2830.610|
+|SMALL_01|NEW_GNN_PORTFOLIO|3/5|3/5|4756.208|2809.284|
+|SMALL_02|RULE|5/5|5/5|2164.083|1884.023|
+|SMALL_02|OLD_GNN_PORTFOLIO|5/5|5/5|3502.193|2108.909|
+|SMALL_02|NEW_GNN_PORTFOLIO|5/5|5/5|2264.163|1957.930|
+|SMALL_03|RULE|5/5|5/5|2003.640|1903.539|
+|SMALL_03|OLD_GNN_PORTFOLIO|5/5|5/5|2204.526|1949.508|
+|SMALL_03|NEW_GNN_PORTFOLIO|5/5|5/5|2974.940|1930.329|
+|SMALL_04|RULE|5/5|5/5|2021.163|1999.557|
+|SMALL_04|OLD_GNN_PORTFOLIO|5/5|5/5|2640.250|2016.462|
+|SMALL_04|NEW_GNN_PORTFOLIO|5/5|5/5|2640.250|2005.834|
+|SMALL_05|RULE|5/5|5/5|2445.865|1882.873|
+|SMALL_05|OLD_GNN_PORTFOLIO|5/5|5/5|3279.268|1956.861|
+|SMALL_05|NEW_GNN_PORTFOLIO|5/5|5/5|3222.335|1940.298|
+|MEDIUM_01|RULE|5/5|5/5|3778.312|3735.261|
+|MEDIUM_01|OLD_GNN_PORTFOLIO|5/5|5/5|6190.312|4571.402|
+|MEDIUM_01|NEW_GNN_PORTFOLIO|5/5|5/5|7420.188|4610.040|
+|MEDIUM_02|RULE|5/5|5/5|4720.126|3749.734|
+|MEDIUM_02|OLD_GNN_PORTFOLIO|3/5|3/5|4980.676|3814.070|
+|MEDIUM_02|NEW_GNN_PORTFOLIO|2/5|2/5|5197.973|3859.942|
+|MEDIUM_03|RULE|5/5|5/5|4181.873|4118.645|
+|MEDIUM_03|OLD_GNN_PORTFOLIO|5/5|5/5|8348.506|5508.968|
+|MEDIUM_03|NEW_GNN_PORTFOLIO|5/5|5/5|8348.506|5508.968|
+|MEDIUM_04|RULE|5/5|5/5|2900.264|2899.092|
+|MEDIUM_04|OLD_GNN_PORTFOLIO|5/5|5/5|5948.105|4933.204|
+|MEDIUM_04|NEW_GNN_PORTFOLIO|5/5|5/5|6037.307|4932.079|
+|MEDIUM_05|RULE|5/5|5/5|3322.536|2846.581|
+|MEDIUM_05|OLD_GNN_PORTFOLIO|5/5|5/5|5653.729|3670.010|
+|MEDIUM_05|NEW_GNN_PORTFOLIO|5/5|5/5|4025.698|3074.300|
+|LARGE_01|RULE|5/5|5/5|3422.690|3417.434|
+|LARGE_01|OLD_GNN_PORTFOLIO|5/5|5/5|6569.581|5494.518|
+|LARGE_01|NEW_GNN_PORTFOLIO|4/5|4/5|7030.443|5968.953|
+|LARGE_02|RULE|5/5|5/5|4432.661|4097.411|
+|LARGE_02|OLD_GNN_PORTFOLIO|5/5|5/5|8423.901|7436.004|
+|LARGE_02|NEW_GNN_PORTFOLIO|5/5|5/5|8423.901|7960.578|
+|LARGE_03|RULE|5/5|5/5|3486.595|3345.313|
+|LARGE_03|OLD_GNN_PORTFOLIO|4/5|4/5|6888.078|5630.124|
+|LARGE_03|NEW_GNN_PORTFOLIO|2/5|2/5|6940.413|5625.100|
+|LARGE_04|RULE|5/5|5/5|6843.509|6548.111|
+|LARGE_04|OLD_GNN_PORTFOLIO|5/5|5/5|13621.103|11241.223|
+|LARGE_04|NEW_GNN_PORTFOLIO|5/5|5/5|11065.032|10925.715|
+|LARGE_05|RULE|5/5|5/5|4551.563|4505.188|
+|LARGE_05|OLD_GNN_PORTFOLIO|2/5|2/5|9666.370|8526.225|
+|LARGE_05|NEW_GNN_PORTFOLIO|5/5|5/5|7698.974|6263.620|
+|HIGH_WORKLOAD_01|RULE|5/5|5/5|5986.474|5982.929|
+|HIGH_WORKLOAD_01|OLD_GNN_PORTFOLIO|5/5|5/5|12606.959|11355.931|
+|HIGH_WORKLOAD_01|NEW_GNN_PORTFOLIO|5/5|5/5|12628.784|11519.503|
+|HIGH_WORKLOAD_02|RULE|5/5|5/5|5520.442|5471.949|
+|HIGH_WORKLOAD_02|OLD_GNN_PORTFOLIO|5/5|5/5|12130.177|11303.573|
+|HIGH_WORKLOAD_02|NEW_GNN_PORTFOLIO|5/5|5/5|12130.177|11303.573|
+|HIGH_WORKLOAD_03|RULE|5/5|5/5|4879.240|4861.676|
+|HIGH_WORKLOAD_03|OLD_GNN_PORTFOLIO|5/5|5/5|10412.116|8270.111|
+|HIGH_WORKLOAD_03|NEW_GNN_PORTFOLIO|5/5|5/5|5416.208|5097.837|
+|HIGH_WORKLOAD_04|RULE|5/5|5/5|5243.611|5235.026|
+|HIGH_WORKLOAD_04|OLD_GNN_PORTFOLIO|5/5|5/5|11383.302|10908.503|
+|HIGH_WORKLOAD_04|NEW_GNN_PORTFOLIO|5/5|5/5|11383.302|10908.503|
+|HIGH_WORKLOAD_05|RULE|5/5|5/5|4554.969|4534.693|
+|HIGH_WORKLOAD_05|OLD_GNN_PORTFOLIO|4/5|4/5|7444.252|6197.648|
+|HIGH_WORKLOAD_05|NEW_GNN_PORTFOLIO|3/5|3/5|7444.252|6203.593|
+
+## 时间和失败记录
+
+实际返回耗时>60s：281/300；最大耗时：70.498s。跨截止B32调用：247。
+失败分布：{"NEW_GNN_PORTFOLIO / INITIALIZATION_FAILED": 11, "OLD_GNN_PORTFOLIO / INITIALIZATION_FAILED": 8}
+代码异常行：0。所有失败原始行保留在CSV。
+
+已保存最佳解的最大完成时间为59.989195s。GNN失败的较短返回时间降低了全样本平均耗时，不能据此宣称求解更快。
+
+## 研究问题与决策
+
+1. **新GNN没有改善规则初始化。** NEW相对RULE初始胜/平/负为1/0/19，配对中位改善-66.291%。初始和最终可行率均为RULE 100/100、OLD 92/100、NEW 89/100。
+2. **相对旧组合有局部增量，整体优势不稳定。** 初始胜/平/负6/6/8，中位改善0.000%；最终11/3/6，中位改善仅0.056%。新组合可行率低于旧组合，不能用成功样本的Cmax均值代替整体优势。
+3. **局部初始优势可以转化，但没有形成相对规则的整体改善。** 相对OLD，6个初始中位Cmax改善的几何中，6个最终中位Cmax也改善：HIGH_WORKLOAD_03、LARGE_04、LARGE_05、MEDIUM_05、SMALL_02、SMALL_05。NEW相对RULE最终仍为1/0/19，配对中位改善-35.280%。部分几何有效种子数不同，以上属于有效结果条件下的比较，不能抵消失败率。
+4. **规模差异明显。** SMALL的NEW最终几何中位数接近RULE，且相对OLD为5胜；MEDIUM、LARGE和HIGH_WORKLOAD对RULE均为0胜5负。HIGH_WORKLOAD_03相对OLD最终中位Cmax改善38.358%，但仍高于RULE；高工作量组整体对OLD为1胜2平2负，不能推广为高工作量普遍优势。
+5. **本轮不支持将GNN初始化保留为论文主方法。** 相对RULE的初始与最终Cmax均无整体优势，可行率还下降11个百分点；相对OLD的最终配对中位收益很小且可行率下降3个百分点。保留此次局部增量和负结果作为研究证据，停止继续训练或堆叠GNN模块，重新评估该技术路线；本轮没有修改网络或MODE_NEW来追逐测试结果。
+
+## 回归验证与复现
+
+2026-11-05完成以下验证：
+
+- 指定环境：`D:\pybullet_test\.venv\Scripts\python.exe`；算法入口在`D:\pybullet_test\MRTA_GA\DRL`执行。
+- 项目与DRL完整回归：**633 passed in 56.62 s**。命令为在项目根目录设置`PYTHONPATH=DRL\src;src`，然后使用指定Python运行`-B -m pytest -q -p no:cacheprovider tests DRL/tests`。
+- 原始CSV共309行：正式300行、冒烟9行；正式键集合恰为20几何×5种子×3方法，无缺项或重复。19条正式失败全部保留，代码异常0条。
+- 100组新旧GNN同几何同种子运行的前两个候选，其策略、解码方式、种子、B32状态和Cmax逐项相同；第三候选按预定方法分别来自旧采样或新模型固定模式贪心。
+- 全部可行初解都取自及时返回的B32成功候选；所有记录的最佳解完成时间≤60s，最大为59.989195s。实际进程返回时间最大70.497917s，未截断为60s。
+- 实测再次调用正式入口，得到`300 saved, 0 pending`，没有启动新的算法运行，断点续跑保留成功和失败行。
+
+复现及继续入口：
+
+```powershell
+Set-Location 'D:\pybullet_test\MRTA_GA\DRL'
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B scripts/run_gnn_initial_mode_new.py --phase all --workers 4
+```
+
+当前CSV已完整，以上命令将跳过现有9条冒烟和300条正式记录。只重新汇总可使用`--phase summarize`。本轮新增永久文件仅为事先逐项确认的实验入口、单一CSV和本报告；回归用例追加到既有测试文件，未新增测试文件或Excel。
