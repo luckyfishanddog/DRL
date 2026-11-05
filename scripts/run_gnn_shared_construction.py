@@ -1032,24 +1032,28 @@ def refinement_evaluate(model,previous_model,rows,config,training_keys):
 
 def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=False,seed=20261104,
                              reference_calls=3,use_learned_modes=False,certify=True,deadline=None,
-                             prune_cmax_lb=False,parent_selection_mode='learned',action_selection_mode='gnn'):
+                             prune_cmax_lb=False,parent_selection_mode='learned',action_selection_mode='gnn',
+                             candidate_observer=None):
     """Bounded neural proposals; return the smallest timely feasible Cmax.
 
     The robust old policy is retained explicitly. No rule solution or teacher
     route is supplied at inference. old_sampling is the equal-call comparator.
     Certification remains enabled by default for historical callers. A deadline
     is absolute perf_counter time; late proposals never replace a timely best.
+    selected_proposal identifies the actual winning zero-based menu entry.
+    The optional observer receives each constructed result and its recorded
+    disposition, including duplicates and safely pruned proposals, without B32.
     """
     from mrta_search.gnn_constructor import select_gnn_patterns
     from mrta_search.lns import oriented_route_state,oriented_route_lower_bound
     from mrta_reference.solution import block_map
     if reference_calls not in (2,3):raise ValueError('portfolio supports two or three proposals')
-    started=time.perf_counter();best=None;attempts=[];seen=set();selected_seconds=None
+    started=time.perf_counter();best=None;attempts=[];seen=set();selected_seconds=None;selected_proposal=None
     policies=[(previous_model,False,'greedy',seed)]
     if reference_calls==3:policies.append((previous_model,False,'sample',seed))
     policies.append((previous_model,False,'sample',seed+reference_calls-2) if old_sampling else
                     (model,use_learned_modes,'greedy',seed))
-    for policy,use_modes,decode,proposal_seed in policies:
+    for proposal_index,(policy,use_modes,decode,proposal_seed) in enumerate(policies):
         if deadline is not None and time.perf_counter()>=deadline:break
         patterns=select_gnn_patterns(parents,policy,config) if use_modes else fixed_split_patterns(parents,config)
         geometry=joint_geometry(parents,patterns,config)
@@ -1062,6 +1066,7 @@ def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=
                      status='CONSTRUCTION_FAILED',cmax=None,b32_calls=0,reason=result.rejection_reason,
                      admitted=False)
         attempt.update(parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode)
+        attempt['proposal_index']=proposal_index
         if deadline is not None and time.perf_counter()>=deadline:
             attempt['status']='CONSTRUCTION_FINISHED_AFTER_DEADLINE'
         elif result.solution is not None:
@@ -1080,6 +1085,7 @@ def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=
                         attempt.update(status='PRUNED_BY_CMAX_LB',elapsed=time.perf_counter()-started,
                                        late=deadline is not None and time.perf_counter()>deadline)
                         attempts.append(attempt)
+                        if candidate_observer is not None:candidate_observer(proposal_index,result,attempt)
                         continue
                 scheduled=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
                 attempt.update(status=scheduled.schedule.status.value,b32_calls=1)
@@ -1091,12 +1097,14 @@ def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=
                     attempt['admitted']=True
                     attempt['cmax']=scheduled.schedule.cmax
                     if best is None or scheduled.schedule.cmax<best.schedule.cmax:
-                        best=scheduled;selected_seconds=completed-started
+                        best=scheduled;selected_seconds=completed-started;selected_proposal=proposal_index
         attempt['elapsed']=time.perf_counter()-started
         attempt['late']=deadline is not None and time.perf_counter()>deadline
         attempts.append(attempt)
+        if candidate_observer is not None:candidate_observer(proposal_index,result,attempt)
     return best,dict(attempts=attempts,b32_calls=sum(a['b32_calls'] for a in attempts),
-                     runtime_s=time.perf_counter()-started,selected_seconds=selected_seconds)
+                     runtime_s=time.perf_counter()-started,selected_seconds=selected_seconds,
+                     selected_proposal=selected_proposal)
 
 
 def refinement_portfolio_evaluate(model,previous,rows,config,*,reference_calls=3,use_learned_modes=False):

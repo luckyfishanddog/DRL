@@ -769,6 +769,15 @@ def mrv_parent(state, parent_ids, blocks, patterns, config, *, insertion_limit=8
     return min(parent_ids,key=priority)
 
 
+def rule_action_costs(variants,preferred_owners):
+    """The existing soft ownership and unrounded P+MOVE ordering."""
+    costs=[]
+    for after,action in variants:
+        completion=tuple(p+sum(arcs) for p,arcs in zip(after.loads,after.arc_costs))
+        costs.append((int(action.robot!=preferred_owners[action.block_id]),max(completion),sum(completion)))
+    return costs
+
+
 def rule_guided_action_logits(logits, variants, preferred_owners):
     """Parameter-free rank fusion over the unchanged legal insertion pool.
 
@@ -777,10 +786,7 @@ def rule_guided_action_logits(logits, variants, preferred_owners):
     existing greedy/sample decoder operates on the resulting negative ranks.
     """
     values=logits.detach().cpu().tolist()
-    costs=[]
-    for after,action in variants:
-        completion=tuple(p+sum(arcs) for p,arcs in zip(after.loads,after.arc_costs))
-        costs.append((int(action.robot!=preferred_owners[action.block_id]),max(completion),sum(completion)))
+    costs=rule_action_costs(variants,preferred_owners)
     neural_order=sorted(range(len(values)),key=lambda i:(-values[i],i))
     rule_order=sorted(range(len(values)),key=lambda i:(costs[i],i))
     neural_rank={i:r for r,i in enumerate(neural_order)}
@@ -790,22 +796,36 @@ def rule_guided_action_logits(logits, variants, preferred_owners):
     return logits.new_tensor([-fused_rank[i] for i in range(len(values))])
 
 
+def rule_anchored_action_logits(logits,variants,preferred_owners):
+    """Freeze the rule cost ordering; let the GNN distinguish equal-cost actions.
+
+    This is a frozen-policy diagnostic, not a learned Cmax residual estimator.
+    All actions retain finite ranks and remain available to sampling. Costs use
+    the same unrounded values as rank fusion; no tolerance or weight is added.
+    """
+    costs=rule_action_costs(variants,preferred_owners)
+    values=logits.detach().cpu().tolist()
+    order=sorted(range(len(values)),key=lambda i:(costs[i],-values[i],i))
+    ranks={i:r for r,i in enumerate(order)}
+    return logits.new_tensor([-ranks[i] for i in range(len(values))])
+
+
 def _decode_joint(reference, routes, directions, pending_parent_ids, model, config,
                   *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
-                  parent_selection_mode='learned',action_selection_mode='gnn'):
+                  parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None):
     """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
     from .direction import _initial_error
     from mrta_reference.geometry import oriented_endpoints
     if parent_selection_mode not in ('learned','mrv'):
         raise ValueError('parent_selection_mode must be learned or mrv')
-    if action_selection_mode not in ('gnn','rule_guided'):
-        raise ValueError('action_selection_mode must be gnn or rule_guided')
+    if action_selection_mode not in ('gnn','gnn_rank','rule_guided','rule','rule_anchored'):
+        raise ValueError('unknown action_selection_mode')
     started = time.perf_counter()
     actions = []
     try:
         graph,blocks,patterns = joint_graph(reference,config)
-        preferred_owners=dict(rule_assignment(graph.blocks,config)) if action_selection_mode=='rule_guided' else None
+        preferred_owners=dict(rule_assignment(graph.blocks,config)) if action_selection_mode in ('rule','rule_guided','rule_anchored') else None
         state = joint_start_state(reference,routes,directions,pending_parent_ids,blocks,config)
         pending = set(pending_parent_ids)
         embeddings = model.encode_static(graph)
@@ -846,9 +866,25 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                 logits = model.joint_action_logits(current_embeddings,indices,dynamic)
                 if not torch.isfinite(logits).all():
                     raise ValueError('NONFINITE_INSERTION_LOGITS')
-                if preferred_owners is not None:
+                raw_logits=logits
+                if action_selection_mode=='gnn_rank':
+                    values=logits.detach().cpu().tolist()
+                    order=sorted(range(len(variants)),key=lambda i:(-values[i],i))
+                    ranks={i:r for r,i in enumerate(order)}
+                    logits=logits.new_tensor([-ranks[i] for i in range(len(variants))])
+                elif action_selection_mode=='rule':
+                    costs=rule_action_costs(variants,preferred_owners)
+                    order=sorted(range(len(variants)),key=lambda i:(costs[i],i))
+                    ranks={i:r for r,i in enumerate(order)}
+                    logits=logits.new_tensor([-ranks[i] for i in range(len(variants))])
+                elif action_selection_mode=='rule_anchored':
+                    logits=rule_anchored_action_logits(logits,variants,preferred_owners)
+                elif preferred_owners is not None:
                     logits=rule_guided_action_logits(logits,variants,preferred_owners)
-                state,action = variants[choose(logits,'insertion')]
+                selected=choose(logits,'insertion')
+                if action_observer is not None:
+                    action_observer(graph,state,variants,raw_logits,selected,preferred_owners)
+                state,action = variants[selected]
                 actions.append(action)
             pending.remove(parent)
         if allow_partial_start_conflicts and not valid_start(state):
@@ -872,7 +908,7 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
 def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
                                  model: JointInsertionGNN, config, *, insertion_limit=8,
                                  decode_mode='greedy', seed=0,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
-                                 parent_selection_mode='learned',action_selection_mode='gnn'):
+                                 parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None):
     """No-gradient decoding; complete results are scheduled outside.
 
     The opt-in partial-start repair can restore heads exposed by destruction.
@@ -884,6 +920,10 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
     deterministic MRV-LPT. Both retain the same insertion head and action pool.
     action_selection_mode='rule_guided' fuses neural/rule ranks at inference;
     the default gnn path and differentiable training rollout stay unchanged.
+    'rule' and 'gnn_rank' are controlled ranking ablations using the same
+    negative ordinal sampling scale and the complete original candidate pool.
+    'rule_anchored' tests neural tie-breaking within the original rule costs.
+    action_observer reads a pool before transition; it does not choose actions.
     """
     if decode_mode not in ('greedy','sample'):
         raise ValueError('decode_mode must be greedy or sample')
@@ -900,7 +940,8 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                              insertion_limit=insertion_limit,choose=choose,
                              allow_partial_start_conflicts=allow_partial_start_conflicts,
                              prefer_legal_start_recovery=prefer_legal_start_recovery,
-                             parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode)
+                             parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode,
+                             action_observer=action_observer)
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,

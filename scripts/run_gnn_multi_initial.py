@@ -346,7 +346,7 @@ def _mode_worker_init():
 
 def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, certify=True,
                  common_initial=None,initial_seconds=0.,initial_attempts=None,save_timeline=False,
-                 prune_cmax_lb=True):
+                 prune_cmax_lb=True, minimum_runtime=0., iteration_checkpoints=(), compact_trace=False):
     from dataclasses import asdict,replace
     from mrta_reference.certifier import certify_schedule
     from mrta_search.lns import (rank_parent_mode_changes,select_bottleneck_parents,repair_partial_state_oriented,
@@ -387,10 +387,13 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
         return dict(row,status='TIME_LIMIT_NO_FEASIBLE' if init_elapsed>budget else 'INITIALIZATION_FAILED',
                     cmax=None,actual_runtime=init_elapsed,overshoot=max(0.,init_elapsed-budget),solution=None)
     iteration=0
+    milestones=[]
     mode_period=2
     unsuccessful_modes=0
     last_mode_iteration=-1
-    while iteration<max_iterations and time.perf_counter()-started<budget:
+    # Diagnostics can continue the SAME seeded path past the iteration endpoint
+    # to observe wall-clock checkpoints. Defaults retain the original stopping.
+    while (iteration<max_iterations or time.perf_counter()-started<minimum_runtime) and time.perf_counter()-started<budget:
         local_seed=seed+iteration
         selector=pilot.SELECTORS[iteration%3]
         q=min(len(parents),(4,8)[(iteration//3)%2])
@@ -471,14 +474,23 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
                 if unsuccessful_modes>=4:
                     mode_period=min(8,mode_period*2)
                     unsuccessful_modes=0
-        row['trace'].append(item)
         iteration+=1
+        if iteration in iteration_checkpoints:
+            milestones.append(dict(iterations=iteration,elapsed=item['elapsed'],cmax=current.schedule.cmax,
+                reference_calls=row['reference_calls'],accepted=row['accepted'],mode_accepted=row['mode_accepted'],
+                pruned=row['pruned_by_cmax_lb'],solution=asdict(current.solution),directions=current.directions))
+        if compact_trace:
+            item={k:item[k] for k in ('iteration','elapsed','status','accepted','after','proposed_modes')}
+            item['reference_calls']=row['reference_calls']
+        row['trace'].append(item)
     elapsed=time.perf_counter()-started
     row.update(status='CERTIFIED' if certify else 'FEASIBLE',cmax=current.schedule.cmax,iterations=iteration,actual_runtime=elapsed,
                overshoot=max(0.,elapsed-budget),solution=asdict(current.solution),directions=current.directions,
                robot_completion=current.schedule.robot_completion,
                schedule_summary=None if certify else _minchild_metrics(current.solution,current.schedule,config),
                split_count=sum(p.kind.value!='WHOLE' for p in current.solution.patterns))
+    if iteration_checkpoints:
+        row['iteration_checkpoints']=milestones
     if save_timeline:
         row['initial_state']=_final_state(initial.solution,initial.directions,initial.schedule,config)
         row['final_state']=_final_state(current.solution,current.directions,current.schedule,config)

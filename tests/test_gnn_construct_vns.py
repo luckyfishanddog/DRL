@@ -1551,7 +1551,60 @@ def test_rule_assignment_is_a_soft_preference_in_rank_fusion():
     assert len(scores)==len(variants) and variants[int(scores.argmax())][1].robot==1
 
 
-@pytest.mark.parametrize('parent,action', [('learned','gnn'),('mrv','gnn'),('mrv','rule_guided')])
+def test_rule_anchor_neural_tie_break_cannot_override_lower_rule_cost():
+    from types import SimpleNamespace
+    from mrta_search.gnn_constructor import rule_anchored_action_logits
+    variants=[]
+    for robot,load in ((0,2.),(0,2.),(0,3.),(1,0.)):
+        state=SimpleNamespace(loads=(load,0.,0.,0.),arc_costs=((),)*4)
+        variants.append((state,SimpleNamespace(robot=robot,block_id='b')))
+    scores=rule_anchored_action_logits(torch.tensor([1.,2.,100.,1000.]),variants,{'b':0})
+    assert int(scores.argmax())==1
+    assert sorted(scores.tolist())==[-3.,-2.,-1.,0.]
+    # Even the nonpreferred robot remains in the sampling distribution.
+    assert torch.all(torch.softmax(scores,0)>0.)
+
+
+def test_diagnostic_action_observer_preserves_decoding_and_same_pool_rankings():
+    import mrta_search.gnn_constructor as constructor
+    from mrta_search.lns import joint_action_key
+    reference=_joint_simple_reference();torch.manual_seed(29)
+    model=constructor.JointInsertionGNN()
+    geometry=constructor.joint_geometry(reference.parents,reference.patterns,CONFIG)
+    observed=[]
+    def observe(graph,state,variants,logits,selected,owners):
+        keys=tuple(joint_action_key(a) for _,a in variants)
+        costs=constructor.rule_action_costs(variants,owners)
+        fusion=constructor.rule_guided_action_logits(logits,variants,owners)
+        assert len(keys)==len(costs)==len(fusion)
+        assert keys==tuple(joint_action_key(a) for _,a in variants)
+        observed.append(keys[selected])
+    options=dict(parent_selection_mode='mrv',action_selection_mode='rule_guided')
+    plain=constructor.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,
+        tuple(p.parent_id for p in reference.parents),model,CONFIG,**options)
+    audited=constructor.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,
+        tuple(p.parent_id for p in reference.parents),model,CONFIG,action_observer=observe,**options)
+    assert plain.solution==audited.solution and plain.directions==audited.directions
+    assert tuple(observed)==tuple(joint_action_key(a) for a in plain.actions)
+
+
+def test_diagnostic_milestones_are_exact_seeded_search_prefixes():
+    import run_gnn_multi_initial as experiment
+    reference=_joint_simple_reference();bits=((0,),(0,),(),())
+    initial=experiment.shared.pilot.oriented.schedule_explicit(reference,bits,CONFIG)
+    options=dict(config=CONFIG,certify=False,common_initial=initial,prune_cmax_lb=True)
+    short=experiment._mode_search(reference.parents,'MODE_NEW',23,float('inf'),2,**options)
+    long=experiment._mode_search(reference.parents,'MODE_NEW',23,float('inf'),4,
+        iteration_checkpoints=(2,4),compact_trace=True,**options)
+    milestone=long['iteration_checkpoints'][0]
+    assert milestone['solution']==short['solution'] and milestone['directions']==short['directions']
+    assert milestone['cmax']==short['cmax'] and milestone['reference_calls']==short['reference_calls']
+    assert milestone['accepted']==short['accepted']
+    assert len(long['trace'])==4 and long['iterations']==4
+
+
+@pytest.mark.parametrize('parent,action', [('learned','gnn'),('mrv','gnn'),('mrv','rule_guided'),
+                                        ('mrv','rule'),('mrv','gnn_rank'),('mrv','rule_anchored')])
 def test_portfolio_passes_rule_guidance_without_extra_proposals(monkeypatch,parent,action):
     from types import SimpleNamespace
     import run_gnn_shared_construction as shared
@@ -1567,6 +1620,15 @@ def test_portfolio_passes_rule_guidance_without_extra_proposals(monkeypatch,pare
         assert options.get('parent_selection_mode','learned')==parent
         assert options.get('action_selection_mode','gnn')==action
         if parent=='learned':assert set(options)=={'decode_mode','seed'}
+
+
+def test_diagnostic_checkpoint_uses_completion_time_and_never_backdates():
+    import run_rule_guided_gnn as experiment
+    events=[[10.,150.,'INITIAL'],[60.01,100.,'MODE'],[300.01,90.,'MODE']]
+    assert experiment.diagnostic_value(events,5.) is None
+    assert experiment.diagnostic_value(events,60.)==150.
+    assert experiment.diagnostic_value(events,300.)==100.
+    assert experiment.diagnostic_value(events,600.)==90.
 
 
 def test_real_mrv_rule_guided_decode_bypasses_parent_head_and_preserves_legal_pool(monkeypatch):
