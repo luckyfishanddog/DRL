@@ -40,7 +40,8 @@ def _model_from_checkpoint(checkpoint):
     if kind not in model_types:
         raise ValueError('unknown joint construction model: '+str(kind))
     model=model_types[kind](checkpoint.get('hidden_dim',64),checkpoint.get('heads',4),
-                           normalize_inputs=checkpoint.get('normalize_inputs',False))
+                           normalize_inputs=checkpoint.get('normalize_inputs',False),
+                           opportunity_features=checkpoint.get('opportunity_features',False))
     model.load_state_dict(checkpoint['state_dict'],strict=True)
     if kind in ('CoordinationJointInsertionGNN','ModeJointInsertionGNN'):
         model.use_dynamic_context=checkpoint.get('use_dynamic_context',True)
@@ -56,6 +57,8 @@ def _expand_neural_checkpoint(payload):
     full.update(metadata['main'])
     if 'candidate' in metadata:
         full['refinement_candidate']=dict(full['refinement_candidate'],**metadata['candidate'])
+    if 'opportunity_candidate' in metadata:
+        full['opportunity_cmax_candidate']=dict(full['opportunity_cmax_candidate'],**metadata['opportunity_candidate'])
     return full
 
 
@@ -69,13 +72,15 @@ def save_neural_checkpoint(checkpoint,path):
     import zlib
     checkpoint=_expand_neural_checkpoint(checkpoint)
     keep=('state_dict','model_type','hidden_dim','heads','normalize_inputs','use_dynamic_context',
-          'scientific_config','mode_head_before_calibration')
+          'scientific_config','mode_head_before_calibration','opportunity_features')
     def split(part):
         return ({k:v for k,v in part.items() if k in keep},
-                {k:v for k,v in part.items() if k not in keep and k!='refinement_candidate'})
+                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate')})
     thin,main=split(checkpoint);metadata=dict(main=main)
     if 'refinement_candidate' in checkpoint:
         thin['refinement_candidate'],metadata['candidate']=split(checkpoint['refinement_candidate'])
+    if 'opportunity_cmax_candidate' in checkpoint:
+        thin['opportunity_cmax_candidate'],metadata['opportunity_candidate']=split(checkpoint['opportunity_cmax_candidate'])
     thin['research_archive']=zlib.compress(json.dumps(metadata,ensure_ascii=False,allow_nan=False,
                                                     separators=(',',':')).encode('utf-8'))
     thin['research_archive_format']='zlib-json'
@@ -1028,6 +1033,106 @@ def refinement_evaluate(model,previous_model,rows,config,training_keys):
                 constructed=constructed,counts=counts,processing_loads=loads,modes=chosen_modes,failure=failure)
             results.append(result);print('REFINEMENT EVAL',entry['instance'],method,result['status'],result['cmax'],flush=True)
     return results
+
+
+def opportunity_ranking_loss(model,graphs,imitation,ranking):
+    """0.5 IL + 1 pair rank + 0.1 existing soft load loss; no new head."""
+    from torch.nn import functional as F
+    encoded={};joint_scores={};il=[];load=[];rank=[]
+    def embedding(key):
+        if key not in encoded:encoded[key]=model.encode_static(graphs[key])
+        return encoded[key]
+    for example in imitation:
+        key=example['graph_key'];step=example['step'];emb=embedding(key)
+        if example['kind']=='parent':
+            logits=model.parent_logits(graphs[key],emb,step['parent_ids'],step['parent_features'])
+        else:logits=model.joint_action_logits(emb,step['indices'],step['features'])
+        il.append(-example['weight']*(example['target']*torch.log_softmax(logits,0)).sum())
+        if 'load_excess' in example:load.append((torch.softmax(logits,0)*example['load_excess']).sum())
+    for state,better,worse in ranking:
+        ident=id(state)
+        if ident not in joint_scores:
+            key=state['graph_key'];emb=embedding(key)
+            parent=torch.log_softmax(model.parent_logits(graphs[key],emb,state['parent_ids'],state['parent_features']),0)
+            scores=[];conditional={}
+            for action in state['options']:
+                p=action['parent_index']
+                if p not in conditional:
+                    conditional[p]=torch.log_softmax(model.joint_action_logits(emb,action['indices'],action['features']),0)
+                scores.append(parent[p]+conditional[p][action['action_index']])
+            joint_scores[ident]=scores
+        scores=joint_scores[ident]
+        rank.append(F.softplus(-(scores[better]-scores[worse])))
+    zero=next(model.parameters()).new_zeros(())
+    il_loss=torch.stack(il).mean() if il else zero
+    rank_loss=torch.stack(rank).mean() if rank else zero
+    load_loss=torch.stack(load).mean() if load else zero
+    return .5*il_loss+rank_loss+.1*load_loss,dict(il=il_loss,rank=rank_loss,load=load_loss)
+
+
+def expand_opportunity_model(source):
+    """Append eight zero-weight inputs to the SAME two existing policy heads."""
+    from mrta_search.gnn_constructor import ModeJointInsertionGNN
+    if not isinstance(source,ModeJointInsertionGNN) or source.opportunity_features:
+        raise ValueError('expand the existing ModeJointInsertionGNN once')
+    model=ModeJointInsertionGNN(source.hidden_dim,source.heads,
+                              normalize_inputs=source.normalize_inputs,opportunity_features=True)
+    old=source.state_dict()
+    with torch.no_grad():
+        for name,target in model.state_dict().items():
+            value=old[name]
+            if target.shape==value.shape:target.copy_(value)
+            elif name in ('parent_head.0.weight','insertion_head.0.weight'):
+                target.zero_();target[:,:value.shape[1]].copy_(value)
+            elif name in ('parent_mean','joint_mean','parent_scale','joint_scale'):
+                target.fill_(1. if name.endswith('scale') else 0.)
+                target[:len(value)].copy_(value)
+            else:raise ValueError('unexpected architecture change: '+name)
+    model.use_dynamic_context=False
+    return model
+
+
+def neural_single_model_portfolio(parents,model,config,*,seed=20261104,proposals=3,scheduled_cache=None):
+    """Independent construction: one model, fixed patterns, no repair or fallback.
+
+    Only the complete greedy/seeded-sample proposals are scheduled. Identical
+    complete routes/directions share one B32 result, never a second certificate.
+    Returned candidate objects support reporting greedy and trio from one run.
+    """
+    if proposals not in (1,2,3):raise ValueError('at most three proposals required')
+    started=time.perf_counter();attempts=[];candidates=[]
+    seen={} if scheduled_cache is None else scheduled_cache
+    external=set(seen);charged=set();credit=0.;best=None;selected=None
+    for index,(decode,draw_seed) in enumerate((('greedy',seed),('sample',seed),('sample',seed+1))[:proposals]):
+        tick=time.perf_counter()
+        geometry=joint_geometry(parents,fixed_split_patterns(parents,config),config)
+        result=construct_or_repair_with_gnn(geometry,EMPTY,EMPTY,tuple(p.parent_id for p in parents),model,config,
+                                          decode_mode=decode,seed=draw_seed)
+        attempt=dict(proposal_index=index,decode=decode,seed=draw_seed,status='CONSTRUCTION_FAILED',
+                     cmax=None,b32_calls=0,reason=result.rejection_reason,actions=[asdict(a) for a in result.actions])
+        candidate=None
+        if result.solution is not None:
+            key=(result.solution.patterns,tuple(r.block_ids for r in result.solution.routes),result.directions)
+            if key not in seen:
+                clock=time.perf_counter()
+                scheduled=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
+                seen[key]=(scheduled,time.perf_counter()-clock)
+                attempt['b32_calls']=1
+            candidate,scheduler_seconds=seen[key]
+            reused_seconds=scheduler_seconds if key in external and key not in charged else 0.
+            credit+=reused_seconds;charged.add(key)
+            attempt['reused_b32_seconds']=reused_seconds
+            attempt.update(status=candidate.schedule.status.value,
+                cmax=candidate.schedule.cmax if candidate.schedule.status is ScheduleStatus.FEASIBLE else None,
+                solution=asdict(result.solution),directions=result.directions)
+            if candidate.schedule.status is ScheduleStatus.FEASIBLE and (best is None or candidate.schedule.cmax<best.schedule.cmax):
+                best=candidate;selected=index
+        attempt['seconds']=time.perf_counter()-tick
+        attempt['elapsed']=time.perf_counter()-started+credit
+        attempts.append(attempt);candidates.append(candidate)
+    return best,dict(attempts=attempts,candidates=candidates,selected_proposal=selected,
+                     b32_calls=sum(a['b32_calls'] for a in attempts),runtime_s=time.perf_counter()-started+credit,
+                     actual_runtime_s=time.perf_counter()-started,reused_b32_seconds=credit)
 
 
 def neural_initial_portfolio(parents,previous_model,model,config,*,old_sampling=False,seed=20261104,

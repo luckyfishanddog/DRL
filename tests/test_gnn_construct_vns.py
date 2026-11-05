@@ -15,6 +15,116 @@ if str(SCRIPT_DIR) not in sys.path:
 import run_gnn_construct_vns_pilot as pilot_script
 
 
+def test_opportunity_counts_use_actual_rail_and_initial_head_legality():
+    from mrta_reference.model import ParentWeld
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(5.,9.),(6.,9.)))
+    ref=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+    _,blocks,patterns=c.joint_graph(ref,CONFIG)
+    empty=c.joint_start_state(ref,((),)*4,((),)*4,('a','b'),blocks,CONFIG)
+    before=c.remaining_robot_work(empty,blocks,patterns,CONFIG)
+    assert before[:4]==pytest.approx((1.,1.,0.,0.)) and before[4:]==(0.,)*4
+    child=next(b for b in blocks.values() if b.parent_id=='a')
+    after=next(s for s,a in joint_block_candidates(empty,child,patterns['a'],blocks,CONFIG)
+               if a.robot==1 and a.direction==0)
+    remaining=next(b for b in blocks.values() if b.parent_id=='b')
+    actual={a.robot for _,a in joint_block_candidates(after,remaining,patterns['b'],blocks,CONFIG)}
+    assert actual=={1}
+    work=c.remaining_robot_work(after,blocks,patterns,CONFIG)
+    assert work[0]==work[2]==work[3]==0. and work[1]>0.
+    assert work[4:]==pytest.approx((0.,work[1],0.,0.))
+
+
+def test_opportunity_expansion_preserves_old_parameters_and_scalers():
+    import run_gnn_shared_construction as shared
+    from mrta_search.gnn_constructor import ModeJointInsertionGNN
+    old=ModeJointInsertionGNN(16,4,normalize_inputs=True);new=shared.expand_opportunity_model(old)
+    for name,value in old.state_dict().items():
+        target=new.state_dict()[name]
+        if value.shape==target.shape:assert torch.equal(target,value)
+        elif value.ndim==2:
+            assert torch.equal(target[:,:value.shape[1]],value)
+            assert torch.count_nonzero(target[:,value.shape[1]:])==0
+        else:assert torch.equal(target[:len(value)],value)
+    new.fit_opportunity_scaling([dict(features=torch.randn(5,49),parent_features=torch.randn(5,20))])
+    for prefix,n in (('joint',41),('parent',12)):
+        assert torch.equal(getattr(new,prefix+'_mean')[:n],getattr(old,prefix+'_mean'))
+        assert torch.equal(getattr(new,prefix+'_scale')[:n],getattr(old,prefix+'_scale'))
+    assert new.use_dynamic_context is False
+
+
+def test_counterfactual_pair_labels_never_rank_two_failures():
+    from run_gnn_cmax_finetune import op_pair_labels
+    rows=[dict(status='DEADLOCK',cmax=None),dict(status='CONSTRUCTION_FAILED',cmax=None),
+          dict(status='FEASIBLE',cmax=20.),dict(status='FEASIBLE',cmax=10.)]
+    pairs=op_pair_labels(rows)
+    assert (0,1) not in pairs and (1,0) not in pairs
+    assert (3,2) in pairs and (2,0) in pairs and (3,1) in pairs
+
+
+def test_forced_joint_decision_uses_the_same_pool_then_neural_completion():
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates
+    reference=_joint_simple_reference();torch.manual_seed(8)
+    model=c.ModeJointInsertionGNN(16,4,opportunity_features=True)
+    geometry=c.joint_geometry(reference.parents,reference.patterns,CONFIG)
+    _,blocks,patterns=c.joint_graph(geometry,CONFIG)
+    pending=tuple(p.parent_id for p in reference.parents)
+    state=c.joint_start_state(geometry,((),)*4,((),)*4,pending,blocks,CONFIG)
+    block=next(iter(blocks.values()))
+    action=joint_block_candidates(state,block,patterns[block.parent_id],blocks,CONFIG)[-1][1]
+    snapshots=[]
+    result=c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,pending,model,CONFIG,
+        forced_action=action,parent_observer=lambda s,p,a:snapshots.append((len(p),len(a))))
+    assert result.solution is not None and result.actions[0]==action
+    assert snapshots[0]==(2,0) and snapshots[1]==(1,1)
+    with pytest.raises(ValueError,match='unchanged legal pool'):
+        c.construct_or_repair_with_gnn(geometry,((),)*4,((),)*4,pending,model,CONFIG,
+            forced_action=replace(action,position=999))
+
+
+def test_cmax_rank_loss_backpropagates_through_both_existing_policy_heads():
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates
+    reference=_joint_simple_reference();torch.manual_seed(17)
+    model=c.ModeJointInsertionGNN(16,4,opportunity_features=True)
+    geometry=c.joint_geometry(reference.parents,reference.patterns,CONFIG)
+    graph,blocks,patterns=c.joint_graph(geometry,CONFIG)
+    pending=tuple(p.parent_id for p in reference.parents)
+    state=c.joint_start_state(geometry,((),)*4,((),)*4,pending,blocks,CONFIG)
+    ids,pf=c.joint_parent_inputs(state,pending,blocks,patterns,CONFIG,include_opportunities=True)
+    options=[]
+    for index,parent in enumerate(ids):
+        child=next(b for b in blocks.values() if b.parent_id==parent)
+        variants=joint_block_candidates(state,child,patterns[parent],blocks,CONFIG)
+        indices,features=c.joint_candidate_inputs(graph,state,variants,blocks,CONFIG,include_opportunities=True,patterns=patterns)
+        options.append(dict(parent_index=index,indices=indices,features=features,action_index=0))
+    record=dict(graph_key='g',parent_ids=ids,parent_features=pf,options=options)
+    loss,parts=shared.opportunity_ranking_loss(model,{'g':graph},[],[(record,0,1)])
+    assert loss==parts['rank'] and parts['il']==parts['load']==0.
+    loss.backward()
+    for name in ('layer1','layer2','parent_head','insertion_head'):
+        assert sum(float(p.grad.abs().sum()) for n,p in model.named_parameters() if n.startswith(name+'.') and p.grad is not None)>0.
+
+
+def test_single_model_three_proposals_have_no_old_model_or_rule_fallback(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_shared_construction as shared
+    reference=_joint_simple_reference();model=object();seen=[]
+    def construct(*args,**kwargs):
+        seen.append((args[4],kwargs['decode_mode'],kwargs['seed']))
+        return SimpleNamespace(solution=None,actions=(),rejection_reason='NO_ACTION')
+    monkeypatch.setattr(shared,'construct_or_repair_with_gnn',construct)
+    def forbidden(*a,**k):raise AssertionError('fallback or independent certification')
+    monkeypatch.setattr(shared.pilot.oriented,'common_initial_beam',forbidden)
+    monkeypatch.setattr(shared,'research_certify',forbidden)
+    best,info=shared.neural_single_model_portfolio(reference.parents,model,CONFIG,seed=7)
+    assert best is None and info['b32_calls']==0
+    assert seen==[(model,'greedy',7),(model,'sample',7),(model,'sample',8)]
+
+
 def test_final_geometry_pairs_exclude_failures_and_average_within_geometry():
     import run_gnn_multi_initial as experiment
     rows=[]

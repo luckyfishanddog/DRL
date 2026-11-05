@@ -1055,7 +1055,7 @@ def _joint_insertion_locations(state, block, pattern, blocks, config, insertion_
 
 
 def has_joint_block_candidate(state, block, pattern, blocks, config, *,
-                              insertion_limit=8, check_initial_feasibility=True):
+                              insertion_limit=8, check_initial_feasibility=True, robot_id=None):
     """Exact membership of the joint action pool, without building route costs.
 
     The public generator evaluates every local direction tuple (at most eight)
@@ -1068,6 +1068,8 @@ def has_joint_block_candidate(state, block, pattern, blocks, config, *,
     unchanged_legal = None
     legal_heads = {}
     for robot, position in _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit):
+        if robot_id is not None and robot!=robot_id:
+            continue
         # Match oriented_insert_variants' validation for malformed forced X
         # assignments, after the same position/sibling filtering.
         if not robot_is_eligible(block, robot, config):

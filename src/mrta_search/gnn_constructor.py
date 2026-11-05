@@ -373,19 +373,22 @@ JOINT_PARENT_DIM = 12
 class JointInsertionGNN(BlockAssignmentGNN):
     """The existing two-layer GAT with conditional parent/insertion heads."""
 
-    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=False):
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=False, opportunity_features=False):
         super().__init__(hidden_dim, heads)
         self.hidden_dim, self.heads = hidden_dim, heads
+        self.opportunity_features=opportunity_features
+        self.joint_feature_dim=JOINT_DYNAMIC_DIM+8*int(opportunity_features)
+        self.parent_feature_dim=JOINT_PARENT_DIM+8*int(opportunity_features)
         self.policy = nn.Identity()  # Assignment-only head is not used here.
-        self.parent_head = nn.Sequential(nn.Linear(hidden_dim+JOINT_PARENT_DIM,hidden_dim),
+        self.parent_head = nn.Sequential(nn.Linear(hidden_dim+self.parent_feature_dim,hidden_dim),
                                          nn.ReLU(),nn.Linear(hidden_dim,1))
-        self.insertion_head = nn.Sequential(nn.Linear(4*hidden_dim+JOINT_DYNAMIC_DIM,hidden_dim),
+        self.insertion_head = nn.Sequential(nn.Linear(4*hidden_dim+self.joint_feature_dim,hidden_dim),
                                             nn.ReLU(),nn.Linear(hidden_dim,1))
         # Optional TRAIN-fitted scaling; the default preserves V1 checkpoints
         # and logits exactly. No new direction head or encoder is introduced.
         self.normalize_inputs = normalize_inputs
         if normalize_inputs:
-            for prefix,dim in (('joint',JOINT_DYNAMIC_DIM),('parent',JOINT_PARENT_DIM)):
+            for prefix,dim in (('joint',self.joint_feature_dim),('parent',self.parent_feature_dim)):
                 self.register_buffer(prefix+'_mean',torch.zeros(dim))
                 self.register_buffer(prefix+'_scale',torch.ones(dim))
 
@@ -398,6 +401,16 @@ class JointInsertionGNN(BlockAssignmentGNN):
                 raise ValueError('nonfinite TRAIN features')
             getattr(self,prefix+'_mean').copy_(rows.mean(0))
             getattr(self,prefix+'_scale').copy_(rows.std(0,unbiased=False).clamp_min(1e-3))
+
+    def fit_opportunity_scaling(self,steps):
+        """Fit only the eight appended TRAIN features; retain legacy scalers."""
+        if not self.opportunity_features or not self.normalize_inputs:
+            raise ValueError('normalized opportunity inputs are required')
+        for prefix,key in (('joint','features'),('parent','parent_features')):
+            rows=torch.cat([s[key][:,-8:] for s in steps if s[key] is not None and len(s[key])])
+            if not torch.isfinite(rows).all():raise ValueError('nonfinite TRAIN opportunities')
+            getattr(self,prefix+'_mean')[-8:].copy_(rows.mean(0))
+            getattr(self,prefix+'_scale')[-8:].copy_(rows.std(0,unbiased=False).clamp_min(1e-3))
 
     def scale_inputs(self, features, prefix):
         if self.normalize_inputs:
@@ -425,8 +438,8 @@ class CoordinationJointInsertionGNN(JointInsertionGNN):
     independent certifier. The original static policy/checkpoints are intact.
     """
 
-    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True):
-        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs)
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True, opportunity_features=False):
+        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,opportunity_features=opportunity_features)
         # Keep each weld's own geometry when attention neighborhoods coincide.
         self.geometry_skip = nn.Linear(NODE_DIM, hidden_dim)
         self.route_direction = nn.Embedding(2, hidden_dim)
@@ -489,8 +502,8 @@ class CoordinationJointInsertionGNN(JointInsertionGNN):
 class ModeJointInsertionGNN(CoordinationJointInsertionGNN):
     """Choose legal parent modes before constructing their directed routes."""
 
-    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True):
-        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs)
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True, opportunity_features=False):
+        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,opportunity_features=opportunity_features)
         self.use_dynamic_context = False
         self.mode_head = nn.Sequential(nn.Linear(hidden_dim + 12, hidden_dim),
                                        nn.ReLU(), nn.Linear(hidden_dim, 1))
@@ -601,7 +614,30 @@ def joint_start_state(reference, routes, directions, pending, blocks, config):
     return state
 
 
-def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8,check_initial_feasibility=True):
+def remaining_robot_work(state,blocks,patterns,config,*,insertion_limit=8,check_initial_feasibility=True):
+    """Current legal insertion opportunities, not allocated load or a mask.
+
+    Eligibility shares the exact existing reach/rail/mode/head/sibling query.
+    A flexible child's processing time is counted for every eligible robot.
+    Zero current options does not prune a future parent or force a fallback.
+    """
+    from .lns import has_joint_block_candidate
+    placed={b for route in state.routes for b in route}
+    eligible=[0.]*4;exclusive=[0.]*4
+    for child in blocks.values():
+        if child.block_id in placed:continue
+        robots=[r for r in range(4) if robot_is_eligible(child,r,config) and
+                has_joint_block_candidate(state,child,patterns[child.parent_id],blocks,config,
+                    insertion_limit=insertion_limit,check_initial_feasibility=check_initial_feasibility,robot_id=r)]
+        processing=config.process_time(child.length)
+        for r in robots:eligible[r]+=processing
+        if len(robots)==1:exclusive[robots[0]]+=processing
+    scale=max(1.,sum(config.process_time(b.length) for b in blocks.values()))
+    return tuple(v/scale for v in eligible+exclusive)
+
+
+def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8,check_initial_feasibility=True,
+                        include_opportunities=False):
     from .lns import has_joint_block_candidate
     scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
     travel = [sum(arcs) for arcs in state.arc_costs]
@@ -609,6 +645,8 @@ def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_l
     for block in blocks.values():
         grouped.setdefault(block.parent_id, []).append(block)
     prefix = [*(v/scale for v in state.loads), *(v/scale for v in travel)]
+    opportunities=remaining_robot_work(state,blocks,patterns,config,insertion_limit=insertion_limit,
+        check_initial_feasibility=check_initial_feasibility) if include_opportunities else ()
     ids, features = [], []
     for p in sorted(pending):
         children = sorted(grouped[p],key=lambda b:b.block_id)
@@ -623,17 +661,20 @@ def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_l
         features.append([*prefix,
                          sum(config.process_time(b.length) for b in children)/scale,
                          min(state.loads[r]+travel[r] for r in legal)/scale,
-                         len(pending)/max(1,len(patterns)),len(children)/2])
-    return tuple(ids),torch.tensor(features,dtype=torch.float32).reshape(-1,JOINT_PARENT_DIM)
+                         len(pending)/max(1,len(patterns)),len(children)/2,*opportunities])
+    return tuple(ids),torch.tensor(features,dtype=torch.float32).reshape(-1,JOINT_PARENT_DIM+8*int(include_opportunities))
 
 
-def joint_candidate_inputs(graph, state, variants, blocks, config):
+def joint_candidate_inputs(graph, state, variants, blocks, config, *, include_opportunities=False,patterns=None,
+                           insertion_limit=8,check_initial_feasibility=True):
     """Only geometry, the current prefix and executable local next states."""
     from mrta_reference.geometry import oriented_endpoints
     scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
     n = max(1,len(blocks))
     old_travel = [sum(arcs) for arcs in state.arc_costs]
     prefix = [*(v/scale for v in state.loads), *(v/scale for v in old_travel)]
+    opportunities=remaining_robot_work(state,blocks,patterns,config,insertion_limit=insertion_limit,
+        check_initial_feasibility=check_initial_feasibility) if include_opportunities else ()
     route_lengths = [len(route)/n for route in state.routes]
     # A position's eight direction variants share identical route geometry.
     # These local caches retain the original sums and min/max operations.
@@ -691,11 +732,11 @@ def joint_candidate_inputs(graph, state, variants, blocks, config):
                          incoming/scale,outgoing/scale,old_arc/scale,(after.travel-state.travel)/scale,
                          old_overlap[r],overlap(after,r),float(r%2==0),
                          start[0]/20,start[1]/12,end[0]/20,end[1]/12,
-                         old_first_x[r],first_x(after,r),old_first_x[r^1],max(estimated)/scale,sum(estimated)/scale])
-    return torch.tensor(indices,dtype=torch.long).reshape(-1,4),torch.tensor(features,dtype=torch.float32).reshape(-1,JOINT_DYNAMIC_DIM)
+                         old_first_x[r],first_x(after,r),old_first_x[r^1],max(estimated)/scale,sum(estimated)/scale,*opportunities])
+    return torch.tensor(indices,dtype=torch.long).reshape(-1,4),torch.tensor(features,dtype=torch.float32).reshape(-1,JOINT_DYNAMIC_DIM+8*int(include_opportunities))
 
 
-def prepare_joint_teacher_steps(reference, routes, directions, pending, actions, config, *, insertion_limit=8):
+def prepare_joint_teacher_steps(reference, routes, directions, pending, actions, config, *, insertion_limit=8,include_opportunities=False):
     """Validate every teacher label against the inference action set; never skip."""
     from .lns import joint_block_candidates,joint_action_key,OrientedInsertionAction
     graph,blocks,patterns = joint_graph(reference,config)
@@ -708,7 +749,8 @@ def prepare_joint_teacher_steps(reference, routes, directions, pending, actions,
             raise ValueError('teacher trajectory ended before complete parent coverage')
         raw = actions[cursor]
         parent = blocks[raw['block_id']].parent_id
-        ids,parent_features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit)
+        ids,parent_features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit,
+                                                  include_opportunities=include_opportunities)
         if parent not in ids:
             raise ValueError(f'teacher parent absent from legal candidates: {parent}')
         children = sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
@@ -722,7 +764,8 @@ def prepare_joint_teacher_steps(reference, routes, directions, pending, actions,
             matches = [i for i,(_,a) in enumerate(variants) if joint_action_key(a)==joint_action_key(action)]
             if len(matches)!=1:
                 raise ValueError(f'teacher action missing/ambiguous: {joint_action_key(action)}; candidates={len(variants)}')
-            indices,features = joint_candidate_inputs(graph,state,variants,blocks,config)
+            indices,features = joint_candidate_inputs(graph,state,variants,blocks,config,
+                include_opportunities=include_opportunities,patterns=patterns,insertion_limit=insertion_limit)
             steps.append(dict(parent_ids=ids if child_index==0 else (),parent_features=parent_features if child_index==0 else None,
                               parent_target=ids.index(parent) if child_index==0 else None,
                               indices=indices,features=features,target=matches[0],
@@ -812,7 +855,8 @@ def rule_anchored_action_logits(logits,variants,preferred_owners):
 
 def _decode_joint(reference, routes, directions, pending_parent_ids, model, config,
                   *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
-                  parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None):
+                  parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None,
+                  forced_action=None,parent_observer=None):
     """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
     from .direction import _initial_error
@@ -829,6 +873,7 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
         state = joint_start_state(reference,routes,directions,pending_parent_ids,blocks,config)
         pending = set(pending_parent_ids)
         embeddings = model.encode_static(graph)
+        opportunities=getattr(model,'opportunity_features',False)
         def valid_start(s):
             points={r:oriented_endpoints(blocks[route[0]],s.directions[r][0])[0]
                     for r,route in enumerate(s.routes) if route}
@@ -838,11 +883,17 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
             # Once a legal partial start is restored, retain the original prune.
             return not allow_partial_start_conflicts or valid_start(s)
         while pending:
+            if parent_observer is not None:parent_observer(state,tuple(sorted(pending)),tuple(actions))
             ids,features = joint_parent_inputs(state,pending,blocks,patterns,config,insertion_limit=insertion_limit,
-                                               check_initial_feasibility=check_start(state))
+                                               check_initial_feasibility=check_start(state),include_opportunities=opportunities)
             if not ids:
                 raise _JointActionUnavailable('NO_LEGAL_PARENT_ACTION')
-            if parent_selection_mode=='learned':
+            forcing=forced_action is not None
+            if forcing:
+                parent=blocks[forced_action.block_id].parent_id
+                if parent not in ids:raise ValueError('forced parent is not a current legal action')
+                current_embeddings=model.contextualize_state(graph,embeddings,state.routes,state.directions)
+            elif parent_selection_mode=='learned':
                 current_embeddings = model.contextualize_state(graph,embeddings,state.routes,state.directions)
                 parent_logits = model.parent_logits(graph,current_embeddings,ids,features)
                 if not torch.isfinite(parent_logits).all():
@@ -857,7 +908,9 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                                                    prefer_legal_start_recovery=prefer_legal_start_recovery)
                 if not variants:
                     raise _JointActionUnavailable('NO_LEGAL_CHILD_INSERTION')
-                indices,dynamic = joint_candidate_inputs(graph,state,variants,blocks,config)
+                indices,dynamic = joint_candidate_inputs(graph,state,variants,blocks,config,
+                    include_opportunities=opportunities,patterns=patterns,insertion_limit=insertion_limit,
+                    check_initial_feasibility=check_start(state))
                 # The parent decision and its first child see the identical
                 # state. Reuse only without gradients; training keeps its
                 # original independent autograd accumulation paths.
@@ -881,7 +934,13 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                     logits=rule_anchored_action_logits(logits,variants,preferred_owners)
                 elif preferred_owners is not None:
                     logits=rule_guided_action_logits(logits,variants,preferred_owners)
-                selected=choose(logits,'insertion')
+                if forcing and child_index==0:
+                    from .lns import joint_action_key
+                    matching=[i for i,(_,a) in enumerate(variants) if joint_action_key(a)==joint_action_key(forced_action)]
+                    if len(matching)!=1:raise ValueError('forced first-child action is not in the unchanged legal pool')
+                    selected=matching[0]
+                    forced_action=None
+                else:selected=choose(logits,'insertion')
                 if action_observer is not None:
                     action_observer(graph,state,variants,raw_logits,selected,preferred_owners)
                 state,action = variants[selected]
@@ -908,7 +967,8 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
 def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_ids,
                                  model: JointInsertionGNN, config, *, insertion_limit=8,
                                  decode_mode='greedy', seed=0,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
-                                 parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None):
+                                 parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None,
+                                 forced_action=None,parent_observer=None):
     """No-gradient decoding; complete results are scheduled outside.
 
     The opt-in partial-start repair can restore heads exposed by destruction.
@@ -941,7 +1001,7 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                              allow_partial_start_conflicts=allow_partial_start_conflicts,
                              prefer_legal_start_recovery=prefer_legal_start_recovery,
                              parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode,
-                             action_observer=action_observer)
+                             action_observer=action_observer,forced_action=forced_action,parent_observer=parent_observer)
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,
