@@ -36,6 +36,69 @@ def test_opportunity_counts_use_actual_rail_and_initial_head_legality():
     assert work[4:]==pytest.approx((0.,work[1],0.,0.))
 
 
+def test_action_delta_excludes_current_child_from_both_opportunity_sums():
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates
+    parent=ParentWeld('only',(1.,9.),(2.,9.))
+    geometry=c.joint_geometry((parent,),c.fixed_split_patterns((parent,),CONFIG),CONFIG)
+    _,blocks,patterns=c.joint_graph(geometry,CONFIG)
+    empty=c.joint_start_state(geometry,((),)*4,((),)*4,('only',),blocks,CONFIG)
+    variants=joint_block_candidates(empty,next(iter(blocks.values())),patterns['only'],blocks,CONFIG)
+    assert c.joint_opportunity_deltas(empty,variants,blocks,patterns,CONFIG,normalize=False)==((0.,)*4,)*len(variants)
+
+
+def test_action_delta_observes_loss_on_the_other_robot_and_uses_process_time():
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(5.,9.),(6.,9.)))
+    geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+    _,blocks,patterns=c.joint_graph(geometry,CONFIG)
+    empty=c.joint_start_state(geometry,((),)*4,((),)*4,('a','b'),blocks,CONFIG)
+    chosen=next(v for v in joint_block_candidates(empty,blocks['a::whole'],patterns['a'],blocks,CONFIG)
+                if v[1].robot==1 and v[1].direction==0)
+    raw=c.joint_opportunity_deltas(empty,[chosen],blocks,patterns,CONFIG,normalize=False)[0]
+    assert raw==pytest.approx((-CONFIG.process_time(blocks['b::whole'].length),0.,0.,0.))
+    scaled=c.joint_opportunity_deltas(empty,[chosen],blocks,patterns,CONFIG)[0]
+    scale=sum(CONFIG.process_time(b.length) for b in blocks.values())
+    assert scaled==pytest.approx(tuple(x/scale for x in raw))
+
+
+@pytest.mark.parametrize('kind',('whole','x_split','mandatory_y'))
+@pytest.mark.parametrize('check_start',(False,True))
+def test_action_delta_local_reuse_matches_full_calculation_with_heads_and_siblings(kind,check_start):
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    p=ParentWeld('p',(10.,9.),(10.,3.)) if kind=='mandatory_y' else ParentWeld('p',(0.,8.),(4.,8.))
+    parents=(p,ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(4.,9.),(5.,9.)),
+             ParentWeld('d',(7.,9.),(8.,9.)),ParentWeld('q',(12.,9.),(13.,9.)))
+    patterns=list(c.fixed_split_patterns(parents,CONFIG))
+    if kind=='x_split':
+        pattern=next(v for v in build_legal_pattern_catalog((p,),CONFIG,FORMAL_SCOPE_V2)['p']
+                     if v.kind is SplitKind.X_SPLIT and v.point_id=='BX_CENTER')
+        patterns=[pattern if v.parent_id=='p' else v for v in patterns]
+    geometry=c.joint_geometry(parents,tuple(patterns),CONFIG)
+    _,blocks,patterns=c.joint_graph(geometry,CONFIG)
+    state=c.joint_start_state(geometry,(('a::whole','b::whole','d::whole'),(),(),()),
+                            ((0,1,0),(),(),()),('p','q'),blocks,CONFIG)
+    children=sorted((b for b in blocks.values() if b.parent_id=='p'),key=lambda b:b.block_id)
+    variants=joint_block_candidates(state,children[0],patterns['p'],blocks,CONFIG,check_initial_feasibility=check_start)
+    assert variants
+    stats={}
+    actual=c.joint_opportunity_deltas(state,variants,blocks,patterns,CONFIG,
+        check_initial_feasibility=check_start,reuse=True,stats=stats)
+    expected=c.joint_opportunity_deltas(state,variants,blocks,patterns,CONFIG,
+        check_initial_feasibility=check_start,reuse=False)
+    assert actual==expected and stats['cache_hits']>0
+    if len(children)==2:
+        for after,_ in variants[:3]:
+            second=joint_block_candidates(after,children[1],patterns['p'],blocks,CONFIG,
+                                          check_initial_feasibility=check_start)
+            assert c.joint_opportunity_deltas(after,second,blocks,patterns,CONFIG,
+                check_initial_feasibility=check_start,reuse=True)==c.joint_opportunity_deltas(
+                after,second,blocks,patterns,CONFIG,check_initial_feasibility=check_start,reuse=False)
+
+
 def test_opportunity_expansion_preserves_old_parameters_and_scalers():
     import run_gnn_shared_construction as shared
     from mrta_search.gnn_constructor import ModeJointInsertionGNN

@@ -484,6 +484,256 @@ def op_complete_key(raw):
             tuple(tuple(r['block_ids']) for r in solution['routes']),tuple(map(tuple,raw['directions'])))
 
 
+def op_delta_analyze():
+    """Stage A: restore real saved actions and labels; ZERO new scheduling."""
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates,joint_action_key,has_joint_block_candidate
+    from mrta_reference.model import ParentWeld
+    rows=op_read()
+    thin=shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)
+    models={'early_counterfactual':shared._model_from_checkpoint(thin[OP_VARIANT]).eval(),
+            'counterfactual':shared.expand_opportunity_model(shared._model_from_checkpoint(thin['refinement_candidate'])).eval()}
+    done={(r['instance'],r['payload']['source_phase'],r['payload']['fraction'])
+          for r in rows if r['phase']=='delta_analysis'}
+    for row in rows:
+        if row['phase'] not in ('counterfactual','early_counterfactual'):continue
+        p=row['payload'];fraction=p['fraction'];source=row['phase']
+        if (row['instance'],source,fraction) in done:continue
+        base=dict(source_phase=source,fraction=fraction)
+        if not p.get('prefix') or not p.get('parents'):
+            op_save(dict(phase='delta_analysis',instance=row['instance'],seed=row['seed'],method='SAME_U_DELTA',
+                status='SKIPPED',b32_calls=0,payload=dict(base,reason='saved prefix or parents absent',outcomes=[],pairs=[])))
+            continue
+        prefix=p['prefix']
+        parents=tuple(ParentWeld(x['parent_id'],tuple(x['start']),tuple(x['end'])) for x in p['parents'])
+        geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+        graph,blocks,patterns=c.joint_graph(geometry,CONFIG)
+        state=c.joint_start_state(geometry,tuple(map(tuple,prefix['routes'])),tuple(map(tuple,prefix['directions'])),
+                                 prefix['pending'],blocks,CONFIG)
+        with torch.inference_mode():
+            model=models[source]
+            ids,features=c.joint_parent_inputs(state,prefix['pending'],blocks,patterns,CONFIG,include_opportunities=True)
+            embedding=model.contextualize_state(graph,model.encode_static(graph),state.routes,state.directions)
+            logits=model.parent_logits(graph,embedding,ids,features)
+            order=sorted(range(len(ids)),key=lambda i:(-float(logits[i]),i))
+            parent_ranks={ids[i]:rank+1 for rank,i in enumerate(order)}
+        variants=[];outcomes=[];pools={}
+        for outcome in p['outcomes']:
+            action=op_action(outcome['action']);child=blocks[action.block_id]
+            if child.block_id not in pools:
+                pools[child.block_id]=joint_block_candidates(state,child,patterns[child.parent_id],blocks,CONFIG)
+            matches=[v for v in pools[child.block_id] if joint_action_key(v[1])==joint_action_key(action)]
+            entry=dict(action=outcome['action'],status=outcome['status'],cmax=outcome['cmax'],delta_seconds=None,
+                       parent_rank=parent_ranks.get(child.parent_id))
+            if len(matches)!=1:
+                entry['recovery_error']='saved action missing or ambiguous in current pool'
+            else:
+                variants.append(matches[0]);entry['variant_index']=len(variants)-1
+                after=matches[0][0];placed={b for route in after.routes for b in route}
+                siblings=[b for b in blocks.values() if b.parent_id==child.parent_id and b.block_id not in placed]
+                entry['unplaced_siblings']=[b.block_id for b in siblings]
+                entry['sibling_has_legal_next']=all(has_joint_block_candidate(after,b,patterns[b.parent_id],blocks,CONFIG)
+                                                    for b in siblings)
+                entry['saved_full_completion']=outcome.get('complete') is not None
+                if outcome.get('complete'):
+                    entry['complete_metrics']=op_route_metrics(outcome['complete'],CONFIG)
+            outcomes.append(entry)
+        stats={};tick=time.perf_counter()
+        deltas=c.joint_opportunity_deltas(state,variants,blocks,patterns,CONFIG,reuse=False,normalize=False,stats=stats)
+        seconds=time.perf_counter()-tick
+        for entry in outcomes:
+            if 'variant_index' in entry:entry['delta_seconds']=deltas[entry.pop('variant_index')]
+        payload=dict(base,prefix=prefix,outcomes=outcomes,pairs=p.get('pairs',[]),full_delta_seconds=seconds,
+            total_processing=sum(CONFIG.process_time(b.length) for b in blocks.values()),
+            block_count=len(blocks),parent_count=len(parents),direct_queries=stats['queries'])
+        op_save(dict(phase='delta_analysis',instance=row['instance'],seed=row['seed'],method='SAME_U_DELTA',
+            status='ANALYZED',runtime_s=seconds,b32_calls=0,payload=payload))
+    # Six real top-two pools cover empty and late states, small and large cases.
+    bench_done={r['method'] for r in rows if r['phase']=='delta_timing'}
+    source_rows=[r for r in rows if r['phase'] in ('counterfactual','early_counterfactual')]
+    requests=(('early_counterfactual',0.,False),('early_counterfactual',0.,True),
+              ('early_counterfactual',.1,True),('early_counterfactual',.25,True),
+              ('counterfactual',.5,True),('counterfactual',.75,True))
+    for source,fraction,large in requests:
+        method=f'{source}_{fraction}_{"large" if large else "small"}'
+        if method in bench_done:continue
+        available=[r for r in source_rows if r['phase']==source and r['payload']['fraction']==fraction and r['payload'].get('prefix')]
+        row=(max if large else min)(available,key=lambda r:len(r['payload']['parents']))
+        p=row['payload'];prefix=p['prefix']
+        parents=tuple(ParentWeld(x['parent_id'],tuple(x['start']),tuple(x['end'])) for x in p['parents'])
+        geometry=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+        graph,blocks,patterns=c.joint_graph(geometry,CONFIG)
+        state=c.joint_start_state(geometry,tuple(map(tuple,prefix['routes'])),tuple(map(tuple,prefix['directions'])),
+                                 prefix['pending'],blocks,CONFIG)
+        with torch.inference_mode():
+            _,_,_,pools=op_decision_pool(geometry,state,prefix['pending'],models[source],CONFIG)
+        variants=[v for pool in pools.values() for v in pool['variants']]
+        direct={};fast={}
+        tick=time.perf_counter()
+        expected=c.joint_opportunity_deltas(state,variants,blocks,patterns,CONFIG,reuse=False,normalize=False,stats=direct)
+        direct_seconds=time.perf_counter()-tick
+        tick=time.perf_counter()
+        actual=c.joint_opportunity_deltas(state,variants,blocks,patterns,CONFIG,reuse=True,normalize=False,stats=fast)
+        reuse_seconds=time.perf_counter()-tick
+        if actual!=expected:raise ValueError('local opportunity reuse differs from direct same-U computation')
+        op_save(dict(phase='delta_timing',instance=row['instance'],seed=OP_SEED,method=method,status='EXACT_MATCH',
+            runtime_s=reuse_seconds,b32_calls=0,payload=dict(source_phase=source,fraction=fraction,parents=len(parents),
+                candidates=len(variants),direct_seconds=direct_seconds,reuse_seconds=reuse_seconds,
+                direct_queries=direct['queries'],reuse_queries=fast['queries'],cache_hits=fast['cache_hits'])))
+
+
+def op_delta_statistics(rows):
+    groups=defaultdict(Counter);examples=[]
+    for row in rows:
+        if row['phase']!='delta_analysis':continue
+        p=row['payload'];group=groups[p['fraction']];group['states']+=1
+        outcomes=p['outcomes'];deltas=[o['delta_seconds'] for o in outcomes]
+        valid=[d for d in deltas if d is not None]
+        group['actions']+=len(valid);group['unrecovered']+=len(outcomes)-len(valid)
+        group['varying_states']+=any(any(abs(x-y)>1e-6 for x,y in zip(a,b))
+                                    for i,a in enumerate(valid) for b in valid[i+1:])
+        group['nonzero_actions']+=sum(any(abs(x)>1e-6 for x in d) for d in valid)
+        for better,worse in p['pairs']:
+            group['saved_pairs']+=1
+            a,b=outcomes[better],outcomes[worse]
+            if a['delta_seconds'] is None or b['delta_seconds'] is None:continue
+            group['pairs']+=1
+            distinct=any(abs(x-y)>1e-6 for x,y in zip(a['delta_seconds'],b['delta_seconds']))
+            group['vector_distinct']+=distinct
+            kind='cmax' if a['status']==b['status']=='FEASIBLE' else 'feasibility'
+            group[kind+'_pairs']+=1;group[kind+'_distinct']+=distinct
+            gap=sum(a['delta_seconds'])-sum(b['delta_seconds'])
+            if gap>1e-6:group['preservation_correct']+=1;group[kind+'_correct']+=1
+            elif gap< -1e-6:group['preservation_wrong']+=1;group[kind+'_wrong']+=1
+            else:group['preservation_tied']+=1
+            if worse==0:
+                group['gnn_errors']+=1;group['errors_distinct']+=distinct
+                group['errors_correct']+=gap>1e-6;group['errors_wrong']+=gap< -1e-6
+                group['better_parent_outside_top2']+=a['parent_rank'] is not None and a['parent_rank']>2
+            if distinct and gap< -1e-6 and len(examples)<3:
+                examples.append(dict(instance=row['instance'],fraction=p['fraction'],better=a,worse=b))
+    total=Counter()
+    for group in groups.values():total.update(group)
+    return total,groups,examples
+
+
+def op_delta_report():
+    rows=op_read();total,groups,examples=op_delta_statistics(rows)
+    analysis=[r for r in rows if r['phase']=='delta_analysis']
+    timing=[r for r in rows if r['phase']=='delta_timing']
+    heading='## 2026-11-06 动作机会变化ΔO：已有真实Cmax反事实检验'
+    original=OP_REPORT.read_text(encoding='utf-8')
+    if heading in original:
+        print('Existing action opportunity report retained.',flush=True);return
+    def num(v):return '—' if v is None or v=='' else f'{float(v):.3f}'
+    actions=[o for r in analysis for o in r['payload']['outcomes']]
+    seconds=sum(r['payload'].get('full_delta_seconds',0.) for r in analysis)
+    lines=['',heading,'',
+        '**结论：当前定义的四维ΔO有动作变化，但没有稳定识别真实Cmax优劣的证据，本轮停在阶段A。** '
+        '按用户要求的终止条件，不改GNN输入维度、不训练NEW、不重复收集标签或开发B32。'
+        '这不证明任何非线性模型都无法利用ΔO；本次数据不支持为它继续投入训练和全路线推理开销。', '',
+        '### 实际修改与计算口径', '',
+        '- gnn_constructor.py增加joint_opportunity_deltas，直接调用已有has_joint_block_candidate和config.process_time；'
+        '没有改合法池、时间定义、拆分模式、B32、网络或默认解码。',
+        '- 候选a是现有OrientedInsertionAction，真实转移插入一个子块。U_a严格取该动作执行后未放置的块，'
+        '前后都在同一个U_a求和；当前块从两个求和中同时排除，未插入的兄弟仍保留在U_a。'
+        '四维返回量可按全几何总加工量统一归一化；诊断保存秒值，未把处理当前块自身当成机会损失。',
+        f'- 已恢复的{sum(bool(o.get("unplaced_siblings")) for o in actions)}个首子块动作均检查真实第二子块合法插入存在性；'
+        f'{sum(not o.get("sibling_has_legal_next",True) for o in actions)}个无合法后继。'
+        f'{sum(o.get("saved_full_completion",False) for o in actions)}个候选有已保存的完整补全，'
+        '未把单块存在性宣称为整个剩余父任务集合一定可完成或可被B32调度。',
+        '- 局部复用只在一次特征计算内进行，依赖本机器人长度、首块/方向、兄弟位置及所有其他机器人首点；'
+        '未假定只有执行机器人或同轨伙伴受影响。lns.py、shared训练入口及全部历史模型未改。', '',
+        '### 阶段A真实结果：只比较同状态保存标签', '',
+        f'读取原25%/50%/75%和早期0%/10%/25%两批数据，共{total["states"]}个前缀、'
+        f'{total["actions"]}个候选、{total["pairs"]}个可比较对，未恢复动作{total["unrecovered"]}个。'
+        '全部来自原21个TRAIN几何；不同状态、几何的绝对Cmax没有混合排序。DEADLOCK的Cmax仍为空，两个失败不排序。', '',
+        '|前缀|状态|候选|ΔO不同的状态|真实排序对|四维可区分对|机会保持方向一致/相反|',
+        '|---:|---:|---:|---:|---:|---:|---:|']
+    for fraction,group in sorted(groups.items()):
+        lines.append(f'|{fraction:.0%}|{group["states"]}|{group["actions"]}|{group["varying_states"]}|{group["pairs"]}|'
+            f'{group["vector_distinct"]}|{group["preservation_correct"]}/{group["preservation_wrong"]}|')
+    lines += [f'|合计|{total["states"]}|{total["actions"]}|{total["varying_states"]}|{total["pairs"]}|'
+        f'{total["vector_distinct"]}|{total["preservation_correct"]}/{total["preservation_wrong"]}|', '',
+        '“方向一致”仅诊断sum_r ΔO_r较大的动作是否对应已保存的更优结果，不是新代理Cmax，也未用于替换GNN。'
+        f'另有{total["preservation_tied"]}对总机会变化相同，本数据中它们的四维向量也完全相同。',
+        f'双方可行的真实Cmax对共{total["cmax_pairs"]}对，仅{total["cmax_distinct"]}对ΔO不同，'
+        f'保持方向为{total["cmax_correct"]}对一致/{total["cmax_wrong"]}对相反；'
+        f'可行胜失败的{total["feasibility_pairs"]}对中仅{total["feasibility_distinct"]}对不同，'
+        f'方向为{total["feasibility_correct"]}/{total["feasibility_wrong"]}。',
+        f'相对当前GNN首选A，已有{total["gnn_errors"]}个替代更优的比较；'
+        f'ΔO仅区分其中{total["errors_distinct"]}个，保持方向仅{total["errors_correct"]}个一致、'
+        f'{total["errors_wrong"]}个相反，其余{total["gnn_errors"]-total["errors_distinct"]}个四维全同。', '',
+        '### 为什么没有形成有效监督信息', '',
+        '0%阶段确有较大机会变化，因此不是把计算实现成常数。变化主要来自启用机器人后对首点合法性的约束；'
+        '当前O表示“至少存在一个合法插入位置”，不表示剩余加工容量、可接受的路线成本或未来协调Cmax。'
+        '当已有合法首点、路线变长且仍可在内部/尾部插入时，局部存在性对加工负载和多数插入位置/方向变化不敏感。'
+        '这解释了25%后几乎没有差异，未通过错误扣除当前任务制造伪变化。',
+        '原记录中75%阶段已有15/21个前缀的max P超过最佳保存教师完整Cmax；本轮对应21个状态的全部候选ΔO均为0，'
+        '因此这些已知加工分配失衡没有得到区分。',
+        '代表性同状态证据：N85_03、75%前缀，同一父任务分配R0得到Cmax=5444.345，改分R1得到4493.538；'
+        '两者ΔO均为(0,0,0,0)，max P分别5056.925、4172.639，max(P+MOVE)分别5444.345、4493.538。'
+        '这对损失主要是机器人加工分配与空走，机会存在性没有反映。',
+        'N35_01、0%前缀，GNN首选R3的ΔO为0却DEADLOCK；同父改R2使R3机会减少3787.333秒，'
+        '反而得到FEASIBLE、Cmax=4204.472。保留更多局部机会并不必然保留更好的完整协调方案。',
+        f'父筛选核查：{total["better_parent_outside_top2"]}/{total["gnn_errors"]}个优于A的替代动作，其父任务排名在Top-2之外。'
+        '这是独立的联合排名限制；本次没有以Top-5/10扩大枚举掩盖它，也没有把它当作ΔO有效的证据。', '',
+        '### 计算开销与精确复用', '',
+        f'371个保存候选的完整直接ΔO计算共{num(seconds)}秒，平均每候选{num(seconds/max(1,total["actions"])*1000)}毫秒。'
+        '以下在真实Top-2全部合法插入池上计算，未调用B32；直接与局部复用的所有四维值逐项完全相同。'
+        '单次分项计时不能作为完整GNN加速倍数，也未将状态耗时乘任务数冒充实测总构造时间。', '',
+        '|几何/前缀|父数|候选数|完整计算/ms|局部复用/ms|真实存在性查询：原/复用|', '|---|---:|---:|---:|---:|---:|']
+    for row in timing:
+        p=row['payload'];lines.append(f'|{row["instance"]}/{p["fraction"]:.0%}|{p["parents"]}|{p["candidates"]}|'
+            f'{num(1000*p["direct_seconds"])}|{num(1000*p["reuse_seconds"])}|{p["direct_queries"]}/{p["reuse_queries"]}|')
+    lines += ['', '85父任务实例的0%前缀复用后约32毫秒，非空前缀仍约87–172毫秒，当前没有质量证据支持把这项成本加到每个构造决策。', '',
+        '### 已有8个开发几何的真实B32参考：本轮不冒充NEW结果', '',
+        'BASE取已保存的机会模型joint_greedy+原两次采样；BASE三个提案均从空路线由同一GNN构造。'
+        'NEW未训练，因而没有NEW可行率、Cmax改善或运行时间可报告，也没有新增开发B32。'
+        '下表只复用相同seed=202611041、CONFIG_05、FORMAL_SCOPE_V2、0.50m及B32的历史结果。'
+        '固定fixed_split_patterns()限制仍在，模式头未重训；这些8例属于已消费开发数据。', '',
+        '|几何|BASE Cmax|RULE/BEAM|WAG|HGA|BASE max P|BASE max(P+MOVE)|BASE使用机器人|',
+        '|---|---:|---:|---:|---:|---:|---:|---|']
+    table={(r['instance'],r['method']):r for r in rows if r['phase'] in ('evaluation','joint_evaluation')}
+    names=sorted(n for n,m in table if m=='OLD_OP_JOINT_MULTI3')
+    for name in names:
+        base=table[name,'OLD_OP_JOINT_MULTI3'];raw=base['payload'].get('complete')
+        metrics=op_route_metrics(raw,CONFIG) if raw else {}
+        robots=','.join(f'R{i}' for i,v in enumerate(metrics.get('loads',())) if v>0) or '—'
+        lines.append('|'+name+'|'+'|'.join(num(table[name,m]['cmax']) for m in
+            ('OLD_OP_JOINT_MULTI3','RULE/BEAM','WAG','HGA'))+
+            f'|{num(max(metrics["loads"]) if metrics else None)}|{num(metrics.get("max_p_move"))}|{robots}|')
+    lines += ['', 'BASE可行7/8，RULE/BEAM 7/8，WAG、HGA均8/8。BASE相对RULE为1胜7负，相对WAG、HGA均0胜8负，'
+        '失败计入负。BASE对双方可行的7例，相对WAG/HGA的Cmax差距中位数分别见下方实际计算，未用失败惩罚Cmax补齐。']
+    for method in ('WAG','HGA'):
+        gaps=[100*(float(table[n,'OLD_OP_JOINT_MULTI3']['cmax'])/float(table[n,method]['cmax'])-1)
+              for n in names if table[n,'OLD_OP_JOINT_MULTI3']['status']=='FEASIBLE' and table[n,method]['status']=='FEASIBLE']
+        lines.append(f'BASE相对{method}的可行配对Cmax中位增加{num(statistics.median(gaps))}%（{len(gaps)}/8，另1例BASE失败）。')
+    lines += ['保存的BASE时间中位3.385秒（由联合首提案与既有两次采样实测分项组成），RULE 3.213秒，'
+        'WAG 60.400秒，HGA 60.051秒。WAG/HGA是原60秒终解，数秒GNN是初解，不能称为公平等预算比较。', '',
+        '### 决定与测试', '',
+        '本轮不声称Cmax、可行率或推理速度改善，也不启动三种子或统一60秒比较。'
+        '当前结果仍不足以支持将GNN作为论文主算法。下一次应优先纠正父任务与机器人分配的联合排名：'
+        '检查网络为何拒绝已有特征和真实Cmax标签显示更低加工负载/P+MOVE的同父替代，'
+        '以及更优不同父动作在预筛选前被排除的问题；不能继续把局部“还能插入”当作剩余加工容量或可调度性。'
+        '本轮不追加其他模块、损失结构或训练轮数。', '',
+        '本轮修改文件为gnn_constructor.py、run_gnn_cmax_finetune.py、既有test_gnn_construct_vns.py、'
+        'gnn_opportunity_cmax.csv及本报告。没有新增文件，历史checkpoint不写入，新增B32/教师/认证调用均为0。']
+    for row in rows:
+        if row['phase']=='delta_verification':lines += ['',row['payload']['summary']]
+    lines += ['', '```powershell',"Set-Location 'D:\\pybullet_test\\MRTA_GA'",
+        "$env:PYTHONPATH = (Join-Path (Get-Location) 'DRL\\src')",
+        "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase delta-data",
+        "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase delta-report",'```','']
+    if not any(r['phase']=='delta_summary' for r in rows):
+        op_save(dict(phase='delta_summary',instance='TRAIN_21',seed=OP_SEED,method='STAGE_A',status='NO_TRAINING',
+            b32_calls=0,payload=dict(statistics=dict(total),training_started=False,new_model=None,new_b32_calls=0,
+                conclusion='Sparse action differences, no consistent within-state Cmax/feasibility advantage; stop after A.')))
+    OP_REPORT.write_text(original+'\n'.join(lines),encoding='utf-8')
+    print('APPENDED',OP_REPORT,flush=True)
+
+
 def op_route_metrics(raw,config):
     import run_gnn_shared_construction as shared
     from mrta_reference.solution import block_map
@@ -1349,10 +1599,15 @@ def write_report(rows, metadata):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
-        'joint-eval','early-all','early-data','early-train','early-eval','early-report'),default='op-all')
+        'joint-eval','early-all','early-data','early-train','early-eval','early-report',
+        'delta-data','delta-report'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
+    if args.phase=='delta-data':
+        op_delta_analyze();return
+    if args.phase=='delta-report':
+        op_delta_report();return
     if args.phase=='joint-eval' or args.phase.startswith('early-'):
         torch.manual_seed(OP_SEED);random.seed(OP_SEED)
         if args.phase in ('joint-eval','early-all'):op_joint_evaluate()

@@ -636,6 +636,68 @@ def remaining_robot_work(state,blocks,patterns,config,*,insertion_limit=8,check_
     return tuple(v/scale for v in eligible+exclusive)
 
 
+def joint_opportunity_deltas(state,variants,blocks,patterns,config,*,insertion_limit=8,
+                             check_initial_feasibility=True,reuse=True,normalize=True,stats=None):
+    """Four action-level changes on the SAME post-action remaining block set.
+
+    An insertion places one child. Its unplaced sibling stays in U_a and uses
+    the real sibling-position restriction. These are block opportunities, not
+    a claim that a selected first child guarantees completion of its parent.
+    All membership queries use the existing insertion-existence function.
+
+    Local reuse follows that function's dependencies: length, possible sibling
+    neighbours, own head (including its alternate direction), and ALL other
+    heads. Loads, internal non-head directions and travel do not affect it.
+    reuse=False is the direct full calculation for small numerical comparisons.
+    Nothing is cached across decision states or inference calls.
+    """
+    from .lns import has_joint_block_candidate
+    from mrta_reference.geometry import oriented_endpoints
+    before_placed={b for route in state.routes for b in route}
+    cache={};queries=hits=0
+    scale=max(1.,sum(config.process_time(b.length) for b in blocks.values())) if normalize else 1.
+    def context(s):
+        heads=tuple((r,oriented_endpoints(blocks[route[0]],s.directions[r][0])[0])
+                    for r,route in enumerate(s.routes) if route)
+        siblings=[]
+        for route in s.routes:
+            positions={}
+            for i,b in enumerate(route):positions.setdefault(blocks[b].parent_id,[]).append((i,b))
+            siblings.append(positions)
+        return heads,siblings
+    def available(s,b,r,ctx):
+        nonlocal queries,hits
+        if reuse:
+            heads,siblings=ctx;route=s.routes[r]
+            key=(b.block_id,r,len(route),route[0] if route else None,
+                 s.directions[r][0] if route else None,tuple(p for p in heads if p[0]!=r),
+                 tuple(i for i,sibling in siblings[r].get(b.parent_id,()) if sibling!=b.block_id))
+            if key in cache:hits+=1;return cache[key]
+        value=has_joint_block_candidate(s,b,patterns[b.parent_id],blocks,config,
+            insertion_limit=insertion_limit,check_initial_feasibility=check_initial_feasibility,robot_id=r)
+        queries+=1
+        if reuse:cache[key]=value
+        return value
+    before_context=context(state) if reuse else None
+    rows=[]
+    for after,action in variants:
+        placed={b for route in after.routes for b in route}
+        if action.block_id in before_placed or placed!=before_placed|{action.block_id}:
+            raise ValueError('opportunity delta expects one actual child insertion')
+        remaining=[b for b in blocks.values() if b.block_id not in placed]
+        after_context=context(after) if reuse else None
+        delta=[]
+        for r in range(4):
+            before=sum(config.process_time(b.length) for b in remaining if available(state,b,r,before_context))
+            post=sum(config.process_time(b.length) for b in remaining if available(after,b,r,after_context))
+            delta.append((post-before)/scale)
+        rows.append(tuple(delta))
+    if stats is not None:
+        stats['queries']=stats.get('queries',0)+queries
+        stats['cache_hits']=stats.get('cache_hits',0)+hits
+    return tuple(rows)
+
+
 def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8,check_initial_feasibility=True,
                         include_opportunities=False):
     from .lns import has_joint_block_candidate
