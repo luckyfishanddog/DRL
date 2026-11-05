@@ -373,17 +373,21 @@ JOINT_PARENT_DIM = 12
 class JointInsertionGNN(BlockAssignmentGNN):
     """The existing two-layer GAT with conditional parent/insertion heads."""
 
-    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=False, opportunity_features=False):
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=False, opportunity_features=False,parent_action_features=False):
         super().__init__(hidden_dim, heads)
         self.hidden_dim, self.heads = hidden_dim, heads
         self.opportunity_features=opportunity_features
         self.joint_feature_dim=JOINT_DYNAMIC_DIM+8*int(opportunity_features)
         self.parent_feature_dim=JOINT_PARENT_DIM+8*int(opportunity_features)
+        self.parent_action_features=parent_action_features
         self.policy = nn.Identity()  # Assignment-only head is not used here.
         self.parent_head = nn.Sequential(nn.Linear(hidden_dim+self.parent_feature_dim,hidden_dim),
                                          nn.ReLU(),nn.Linear(hidden_dim,1))
         self.insertion_head = nn.Sequential(nn.Linear(4*hidden_dim+self.joint_feature_dim,hidden_dim),
                                             nn.ReLU(),nn.Linear(hidden_dim,1))
+        if parent_action_features:
+            self.parent_action_head=nn.Sequential(nn.Linear(9*hidden_dim+self.parent_feature_dim+2*self.joint_feature_dim+17,32),
+                                                  nn.ReLU(),nn.Linear(32,1))
         # Optional TRAIN-fitted scaling; the default preserves V1 checkpoints
         # and logits exactly. No new direction head or encoder is introduced.
         self.normalize_inputs = normalize_inputs
@@ -425,6 +429,23 @@ class JointInsertionGNN(BlockAssignmentGNN):
         context = embeddings[indices.clamp_min(0)] * (indices>=0).unsqueeze(-1)
         return self.insertion_head(torch.cat((context.flatten(1),self.scale_inputs(features,'joint')),dim=1)).squeeze(1)
 
+    def parent_action_scores(self,graph,embeddings,inputs):
+        """One learned scalar per WHOLE or complete split action; no log-product."""
+        rows=self.parent_action_rows(graph,embeddings,inputs)
+        return self.parent_action_head(rows).squeeze(1)
+
+    def parent_action_rows(self,graph,embeddings,inputs):
+        """The same complete-action inputs, cacheable when the base is frozen."""
+        if not self.parent_action_features:raise ValueError('complete parent scoring head is disabled')
+        parent=torch.stack([embeddings[graph.parent_block_indices[p]].mean(0) for p in inputs['parent_ids']])
+        indices=inputs['child_indices'];mask=inputs['child_mask']
+        context=embeddings[indices.clamp_min(0)]*(indices>=0).unsqueeze(-1)
+        context=context*mask[:,:,None,None]
+        dynamic=self.scale_inputs(inputs['child_features'],'joint')*mask[:,:,None]
+        features=torch.cat((parent,self.scale_inputs(inputs['parent_features'],'parent'),context.flatten(1),
+            dynamic.flatten(1),inputs['after_features'],mask),dim=1)
+        return features
+
     def contextualize_state(self, graph, embeddings, routes, directions):
         """Legacy policies retain their original static embeddings exactly."""
         return embeddings
@@ -438,8 +459,9 @@ class CoordinationJointInsertionGNN(JointInsertionGNN):
     independent certifier. The original static policy/checkpoints are intact.
     """
 
-    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True, opportunity_features=False):
-        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,opportunity_features=opportunity_features)
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True, opportunity_features=False,parent_action_features=False):
+        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,opportunity_features=opportunity_features,
+                         parent_action_features=parent_action_features)
         # Keep each weld's own geometry when attention neighborhoods coincide.
         self.geometry_skip = nn.Linear(NODE_DIM, hidden_dim)
         self.route_direction = nn.Embedding(2, hidden_dim)
@@ -502,8 +524,9 @@ class CoordinationJointInsertionGNN(JointInsertionGNN):
 class ModeJointInsertionGNN(CoordinationJointInsertionGNN):
     """Choose legal parent modes before constructing their directed routes."""
 
-    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True, opportunity_features=False):
-        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,opportunity_features=opportunity_features)
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True, opportunity_features=False,parent_action_features=False):
+        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,opportunity_features=opportunity_features,
+                         parent_action_features=parent_action_features)
         self.use_dynamic_context = False
         self.mode_head = nn.Sequential(nn.Linear(hidden_dim + 12, hidden_dim),
                                        nn.ReLU(), nn.Linear(hidden_dim, 1))
@@ -915,9 +938,73 @@ def rule_anchored_action_logits(logits,variants,preferred_owners):
     return logits.new_tensor([-ranks[i] for i in range(len(values))])
 
 
+def diverse_parent_indices(state,parent_ids,parent_logits,blocks,patterns,config,*,parent_limit=4,insertion_limit=8,
+                           check_initial_feasibility=True):
+    """Keep learned top-K and at most two legal qualification/load representatives."""
+    from .lns import has_joint_block_candidate
+    order=sorted(range(len(parent_ids)),key=lambda i:(-float(parent_logits[i]),i))
+    chosen=order[:parent_limit];available=order[parent_limit:]
+    information={}
+    for i in order:
+        children=sorted((b for b in blocks.values() if b.parent_id==parent_ids[i]),key=lambda b:b.block_id)
+        robots=tuple(r for r in range(4) if has_joint_block_candidate(state,children[0],patterns[parent_ids[i]],blocks,config,
+            insertion_limit=insertion_limit,robot_id=r,check_initial_feasibility=check_initial_feasibility))
+        information[i]=(robots,sum(config.process_time(b.length) for b in children))
+    if available and len(chosen)<8:
+        scarce=max(available,key=lambda i:(information[i][1]/max(1,len(information[i][0])),information[i][1],
+            -len(information[i][0]),float(parent_logits[i]),-i))
+        chosen.append(scarce);available.remove(scarce)
+    if available and len(chosen)<8:
+        profiles={information[i][0] for i in chosen}
+        low_load=max(available,key=lambda i:(information[i][0] not in profiles,
+            max(state.loads)-min(state.loads[r] for r in information[i][0]),information[i][1],float(parent_logits[i]),-i))
+        chosen.append(low_load)
+    return tuple(chosen)
+
+
+def diverse_child_indices(variants,logits,*,limit=2):
+    """Keep neural best, then a different robot/load or insertion structure."""
+    order=sorted(range(len(variants)),key=lambda i:(-float(logits[i]),i))
+    if not order:return ()
+    chosen=[order[0]]
+    if limit==1:return tuple(chosen)
+    first=variants[chosen[0]][1]
+    other=[i for i in order[1:] if variants[i][1].robot!=first.robot]
+    if other:chosen.append(min(other,key=lambda i:(max(variants[i][0].loads),-float(logits[i]),i)))
+    else:
+        other=[i for i in order[1:] if variants[i][1].position!=first.position]
+        if other:chosen.append(other[0])
+        elif len(order)>1:chosen.append(order[1])
+    return tuple(chosen)
+
+
+def parent_action_inputs(graph,state,plans,blocks,config):
+    """Existing child features plus exact final partial loads/travel/head geometry."""
+    from mrta_reference.geometry import oriented_endpoints
+    n=len(plans);dim=plans[0]['child_features'].shape[1]
+    indices=torch.full((n,2,4),-1,dtype=torch.long);features=torch.zeros(n,2,dim);mask=torch.zeros(n,2)
+    scale=max(1.,sum(config.process_time(b.length) for b in blocks.values()));after_rows=[]
+    for i,plan in enumerate(plans):
+        count=len(plan['actions']);indices[i,:count]=plan['child_indices'];features[i,:count]=plan['child_features'];mask[i,:count]=1.
+        after=plan['state'];moves=[sum(a) for a in after.arc_costs];pm=[p+m for p,m in zip(after.loads,moves)]
+        overlaps=[];gaps=[]
+        for left,right in ((0,1),(2,3)):
+            if not after.routes[left] or not after.routes[right]:overlaps.append(0.);gaps.append(0.);continue
+            upper=max(max(blocks[b].start[0],blocks[b].end[0]) for b in after.routes[left])
+            lower=min(min(blocks[b].start[0],blocks[b].end[0]) for b in after.routes[right])
+            overlaps.append(max(0.,upper+config.interference_dx-lower)/20.)
+            starts=[oriented_endpoints(blocks[after.routes[r][0]],after.directions[r][0])[0][0] for r in (left,right)]
+            gaps.append((starts[1]-starts[0])/20.)
+        after_rows.append([*(p/scale for p in after.loads),*(m/scale for m in moves),max(after.loads)/scale,
+                           max(pm)/scale,sum(moves)/scale,*overlaps,*gaps])
+    return dict(parent_ids=tuple(p['parent_id'] for p in plans),parent_features=torch.stack([p['parent_features'] for p in plans]),
+        child_indices=indices,child_features=features,child_mask=mask,after_features=torch.tensor(after_rows,dtype=torch.float32))
+
+
 def joint_parent_action_candidates(graph,state,parent_ids,parent_logits,embeddings,model,blocks,patterns,config,
                                    *,parent_limit=4,child_limit=2,insertion_limit=8,current_embeddings=None,
-                                   check_initial_feasibility=True,prefer_legal_start_recovery=True,timing=None):
+                                   check_initial_feasibility=True,prefer_legal_start_recovery=True,timing=None,
+                                   diverse=False,retain_inputs=False,parent_features=None):
     """Bounded complete parent actions scored by the existing conditional heads.
 
     Every softmax uses its full legal pool, before either top-k truncation.
@@ -929,18 +1016,27 @@ def joint_parent_action_candidates(graph,state,parent_ids,parent_logits,embeddin
         raise ValueError('parent_limit must be 1..8 and child_limit must be 1..2')
     if not torch.isfinite(parent_logits).all():raise ValueError('NONFINITE_PARENT_LOGITS')
     parent_logp=torch.log_softmax(parent_logits,dim=0)
-    order=sorted(range(len(parent_ids)),key=lambda i:(-float(parent_logits[i]),i))[:parent_limit]
+    ranking=sorted(range(len(parent_ids)),key=lambda i:(-float(parent_logits[i]),i))
+    order=(diverse_parent_indices(state,parent_ids,parent_logits,blocks,patterns,config,
+        parent_limit=parent_limit,insertion_limit=insertion_limit,check_initial_feasibility=
+        check_initial_feasibility(state) if callable(check_initial_feasibility) else check_initial_feasibility)
+        if diverse else ranking[:parent_limit])
+    if retain_inputs and parent_features is None:
+        ids,values=joint_parent_inputs(state,parent_ids,blocks,patterns,config,insertion_limit=insertion_limit,
+            include_opportunities=getattr(model,'opportunity_features',False))
+        parent_features=torch.stack([values[ids.index(p)] for p in parent_ids])
     plans=[]
     def check(s):
         return check_initial_feasibility(s) if callable(check_initial_feasibility) else check_initial_feasibility
-    for rank,index in enumerate(order,1):
+    for index in order:
+        rank=ranking.index(index)+1
         parent=parent_ids[index]
         children=sorted((b for b in blocks.values() if b.parent_id==parent),key=lambda b:b.block_id)
         if len(children) not in (1,2):raise ValueError('existing parent catalog must contain one or two children')
-        branches=[(state,(),float(parent_logp[index]),(),(),())]
+        branches=[(state,(),float(parent_logp[index]),(),(),(),())]
         for child_index,child in enumerate(children):
             following=[]
-            for partial,actions,score,logs,sizes,ranks in branches:
+            for partial,actions,score,logs,sizes,ranks,inputs in branches:
                 tick=time.perf_counter() if timing is not None else 0.
                 variants=joint_block_candidates(partial,child,patterns[parent],blocks,config,
                     insertion_limit=insertion_limit,check_initial_feasibility=check(partial),
@@ -963,15 +1059,20 @@ def joint_parent_action_candidates(graph,state,parent_ids,parent_logits,embeddin
                     timing['network_s']=timing.get('network_s',0.)+time.perf_counter()-tick
                 if not torch.isfinite(logits).all():raise ValueError('NONFINITE_INSERTION_LOGITS')
                 logp=torch.log_softmax(logits,dim=0)
-                selected=sorted(range(len(variants)),key=lambda i:(-float(logits[i]),i))[:child_limit]
+                selected=(diverse_child_indices(variants,logits,limit=child_limit) if diverse else
+                          sorted(range(len(variants)),key=lambda i:(-float(logits[i]),i))[:child_limit])
                 for child_rank,i in enumerate(selected,1):
                     after,action=variants[i];value=float(logp[i])
-                    following.append((after,actions+(action,),score+value,logs+(value,),sizes+(len(variants),),ranks+(child_rank,)))
+                    retained=inputs+((indices[i].clone(),features[i].clone()),) if retain_inputs else ()
+                    following.append((after,actions+(action,),score+value,logs+(value,),sizes+(len(variants),),ranks+(child_rank,),retained))
             branches=following
-        for after,actions,score,logs,sizes,ranks in branches:
-            plans.append(dict(parent_id=parent,parent_rank=rank,state=after,actions=actions,score=score,
+        for after,actions,score,logs,sizes,ranks,inputs in branches:
+            plan=dict(parent_id=parent,parent_rank=rank,state=after,actions=actions,score=score,
                 parent_log_probability=float(parent_logp[index]),child_log_probabilities=logs,
-                child_pool_sizes=sizes,child_ranks=ranks))
+                child_pool_sizes=sizes,child_ranks=ranks)
+            if retain_inputs:plan.update(parent_features=parent_features[index].clone(),
+                child_indices=torch.stack([x[0] for x in inputs]),child_features=torch.stack([x[1] for x in inputs]))
+            plans.append(plan)
     return tuple(plans)
 
 
@@ -979,7 +1080,7 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                   *, insertion_limit, choose,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
                   parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None,
                   forced_action=None,parent_observer=None,joint_greedy=False,parent_joint=False,
-                  parent_candidate_limit=4,parent_action_observer=None):
+                  parent_candidate_limit=4,parent_action_observer=None,parent_cmax=False,diverse_candidates=False):
     """Shared state transitions and action space for inference and training."""
     from .lns import joint_block_candidates
     from .direction import _initial_error
@@ -1026,9 +1127,15 @@ def _decode_joint(reference, routes, directions, pending_parent_ids, model, conf
                     plans=joint_parent_action_candidates(graph,state,ids,parent_logits,embeddings,model,blocks,patterns,config,
                         parent_limit=parent_candidate_limit,child_limit=2,insertion_limit=insertion_limit,
                         current_embeddings=current_embeddings,check_initial_feasibility=check_start,
-                        prefer_legal_start_recovery=prefer_legal_start_recovery)
+                        prefer_legal_start_recovery=prefer_legal_start_recovery,diverse=diverse_candidates,
+                        retain_inputs=parent_cmax,parent_features=features)
                     if not plans:raise _JointActionUnavailable('NO_LEGAL_PARENT_COMPLETION')
-                    best=max(plans,key=lambda p:p['score'])
+                    if parent_cmax:
+                        inputs=parent_action_inputs(graph,state,plans,blocks,config)
+                        scores=model.parent_action_scores(graph,current_embeddings,inputs)
+                        if not torch.isfinite(scores).all():raise ValueError('NONFINITE_PARENT_ACTION_SCORES')
+                        best=plans[choose(scores,'parent_action')]
+                    else:best=max(plans,key=lambda p:p['score'])
                     if parent_action_observer is not None:
                         parent_action_observer(state,plans,best)
                     # One commit after both children have been evaluated. A
@@ -1141,7 +1248,8 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                                  model: JointInsertionGNN, config, *, insertion_limit=8,
                                  decode_mode='greedy', seed=0,allow_partial_start_conflicts=False,prefer_legal_start_recovery=True,
                                  parent_selection_mode='learned',action_selection_mode='gnn',action_observer=None,
-                                 forced_action=None,parent_observer=None,parent_candidate_limit=4,parent_action_observer=None):
+                                 forced_action=None,parent_observer=None,parent_candidate_limit=4,parent_action_observer=None,
+                                 diverse_candidates=False):
     """No-gradient decoding; complete results are scheduled outside.
 
     The opt-in partial-start repair can restore heads exposed by destruction.
@@ -1162,16 +1270,20 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
     search strategy; subsequent split children still use legal greedy insertion.
     'parent_joint' evaluates complete parents within top-K (K<=8), with top-two
     child branches and the conditional probability of every split child.
+    'parent_cmax' uses the learned complete-action scalar and bounded diverse
+    proposals. 'parent_cmax_sample' samples these same scores at temperature 1.
     """
-    if decode_mode not in ('greedy','sample','joint_greedy','parent_joint'):
-        raise ValueError('decode_mode must be greedy, sample, joint_greedy or parent_joint')
-    if decode_mode in ('joint_greedy','parent_joint') and (parent_selection_mode!='learned' or action_selection_mode!='gnn'):
+    if decode_mode not in ('greedy','sample','joint_greedy','parent_joint','parent_cmax','parent_cmax_sample'):
+        raise ValueError('unknown GNN decode_mode')
+    if decode_mode in ('joint_greedy','parent_joint','parent_cmax','parent_cmax_sample') and (parent_selection_mode!='learned' or action_selection_mode!='gnn'):
         raise ValueError('joint decoding requires the learned parent and GNN insertion heads')
+    if decode_mode.startswith('parent_cmax') and not getattr(model,'parent_action_features',False):
+        raise ValueError('parent_cmax requires the complete action scoring head')
     generator=None
-    if decode_mode=='sample':
+    if decode_mode in ('sample','parent_cmax_sample'):
         generator=torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
     def choose(logits,kind):
-        if decode_mode in ('greedy','joint_greedy','parent_joint'):
+        if decode_mode in ('greedy','joint_greedy','parent_joint','parent_cmax'):
             return int(torch.argmax(logits))
         return int(torch.multinomial(torch.softmax(logits,dim=0),1,generator=generator).item())
     model.eval()
@@ -1182,8 +1294,10 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                              prefer_legal_start_recovery=prefer_legal_start_recovery,
                              parent_selection_mode=parent_selection_mode,action_selection_mode=action_selection_mode,
                              action_observer=action_observer,forced_action=forced_action,parent_observer=parent_observer,
-                             joint_greedy=decode_mode=='joint_greedy',parent_joint=decode_mode=='parent_joint',
-                             parent_candidate_limit=parent_candidate_limit,parent_action_observer=parent_action_observer)
+                             joint_greedy=decode_mode=='joint_greedy',parent_joint=decode_mode in ('parent_joint','parent_cmax','parent_cmax_sample'),
+                             parent_candidate_limit=parent_candidate_limit,parent_action_observer=parent_action_observer,
+                             parent_cmax=decode_mode.startswith('parent_cmax'),
+                             diverse_candidates=diverse_candidates or decode_mode.startswith('parent_cmax'))
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,

@@ -35,6 +35,8 @@ OP_CSV=ROOT/'results/gnn_opportunity_cmax.csv'
 OP_REPORT=ROOT/'docs/GNN_INITIAL_MINCHILD05_FINAL.md'
 OP_VARIANT='opportunity_cmax_candidate'
 EARLY_VARIANT='early_cmax_candidate'
+PARENT_CMAX_VARIANT='parent_cmax_candidate'
+PARENT_MACRO_IL_VARIANT='parent_cmax_macro_il_candidate'
 OP_SEED=20261104
 OP_EVAL_SEED=202611041  # Exact existing RULE/WAG/HGA pairs; no formal rerun.
 OP_FIELDS=('phase','instance','seed','method','status','cmax','runtime_s','b32_calls','loads','move','wait','robots','payload')
@@ -582,6 +584,521 @@ def op_parent_diagnose():
                     kind='cmax' if p['outcomes'][0]['status']=='FEASIBLE' else 'feasibility'))
         op_save(dict(phase='parent_action_coverage',instance=row['instance'],seed=OP_SEED,method='FROZEN_OP',
             status='MEASURED',b32_calls=0,payload=dict(fraction=fraction,alternatives=measured)))
+
+
+def cmax_prefix(payload,config=CONFIG):
+    from mrta_search import gnn_constructor as c
+    from mrta_reference.model import ParentWeld
+    parents=tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in payload['parents'])
+    reference=c.joint_geometry(parents,c.fixed_split_patterns(parents,config),config)
+    graph,blocks,patterns=c.joint_graph(reference,config);prefix=payload['prefix']
+    state=c.joint_start_state(reference,tuple(map(tuple,prefix['routes'])),tuple(map(tuple,prefix['directions'])),
+                             prefix['pending'],blocks,config)
+    return reference,graph,blocks,patterns,state
+
+
+def cmax_plans(reference,graph,blocks,patterns,state,pending,model,config=CONFIG,*,diverse=True):
+    from mrta_search import gnn_constructor as c
+    # These graphs/indices are reused by autograd during offline training.
+    # no_grad keeps their lazy incoming-edge cache as ordinary tensors.
+    with torch.no_grad():
+        ids,pf=c.joint_parent_inputs(state,pending,blocks,patterns,config,include_opportunities=True)
+        emb=model.encode_static(graph);context=model.contextualize_state(graph,emb,state.routes,state.directions)
+        logits=model.parent_logits(graph,context,ids,pf)
+        return c.joint_parent_action_candidates(graph,state,ids,logits,emb,model,blocks,patterns,config,
+            parent_limit=4,child_limit=2,current_embeddings=context,diverse=diverse,retain_inputs=True,parent_features=pf)
+
+
+def cmax_action_key(plan):
+    from mrta_search.lns import joint_action_key
+    return tuple(joint_action_key(a) for a in plan['actions'])
+
+
+def cmax_compile(rows,source,graphs):
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_action_key
+    records=[]
+    for row in rows:
+        if row['phase']!='parent_cmax_counterfactual' or not row['payload']['pairs']:continue
+        payload=row['payload'];reference,graph,blocks,patterns,state=cmax_prefix(payload)
+        key=op_graph_key(reference);graphs.setdefault(key,graph)
+        plans=cmax_plans(reference,graph,blocks,patterns,state,payload['prefix']['pending'],source)
+        by_action={cmax_action_key(p):p for p in plans}
+        chosen=[by_action[tuple(joint_action_key(op_action(a)) for a in o['actions'])] for o in payload['outcomes']]
+        inputs=c.parent_action_inputs(graph,state,chosen,blocks,CONFIG)
+        records.append(dict(graph_key=key,inputs=inputs,pairs=payload['pairs'],instance=row['instance'],fraction=payload['fraction'],
+                            legacy_scores=tuple(p['score'] for p in chosen)))
+    return records
+
+
+def cmax_rank_accuracy(model,graphs,records):
+    correct=total=legacy=0;encoded={}
+    model.eval()
+    with torch.no_grad():
+        for record in records:
+            key=record['graph_key']
+            if key not in encoded:encoded[key]=model.encode_static(graphs[key])
+            scores=model.parent_action_scores(graphs[key],encoded[key],record['inputs'])
+            for better,worse in record['pairs']:
+                total+=1;correct+=float(scores[better])>float(scores[worse])
+                legacy+=record['legacy_scores'][better]>record['legacy_scores'][worse]
+    return dict(correct=correct,total=total,accuracy=correct/max(1,total),legacy_correct=legacy,
+                legacy_accuracy=legacy/max(1,total))
+
+
+def cmax_expert_macro_examples(source,graphs,examples):
+    """Six real teacher prefixes per geometry, including late construction.
+
+    Recover both teacher children from already validated insertion examples.
+    A missing teacher action may be appended ONLY to the offline IL pool; it
+    does not expand the inference candidates or supply a synthetic Cmax label.
+    """
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_block_candidates,joint_action_key,oriented_route_state
+    from mrta_reference.model import ParentWeld
+    insertion=[e for e in examples if e['kind']=='insertion']
+    following={}
+    starts={}
+    for e in insertion:
+        step=e['step'];key=(e['graph_key'],step['state_routes'],step['state_directions'],step['pending_parent_ids'])
+        if step['parent_target'] is None:following[key]=e
+        else:starts.setdefault(e['graph_key'][0],[]).append(e)
+    result=[];missing=0;duplicates=set()
+    for geometry,available in starts.items():
+        for fraction in (0.,.1,.25,.5,.75,.9):
+            order=sorted(available,key=lambda e:(abs(1-len(e['step']['pending_parent_ids'])/len(geometry)-fraction),-e['weight']))
+            selected=None
+            for e in order:
+                key=e['graph_key'];step=e['step'];ident=(key,step['state_routes'],step['state_directions'],step['pending_parent_ids'])
+                if ident in duplicates:continue
+                graph=graphs[key];blocks={b.block_id:b for b in graph.blocks};patterns={p.parent_id:p for p in key[1]}
+                ref=c.joint_geometry(tuple(ParentWeld(*p) for p in key[0]),key[1],CONFIG)
+                state=oriented_route_state(step['state_routes'],step['state_directions'],blocks,CONFIG)
+                first_index=int(e['target'].argmax());first=step['candidate_actions'][first_index]
+                parent=blocks[first.block_id].parent_id
+                variants=joint_block_candidates(state,blocks[first.block_id],patterns[parent],blocks,CONFIG)
+                after=next((s for s,a in variants if joint_action_key(a)==joint_action_key(first)),None)
+                if after is None:continue
+                actions=[first];indices=[step['indices'][first_index]];features=[step['features'][first_index]]
+                if sum(b.parent_id==parent for b in blocks.values())==2:
+                    second=following.get((key,after.routes,after.directions,step['pending_parent_ids']))
+                    if second is None:continue
+                    j=int(second['target'].argmax());action=second['step']['candidate_actions'][j]
+                    if blocks[action.block_id].parent_id!=parent:continue
+                    variants=joint_block_candidates(after,blocks[action.block_id],patterns[parent],blocks,CONFIG)
+                    last=next((s for s,a in variants if joint_action_key(a)==joint_action_key(action)),None)
+                    if last is None:continue
+                    after=last;actions.append(action);indices.append(second['step']['indices'][j]);features.append(second['step']['features'][j])
+                teacher=dict(parent_id=parent,state=after,actions=tuple(actions),child_indices=torch.stack(indices),
+                    child_features=torch.stack(features),parent_features=step['parent_features'][step['parent_target']].clone())
+                plans=list(cmax_plans(ref,graph,blocks,patterns,state,step['pending_parent_ids'],source))
+                target=next((i for i,p in enumerate(plans) if cmax_action_key(p)==cmax_action_key(teacher)),None)
+                covered=target is not None
+                if target is None:target=len(plans);plans.append(teacher)
+                inputs=c.parent_action_inputs(graph,state,plans,blocks,CONFIG)
+                selected=dict(graph_key=key,inputs=inputs,target=target,weight=e['weight'],fraction=fraction,
+                    progress=1-len(step['pending_parent_ids'])/len(geometry),teacher_in_inference_pool=covered)
+                duplicates.add(ident);break
+            if selected is None:missing+=1
+            else:result.append(selected)
+    return result,dict(expert_macro_examples=len(result),unavailable_prefixes=missing,
+        teacher_action_in_inference_pool=sum(e['teacher_in_inference_pool'] for e in result),
+        prefix_bins=dict(Counter(str(e['fraction']) for e in result)))
+
+
+def op_parent_cmax_macro_train():
+    shared,config,checkpoint,archive,teachers,_,_,_=op_sources()
+    if PARENT_MACRO_IL_VARIANT in checkpoint:
+        print('Retain existing macro-IL correction; no repeated training.',flush=True);return
+    rows=op_read();graphs,examples,_,preparation=op_saved_imitation(shared,config,archive,teachers)
+    source=shared._model_from_checkpoint(checkpoint[OP_VARIANT]).eval()
+    records=cmax_compile(rows,source,graphs)
+    macro,coverage=cmax_expert_macro_examples(source,graphs,examples)
+    torch.manual_seed(OP_SEED);rng=random.Random(OP_SEED);model=shared.expand_parent_action_model(source)
+    model.requires_grad_(False);model.parent_action_head.requires_grad_(True)
+    encoded={}
+    with torch.no_grad():
+        for record in records+macro:
+            key=record['graph_key']
+            if key not in encoded:encoded[key]=model.encode_static(graphs[key])
+            record['rows']=model.parent_action_rows(graphs[key],encoded[key],record['inputs']).clone()
+    pairs=[(record,a,b) for record in records for a,b in record['pairs']]
+    initial=cmax_rank_accuracy(model,graphs,records)
+    op_save(dict(phase='parent_cmax_macro_preparation',instance='TRAIN_21',seed=OP_SEED,method='FROZEN_BASE_DIRECT_MACRO_IL',
+        status='PREPARED',b32_calls=0,payload=dict(coverage=coverage,preparation=preparation,initial=initial)))
+    optimizer=torch.optim.AdamW(model.parent_action_head.parameters(),lr=1e-4)
+    steps=checkpoint[PARENT_CMAX_VARIANT]['training']['history'][0]['updates']
+    started=time.perf_counter();history=[]
+    from torch.nn import functional as F
+    for epoch in range(10):
+        totals=Counter();model.train()
+        for _ in range(steps):
+            chosen=[rng.choice(pairs) for _ in range(16)];expert=[rng.choice(macro) for _ in range(16)]
+            optimizer.zero_grad(set_to_none=True);scores={};rank=[];il=[]
+            for record,better,worse in chosen:
+                ident=id(record)
+                if ident not in scores:scores[ident]=model.parent_action_head(record['rows']).squeeze(1)
+                value=scores[ident];rank.append(F.softplus(-(value[better]-value[worse])))
+            for e in expert:
+                logits=model.parent_action_head(e['rows']).squeeze(1)
+                il.append(-e['weight']*torch.log_softmax(logits,0)[e['target']])
+            rank_loss=torch.stack(rank).mean();il_loss=torch.stack(il).mean();loss=rank_loss+.1*il_loss
+            if not torch.isfinite(loss):raise ValueError('nonfinite direct macro imitation loss')
+            loss.backward();torch.nn.utils.clip_grad_norm_(model.parent_action_head.parameters(),1.,error_if_nonfinite=True);optimizer.step()
+            totals['loss']+=float(loss.detach());totals['rank']+=float(rank_loss.detach());totals['il']+=float(il_loss.detach())
+        result=dict(epoch=epoch+1,updates=steps,seconds=time.perf_counter()-started,
+            **{k:v/steps for k,v in totals.items()},training_pairs=cmax_rank_accuracy(model,graphs,records))
+        with torch.no_grad():result['macro_imitation_accuracy']=sum(int(model.parent_action_head(e['rows']).argmax())==e['target'] for e in macro)/len(macro)
+        history.append(result)
+        op_save(dict(phase='parent_cmax_macro_training',instance='TRAIN_21',seed=OP_SEED,method='RANK_PLUS_01_COMPLETE_IL',
+            status='EPOCH_COMPLETE',runtime_s=result['seconds'],b32_calls=0,payload=result))
+    if not all(torch.equal(v,model.state_dict()[k]) for k,v in source.state_dict().items()):
+        raise ValueError('the corrected proposal network must remain exactly frozen')
+    metadata=dict(initialization=OP_VARIANT,frozen_base=True,coverage=coverage,epochs=10,updates_per_epoch=steps,seed=OP_SEED,
+        learning_rate=1e-4,batch_size=16,gradient_clip=1.,losses=dict(rank=1.,complete_imitation=.1),
+        rank_pairs=len(pairs),history=history,initial=initial,training_seconds=time.perf_counter()-started,
+        new_teacher_b32_calls=0,new_counterfactual_b32_calls=0,training_geometries=21)
+    protected={k:{n:v.clone() for n,v in checkpoint[k]['state_dict'].items()} for k in
+        ('refinement_candidate',OP_VARIANT,EARLY_VARIANT,PARENT_CMAX_VARIANT)}
+    protected['root']={n:v.clone() for n,v in checkpoint['state_dict'].items()}
+    checkpoint[PARENT_MACRO_IL_VARIANT]=dict(model_type='ModeJointInsertionGNN',hidden_dim=64,heads=4,normalize_inputs=True,
+        opportunity_features=True,parent_action_features=True,use_dynamic_context=False,scientific_config=config.scientific_mapping(),
+        state_dict=model.state_dict(),training=metadata)
+    shared.save_neural_checkpoint(checkpoint,OP_CHECKPOINT)
+    saved=shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)
+    for key,values in protected.items():
+        actual=saved['state_dict'] if key=='root' else saved[key]['state_dict']
+        if not all(torch.equal(v,actual[k]) for k,v in values.items()):raise ValueError('historical weight branch changed')
+    op_save(dict(phase='parent_cmax_macro_model',instance='TRAIN_21',seed=OP_SEED,method=PARENT_MACRO_IL_VARIANT,
+        status='TRAINED',runtime_s=metadata['training_seconds'],b32_calls=0,payload=metadata))
+
+
+def op_parent_cmax_train():
+    shared,config,checkpoint,archive,teachers,_,_,_=op_sources()
+    if PARENT_CMAX_VARIANT in checkpoint:
+        print('Retain existing complete-action model; no repeated training.',flush=True);return
+    rows=op_read();data=[r for r in rows if r['phase']=='parent_cmax_counterfactual']
+    if len(data)!=63:raise ValueError('complete the 63 original early TRAIN states first')
+    graphs,examples,_,preparation=op_saved_imitation(shared,config,archive,teachers)
+    source=shared._model_from_checkpoint(checkpoint[OP_VARIANT]).eval()
+    records=cmax_compile(rows,source,graphs)
+    torch.manual_seed(OP_SEED);rng=random.Random(OP_SEED)
+    model=shared.expand_parent_action_model(source)
+    initial=cmax_rank_accuracy(model,graphs,records)
+    preparation.update(complete_parent_states=len(records),rank_pairs=initial['total'],
+        new_b32_calls=sum(int(r['b32_calls']) for r in data),head_parameters=sum(p.numel() for p in model.parent_action_head.parameters()))
+    op_save(dict(phase='parent_cmax_preparation',instance='TRAIN_21',seed=OP_SEED,method='COMPLETE_ACTION_RANK',
+        status='PREPARED',b32_calls=0,payload=dict(preparation=preparation,initial=initial)))
+    grouped={};ranked={}
+    for example in examples:grouped.setdefault(example['graph_key'][0],[]).append(example)
+    for record in records:
+        ranked.setdefault(record['graph_key'][0],[]).extend((record,a,b) for a,b in record['pairs'])
+    optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4);history=[];started=time.perf_counter()
+    for epoch in range(10):
+        model.train();keys=list(grouped);rng.shuffle(keys);totals=Counter();updates=0
+        for geometry in keys:
+            batch=list(grouped[geometry]);rng.shuffle(batch);pairs=ranked.get(geometry,[])
+            for offset in range(0,len(batch),16):
+                selected=[rng.choice(pairs) for _ in range(16)] if pairs else []
+                optimizer.zero_grad(set_to_none=True)
+                loss,parts=shared.opportunity_ranking_loss(model,graphs,batch[offset:offset+16],selected,
+                    complete_actions=True,imitation_weight=.1,load_weight=0.)
+                if not torch.isfinite(loss):raise ValueError('nonfinite complete-parent ranking loss')
+                loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
+                optimizer.step();updates+=1;totals['loss']+=float(loss.detach())
+                for k in ('il','rank'):totals[k]+=float(parts[k].detach())
+        result=dict(epoch=epoch+1,updates=updates,seconds=time.perf_counter()-started,
+            **{k:v/updates for k,v in totals.items()},training_pairs=cmax_rank_accuracy(model,graphs,records))
+        history.append(result)
+        op_save(dict(phase='parent_cmax_training',instance='TRAIN_21',seed=OP_SEED,method='PAIR_RANK_PLUS_01_IL',
+            status='EPOCH_COMPLETE',runtime_s=result['seconds'],b32_calls=0,payload=result))
+    protected={'root':checkpoint['state_dict']}
+    for key in ('refinement_candidate',OP_VARIANT,EARLY_VARIANT):protected[key]=checkpoint[key]['state_dict']
+    metadata=dict(seed=OP_SEED,epochs=10,learning_rate=1e-4,batch_size=16,gradient_clip=1.,losses=dict(rank=1.,imitation=.1,load=0.),
+        initialization=OP_VARIANT,preparation=preparation,initial=initial,history=history,
+        training_seconds=time.perf_counter()-started,training_geometries=21,development_geometries=8,
+        frozen_completion='original OP hierarchical greedy for every offline branch',candidate_parents='top4 + at most 2 legal qualification/load representatives',
+        children='2 legal structures per child, maximum 4 complete branches per split parent')
+    checkpoint[PARENT_CMAX_VARIANT]=dict(model_type='ModeJointInsertionGNN',hidden_dim=64,heads=4,normalize_inputs=True,
+        opportunity_features=True,parent_action_features=True,use_dynamic_context=False,scientific_config=config.scientific_mapping(),
+        state_dict=model.state_dict(),training=metadata)
+    shared.save_neural_checkpoint(checkpoint,OP_CHECKPOINT)
+    saved=shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)
+    for key,values in protected.items():
+        actual=saved['state_dict'] if key=='root' else saved[key]['state_dict']
+        if not all(torch.equal(v,actual[n]) for n,v in values.items()):raise ValueError('protected historical model changed')
+    op_save(dict(phase='parent_cmax_model',instance='TRAIN_21',seed=OP_SEED,method=PARENT_CMAX_VARIANT,
+        status='TRAINED',runtime_s=metadata['training_seconds'],b32_calls=0,payload=metadata))
+
+
+def op_parent_cmax_data():
+    """Reuse legacy labels; only ONE extra full-parent candidate may call B32."""
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_action_key
+    source=shared._model_from_checkpoint(shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)[OP_VARIANT]).eval()
+    rows=op_read();done={(r['instance'],r['payload']['fraction']) for r in rows if r['phase']=='parent_cmax_counterfactual'}
+    cache={}
+    for row in rows:
+        if row['phase'] not in ('counterfactual','early_counterfactual','parent_cmax_counterfactual'):continue
+        for o in row['payload'].get('outcomes',[]):
+            if o.get('complete'):cache[op_complete_key(o['complete'])]=o
+    for row in rows:
+        if row['phase']!='early_counterfactual':continue
+        payload=row['payload'];fraction=payload['fraction'];name=row['instance']
+        if (name,fraction) in done:continue
+        reference,graph,blocks,patterns,state=cmax_prefix(payload)
+        plans=cmax_plans(reference,graph,blocks,patterns,state,payload['prefix']['pending'],source)
+        outcomes=[];chosen=[];coverage=[];skipped=[];physical=0;started=time.perf_counter()
+        def complete(plan):
+            pending=tuple(p for p in payload['prefix']['pending'] if p!=plan['parent_id'])
+            return c.construct_or_repair_with_gnn(reference,plan['state'].routes,plan['state'].directions,pending,source,CONFIG)
+        # This loop NEVER schedules: either an exact existing completion is
+        # reproduced and its label reused, or the record is skipped explicitly.
+        for index,old in enumerate(payload['outcomes']):
+            action=op_action(old['action'])
+            matching=[p for p in plans if joint_action_key(p['actions'][0])==joint_action_key(action)]
+            coverage.append(dict(index=index,covered=bool(matching),
+                parent_covered=any(p['parent_id']==blocks[action.block_id].parent_id for p in plans),
+                strict_better=(index,0) in op_pair_labels(payload['outcomes']) and payload['outcomes'][0]['status']=='FEASIBLE'))
+            if not matching:continue
+            plan=max(matching,key=lambda p:p['child_log_probabilities'][-1] if len(p['actions'])==2 else p['score'])
+            result=complete(plan)
+            raw=None if result.solution is None else dict(solution=asdict(result.solution),directions=result.directions)
+            if raw is None or not old.get('complete') or op_complete_key(raw)!=op_complete_key(old['complete']):
+                skipped.append(dict(index=index,reason='legacy full continuation not reproduced'));continue
+            if cmax_action_key(plan) in {cmax_action_key(p) for p in chosen}:continue
+            chosen.append(plan)
+            outcomes.append(dict(actions=[asdict(a) for a in plan['actions']],status=old['status'],cmax=old['cmax'],
+                complete=raw,reused=True,b32_calls=0,origin='legacy'))
+        remaining=[p for p in plans if cmax_action_key(p) not in {cmax_action_key(v) for v in chosen}]
+        if remaining:
+            parents={p['parent_id'] for p in chosen};count=len(chosen[0]['actions']) if chosen else 1
+            # Exactly one extra candidate, favouring a new parent or a different
+            # WHOLE/split length. The unchanged B32 is called only below.
+            plan=max(remaining,key=lambda p:(p['parent_id'] not in parents,len(p['actions'])!=count,
+                -max(p['state'].loads),-p['state'].travel,p['score']))
+            result=complete(plan)
+            o=dict(actions=[asdict(a) for a in plan['actions']],status='CONSTRUCTION_FAILED',cmax=None,
+                   b32_calls=0,reused=False,origin='one_extra',failure=result.rejection_reason)
+            if result.solution is not None:
+                raw=dict(solution=asdict(result.solution),directions=result.directions);key=op_complete_key(raw);o['complete']=raw
+                if key in cache:o.update(status=cache[key]['status'],cmax=cache[key]['cmax'],reused=True)
+                else:
+                    candidate=pilot.oriented.schedule_explicit(result.solution,result.directions,CONFIG)
+                    physical=1;valid=candidate.schedule.status is ScheduleStatus.FEASIBLE
+                    o.update(status=candidate.schedule.status.value,cmax=candidate.schedule.cmax if valid else None,b32_calls=1)
+                    cache[key]=o
+            outcomes.append(o)
+        op_save(dict(phase='parent_cmax_counterfactual',instance=name,seed=OP_SEED,method='FULL_PARENT_FROZEN_OP_COMPLETION',
+            status='COLLECTED',runtime_s=time.perf_counter()-started,b32_calls=physical,payload=dict(fraction=fraction,
+                parents=payload['parents'],prefix=payload['prefix'],outcomes=outcomes,pairs=op_pair_labels(outcomes),
+                coverage=coverage,skipped=skipped,parent_candidates=len({p['parent_id'] for p in plans}),
+                complete_parent_candidates=len(plans))))
+
+
+def op_parent_cmax_evaluate(*,macro_imitation=False):
+    shared,config,_,_,_,_,entries,_=op_sources()
+    phase='parent_cmax_macro_evaluation' if macro_imitation else 'parent_cmax_evaluation'
+    coverage_phase='parent_cmax_macro_coverage' if macro_imitation else 'parent_cmax_coverage'
+    variant=PARENT_MACRO_IL_VARIANT if macro_imitation else PARENT_CMAX_VARIANT
+    rows=op_read();cache=op_evaluation_cache(rows)
+    done={(r['instance'],r['method']) for r in rows if r['phase']==phase}
+    for name,parents in sorted(entries.items()):
+        for method,source in (('ORIGINAL_GNN_MULTI3','NEW_GNN_MULTI3'),
+                              ('PARENT_JOINT_MULTI3','GNN_PARENT_JOINT_MULTI3'),('RULE/BEAM','RULE/BEAM')):
+            if (name,method) in done:continue
+            old=next(r for r in rows if r['phase']=='parent_evaluation' and r['instance']==name and r['method']==source)
+            op_save(dict(old,phase=phase,method=method,b32_calls=0,
+                payload=dict(old['payload'],reused=True,source_phase='parent_evaluation',source_method=source)))
+        if (name,'PARENT_CMAX_MULTI3') in done:continue
+        info=op_measure_decodes(shared,config,parents,variant,
+            ('parent_cmax','parent_cmax_sample','parent_cmax_sample'),cache)
+        op_save_measured(phase,name,'PARENT_CMAX_GREEDY',info,first_only=True)
+        op_save_measured(phase,name,'PARENT_CMAX_MULTI3',info)
+    if not any(r['phase']==coverage_phase for r in rows):
+        from mrta_search.lns import joint_action_key
+        source=shared._model_from_checkpoint(shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)[variant]).eval()
+        counts=Counter()
+        for row in rows:
+            if row['phase']!='early_counterfactual':continue
+            p=row['payload'];reference,graph,blocks,patterns,state=cmax_prefix(p)
+            plans=cmax_plans(reference,graph,blocks,patterns,state,p['prefix']['pending'],source)
+            for i,o in enumerate(p['outcomes']):
+                if (i,0) not in op_pair_labels(p['outcomes']) or p['outcomes'][0]['status']!='FEASIBLE':continue
+                action=op_action(o['action']);counts['strict_good']+=1
+                counts['parent_covered']+=any(v['parent_id']==blocks[action.block_id].parent_id for v in plans)
+                counts['action_covered']+=any(joint_action_key(v['actions'][0])==joint_action_key(action) for v in plans)
+        op_save(dict(phase=coverage_phase,instance='TRAIN_21',seed=OP_SEED,method='AFTER_TRAINING',
+            status='MEASURED',b32_calls=0,payload=dict(counts)))
+
+
+def op_parent_cmax_report():
+    import run_gnn_shared_construction as shared
+    rows=op_read();heading='## 2026-11-06 有界多样候选与完整父动作Cmax评分训练'
+    original=OP_REPORT.read_text(encoding='utf-8')
+    if heading in original:
+        print('Existing complete-action training report retained.',flush=True);return
+    checkpoint=shared.read_neural_checkpoint(OP_CHECKPOINT)
+    metadata=checkpoint[PARENT_CMAX_VARIANT]['training']
+    data=[r for r in rows if r['phase']=='parent_cmax_counterfactual']
+    outcomes=[o for r in data for o in r['payload']['outcomes']]
+    evaluation=[r for r in rows if r['phase']=='parent_cmax_evaluation']
+    table={(r['instance'],r['method']):r for r in evaluation}
+    methods=('ORIGINAL_GNN_MULTI3','PARENT_JOINT_MULTI3','PARENT_CMAX_MULTI3','RULE/BEAM')
+    names=sorted(n for n,m in table if m=='PARENT_CMAX_MULTI3')
+    if len(names)!=8 or any((n,m) not in table for n in names for m in methods):raise ValueError('finish the original eight development geometries')
+    good=lambda r:r['status']=='FEASIBLE' and r['cmax'] not in ('',None)
+    num=lambda v:'—' if v is None or v=='' else f'{float(v):.3f}'
+    def compare(baseline):
+        counts=Counter();changes=[]
+        for name in names:
+            a,b=table[name,'PARENT_CMAX_MULTI3'],table[name,baseline];fa,fb=good(a),good(b)
+            if fa and fb:
+                change=100*(float(b['cmax'])-float(a['cmax']))/float(b['cmax']);changes.append(change)
+                counts['win' if change>1e-8 else 'loss' if change< -1e-8 else 'tie']+=1
+            elif fa:counts['win']+=1
+            elif fb:counts['loss']+=1
+            else:counts['both_fail']+=1
+        return counts,len(changes),statistics.median(changes) if changes else None
+    lines=['',heading,'',
+        '**结论：新三候选仅4/8可行，原GNN为6/8、parent_joint为7/8；候选覆盖和训练排序改善没有转化为完整Cmax收益。**', '',
+        '本轮实际完成候选覆盖改进、32单元完整动作标量头、真实Cmax排序训练及原8几何B32验证。'
+        '工作区核查：DRL没有独立.git，所属根仓库为codex/project-cleanup、0935ad8，并非可核实的main。'
+        '未切换或重置含大量既有清理改动的根仓库，以当前与11月6日报告一致的DRL文件为实验基线。', '',
+        '### 候选与网络修改', '',
+        '复用joint_parent_action_candidates：保留GNN Top-4父，最多补两个真实合法资格/低负载代表父，最多6父、每子2动作、'
+        '每拆分父最多4完整组合。首子保留网络最佳，再优先不同机器人（以当前最大加工负载和原分数选代表），'
+        '无不同机器人则选不同位置，均不存在才保留方向变体。未新增合法性模型或强制平均负载，整父仍一次提交。',
+        '原18个已知严格Cmax优质替代：父覆盖7/18→18/18，完整父池内首动作覆盖4/18→18/18。'
+        '这里仅指已保存的代表动作，不是未知全动作空间覆盖率。',
+        '保留两层GAT、hidden=64、heads=4与原父/插入头。新增一个711→32→1完整父标量头（22817参数）。'
+        '输入复用父表示、两个有序子动作的块/机器人/前后邻居GAT表示及原20/49维特征；'
+        'WHOLE第二槽置零并掩码，另含动作后四机P/M、最大P、最大P+MOVE、总空走、同轨范围重叠和首点间隔。'
+        'WHOLE和拆分统一比较一个标量，不再把子动作log概率相加作为最终得分。零权重时不同子段数得分相同的测试通过。',
+        '保留旧greedy/sample/parent_joint入口；新入口为parent_cmax及parent_cmax_sample，三个提案都来自同一个新GNN完整动作头。'
+        '未加入ΔO、PPO、独立方向优化、Beam后处理或MODE_NEW/VNS/ALNS回退。'
+        '固定fixed_split_patterns()的模式搜索限制仍然存在，ScientificConfig、FORMAL_SCOPE_V2、0.50m与B32均未修改。', '',
+        '### 同状态标签与实际训练', '',
+        f'复用63个原TRAIN学生0%/10%/25%真实前缀，保存原路线、方向、已分配和剩余父任务。'
+        f'获得{len(outcomes)}个完整父动作结果，其中{sum(o["origin"]=="legacy" for o in outcomes)}个旧结果精确复现并复用，'
+        f'每状态最多补一个新完整父动作；新增B32 {sum(int(r["b32_calls"]) for r in data)}次，最大单状态新增'
+        f'{max(int(r["b32_calls"]) for r in data)}次，跳过旧结果{sum(len(r["payload"]["skipped"]) for r in data)}个。',
+        '所有候选从完全相同前缀提交完整父动作后，统一由冻结原OP分层greedy补全。相同完整方案和方向复用原B32；'
+        '没有将不同后续策略的Cmax直接混为标签，也没有重新生成教师。',
+        f'可行{sum(o["status"]=="FEASIBLE" for o in outcomes)}，DEADLOCK {sum(o["status"]=="DEADLOCK" for o in outcomes)}；'
+        f'{metadata["preparation"]["complete_parent_states"]}个状态形成{metadata["preparation"]["rank_pairs"]}个有效同状态对。'
+        '两个失败不排序，失败Cmax为空；无可比标签的状态保留但不编造监督。',
+        f'复用{metadata["preparation"]["teachers_reused"]}个完整教师动作、'
+        f'{metadata["preparation"]["prefix_continuations_reused"]}个既有延续和{metadata["preparation"]["imitation_examples"]}个IL样本，教师新B32为0。'
+        'L=softplus(−(score_better−score_worse))+0.1 IL，不使用负载/机会损失。'
+        f'从OP初始化，AdamW lr=1e-4、batch=16、clip=1、seed={OP_SEED}，固定10轮、614更新/轮；'
+        f'训练{num(metadata["training_seconds"])}秒。未按开发结果加训或挑epoch。',
+        f'相同TRAIN标签上，原完整概率分数正确{metadata["initial"]["legacy_correct"]}/{metadata["initial"]["total"]}，'
+        f'新头初始{metadata["initial"]["correct"]}/{metadata["initial"]["total"]}，'
+        f'第10轮{metadata["history"][-1]["training_pairs"]["correct"]}/{metadata["history"][-1]["training_pairs"]["total"]}。'
+        '这只是训练排序拟合，不能代替开发Cmax。',
+        '新权重保存在既有models/gnn_coordination_constructor_05.pt的独立parent_cmax_candidate；'
+        '保存后逐张量核对原顶层、refinement、opportunity与early分支均保留。没有新建文件。', '',
+        '### 原8个开发几何，seed=202611041', '',
+        '每个方法最多三个完整提案和三次B32。旧GNN三候选、原parent_joint三候选及符合三次预算的RULE结果复用，'
+        '新三候选为一次完整头贪心及两次温度1固定种子采样，无旧模型或规则回退。'
+        '8例均为已消费开发集，不称独立测试集。', '',
+        '|几何|'+'|'.join(methods)+'|','|---|'+'---:|'*len(methods)]
+    for name in names:lines.append('|'+name+'|'+'|'.join(num(table[name,m]['cmax']) for m in methods)+'|')
+    lines += ['', '|方法|可行/8|总时间中位/s|物理墙钟中位/s|本轮B32|', '|---|---:|---:|---:|---:|']
+    for method in methods:
+        rs=[table[n,method] for n in names]
+        actual=[r['payload'].get('actual_runtime_s') for r in rs]
+        lines.append(f'|{method}|{sum(good(r) for r in rs)}/8|{num(statistics.median(float(r["runtime_s"]) for r in rs))}|'
+            f'{num(statistics.median(actual) if all(v is not None for v in actual) else None)}|{sum(int(r["b32_calls"]) for r in rs)}|')
+    lines += ['', '新GNN总时间包括模型文件读取、实例化、全部图/候选构建、三次完整构造/采样和B32。'
+        '外部缓存命中计入原B32实测时长，同时保留本次物理墙钟；内部重复方案不重复调度。'
+        '旧parent_joint三候选时间是上轮实测分项组成值，不冒充本轮连续墙钟。', '',
+        '|新三候选对照|胜/平/负|双失败|双方可行/8|条件中位Cmax改善/%|','|---|---:|---:|---:|---:|']
+    for baseline in ('ORIGINAL_GNN_MULTI3','PARENT_JOINT_MULTI3','RULE/BEAM'):
+        counts,paired,change=compare(baseline)
+        lines.append(f'|{baseline}|{counts["win"]}/{counts["tie"]}/{counts["loss"]}|{counts["both_fail"]}|{paired}/8|{num(change)}|')
+    lines += ['', '胜负计入“可行优于失败”；两个失败单列，不伪造Cmax。改善为100×(baseline−NEW)/baseline，条件中位数明确列出有效配对数。', '',
+        '|新三候选几何|R0/R1/R2/R3加工负载|max(P+MOVE)|MOVE|WAIT|失败提案状态|','|---|---|---:|---:|---:|---|']
+    for name in names:
+        row=table[name,'PARENT_CMAX_MULTI3'];p=row['payload'];m=p.get('metrics',{})
+        lines.append(f'|{name}|'+(' / '.join(num(v) for v in m.get('loads',())) or '—')+
+            f'|{num(m.get("max_p_move"))}|{num(row.get("move"))}|{num(row.get("wait"))}|'+
+            ', '.join(a['status'] for a in p['attempts'] if a['status']!='FEASIBLE')+'|')
+    for row in rows:
+        if row['phase']=='parent_cmax_coverage':lines += ['', '训练后同一18个已知优质替代的候选覆盖：'+str(row['payload'])+'。']
+    reference={(r['instance'],r['method']):r for r in rows if r['phase']=='evaluation'}
+    lines += ['', '### WAG/HGA差距与实测结论', '',
+        'WAG/HGA取原同几何、同种子60秒终解，预算不同，只作距离参考，不能作为等预算优越性证据。']
+    for method in ('WAG','HGA'):
+        values=[];failed=0
+        for name in names:
+            new,old=table[name,'PARENT_CMAX_MULTI3'],reference[name,method]
+            if good(new) and good(old):values.append(100*(float(new['cmax'])/float(old['cmax'])-1))
+            elif not good(new):failed+=1
+        lines.append(f'新GNN相对{method}的双方可行Cmax中位差距为+{num(statistics.median(values) if values else None)}%'
+                     f'（{len(values)}/8，另有{failed}个新GNN失败）；原{method}运行中位{num(statistics.median(float(reference[n,method]["runtime_s"]) for n in names))}秒。')
+    # Diagnose the failed rollout using saved actions and the same TRAIN
+    # tensors; no additional complete construction or scheduler is needed.
+    source=shared._model_from_checkpoint(checkpoint[OP_VARIANT]);graphs={};records=cmax_compile(rows,source,graphs)
+    support=max(float(r['inputs']['parent_features'][:,:4].max()) for r in records)
+    from mrta_reference.solution import block_map
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    support_rows=[]
+    for name in names:
+        attempt=table[name,'PARENT_CMAX_GREEDY']['payload']['attempts'][0]
+        if not attempt.get('solution'):continue
+        solution,_,_,_,_=shared.research_restore(attempt,CONFIG)
+        blocks=block_map(solution,CONFIG,scope=FORMAL_SCOPE_V2)
+        scale=sum(CONFIG.process_time(b.length) for b in blocks.values());loads=[0.]*4;completed=0;snapshots={}
+        actions=attempt['actions'];targets={f:int(len(solution.parents)*f) for f in (.25,.5,.75)}
+        for i,a in enumerate(actions):
+            loads[a['robot']]+=CONFIG.process_time(blocks[a['block_id']].length)
+            if i+1==len(actions) or blocks[actions[i+1]['block_id']].parent_id!=blocks[a['block_id']].parent_id:
+                completed+=1
+                for fraction,target in targets.items():
+                    if completed==target:snapshots[str(fraction)]=max(loads)/scale
+        support_rows.append(dict(instance=name,normalized_max_processing=snapshots))
+    diagnosis=dict(training_prefix_max_normalized_processing=support,new_head_has_direct_expert_macro_imitation=False,
+        development_prefixes=support_rows,
+        above_training_range_at_half=sum(r['normalized_max_processing'].get('0.5',0.)>support for r in support_rows))
+    if not any(r['phase']=='parent_cmax_diagnosis' for r in rows):
+        op_save(dict(phase='parent_cmax_diagnosis',instance='TRAIN_AND_DEV',seed=OP_SEED,method='STATE_SUPPORT_AND_CANDIDATE_DRIFT',
+            status='ANALYZED',b32_calls=0,payload=diagnosis))
+    large=table['LARGE_04','PARENT_CMAX_MULTI3'];large_metrics=large['payload']['metrics']
+    lines += ['', '**本轮结论：候选覆盖和TRAIN排序拟合改善，完整构造质量却退化，不能替换原parent_joint。** '
+        '新三候选仅4/8可行，原GNN为6/8、parent_joint为7/8；未满足进入60秒完整求解比较的条件。'
+        '保留失败权重与全部24个提案，不追加采样、温度调参或重复训练。', '',
+        '原因已缩小到候选漂移和监督分布，而不是局部合法性或B32被改动：', '',
+        '- 候选漂移：训练前18/18父与18/18首动作覆盖，训练后仅16/18父、12/18首动作。'
+        '本轮联合更新共享GAT和旧父/子头，训练使用的旧候选集与新策略实际生成的候选集发生漂移。',
+        '- 评分监督不足：新完整头仅由48个0%/10%/25%状态的215个排序对训练；专家IL作用于原父/子头及共享编码器，'
+        '没有直接给新完整头提供全构造阶段的专家动作监督。不能把旧头的全轨迹IL当作新头也有后半程监督。',
+        f'- 状态范围：48个评分状态的最大归一化已分配负载为{support:.6f}；'
+        f'新贪心{diagnosis["above_training_range_at_half"]}/8个几何在50%父任务进度时已超过这一输入范围。'
+        '高TRAIN成对正确率没有检验新头在自身后半段路线状态上的行为。',
+        '- 标签策略差异：旧结果精确复现、相同起点/相同冻结OP续补和单次B32均通过；但标签衡量的是动作后交给旧OP贪心的结果，'
+        '正式推理后续由新完整头控制，实际续补策略与离线价值条件不相同。这是策略/状态分布差异，不是跨状态混排或虚假Cmax。',
+        f'- 真实瓶颈：LARGE_04的新可行返回max P={num(max(large_metrics["loads"]))}、'
+        f'max(P+MOVE)={num(large_metrics["max_p_move"])}、Cmax={num(large["cmax"])}；'
+        'MEDIUM_04和SMALL_02可行返回的Cmax等于P+MOVE，主要损失已来自机器人加工分配。'
+        'HIGH_WORKLOAD_02/04、LARGE_02和MEDIUM_02三个完整提案均DEADLOCK，暴露全局同轨协调失败。'
+        'SMALL_02贪心甚至只用R0/R2，说明覆盖候选并不阻止新头后续持续选择同一机器人。',
+        '下一步仍有必要研究GNN，但不值得原样重复本轮训练。应先保持候选生成稳定，'
+        '把已保存教师的完整父动作模仿直接作用到新评分头并覆盖完整构造阶段，再用新头自身状态/一致续补策略收集小量Cmax反馈。'
+        '这属于纠正监督覆盖和分布，不需要增加GAT层数、新调度器或新的机会损失。本轮没有提前叠加这些改动。']
+    for row in rows:
+        if row['phase']=='parent_cmax_verification':lines += ['',row['payload']['summary']]
+    lines += ['', '本轮未新增文件；代码、测试、CSV、模型容器及Markdown均复用已有文件。复现入口：', '',
+        '```powershell',"Set-Location 'D:\\pybullet_test\\MRTA_GA'",
+        "$env:PYTHONPATH = (Join-Path (Get-Location) 'DRL\\src')",
+        "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-cmax-data",
+        "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-cmax-train",
+        "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-cmax-eval",
+        "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B DRL/scripts/run_gnn_cmax_finetune.py --phase parent-cmax-report",'```','']
+    OP_REPORT.write_text(original+'\n'.join(lines),encoding='utf-8')
+    print('APPENDED',OP_REPORT,flush=True)
 
 
 def op_parent_evaluate():
@@ -1225,7 +1742,7 @@ def op_save_measured(phase,name,method,info,*,first_only=False):
 def op_evaluation_cache(rows):
     cache={}
     for row in rows:
-        if row['phase'] not in ('joint_evaluation','early_evaluation','parent_evaluation'):continue
+        if row['phase'] not in ('joint_evaluation','early_evaluation','parent_evaluation','parent_cmax_evaluation','parent_cmax_macro_evaluation'):continue
         for attempt in row['payload'].get('attempts',[]):
             if attempt.get('solution') and 'scheduler_seconds' in attempt:
                 cache[op_complete_key(attempt)]={k:attempt[k] for k in
@@ -2010,7 +2527,9 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
         'joint-eval','early-all','early-data','early-train','early-eval','early-report',
-        'delta-data','delta-report','parent-diagnose','parent-eval','parent-audit','parent-report'),default='op-all')
+        'delta-data','delta-report','parent-diagnose','parent-eval','parent-audit','parent-report',
+        'parent-cmax-data','parent-cmax-train','parent-cmax-eval','parent-cmax-report',
+        'parent-cmax-macro-train','parent-cmax-macro-eval'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
@@ -2022,6 +2541,18 @@ def main():
         op_parent_score_audit();return
     if args.phase=='parent-report':
         op_parent_report();return
+    if args.phase=='parent-cmax-data':
+        op_parent_cmax_data();return
+    if args.phase=='parent-cmax-train':
+        op_parent_cmax_train();return
+    if args.phase=='parent-cmax-eval':
+        op_parent_cmax_evaluate();return
+    if args.phase=='parent-cmax-report':
+        op_parent_cmax_report();return
+    if args.phase=='parent-cmax-macro-train':
+        op_parent_cmax_macro_train();return
+    if args.phase=='parent-cmax-macro-eval':
+        op_parent_cmax_evaluate(macro_imitation=True);return
     if args.phase=='delta-data':
         op_delta_analyze();return
     if args.phase=='delta-report':

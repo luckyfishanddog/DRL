@@ -41,7 +41,8 @@ def _model_from_checkpoint(checkpoint):
         raise ValueError('unknown joint construction model: '+str(kind))
     model=model_types[kind](checkpoint.get('hidden_dim',64),checkpoint.get('heads',4),
                            normalize_inputs=checkpoint.get('normalize_inputs',False),
-                           opportunity_features=checkpoint.get('opportunity_features',False))
+                           opportunity_features=checkpoint.get('opportunity_features',False),
+                           parent_action_features=checkpoint.get('parent_action_features',False))
     model.load_state_dict(checkpoint['state_dict'],strict=True)
     if kind in ('CoordinationJointInsertionGNN','ModeJointInsertionGNN'):
         model.use_dynamic_context=checkpoint.get('use_dynamic_context',True)
@@ -61,6 +62,10 @@ def _expand_neural_checkpoint(payload):
         full['opportunity_cmax_candidate']=dict(full['opportunity_cmax_candidate'],**metadata['opportunity_candidate'])
     if 'early_candidate' in metadata:
         full['early_cmax_candidate']=dict(full['early_cmax_candidate'],**metadata['early_candidate'])
+    if 'parent_cmax_candidate' in metadata:
+        full['parent_cmax_candidate']=dict(full['parent_cmax_candidate'],**metadata['parent_cmax_candidate'])
+    if 'parent_cmax_macro_il_candidate' in metadata:
+        full['parent_cmax_macro_il_candidate']=dict(full['parent_cmax_macro_il_candidate'],**metadata['parent_cmax_macro_il_candidate'])
     return full
 
 
@@ -74,10 +79,10 @@ def save_neural_checkpoint(checkpoint,path):
     import zlib
     checkpoint=_expand_neural_checkpoint(checkpoint)
     keep=('state_dict','model_type','hidden_dim','heads','normalize_inputs','use_dynamic_context',
-          'scientific_config','mode_head_before_calibration','opportunity_features')
+          'scientific_config','mode_head_before_calibration','opportunity_features','parent_action_features')
     def split(part):
         return ({k:v for k,v in part.items() if k in keep},
-                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate','early_cmax_candidate')})
+                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate','early_cmax_candidate','parent_cmax_candidate','parent_cmax_macro_il_candidate')})
     thin,main=split(checkpoint);metadata=dict(main=main)
     if 'refinement_candidate' in checkpoint:
         thin['refinement_candidate'],metadata['candidate']=split(checkpoint['refinement_candidate'])
@@ -85,6 +90,10 @@ def save_neural_checkpoint(checkpoint,path):
         thin['opportunity_cmax_candidate'],metadata['opportunity_candidate']=split(checkpoint['opportunity_cmax_candidate'])
     if 'early_cmax_candidate' in checkpoint:
         thin['early_cmax_candidate'],metadata['early_candidate']=split(checkpoint['early_cmax_candidate'])
+    if 'parent_cmax_candidate' in checkpoint:
+        thin['parent_cmax_candidate'],metadata['parent_cmax_candidate']=split(checkpoint['parent_cmax_candidate'])
+    if 'parent_cmax_macro_il_candidate' in checkpoint:
+        thin['parent_cmax_macro_il_candidate'],metadata['parent_cmax_macro_il_candidate']=split(checkpoint['parent_cmax_macro_il_candidate'])
     thin['research_archive']=zlib.compress(json.dumps(metadata,ensure_ascii=False,allow_nan=False,
                                                     separators=(',',':')).encode('utf-8'))
     thin['research_archive_format']='zlib-json'
@@ -1039,8 +1048,11 @@ def refinement_evaluate(model,previous_model,rows,config,training_keys):
     return results
 
 
-def opportunity_ranking_loss(model,graphs,imitation,ranking):
-    """0.5 IL + 1 pair rank + 0.1 existing soft load loss; no new head."""
+def opportunity_ranking_loss(model,graphs,imitation,ranking,*,complete_actions=False,imitation_weight=.5,load_weight=.1):
+    """Legacy defaults retained; complete_actions scores the new scalar head.
+
+    Complete-action training selects 1 rank + 0.1 IL and load_weight=0.
+    """
     from torch.nn import functional as F
     encoded={};joint_scores={};il=[];load=[];rank=[]
     def embedding(key):
@@ -1057,13 +1069,16 @@ def opportunity_ranking_loss(model,graphs,imitation,ranking):
         ident=id(state)
         if ident not in joint_scores:
             key=state['graph_key'];emb=embedding(key)
-            parent=torch.log_softmax(model.parent_logits(graphs[key],emb,state['parent_ids'],state['parent_features']),0)
-            scores=[];conditional={}
-            for action in state['options']:
-                p=action['parent_index']
-                if p not in conditional:
-                    conditional[p]=torch.log_softmax(model.joint_action_logits(emb,action['indices'],action['features']),0)
-                scores.append(parent[p]+conditional[p][action['action_index']])
+            if complete_actions:
+                scores=model.parent_action_scores(graphs[key],emb,state['inputs'])
+            else:
+                parent=torch.log_softmax(model.parent_logits(graphs[key],emb,state['parent_ids'],state['parent_features']),0)
+                scores=[];conditional={}
+                for action in state['options']:
+                    p=action['parent_index']
+                    if p not in conditional:
+                        conditional[p]=torch.log_softmax(model.joint_action_logits(emb,action['indices'],action['features']),0)
+                    scores.append(parent[p]+conditional[p][action['action_index']])
             joint_scores[ident]=scores
         scores=joint_scores[ident]
         rank.append(F.softplus(-(scores[better]-scores[worse])))
@@ -1071,7 +1086,7 @@ def opportunity_ranking_loss(model,graphs,imitation,ranking):
     il_loss=torch.stack(il).mean() if il else zero
     rank_loss=torch.stack(rank).mean() if rank else zero
     load_loss=torch.stack(load).mean() if load else zero
-    return .5*il_loss+rank_loss+.1*load_loss,dict(il=il_loss,rank=rank_loss,load=load_loss)
+    return imitation_weight*il_loss+rank_loss+load_weight*load_loss,dict(il=il_loss,rank=rank_loss,load=load_loss)
 
 
 def expand_opportunity_model(source):
@@ -1093,6 +1108,17 @@ def expand_opportunity_model(source):
                 target[:len(value)].copy_(value)
             else:raise ValueError('unexpected architecture change: '+name)
     model.use_dynamic_context=False
+    return model
+
+
+def expand_parent_action_model(source):
+    """Add only a small complete-action scalar head; retain every old tensor."""
+    from mrta_search.gnn_constructor import ModeJointInsertionGNN
+    model=ModeJointInsertionGNN(source.hidden_dim,source.heads,normalize_inputs=source.normalize_inputs,
+        opportunity_features=source.opportunity_features,parent_action_features=True)
+    with torch.no_grad():
+        for name,value in source.state_dict().items():model.state_dict()[name].copy_(value)
+    model.use_dynamic_context=source.use_dynamic_context
     return model
 
 

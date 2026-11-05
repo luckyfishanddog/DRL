@@ -15,6 +15,155 @@ if str(SCRIPT_DIR) not in sys.path:
 import run_gnn_construct_vns_pilot as pilot_script
 
 
+def test_diverse_child_pool_keeps_a_different_robot_then_position():
+    from types import SimpleNamespace as NS
+    from mrta_search.gnn_constructor import diverse_child_indices
+    variants=[(NS(loads=(10.,0.,0.,0.)),NS(robot=r,position=p,direction=d))
+              for r,p,d in ((0,0,0),(0,0,1),(0,1,0),(1,0,0))]
+    logits=torch.tensor([4.,3.,2.,1.])
+    assert diverse_child_indices(variants,logits)==(0,3)
+    assert diverse_child_indices(variants[:3],logits[:3])==(0,2)
+    assert diverse_child_indices(variants,logits,limit=1)==(0,)
+
+
+def test_diverse_parent_pool_preserves_top_four_and_adds_bounded_legal_representatives():
+    from mrta_search import gnn_constructor as c
+    parents=tuple(ParentWeld(p,(x,9.),(x+1.,9.)) for p,x in (('a',1.),('b',4.),('c',7.),('d',10.)))+(
+        ParentWeld('e',(12.,9.),(13.,9.)),ParentWeld('z',(2.,3.),(17.,3.)),ParentWeld('y',(3.,6.),(4.,6.)))
+    ref=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+    _,blocks,patterns=c.joint_graph(ref,CONFIG)
+    pending=tuple(p.parent_id for p in ref.parents);state=c.joint_start_state(ref,((),)*4,((),)*4,pending,blocks,CONFIG)
+    ids,_=c.joint_parent_inputs(state,pending,blocks,patterns,CONFIG)
+    values=torch.tensor([10.-i for i in range(len(ids))])
+    selected=c.diverse_parent_indices(state,ids,values,blocks,patterns,CONFIG)
+    assert selected[:4]==(0,1,2,3) and len(selected)<=6
+    assert ids.index('z') in selected and len(set(selected))==len(selected)
+
+
+def test_complete_action_head_is_length_neutral_at_zero_and_rank_reaches_existing_gat():
+    import run_gnn_shared_construction as shared
+    import run_gnn_cmax_finetune as study
+    from mrta_search import gnn_constructor as c
+    torch.manual_seed(17)
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('cross',(10.,9.),(10.,3.)))
+    ref=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+    graph,blocks,patterns=c.joint_graph(ref,CONFIG);pending=tuple(p.parent_id for p in ref.parents)
+    state=c.joint_start_state(ref,((),)*4,((),)*4,pending,blocks,CONFIG)
+    source=c.ModeJointInsertionGNN(16,4,opportunity_features=True)
+    model=shared.expand_parent_action_model(source)
+    assert all(torch.equal(v,model.state_dict()[k]) for k,v in source.state_dict().items())
+    plans=study.cmax_plans(ref,graph,blocks,patterns,state,pending,source)
+    inputs=c.parent_action_inputs(graph,state,plans,blocks,CONFIG)
+    assert set(inputs['child_mask'].sum(1).tolist())=={1.,2.}
+    record=dict(graph_key='g',inputs=inputs)
+    loss,parts=shared.opportunity_ranking_loss(model,{'g':graph},[],[(record,0,len(plans)-1)],
+        complete_actions=True,imitation_weight=.1,load_weight=0.)
+    assert torch.equal(loss,parts['rank'])
+    loss.backward()
+    for prefix in ('layer1','layer2','parent_action_head'):
+        assert sum(float(p.grad.abs().sum()) for n,p in model.named_parameters() if n.startswith(prefix+'.') and p.grad is not None)>0
+    with torch.no_grad():
+        for parameter in model.parent_action_head.parameters():parameter.zero_()
+        scores=model.parent_action_scores(graph,model.encode_static(graph),inputs)
+    assert torch.equal(scores,torch.zeros(len(plans)))
+
+
+def test_complete_action_model_archive_retains_old_weights_and_new_head():
+    import io
+    import run_gnn_shared_construction as shared
+    from mrta_search.gnn_constructor import ModeJointInsertionGNN
+    source=ModeJointInsertionGNN(16,4,opportunity_features=True);model=shared.expand_parent_action_model(source)
+    base=dict(model_type='ModeJointInsertionGNN',hidden_dim=16,heads=4,normalize_inputs=True,opportunity_features=True,
+              use_dynamic_context=False,state_dict=source.state_dict())
+    payload=dict(base,parent_cmax_candidate=dict(base,parent_action_features=True,state_dict=model.state_dict(),training=dict(epochs=10)),
+        parent_cmax_macro_il_candidate=dict(base,parent_action_features=True,state_dict=model.state_dict(),training=dict(frozen_base=True)))
+    stream=io.BytesIO();shared.save_neural_checkpoint(payload,stream);stream.seek(0)
+    full=shared.read_neural_checkpoint(stream)
+    assert full['parent_cmax_candidate']['training']==dict(epochs=10)
+    assert full['parent_cmax_macro_il_candidate']['training']==dict(frozen_base=True)
+    stream.seek(0);thin=shared.read_neural_checkpoint(stream,include_research=False)
+    loaded=shared._model_from_checkpoint(thin['parent_cmax_candidate'])
+    assert loaded.parent_action_features and 'training' not in thin['parent_cmax_candidate']
+    assert all(torch.equal(v,thin['state_dict'][k]) for k,v in source.state_dict().items())
+    assert all(torch.equal(v,loaded.state_dict()[k]) for k,v in model.state_dict().items())
+    corrected=shared._model_from_checkpoint(thin['parent_cmax_macro_il_candidate'])
+    assert all(torch.equal(v,corrected.state_dict()[k]) for k,v in model.state_dict().items())
+
+
+def test_direct_macro_imitation_replays_both_children_and_only_trains_scalar_head():
+    from dataclasses import asdict
+    import run_gnn_cmax_finetune as study
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    torch.manual_seed(17)
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('cross',(10.,9.),(10.,3.)))
+    reference=c.joint_geometry(parents,c.fixed_split_patterns(parents,CONFIG),CONFIG)
+    source=c.ModeJointInsertionGNN(16,4,opportunity_features=True)
+    pending=tuple(p.parent_id for p in parents)
+    result=c.construct_or_repair_with_gnn(reference,((),)*4,((),)*4,pending,source,CONFIG)
+    assert result.solution is not None
+    graph,steps,_=c.prepare_joint_teacher_steps(reference,((),)*4,((),)*4,pending,
+        [asdict(a) for a in result.actions],CONFIG,include_opportunities=True)
+    key=study.op_graph_key(reference)
+    examples=[]
+    for step in steps:
+        target=torch.zeros(len(step['candidate_actions']));target[step['target']]=1.
+        examples.append(dict(kind='insertion',graph_key=key,step=step,target=target,weight=1.))
+    macro,coverage=study.cmax_expert_macro_examples(source,{key:graph},examples)
+    assert coverage['expert_macro_examples']==len(macro)==2
+    assert sorted(int(e['inputs']['child_mask'][e['target']].sum()) for e in macro)==[1,2]
+    assert max(e['progress'] for e in macro)==.5
+    model=shared.expand_parent_action_model(source)
+    model.requires_grad_(False);model.parent_action_head.requires_grad_(True)
+    optimizer=torch.optim.AdamW(model.parent_action_head.parameters(),lr=1e-4)
+    head_before={k:v.clone() for k,v in model.parent_action_head.state_dict().items()}
+    losses=[]
+    with torch.no_grad():
+        embedded=model.encode_static(graph)
+        cached=[model.parent_action_rows(graph,embedded,e['inputs']).clone() for e in macro]
+    for e,rows in zip(macro,cached):
+        scores=model.parent_action_head(rows).squeeze(1)
+        assert torch.equal(scores,model.parent_action_scores(graph,embedded,e['inputs']))
+        losses.append(-torch.log_softmax(scores,0)[e['target']])
+    torch.stack(losses).mean().backward();optimizer.step()
+    assert all(torch.equal(v,model.state_dict()[k]) for k,v in source.state_dict().items())
+    assert any(not torch.equal(v,model.parent_action_head.state_dict()[k]) for k,v in head_before.items())
+
+
+def test_complete_parent_feedback_never_reschedules_legacy_and_adds_at_most_one_b32(monkeypatch):
+    from dataclasses import asdict
+    from types import SimpleNamespace as NS
+    import run_gnn_cmax_finetune as study
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    reference=_joint_simple_reference();model=c.ModeJointInsertionGNN(16,4,opportunity_features=True)
+    ref=c.joint_geometry(reference.parents,reference.patterns,CONFIG)
+    pending=tuple(p.parent_id for p in ref.parents)
+    graph,blocks,patterns=c.joint_graph(ref,CONFIG)
+    state=c.joint_start_state(ref,((),)*4,((),)*4,pending,blocks,CONFIG)
+    actions=study.op_representative_actions(ref,state,pending,model,CONFIG,early=True)
+    outcomes=[]
+    for i,action in enumerate(actions):
+        result=c.construct_or_repair_with_gnn(ref,((),)*4,((),)*4,pending,model,CONFIG,forced_action=action)
+        assert result.solution is not None
+        outcomes.append(dict(action=asdict(action),status='FEASIBLE',cmax=100.+i,
+            complete=dict(solution=asdict(result.solution),directions=result.directions)))
+    row=dict(phase='early_counterfactual',instance='unit',payload=dict(fraction=0.,parents=[asdict(p) for p in ref.parents],
+        prefix=dict(routes=((),)*4,directions=((),)*4,pending=pending),outcomes=outcomes))
+    written=[];calls=[]
+    monkeypatch.setattr(study,'op_read',lambda:[row]);monkeypatch.setattr(study,'op_save',written.append)
+    monkeypatch.setattr(shared,'read_neural_checkpoint',lambda *a,**k:{study.OP_VARIANT:{}})
+    monkeypatch.setattr(shared,'_model_from_checkpoint',lambda *a:model)
+    def schedule(solution,directions,config):
+        calls.append((solution,directions))
+        return NS(schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100.))
+    monkeypatch.setattr(study.pilot.oriented,'schedule_explicit',schedule)
+    study.op_parent_cmax_data()
+    assert len(written)==1 and len(calls)<=1 and written[0]['b32_calls']==len(calls)
+    assert sum(o['origin']=='one_extra' for o in written[0]['payload']['outcomes'])<=1
+    assert all(o['reused'] and o['b32_calls']==0 for o in written[0]['payload']['outcomes'] if o['origin']=='legacy')
+
+
 def test_opportunity_counts_use_actual_rail_and_initial_head_legality():
     from mrta_reference.model import ParentWeld
     from mrta_search import gnn_constructor as c
