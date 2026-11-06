@@ -1,12 +1,12 @@
-"""Block-level GNN policy for fixed-split task assignment.
+"""GNN welding assignment and complete-parent route construction.
 
-This module deliberately does not depend on the historical candidate rankers.  The
-GAT encoder sees the actual welding blocks produced by the frozen first-round split
-rule, and the policy head scores eligible robots while an assignment is constructed.
+The fixed-pattern policies and the joint all-pattern constructor share the existing
+two-layer GAT and native legal insertion states. CompleteParentGNN scores mode,
+robot assignment, insertion positions and directions as a single atomic action.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 import math
 import time
@@ -1298,6 +1298,176 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
                              parent_candidate_limit=parent_candidate_limit,parent_action_observer=parent_action_observer,
                              parent_cmax=decode_mode.startswith('parent_cmax'),
                              diverse_candidates=diverse_candidates or decode_mode.startswith('parent_cmax'))
+
+
+class CompleteParentGNN(ModeJointInsertionGNN):
+    """Two existing GAT layers and one joint mode/assignment/insertion scorer."""
+
+    def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True,
+                 opportunity_features=True, parent_action_features=True):
+        super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,
+                         opportunity_features=opportunity_features, parent_action_features=True)
+        width=self.parent_action_head[0].in_features
+        self.parent_action_head=nn.Sequential(nn.Linear(width+12,32),nn.ReLU(),nn.Linear(32,1))
+
+    def parent_action_rows(self,graph,embeddings,inputs):
+        return torch.cat((super().parent_action_rows(graph,embeddings,inputs),inputs['mode_features']),1)
+
+
+def complete_parent_space(parents, config):
+    """Encode every legal pattern once; aliases distinguish alternative geometries.
+
+    Routes/actions retain native block IDs. Only GAT node IDs are namespaced,
+    so mutually exclusive modes never overwrite one another's geometry.
+    """
+    parents=tuple(sorted(parents,key=lambda p:p.parent_id))
+    catalog=build_legal_pattern_catalog(parents,config,FORMAL_SCOPE_V2)
+    nodes=[];indices={};options={}
+    for parent in parents:
+        for k,pattern in enumerate(catalog[parent.parent_id]):
+            children=blocks_for_pattern(parent,pattern,config)
+            options[pattern]=children
+            for child in children:
+                alias=f'{parent.parent_id}@{k}/{child.block_id}'
+                indices[pattern,child.block_id]=len(nodes)
+                nodes.append(replace(child,block_id=alias))
+    graph=build_block_robot_graph(nodes,tuple(p for ps in catalog.values() for p in ps),config,
+                                  include_parent_edges=True)
+    return dict(parents=parents,catalog=catalog,options=options,indices=indices,graph=graph)
+
+
+def complete_parent_view(space, selected):
+    patterns={p.parent_id:selected.get(p.parent_id,space['catalog'][p.parent_id][0]) for p in space['parents']}
+    blocks={b.block_id:b for p in patterns.values() for b in space['options'][p]}
+    index={b.block_id:space['indices'][p,b.block_id] for p in patterns.values() for b in space['options'][p]}
+    return replace(space['graph'],block_index=index),blocks,patterns
+
+
+def structural_child_indices(variants, *, limit):
+    """Bounded weight-independent representatives of robot, direction and position.
+
+    Preserve the cheapest exact neighbour configuration for each position and
+    direction, then round-robin robots/directions before filling by travel.
+    No teacher action or old policy logit participates in this selection.
+    """
+    order=sorted(range(len(variants)),key=lambda i:(variants[i][0].travel,i))
+    groups={}
+    for i in order:
+        a=variants[i][1]
+        groups.setdefault((a.robot,a.direction),[]).append(i)
+    chosen=[]
+    for depth in range(limit):
+        for key in sorted(groups):
+            values=groups[key]
+            # Distinct insertion positions before further neighbour variants.
+            positions={};rest=[]
+            for i in values:
+                position=variants[i][1].position
+                if position not in positions:positions[position]=i
+                else:rest.append(i)
+            spread=list(positions.values())+rest
+            if depth<len(spread):chosen.append(spread[depth])
+            if len(chosen)>=limit:return tuple(chosen)
+    return tuple(chosen)
+
+
+def complete_parent_candidates(space,state,pending,selected,config,*,first_limit=16,second_limit=8):
+    """Every unassigned parent/mode gets complete bounded sequential proposals.
+
+    WHOLE exposes its bounded insertion pool. Split branches retain at most
+    first_limit*second_limit actions, never the full child Cartesian product.
+    """
+    from .lns import joint_block_candidates
+    plans=[]
+    for parent in sorted(pending):
+        for pattern in space['catalog'][parent]:
+            graph,blocks,patterns=complete_parent_view(space,dict(selected,**{parent:pattern}))
+            children=space['options'][pattern]
+            scale=max(1.,sum(config.process_time(b.length) for b in blocks.values()))
+            moves=[sum(a) for a in state.arc_costs]
+            legal=_eligible_robots(children[0],config)
+            pf=torch.tensor([*(p/scale for p in state.loads),*(v/scale for v in moves),
+                sum(config.process_time(b.length) for b in children)/scale,
+                min(state.loads[r]+moves[r] for r in legal)/scale,len(pending)/len(patterns),len(children)/2,
+                *([0.]*8)],dtype=torch.float32)
+            branches=[(state,(),(),())]
+            for child_no,child in enumerate(children):
+                following=[]
+                for partial,actions,indices,features in branches:
+                    variants=joint_block_candidates(partial,child,pattern,blocks,config,insertion_limit=8)
+                    keep=(range(len(variants)) if len(children)==1 else
+                          structural_child_indices(variants,limit=first_limit if child_no==0 else second_limit))
+                    kept=tuple(variants[i] for i in keep)
+                    if not kept:continue
+                    ix,fs=joint_candidate_inputs(graph,partial,kept,blocks,config)
+                    fs=torch.cat((fs,torch.zeros(len(fs),8)),1)
+                    for i,(after,action) in enumerate(kept):
+                        following.append((after,actions+(action,),indices+(ix[i],),features+(fs[i],)))
+                branches=following
+            lengths=[b.length for b in children];processing=[config.process_time(v) for v in lengths]
+            mode=torch.tensor([float(pattern.kind is SplitKind.WHOLE),float(pattern.kind is SplitKind.Y_SPLIT),
+                float(pattern.kind is SplitKind.X_SPLIT),float(pattern.mandatory),pattern.t if pattern.t is not None else .5,
+                float(pattern.rail is Rail.UPPER),float(pattern.rail is Rail.LOWER),len(children)/2,
+                min(lengths)/sum(lengths),max(lengths)/sum(lengths),min(processing)/2500,max(processing)/2500])
+            mode_plans=[]
+            for after,actions,indices,features in branches:
+                plan=dict(parent_id=parent,pattern=pattern,state=after,actions=actions,
+                    child_indices=torch.stack(indices),child_features=torch.stack(features),parent_features=pf,mode_features=mode)
+                mode_plans.append(plan)
+            if mode_plans:
+                # Geometry-dependent final features use this mode's native blocks.
+                after_rows=parent_action_inputs(graph,state,mode_plans,blocks,config)['after_features']
+                for plan,row in zip(mode_plans,after_rows):plan['after_features']=row
+                plans.extend(mode_plans)
+    return tuple(plans)
+
+
+def complete_parent_inputs(plans):
+    """Collate exactly the same complete-action pool for training and decoding."""
+    n=len(plans);dim=plans[0]['child_features'].shape[1]
+    indices=torch.full((n,2,4),-1,dtype=torch.long);features=torch.zeros(n,2,dim);mask=torch.zeros(n,2)
+    for i,p in enumerate(plans):
+        k=len(p['actions']);indices[i,:k]=p['child_indices'];features[i,:k]=p['child_features'];mask[i,:k]=1
+    return dict(parent_ids=tuple(p['parent_id'] for p in plans),
+        parent_features=torch.stack([p['parent_features'] for p in plans]),child_indices=indices,
+        child_features=features,child_mask=mask,after_features=torch.stack([p['after_features'] for p in plans]),
+        mode_features=torch.stack([p['mode_features'] for p in plans]))
+
+
+def construct_complete_parent_gnn(parents,model,config,*,seed=None,space=None,state=None,selected=None,
+                                  pending=None,observer=None,forced_plan=None):
+    """Empty routes -> joint actions -> complete solution, with no other solver."""
+    from .lns import oriented_route_state
+    started=time.perf_counter();actions=[]
+    space=complete_parent_space(parents,config) if space is None else space
+    selected={} if selected is None else dict(selected)
+    pending={p.parent_id for p in parents}-set(selected) if pending is None else set(pending)
+    _,blocks,_=complete_parent_view(space,selected)
+    state=oriented_route_state(((),)*4,((),)*4,blocks,config) if state is None else state
+    generator=None if seed is None else torch.Generator().manual_seed(seed)
+    model.eval()
+    with torch.inference_mode():
+        embeddings=model.encode_static(space['graph'])
+        while pending:
+            plans=complete_parent_candidates(space,state,pending,selected,config)
+            if not plans:return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,'NO_COMPLETE_PARENT_ACTION',state)
+            context=model.contextualize_state(complete_parent_view(space,selected)[0],embeddings,state.routes,state.directions)
+            scores=model.parent_action_scores(space['graph'],context,complete_parent_inputs(plans))
+            if not torch.isfinite(scores).all():raise ValueError('NONFINITE_COMPLETE_PARENT_SCORE')
+            index=int(scores.argmax()) if generator is None else int(torch.multinomial(torch.softmax(scores,0),1,generator=generator))
+            best=plans[index] if forced_plan is None else forced_plan
+            if forced_plan is not None:
+                from .lns import joint_action_key
+                match=[p for p in plans if p['pattern']==best['pattern'] and tuple(map(joint_action_key,p['actions']))==tuple(map(joint_action_key,best['actions']))]
+                if len(match)!=1:raise ValueError('forced complete action is outside inference pool')
+                best=match[0];forced_plan=None
+            if observer is not None:observer(space,state,tuple(sorted(pending)),dict(selected),plans,best)
+            state=best['state'];selected[best['parent_id']]=best['pattern'];pending.remove(best['parent_id']);actions.extend(best['actions'])
+        solution=canonicalize(space['parents'],tuple(selected[p.parent_id] for p in space['parents']),
+            tuple(Route(r,state.routes[r]) for r in range(4)),config,scope=FORMAL_SCOPE_V2)
+        if tuple(r.block_ids for r in solution.routes)!=state.routes:
+            raise ValueError('complete joint action unexpectedly changed under canonicalization')
+        return JointCompletionResult(solution,state.directions,tuple(actions),time.perf_counter()-started,oriented_state=state)
 
 
 def rollout_joint_repair(reference, routes, directions, pending_parent_ids,

@@ -15,6 +15,99 @@ if str(SCRIPT_DIR) not in sys.path:
 import run_gnn_construct_vns_pilot as pilot_script
 
 
+def test_complete_parent_pool_covers_all_parents_and_legal_modes_without_policy_heads():
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import oriented_route_state
+    parents=_parents()
+    space=c.complete_parent_space(parents,CONFIG)
+    _,blocks,_=c.complete_parent_view(space,{})
+    state=oriented_route_state(((),)*4,((),)*4,blocks,CONFIG)
+    plans=c.complete_parent_candidates(space,state,{p.parent_id for p in parents},{},CONFIG)
+    assert {p['parent_id'] for p in plans}=={p.parent_id for p in parents}
+    assert {p['pattern'] for p in plans}=={p for ps in space['catalog'].values() for p in ps}
+    assert {p['pattern'].kind for p in plans}=={SplitKind.WHOLE,SplitKind.X_SPLIT,SplitKind.Y_SPLIT}
+    assert all(len(p['actions'])==(1 if p['pattern'].kind is SplitKind.WHOLE else 2) for p in plans)
+    assert all(len({a.block_id for a in p['actions']})==len(p['actions']) for p in plans)
+    assert not any(state.routes) and not any(state.loads)
+    for pattern in space['catalog']['mandatory']:
+        for block in space['options'][pattern]:
+            assert space['graph'].blocks[space['indices'][pattern,block.block_id]].start==block.start
+
+
+def test_complete_parent_second_child_uses_temporary_routes_and_failed_mode_is_not_committed(monkeypatch):
+    from mrta_search import gnn_constructor as c
+    from mrta_search import lns
+    parents=(ParentWeld('x',(0.,8.),(4.,8.)),)
+    space=c.complete_parent_space(parents,CONFIG)
+    _,blocks,_=c.complete_parent_view(space,{})
+    state=lns.oriented_route_state(((),)*4,((),)*4,blocks,CONFIG)
+    original=lns.joint_block_candidates;seen=[]
+    def reject_second(partial,child,pattern,*args,**kwargs):
+        if child.block_id.endswith('::1'):
+            seen.append(partial)
+            assert any('x::0' in route for route in partial.routes)
+            return ()
+        return original(partial,child,pattern,*args,**kwargs)
+    monkeypatch.setattr(lns,'joint_block_candidates',reject_second)
+    plans=c.complete_parent_candidates(space,state,('x',),{},CONFIG)
+    assert seen and all(p['pattern'].kind is SplitKind.WHOLE for p in plans)
+    assert state.routes==((),)*4
+
+
+def test_complete_parent_neural_mode_atomic_assignment_and_directions_enter_real_b32(monkeypatch):
+    from mrta_search import gnn_constructor as c
+    import run_joint_oriented_repair_pilot as direct
+    model=c.CompleteParentGNN(16,4)
+    def forbidden(*args):raise AssertionError('independent old policy head was called')
+    monkeypatch.setattr(model,'parent_logits',forbidden)
+    monkeypatch.setattr(model,'joint_action_logits',forbidden)
+    monkeypatch.setattr(model,'mode_logits',forbidden)
+    monkeypatch.setattr(model,'parent_action_scores',lambda graph,h,x:
+        x['mode_features'][:,2]*100-x['child_features'][:,:,19].sum(1))
+    observed=[]
+    result=c.construct_complete_parent_gnn((ParentWeld('x',(0.,8.),(4.,8.)),),model,CONFIG,
+        observer=lambda sp,s,pending,selected,plans,best:observed.append((s,pending,best)))
+    assert result.solution is not None and len(observed)==1
+    assert observed[0][0].routes==((),)*4 and observed[0][1]==('x',)
+    assert result.solution.patterns[0].kind is SplitKind.X_SPLIT
+    assert result.solution.routes[0].block_ids==('x::0',)
+    assert result.solution.routes[1].block_ids==('x::1',)
+    assert result.directions[:2]==((0,),(0,)) and len(result.actions)==2
+    assert direct.schedule_explicit(result.solution,result.directions,CONFIG).schedule.status is ScheduleStatus.FEASIBLE
+
+
+def test_complete_parent_scalar_gradients_reach_both_gat_layers_and_archive_roundtrips():
+    import io
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import oriented_route_state
+    model=c.CompleteParentGNN(16,4);space=c.complete_parent_space(_parents(),CONFIG)
+    _,blocks,_=c.complete_parent_view(space,{})
+    state=oriented_route_state(((),)*4,((),)*4,blocks,CONFIG)
+    plans=c.complete_parent_candidates(space,state,tuple(p.parent_id for p in _parents()),{},CONFIG)
+    inputs=c.complete_parent_inputs(plans)
+    scores=model.parent_action_scores(space['graph'],model.encode_static(space['graph']),inputs)
+    (-torch.log_softmax(scores,0)[0]).backward()
+    for prefix in ('layer1.','layer2.','parent_action_head.'):
+        assert any(p.grad is not None and torch.count_nonzero(p.grad) for n,p in model.named_parameters() if n.startswith(prefix))
+    branch=dict(model_type='CompleteParentGNN',hidden_dim=16,heads=4,normalize_inputs=True,
+                opportunity_features=True,parent_action_features=True,state_dict=model.state_dict(),
+                training=dict(epochs=10),feedback_state_dict=model.state_dict())
+    stream=io.BytesIO();shared.save_neural_checkpoint(dict(branch,complete_parent_candidate=branch),stream)
+    stream.seek(0);full=shared.read_neural_checkpoint(stream)
+    assert full['complete_parent_candidate']['training']==dict(epochs=10)
+    stream.seek(0);thin=shared.read_neural_checkpoint(stream,include_research=False)
+    loaded=shared._model_from_checkpoint(thin['complete_parent_candidate'])
+    assert all(torch.equal(v,loaded.state_dict()[k]) for k,v in model.state_dict().items())
+
+
+def test_complete_parent_cmax_pairs_only_use_true_same_state_feasible_values():
+    import run_gnn_cmax_finetune as study
+    outcomes=[dict(status='FEASIBLE',cmax=20.),dict(status='DEADLOCK',cmax=None),
+              dict(status='FEASIBLE',cmax=10.),dict(status='CONSTRUCTION_FAILED',cmax=None)]
+    assert study.complete_cmax_pairs(outcomes)==[(2,0)]
+
+
 def test_diverse_child_pool_keeps_a_different_robot_then_position():
     from types import SimpleNamespace as NS
     from mrta_search.gnn_constructor import diverse_child_indices
