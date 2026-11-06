@@ -437,7 +437,8 @@ class JointInsertionGNN(BlockAssignmentGNN):
     def parent_action_rows(self,graph,embeddings,inputs):
         """The same complete-action inputs, cacheable when the base is frozen."""
         if not self.parent_action_features:raise ValueError('complete parent scoring head is disabled')
-        parent=torch.stack([embeddings[graph.parent_block_indices[p]].mean(0) for p in inputs['parent_ids']])
+        pooled={p:embeddings[graph.parent_block_indices[p]].mean(0) for p in dict.fromkeys(inputs['parent_ids'])}
+        parent=torch.stack([pooled[p] for p in inputs['parent_ids']])
         indices=inputs['child_indices'];mask=inputs['child_mask']
         context=embeddings[indices.clamp_min(0)]*(indices>=0).unsqueeze(-1)
         context=context*mask[:,:,None,None]
@@ -1304,17 +1305,22 @@ class CompleteParentGNN(ModeJointInsertionGNN):
     """Two existing GAT layers and one joint mode/assignment/insertion scorer."""
 
     def __init__(self, hidden_dim=64, heads=4, *, normalize_inputs=True,
-                 opportunity_features=True, parent_action_features=True):
+                 opportunity_features=True, parent_action_features=True, remaining_workload_features=False):
         super().__init__(hidden_dim, heads, normalize_inputs=normalize_inputs,
                          opportunity_features=opportunity_features, parent_action_features=True)
         width=self.parent_action_head[0].in_features
-        self.parent_action_head=nn.Sequential(nn.Linear(width+12,32),nn.ReLU(),nn.Linear(32,1))
+        self.remaining_workload_features=remaining_workload_features
+        self.compact_parent_limit=6 if remaining_workload_features else None
+        self.parent_action_head=nn.Sequential(nn.Linear(width+12+4*int(remaining_workload_features),32),nn.ReLU(),nn.Linear(32,1))
 
     def parent_action_rows(self,graph,embeddings,inputs):
-        return torch.cat((super().parent_action_rows(graph,embeddings,inputs),inputs['mode_features']),1)
+        rows=torch.cat((super().parent_action_rows(graph,embeddings,inputs),inputs['mode_features']),1)
+        if self.remaining_workload_features:
+            rows=torch.cat((rows,inputs['remaining_eligible_workload']),1)
+        return rows
 
 
-def complete_parent_space(parents, config):
+def complete_parent_space(parents, config, *, compact=False):
     """Encode every legal pattern once; aliases distinguish alternative geometries.
 
     Routes/actions retain native block IDs. Only GAT node IDs are namespaced,
@@ -1333,7 +1339,43 @@ def complete_parent_space(parents, config):
                 nodes.append(replace(child,block_id=alias))
     graph=build_block_robot_graph(nodes,tuple(p for ps in catalog.values() for p in ps),config,
                                   include_parent_edges=True)
-    return dict(parents=parents,catalog=catalog,options=options,indices=indices,graph=graph)
+    space=dict(parents=parents,catalog=catalog,options=options,indices=indices,graph=graph)
+    if compact:
+        flexibility={};workload={}
+        for parent in parents:
+            classes={};flex=0
+            for pattern in catalog[parent.parent_id]:
+                row=[0.]*4;count=1
+                for child in options[pattern]:
+                    robots=((0 if pattern.rail is Rail.UPPER else 2)+int(child.block_id.endswith('::1')), ) if pattern.kind is SplitKind.X_SPLIT else _eligible_robots(child,config)
+                    count*=len(robots)
+                    work=config.process_time(child.length)/len(robots)
+                    for robot in robots:row[robot]+=work
+                flex+=count;classes.setdefault(pattern.kind,[]).append(row)
+            # Equal weight per mode KIND, then equal weight per cut in that kind.
+            workload[parent.parent_id]=tuple(sum(sum(row[r] for row in rows)/len(rows)
+                for rows in classes.values())/len(classes) for r in range(4))
+            flexibility[parent.parent_id]=flex
+        space.update(flexibility=flexibility,remaining_parent_workload=workload,
+            original_processing={p.parent_id:config.process_time(p.length) for p in parents})
+    return space
+
+
+def compact_parent_ids(space,pending,*,parent_limit=4):
+    """MRV + original-parent LPT; no learned parent head or mode cut count bias."""
+    if parent_limit not in (4,6):raise ValueError('compact parent limit must be 4 or 6')
+    count=parent_limit//2
+    scarce=sorted(pending,key=lambda p:(space['flexibility'][p],-space['original_processing'][p],p))[:count]
+    long=sorted(pending,key=lambda p:(-space['original_processing'][p],space['flexibility'][p],p))[:count]
+    return tuple(dict.fromkeys(scarce+long))
+
+
+def remaining_eligible_workload(space,pending):
+    """Category-averaged remaining eligibility shares, not a load lower bound."""
+    pending=tuple(sorted(pending))
+    work=[sum(space['remaining_parent_workload'][p][r] for p in pending) for r in range(4)]
+    total=sum(work)
+    return torch.tensor([w/total if total else 0. for w in work],dtype=torch.float32)
 
 
 def complete_parent_view(space, selected):
@@ -1371,7 +1413,8 @@ def structural_child_indices(variants, *, limit):
     return tuple(chosen)
 
 
-def complete_parent_candidates(space,state,pending,selected,config,*,first_limit=16,second_limit=8):
+def complete_parent_candidates(space,state,pending,selected,config,*,first_limit=16,second_limit=8,
+                               parent_limit=None,include_remaining_workload=False):
     """Every unassigned parent/mode gets complete bounded sequential proposals.
 
     WHOLE exposes its bounded insertion pool. Split branches retain at most
@@ -1379,7 +1422,9 @@ def complete_parent_candidates(space,state,pending,selected,config,*,first_limit
     """
     from .lns import joint_block_candidates
     plans=[]
-    for parent in sorted(pending):
+    parents=sorted(pending) if parent_limit is None else compact_parent_ids(space,pending,parent_limit=parent_limit)
+    remaining=remaining_eligible_workload(space,pending) if include_remaining_workload else None
+    for parent in parents:
         for pattern in space['catalog'][parent]:
             graph,blocks,patterns=complete_parent_view(space,dict(selected,**{parent:pattern}))
             children=space['options'][pattern]
@@ -1395,7 +1440,7 @@ def complete_parent_candidates(space,state,pending,selected,config,*,first_limit
                 following=[]
                 for partial,actions,indices,features in branches:
                     variants=joint_block_candidates(partial,child,pattern,blocks,config,insertion_limit=8)
-                    keep=(range(len(variants)) if len(children)==1 else
+                    keep=(range(len(variants)) if len(children)==1 and parent_limit is None else
                           structural_child_indices(variants,limit=first_limit if child_no==0 else second_limit))
                     kept=tuple(variants[i] for i in keep)
                     if not kept:continue
@@ -1413,6 +1458,7 @@ def complete_parent_candidates(space,state,pending,selected,config,*,first_limit
             for after,actions,indices,features in branches:
                 plan=dict(parent_id=parent,pattern=pattern,state=after,actions=actions,
                     child_indices=torch.stack(indices),child_features=torch.stack(features),parent_features=pf,mode_features=mode)
+                if remaining is not None:plan['remaining_eligible_workload']=remaining
                 mode_plans.append(plan)
             if mode_plans:
                 # Geometry-dependent final features use this mode's native blocks.
@@ -1428,18 +1474,23 @@ def complete_parent_inputs(plans):
     indices=torch.full((n,2,4),-1,dtype=torch.long);features=torch.zeros(n,2,dim);mask=torch.zeros(n,2)
     for i,p in enumerate(plans):
         k=len(p['actions']);indices[i,:k]=p['child_indices'];features[i,:k]=p['child_features'];mask[i,:k]=1
-    return dict(parent_ids=tuple(p['parent_id'] for p in plans),
+    result=dict(parent_ids=tuple(p['parent_id'] for p in plans),
         parent_features=torch.stack([p['parent_features'] for p in plans]),child_indices=indices,
         child_features=features,child_mask=mask,after_features=torch.stack([p['after_features'] for p in plans]),
         mode_features=torch.stack([p['mode_features'] for p in plans]))
+    if 'remaining_eligible_workload' in plans[0]:
+        result['remaining_eligible_workload']=torch.stack([p['remaining_eligible_workload'] for p in plans])
+    return result
 
 
 def construct_complete_parent_gnn(parents,model,config,*,seed=None,space=None,state=None,selected=None,
-                                  pending=None,observer=None,forced_plan=None):
+                                  pending=None,observer=None,forced_plan=None,parent_limit=None):
     """Empty routes -> joint actions -> complete solution, with no other solver."""
     from .lns import oriented_route_state
     started=time.perf_counter();actions=[]
-    space=complete_parent_space(parents,config) if space is None else space
+    if parent_limit is None:parent_limit=getattr(model,'compact_parent_limit',None)
+    compact=parent_limit is not None
+    space=complete_parent_space(parents,config,compact=compact) if space is None else space
     selected={} if selected is None else dict(selected)
     pending={p.parent_id for p in parents}-set(selected) if pending is None else set(pending)
     _,blocks,_=complete_parent_view(space,selected)
@@ -1449,7 +1500,8 @@ def construct_complete_parent_gnn(parents,model,config,*,seed=None,space=None,st
     with torch.inference_mode():
         embeddings=model.encode_static(space['graph'])
         while pending:
-            plans=complete_parent_candidates(space,state,pending,selected,config)
+            plans=complete_parent_candidates(space,state,pending,selected,config,
+                **dict(first_limit=8,second_limit=4,parent_limit=parent_limit,include_remaining_workload=True) if compact else {})
             if not plans:return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,'NO_COMPLETE_PARENT_ACTION',state)
             context=model.contextualize_state(complete_parent_view(space,selected)[0],embeddings,state.routes,state.directions)
             scores=model.parent_action_scores(space['graph'],context,complete_parent_inputs(plans))

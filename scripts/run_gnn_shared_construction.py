@@ -42,10 +42,15 @@ def _model_from_checkpoint(checkpoint):
     model=model_types[kind](checkpoint.get('hidden_dim',64),checkpoint.get('heads',4),
                            normalize_inputs=checkpoint.get('normalize_inputs',False),
                            opportunity_features=checkpoint.get('opportunity_features',False),
-                           parent_action_features=checkpoint.get('parent_action_features',False))
+                           parent_action_features=checkpoint.get('parent_action_features',False),
+                           **({'remaining_workload_features':checkpoint.get('remaining_workload_features',False)}
+                              if kind=='CompleteParentGNN' else {}))
     model.load_state_dict(checkpoint['state_dict'],strict=True)
     if kind in ('CoordinationJointInsertionGNN','ModeJointInsertionGNN'):
         model.use_dynamic_context=checkpoint.get('use_dynamic_context',True)
+    if kind=='CompleteParentGNN':
+        model.use_dynamic_context=checkpoint.get('use_dynamic_context',False)
+        model.compact_parent_limit=checkpoint.get('compact_parent_limit',model.compact_parent_limit)
     return model
 
 
@@ -68,6 +73,8 @@ def _expand_neural_checkpoint(payload):
         full['parent_cmax_macro_il_candidate']=dict(full['parent_cmax_macro_il_candidate'],**metadata['parent_cmax_macro_il_candidate'])
     if 'complete_parent_candidate' in metadata:
         full['complete_parent_candidate']=dict(full['complete_parent_candidate'],**metadata['complete_parent_candidate'])
+    if 'compact_workload_candidate' in metadata:
+        full['compact_workload_candidate']=dict(full['compact_workload_candidate'],**metadata['compact_workload_candidate'])
     return full
 
 
@@ -81,10 +88,11 @@ def save_neural_checkpoint(checkpoint,path):
     import zlib
     checkpoint=_expand_neural_checkpoint(checkpoint)
     keep=('state_dict','model_type','hidden_dim','heads','normalize_inputs','use_dynamic_context',
-          'scientific_config','mode_head_before_calibration','opportunity_features','parent_action_features','feedback_state_dict')
+          'scientific_config','mode_head_before_calibration','opportunity_features','parent_action_features','feedback_state_dict',
+          'remaining_workload_features','compact_parent_limit')
     def split(part):
         return ({k:v for k,v in part.items() if k in keep},
-                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate','early_cmax_candidate','parent_cmax_candidate','parent_cmax_macro_il_candidate','complete_parent_candidate')})
+                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate','early_cmax_candidate','parent_cmax_candidate','parent_cmax_macro_il_candidate','complete_parent_candidate','compact_workload_candidate')})
     thin,main=split(checkpoint);metadata=dict(main=main)
     if 'refinement_candidate' in checkpoint:
         thin['refinement_candidate'],metadata['candidate']=split(checkpoint['refinement_candidate'])
@@ -98,10 +106,28 @@ def save_neural_checkpoint(checkpoint,path):
         thin['parent_cmax_macro_il_candidate'],metadata['parent_cmax_macro_il_candidate']=split(checkpoint['parent_cmax_macro_il_candidate'])
     if 'complete_parent_candidate' in checkpoint:
         thin['complete_parent_candidate'],metadata['complete_parent_candidate']=split(checkpoint['complete_parent_candidate'])
+    if 'compact_workload_candidate' in checkpoint:
+        thin['compact_workload_candidate'],metadata['compact_workload_candidate']=split(checkpoint['compact_workload_candidate'])
     thin['research_archive']=zlib.compress(json.dumps(metadata,ensure_ascii=False,allow_nan=False,
                                                     separators=(',',':')).encode('utf-8'))
     thin['research_archive_format']='zlib-json'
     torch.save(thin,path)
+
+
+def expand_remaining_workload_model(source):
+    """Preserve every old coefficient; append four zero columns to the head."""
+    from mrta_search.gnn_constructor import CompleteParentGNN
+    model=CompleteParentGNN(source.hidden_dim,source.heads,normalize_inputs=source.normalize_inputs,
+        opportunity_features=source.opportunity_features,remaining_workload_features=True)
+    with torch.no_grad():
+        for name,value in source.state_dict().items():
+            target=model.state_dict()[name]
+            if name=='parent_action_head.0.weight' and target.shape!=value.shape:
+                target.zero_();target[:,:value.shape[1]].copy_(value)
+            else:target.copy_(value)
+    model.use_dynamic_context=source.use_dynamic_context
+    model.requires_grad_(False);model.parent_action_head.requires_grad_(True)
+    return model
 
 
 def load_model(path,*,variant=None):

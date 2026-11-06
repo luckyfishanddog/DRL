@@ -38,6 +38,7 @@ EARLY_VARIANT='early_cmax_candidate'
 PARENT_CMAX_VARIANT='parent_cmax_candidate'
 PARENT_MACRO_IL_VARIANT='parent_cmax_macro_il_candidate'
 COMPLETE_VARIANT='complete_parent_candidate'
+COMPACT_VARIANT='compact_workload_candidate'
 OP_SEED=20261104
 OP_EVAL_SEED=202611041  # Exact existing RULE/WAG/HGA pairs; no formal rerun.
 OP_FIELDS=('phase','instance','seed','method','status','cmax','runtime_s','b32_calls','loads','move','wait','robots','payload')
@@ -2896,6 +2897,408 @@ def complete_parent_report():
     print('COMPLETE_REPORT',feasible,'/8',train_b32+dev_b32,'B32',flush=True)
 
 
+def compact_imitation(shared,config,archive,teachers,source):
+    """Measure both prescribed MRV/LPT quotas; train only actual six-parent labels."""
+    from mrta_search import gnn_constructor as c
+    graphs,examples,_,preparation=op_saved_imitation(shared,config,archive,teachers)
+    raw,_=cmax_expert_macro_examples(source,graphs,examples,raw_only=True)
+    spaces={};records=[];counts=Counter();sizes=[];bins=Counter();elapsed=[]
+    for e in raw:
+        parents=e['reference'].parents
+        if parents not in spaces:spaces[parents]=c.complete_parent_space(parents,config,compact=True)
+        space=spaces[parents];parent=e['teacher_plan']['parent_id']
+        pattern=next(p for p in e['reference'].patterns if p.parent_id==parent)
+        selected={p.parent_id:p for p in e['reference'].patterns if p.parent_id not in e['pending']}
+        for limit in (4,6):
+            ids=c.compact_parent_ids(space,e['pending'],parent_limit=limit)
+            counts[f'parent_{limit}']+=int(parent in ids)
+            if limit==4 and parent not in ids:continue
+            tick=time.perf_counter()
+            plans=c.complete_parent_candidates(space,e['state'],e['pending'],selected,config,
+                first_limit=8,second_limit=4,parent_limit=limit,include_remaining_workload=True)
+            target=next((i for i,p in enumerate(plans) if p['pattern']==pattern and
+                         cmax_action_key(p)==cmax_action_key(e['teacher_plan'])),None)
+            counts[f'complete_{limit}']+=int(target is not None)
+            if limit==6:
+                elapsed.append(time.perf_counter()-tick);sizes.append(len(plans))
+                if target is not None:
+                    records.append(dict(space=space,inputs=c.complete_parent_inputs(plans),target=target,weight=e['weight']))
+                    bins[str(e['fraction'])]+=1
+    coverage=dict(total=len(raw),**dict(counts),expert_actions=len(records),prefix_bins=dict(bins),
+        candidate_min=min(sizes),candidate_median=statistics.median(sizes),candidate_max=max(sizes),
+        generation_seconds_median=statistics.median(elapsed),preparation=preparation,
+        decision='User selected six-parent experiment despite 50/126 teacher coverage; no offline injection')
+    return records,spaces,coverage
+
+
+def compact_training_geometries(spaces):
+    """Use actual seam-count clusters present in the retained TRAIN data."""
+    ordered=sorted(spaces,key=lambda parents:(len(parents),tuple(p.parent_id for p in parents)))
+    groups=(('SMALL',[p for p in ordered if len(p)<50]),
+            ('MEDIUM',[p for p in ordered if 50<=len(p)<63]),
+            ('LARGE',[p for p in ordered if len(p)>=63]))
+    if any(len(g)<2 for _,g in groups):raise ValueError('two actual TRAIN geometries per scale are required')
+    return [(label,parents,spaces[parents]) for label,group in groups for parents in (group[0],group[-1])]
+
+
+def compact_feedback(model,spaces,config,rows):
+    from mrta_search import gnn_constructor as c
+    # Reuse requires this exact prefix, action, full continuation AND config.
+    old=[r for r in rows if r['phase']=='compact_workload_feedback']
+    spent=sum(int(r['b32_calls'] or 0) for r in old)
+    records=[];physical=0;reuses=0;selection=[]
+    scientific=json.loads(json.dumps(config.scientific_mapping()))
+    for index,(scale,parents,space) in enumerate(compact_training_geometries(spaces)):
+        targets={0:0.,round(.1*len(parents)):.1};prefixes={};selection.append(dict(scale=scale,parents=len(parents)))
+        def observe(sp,state,pending,selected,plans,best):
+            progress=len(parents)-len(pending)
+            if progress in targets:prefixes[progress]=(state,pending,selected,plans,best)
+        trajectory=c.construct_complete_parent_gnn(parents,model,config,space=space,parent_limit=6,observer=observe)
+        if set(prefixes)!=set(targets):raise ValueError('compact policy did not reach both actual TRAIN prefixes')
+        with torch.no_grad():embedding=model.encode_static(space['graph'])
+        for target,fraction in targets.items():
+            state,pending,selected,plans,first=prefixes[target]
+            with torch.no_grad():
+                scores=model.parent_action_scores(space['graph'],embedding,c.complete_parent_inputs(plans))
+            ranking=sorted(range(len(plans)),key=lambda i:(-float(scores[i]),i))
+            def robots(p):return tuple(a.robot for a in p['actions'])
+            alternatives=[i for i in ranking if plans[i]['pattern']==first['pattern'] and robots(plans[i])!=robots(first)]
+            if not alternatives:alternatives=[i for i in ranking if robots(plans[i])!=robots(first)]
+            if not alternatives:alternatives=[i for i in ranking if cmax_action_key(plans[i])!=cmax_action_key(first) or plans[i]['pattern']!=first['pattern']]
+            if not alternatives:raise ValueError('two distinct complete actions unavailable at a required state')
+            chosen=(first,plans[alternatives[0]])
+            prefix=dict(routes=state.routes,directions=state.directions,pending=pending,
+                        selected_patterns=[asdict(p) for p in selected.values()])
+            normalized_prefix=json.loads(json.dumps(prefix))
+            outcomes=[];calls=0;tick=time.perf_counter();name=f'{scale}_TRAIN_{index:02d}'
+            for action_index,plan in enumerate(chosen):
+                # The greedy continuation from the empty route is also the
+                # exact A-branch continuation at every prefix on that path.
+                result=trajectory if action_index==0 else c.construct_complete_parent_gnn(parents,model,config,
+                    space=space,state=plan['state'],pending=set(pending)-{plan['parent_id']},
+                    selected=dict(selected,**{plan['parent_id']:plan['pattern']}),parent_limit=6)
+                action=dict(pattern=asdict(plan['pattern']),actions=[asdict(a) for a in plan['actions']])
+                action=json.loads(json.dumps(action))
+                outcome=dict(**action,status='CONSTRUCTION_FAILED',cmax=None,b32_calls=0,reason=result.rejection_reason)
+                if result.solution is not None:
+                    raw=dict(solution=asdict(result.solution),directions=result.directions)
+                    reused=None
+                    for row in old:
+                        p=row['payload']
+                        if p['scientific_config']!=scientific or p['prefix']!=normalized_prefix:continue
+                        for previous in p['outcomes']:
+                            if (previous.get('complete') and previous['pattern']==action['pattern'] and previous['actions']==action['actions']
+                                and op_complete_key(previous['complete'])==op_complete_key(raw)):reused=previous;break
+                        if reused:break
+                    if reused:
+                        outcome.update({k:reused[k] for k in ('status','cmax','scheduler_seconds','diagnostics','metrics')});reuses+=1
+                    else:
+                        if spent+physical>=24:raise ValueError('twenty-four compact TRAIN B32 calls exhausted')
+                        clock=time.perf_counter();candidate=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
+                        seconds=time.perf_counter()-clock;valid=candidate.schedule.status is ScheduleStatus.FEASIBLE
+                        metrics=op_route_metrics(raw,config)
+                        if valid:metrics.update(op_metrics(candidate,config))
+                        outcome.update(status=candidate.schedule.status.value,cmax=candidate.schedule.cmax if valid else None,
+                            scheduler_seconds=seconds,metrics=metrics,diagnostics=candidate.schedule.diagnostics,b32_calls=1)
+                        physical+=1;calls+=1
+                    outcome['complete']=raw
+                outcomes.append(outcome)
+            pairs=complete_cmax_pairs(outcomes)
+            records.append(dict(space=space,inputs=c.complete_parent_inputs(chosen),pairs=pairs))
+            if not any(r['instance']==name and r['payload']['fraction']==fraction for r in old):
+                op_save(dict(phase='compact_workload_feedback',instance=name,seed=OP_SEED,method='FROZEN_COMPACT_SAME_STATE_AB',
+                    status='COLLECTED',runtime_s=time.perf_counter()-tick,b32_calls=calls,payload=dict(
+                        scale=scale,fraction=fraction,progress=target/len(parents),parents=[asdict(p) for p in parents],
+                        scientific_config=scientific,prefix=prefix,outcomes=outcomes,pairs=pairs,
+                        same_parent_mode=chosen[0]['pattern']==chosen[1]['pattern'],
+                        different_robot_assignment=robots(chosen[0])!=robots(chosen[1]),
+                        completion_policy='frozen complete_parent_candidate with zero new columns and compact 6/8/4 decoding')))
+            print('COMPACT_FEEDBACK',name,fraction,[o['status'] for o in outcomes],'pairs',len(pairs),'calls',physical,flush=True)
+    return records,dict(states=len(records),actions=2*len(records),cmax_pairs=sum(len(r['pairs']) for r in records),
+        states_with_pairs=sum(bool(r['pairs']) for r in records),new_b32=physical,exact_reuses=reuses,geometries=selection)
+
+
+def compact_workload_train():
+    shared,config,checkpoint,archive,teachers,_,_,_=op_sources()
+    if COMPACT_VARIANT in checkpoint:
+        print('Retain existing compact model; do not retrain.',flush=True);return
+    torch.manual_seed(OP_SEED);rng=random.Random(OP_SEED)
+    source=shared._model_from_checkpoint(checkpoint[COMPLETE_VARIANT]).eval()
+    imitation,spaces,coverage=compact_imitation(shared,config,archive,teachers,source)
+    if not any(r['phase']=='compact_workload_coverage' for r in op_read()):
+        op_save(dict(phase='compact_workload_coverage',instance='TRAIN_21',seed=OP_SEED,method='MRV3_LPT3_CHILD8_4',
+            status='BELOW_90_PERCENT_RECORDED',b32_calls=0,payload=coverage))
+    model=shared.expand_remaining_workload_model(source)
+    frozen={k:v.clone() for k,v in model.state_dict().items() if not k.startswith('parent_action_head.')}
+    feedback_start=time.perf_counter();feedback,feedback_info=compact_feedback(model,spaces,config,op_read())
+    feedback_seconds=time.perf_counter()-feedback_start
+    encoded={}
+    with torch.no_grad():
+        for record in imitation+feedback:
+            space=record['space'];key=id(space)
+            if key not in encoded:encoded[key]=model.encode_static(space['graph'])
+            record['rows']=model.parent_action_rows(space['graph'],encoded[key],record['inputs']).clone()
+    pairs=[(r,a,b) for r in feedback for a,b in r['pairs']]
+    optimizer=torch.optim.AdamW(model.parent_action_head.parameters(),lr=1e-4);history=[];started=time.perf_counter()
+    for epoch in range(10):
+        totals=Counter();tick=time.perf_counter()
+        for _ in range(64):
+            optimizer.zero_grad(set_to_none=True)
+            il=torch.stack([-e['weight']*torch.log_softmax(model.parent_action_head(e['rows']).squeeze(1),0)[e['target']]
+                for e in (rng.choice(imitation) for _ in range(8))]).mean()
+            rank=torch.stack([F.softplus(-(model.parent_action_head(r['rows']).squeeze(1)[a]-
+                model.parent_action_head(r['rows']).squeeze(1)[b]))
+                for r,a,b in (rng.choice(pairs) for _ in range(8))]).mean() if pairs else il.new_zeros(())
+            loss=rank+.1*il
+            if not torch.isfinite(loss):raise ValueError('nonfinite compact head loss')
+            loss.backward();torch.nn.utils.clip_grad_norm_(model.parent_action_head.parameters(),1.,error_if_nonfinite=True);optimizer.step()
+            totals['loss']+=float(loss.detach());totals['cmax']+=float(rank.detach());totals['il']+=float(il.detach())
+        result=dict(epoch=epoch+1,updates=64,seconds=time.perf_counter()-tick,**{k:v/64 for k,v in totals.items()})
+        history.append(result)
+        op_save(dict(phase='compact_workload_training',instance='TRAIN_21',seed=OP_SEED,method='CMAX_PLUS_01_IL_HEAD_ONLY',
+            status='EPOCH_COMPLETE',runtime_s=result['seconds'],b32_calls=0,payload=result))
+    if not all(torch.equal(v,model.state_dict()[k]) for k,v in frozen.items()):raise ValueError('frozen encoder or scalers changed')
+    metadata=dict(seed=OP_SEED,initialization=COMPLETE_VARIANT,parent_limit=6,first_limit=8,second_limit=4,
+        coverage=coverage,feedback=feedback_info,epochs=10,updates_per_epoch=64,batch_size=8,learning_rate=1e-4,
+        losses=dict(cmax=1.,imitation=.1),training_seconds=time.perf_counter()-started,feedback_seconds=feedback_seconds,
+        history=history,encoder_frozen=True,normalization_frozen=True,new_columns_initialization='zero',new_teacher_b32=0)
+    old={'root':checkpoint['state_dict']}
+    old.update({k:v['state_dict'] for k,v in checkpoint.items() if isinstance(v,dict) and 'state_dict' in v})
+    checkpoint[COMPACT_VARIANT]=dict(model_type='CompleteParentGNN',hidden_dim=64,heads=4,normalize_inputs=True,
+        opportunity_features=True,parent_action_features=True,remaining_workload_features=True,compact_parent_limit=6,
+        use_dynamic_context=False,scientific_config=config.scientific_mapping(),state_dict=model.state_dict(),training=metadata)
+    shared.save_neural_checkpoint(checkpoint,OP_CHECKPOINT)
+    saved=shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)
+    for key,values in old.items():
+        actual=saved['state_dict'] if key=='root' else saved[key]['state_dict']
+        if not all(torch.equal(v,actual[n]) for n,v in values.items()):raise ValueError('historical branch changed')
+    op_save(dict(phase='compact_workload_model',instance='TRAIN_21',seed=OP_SEED,method=COMPACT_VARIANT,
+        status='TRAINED',runtime_s=metadata['training_seconds'],b32_calls=0,payload=metadata))
+
+
+def compact_workload_evaluate():
+    from mrta_search import gnn_constructor as c
+    shared,config,_,_,_,_,entries,_=op_sources();rows=op_read()
+    done={r['instance'] for r in rows if r['phase']=='compact_workload_evaluation'}
+    for name,parents in sorted(entries.items()):
+        if name in done:continue
+        started=time.perf_counter();thin=shared.read_neural_checkpoint(OP_CHECKPOINT,include_research=False)
+        model=shared._model_from_checkpoint(thin[COMPACT_VARIANT]).eval();load=time.perf_counter()-started
+        decisions=[]
+        def observe(space,state,pending,selected,plans,best):
+            decisions.append(dict(candidates=len(plans),parents=len({p['parent_id'] for p in plans}),
+                selected_parent=best['parent_id'],pattern=asdict(best['pattern']),loads=best['state'].loads,
+                remaining_eligible_workload=c.remaining_eligible_workload(space,pending).tolist()))
+        tick=time.perf_counter()
+        result=c.construct_complete_parent_gnn(parents,model,config,parent_limit=6,observer=observe)
+        construction=time.perf_counter()-tick;calls=0;metrics={};diagnostics=[];scheduler=0.;raw=None;cmax=None
+        status='CONSTRUCTION_FAILED'
+        if result.solution is not None:
+            raw=dict(solution=asdict(result.solution),directions=result.directions)
+            tick=time.perf_counter();candidate=pilot.oriented.schedule_explicit(result.solution,result.directions,config)
+            scheduler=time.perf_counter()-tick;calls=1;status=candidate.schedule.status.value
+            diagnostics=candidate.schedule.diagnostics;metrics=op_route_metrics(raw,config)
+            if candidate.schedule.status is ScheduleStatus.FEASIBLE:cmax=candidate.schedule.cmax;metrics.update(op_metrics(candidate,config))
+        op_save(dict(phase='compact_workload_evaluation',instance=name,seed=OP_EVAL_SEED,method='COMPACT_WORKLOAD_GNN_GREEDY',
+            status=status,cmax=cmax,runtime_s=time.perf_counter()-started,b32_calls=calls,**metrics,payload=dict(
+                source_variant=COMPACT_VARIANT,proposals=1,sampling=False,model_load_seconds=load,
+                construction_seconds=construction,scheduler_seconds=scheduler,metrics=metrics,complete=raw,
+                reason=result.rejection_reason,diagnostics=diagnostics,
+                wait_for_graph=candidate.schedule.wait_for_graph if result.solution is not None else (),
+                decisions=decisions,actions=[asdict(a) for a in result.actions])))
+
+
+def compact_single_baselines(rows,development):
+    """Use original single proposals; never relabel a multi-proposal winner."""
+    result={}
+    for phase,method,label in (('evaluation','NEW_GNN_GREEDY','ORIGINAL_GNN_GREEDY'),
+        ('parent_evaluation','GNN_PARENT_JOINT','PARENT_JOINT_GREEDY')):
+        result[label]={r['instance']:r for r in rows if r['phase']==phase and r['method']==method and r['seed']==str(OP_EVAL_SEED)}
+    rules={}
+    for name in result['ORIGINAL_GNN_GREEDY']:
+        saved=next(r for r in rows if r['phase']=='parent_evaluation' and r['method']=='RULE/BEAM' and r['instance']==name)
+        scheduled=saved['payload'].get('scheduled_proposals',[])
+        source=next(r for r in development if r['instance']==name and r['seed']==OP_EVAL_SEED and r['method']=='MODE_NEW')
+        detail=source['details'];attempts=detail.get('initial_attempts',[])
+        if scheduled:
+            first=scheduled[0];status=first['status'];cmax=first['cmax'];where='retained first scheduled proposal'
+        else:
+            scheduled_statuses=[a for a in attempts if a['status'] in {s.value for s in ScheduleStatus}]
+            status=scheduled_statuses[0]['status'] if scheduled_statuses else 'CONSTRUCTION_FAILED';cmax=None
+            where='retained initial attempt statuses; per-proposal Cmax unavailable'
+            if status=='FEASIBLE' and sum(a['status']=='FEASIBLE' for a in scheduled_statuses)==1:
+                cmax=detail['initial_state']['cmax'];where='only feasible attempt was proposal one, so retained winner is identical'
+        rules[name]=dict(status=status,cmax=cmax,runtime_s=None,source=where)
+    result['RULE_FIRST_PROPOSAL']=rules
+    return result
+
+
+def compact_route_overlap(raw,config):
+    """Read route geometry only; interval overlap does not establish collision."""
+    import run_gnn_shared_construction as shared
+    from mrta_reference.solution import block_map
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    solution,_,_,_,_=shared.research_restore(raw,config)
+    blocks=block_map(solution,config,scope=FORMAL_SCOPE_V2);spans=[]
+    for route in solution.routes:
+        xs=[x for b in route.block_ids for x in (blocks[b].start[0],blocks[b].end[0])]
+        spans.append((min(xs),max(xs)) if xs else None)
+    return [dict(pair=(left,right),left_span=spans[left],right_span=spans[right],overlap=
+        max(0.,min(spans[left][1],spans[right][1])-max(spans[left][0],spans[right][0]))
+        if spans[left] is not None and spans[right] is not None else 0.) for left,right in ((0,1),(2,3))]
+
+
+def compact_workload_report():
+    import run_gnn_shared_construction as shared
+    import re
+    from mrta_reference.model import ScientificConfig
+    heading='## 2026-11-06 剩余资格加权工作量与紧凑MRV/LPT联合构造'
+    if heading in OP_REPORT.read_text(encoding='utf-8'):
+        print('Retain existing compact report.',flush=True);return
+    rows=op_read();new={r['instance']:r for r in rows if r['phase']=='compact_workload_evaluation'}
+    if len(new)!=8:raise ValueError('finish all eight single-proposal DEV cases before reporting')
+    _,config,_,_,_,_,_,development=op_sources()
+    checkpoint=shared.read_neural_checkpoint(OP_CHECKPOINT);meta=checkpoint[COMPACT_VARIANT]['training']
+    baselines=compact_single_baselines(rows,development);names=sorted(new)
+    numeric=lambda r:r['status']=='FEASIBLE' and r['cmax'] not in (None,'')
+    number=lambda v:'—' if v in (None,'') else f'{float(v):.3f}'
+    def compare(old):
+        changes=[];count=Counter();missing=[]
+        for name in names:
+            a,b=new[name],old[name];fa=a['status']=='FEASIBLE';fb=b['status']=='FEASIBLE'
+            if fa and fb:
+                if not numeric(b):missing.append(name);continue
+                d=100*(float(b['cmax'])-float(a['cmax']))/float(b['cmax']);changes.append(d)
+                count['win' if d>1e-8 else 'loss' if d< -1e-8 else 'tie']+=1
+            elif fa:count['win']+=1
+            elif fb:count['loss']+=1
+            else:count['both_fail']+=1
+        return count,changes,missing
+    feedback=[r for r in rows if r['phase']=='compact_workload_feedback'];outcomes=[o for r in feedback for o in r['payload']['outcomes']]
+    calls_train=sum(int(r['b32_calls'] or 0) for r in feedback);calls_dev=sum(int(r['b32_calls'] or 0) for r in new.values())
+    feasible=sum(r['status']=='FEASIBLE' for r in new.values());coverage=meta['coverage']
+    construction=statistics.median(r['payload']['construction_seconds'] for r in new.values())
+    scheduler=statistics.median(r['payload']['scheduler_seconds'] for r in new.values())
+    total=statistics.median(float(r['runtime_s']) for r in new.values())
+    earlier={r['instance']:r for r in rows if r['phase']=='complete_parent_evaluation'}
+    previous_construction=statistics.median(r['payload']['attempts'][0]['construction_seconds'] for r in earlier.values())
+    old_coverage=checkpoint[COMPLETE_VARIANT]['training']['coverage']
+    comparable={label:compare(old) for label,old in baselines.items()}
+    parent_changes=comparable['PARENT_JOINT_GREEDY'][1];rule_changes=comparable['RULE_FIRST_PROPOSAL'][1]
+    goals=feasible>=7 and construction<=5 and parent_changes and statistics.median(parent_changes)>0 and rule_changes and not comparable['RULE_FIRST_PROPOSAL'][2] and statistics.median(rule_changes)>0
+    lines=['',heading,'',f'**实际单提案结果：{feasible}/8可行，完整构造中位{construction:.3f}s。'
+        +('满足本轮可核对的开发目标，仍需新独立数据验证。**' if goals else '未满足本轮全部目标，不进入正式独立实验。**'),'',
+        '本轮使用指定venv，在DRL内执行，CPU单线程。继续修改gnn_constructor.py、run_gnn_shared_construction.py、'
+        'run_gnn_cmax_finetune.py及既有测试；模型保存于既有checkpoint的compact_workload_candidate独立分支，'
+        'CSV与报告均追加，没有新建代码、数据、报告或中间文件。MODE_NEW、科学配置、FORMAL_SCOPE_V2、'
+        'min_child_length与delta_x/delta_y=0.50m、B32和既有135/162/500历史实验均未重跑或改写。','',
+        '### 紧凑构造与输入','',
+        '对每父按合法目录计算F_i=Σ_m Π_b |R_b|，X_SPLIT使用指定轨左右机器人的实际强制资格。'
+        '初始MRV2+LPT2去重，覆盖不足后按用户确认使用MRV3+LPT3去重，最多6父；'
+        'MRV同灵活性按原始父加工时间降序、再按ID稳定打破平局，LPT按父原始加工时间降序。'
+        '保留这些父的全部合法WHOLE/Y_SPLIT/X_SPLIT模式；每首子最多8个代表、第二子最多4个，'
+        '次子在首子后的真实临时路线中生成，最多32个拆分组合，WHOLE也限8。'
+        '完整模式、机器人、位置、方向仍由同一个完整动作头选择，整父原子提交，从空路线连续构造。'
+        '没有新父网络、独立mode_head、独立方向优化、概率连乘、随机采样或后处理补救。','',
+        '剩余工作量对每合法模式的各子段按w_b/|R_b|分给资格机器人，先平均同类别切点，再平均父的模式类别，'
+        '最后对全部剩余父求和并以同样平均方式的总加工时间归一化；四维和为1，空集合为0。'
+        '每父工作量和资格在几何构图时缓存，当前状态复用已有资格计算结果，不重复执行插入可行性查询。'
+        '这是机器人资格加权工作量分布，不是数学负载下界。','',
+        '保留两层GAT、hidden=64、heads=4及原图/机器人节点。完整头由723→32→1扩为727→32→1，'
+        '新增4列初始为0，全部旧列/偏置从complete_parent_candidate精确复制；只训练23329参数的完整头，'
+        '编码器、其余旧头和归一化张量保持不变。父表示在同一状态内只计算一次再复用，避免每个动作重复求同一父均值，'
+        '这一等价计算已用逐元素相等检查。','',
+        '### 教师覆盖、反馈与实际训练','',
+        f"旧126动作：4父覆盖{coverage['complete_4']}/126，6父覆盖{coverage['complete_6']}/126="
+        f"{100*coverage['complete_6']/126:.2f}%，未达到90%。6父父任务覆盖本身只有{coverage['parent_6']}/126；"
+        '其余损失不能靠增加子分支解决。用户明确选择沿用6父完成本轮，故仅训练真实入池的50个完整动作，'
+        '未把另外76个动作注入离线池，未扩大父池或筛掉覆盖失败。'
+        f"六个进度有效数量：{coverage['prefix_bins']}。复用76条教师重放、27条续补和9654条旧局部样本恢复这些标签，教师新增B32=0。",'',
+        f"同一126教师状态的完整池min/median/max={coverage['candidate_min']}/{coverage['candidate_median']}/{coverage['candidate_max']}，"
+        f"上一轮为{old_coverage['candidate_min']}/{old_coverage['candidate_median']}/{old_coverage['candidate_max']}。"
+        f"中位池缩小{100*(1-coverage['candidate_median']/old_coverage['candidate_median']):.2f}%；"
+        f"本轮候选生成中位{coverage['generation_seconds_median']:.6f}s/状态。",'',
+        f"实际TRAIN几何：{meta['feedback']['geometries']}。各取空路线和round(0.1N)个已完成父的真实前缀，共12状态。"
+        'A为冻结初始化模型的贪心动作，B优先保持相同父/模式而改变机器人组合，无该动作时才选其他完整动作。'
+        f"同父同模式{sum(r['payload']['same_parent_mode'] for r in feedback)}/12，不同机器人组合"
+        f"{sum(r['payload']['different_robot_assignment'] for r in feedback)}/12。全部分支使用同一个冻结模型和紧凑规则贪心续补。",'',
+        f"反馈结果{dict(Counter(o['status'] for o in outcomes))}，可行Cmax数{sum(o['status']=='FEASIBLE' for o in outcomes)}/24，"
+        f"有效同状态排序对{meta['feedback']['cmax_pairs']}、可排序状态{meta['feedback']['states_with_pairs']}/12。"
+        f"本轮新增TRAIN B32={calls_train}、DEV B32={calls_dev}，合计{calls_train+calls_dev}。"
+        '复用要求前缀、完整动作、完整续补路线/方向及科学配置都完全一致；本轮未精确命中可复用结果。'
+        'DEADLOCK没有数值Cmax，不与其他状态混排，也不将可行/失败伪装成数值Cmax差。','',
+        '固定10轮、64步/轮、batch=8、AdamW lr=1e-4、clip=1，L=L_Cmax+0.1L_IL。'
+        f"头部优化{meta['training_seconds']:.3f}s，反馈采集{meta['feedback_seconds']:.3f}s。"
+        +('由于0个有效排序对，实际L_Cmax始终为0，这次只有50动作模仿产生梯度，不能称为完成了有效Cmax排序学习。'
+          if not meta['feedback']['cmax_pairs'] else '仅使用上述真实同状态排序对，不使用旧OP或旧冻结模型标签。'),'',
+        '### 单提案DEV结果与比较口径','',
+        '固定seed=202611041，每几何只有一个确定性贪心完整方案，最多1次B32，无随机种子追加、epoch选择或旧算法回退。'
+        '原GNN单提案为现有evaluation/NEW_GNN_GREEDY，PARENT_JOINT为parent_evaluation/GNN_PARENT_JOINT，'
+        '它们分别只有3/8、5/8可行；历史6/8、7/8是三提案结果，不能当作单提案。','',
+        'RULE首提案尽量从已保存scheduled_proposals[0]恢复，其他只用原initial_attempts的首个实际B32状态。'
+        '若仅首提案可行，其原保存赢家Cmax就是首提案；若多个提案可行但只保存赢家，则首提案Cmax缺失。'
+        '没有重跑RULE、用多提案赢家代替首提案，或把缺失Cmax填0。', '',
+        '|几何|原GNN单提案|PARENT_JOINT单提案|RULE首提案|新GNN|构造/s|B32/s|总耗时/s|',
+        '|---|---:|---:|---:|---:|---:|---:|---:|']
+    for name in names:
+        r=new[name];rule=baselines['RULE_FIRST_PROPOSAL'][name]
+        rule_value='可行，Cmax未存' if rule['status']=='FEASIBLE' and not numeric(rule) else number(rule['cmax'])
+        lines.append('|'+name+'|'+ '|'.join(number(baselines[label][name]['cmax']) for label in ('ORIGINAL_GNN_GREEDY','PARENT_JOINT_GREEDY'))+
+            f"|{rule_value}|{number(r['cmax'])}|{number(r['payload']['construction_seconds'])}|{number(r['payload']['scheduler_seconds'])}|{number(r['runtime_s'])}|")
+    lines+=['','“—”为失败而无Cmax；“可行，Cmax未存”为旧记录缺失，不视为失败。','',
+        '|单提案方法|可行/8|构造中位/s|B32中位/s|总耗时中位/s|','|---|---:|---:|---:|---:|']
+    for label,old in baselines.items():
+        times=[float(r['runtime_s']) for r in old.values() if r.get('runtime_s') is not None]
+        lines.append(f"|{label}|{sum(r['status']=='FEASIBLE' for r in old.values())}/8|—|—|{number(statistics.median(times) if len(times)==8 else None)}|")
+    lines.append(f'|COMPACT_WORKLOAD_GNN_GREEDY|{feasible}/8|{construction:.3f}|{scheduler:.3f}|{total:.3f}|')
+    lines+=['','|新模型相对单提案|胜/平/负|双失败|可比Cmax配对|中位改善/%|共同可行但旧Cmax缺失|','|---|---:|---:|---:|---:|---|']
+    for label,(count,changes,missing) in comparable.items():
+        lines.append(f"|{label}|{count['win']}/{count['tie']}/{count['loss']}|{count['both_fail']}|{len(changes)}/8|"
+            f"{number(statistics.median(changes) if changes else None)}|{','.join(missing) or '无'}|")
+    lines+=['','改善=100×(old−new)/old；可行优于失败，双失败单列。RULE只在可恢复Cmax的配对上给出结果，'
+        '缺失的共同可行配对使其完整配对目标不能得到验证。','',
+        f'上一轮COMPLETE_PARENT_GNN的同一8例首个贪心构造中位{previous_construction:.3f}s，'
+        f'本轮{construction:.3f}s，按同为单提案计减少{100*(1-construction/previous_construction):.2f}%。'
+        '不把上一轮三提案115.963s与本轮单提案直接作为等预算加速比。','',
+        '补充历史三提案：ORIGINAL_GNN_MULTI3 6/8、PARENT_JOINT_MULTI3 7/8、RULE/BEAM最多三次B32 7/8、'
+        'COMPLETE_PARENT_GNN_MULTI3 3/8，总耗时中位分别4.195/3.850/3.213/119.292s；仅供补充，不替代上面的单提案比较。','',
+        '### 分配负载和同轨阻塞检查','',
+        '|几何|状态|R0/R1/R2/R3加工负载|max(P+MOVE)|','|---|---|---|---:|']
+    for name in names:
+        r=new[name];m=r['payload']['metrics']
+        lines.append(f"|{name}|{r['status']}|"+' / '.join(number(x) for x in m.get('loads',[]))+f"|{number(m.get('max_p_move'))}|")
+    lines+=['','失败方案的max(P+MOVE)仅为路线代理，不是失败Cmax。以下X区间是路线各任务几何端点的包络；'
+        '重叠仅表示共享空间使用，不能直接认定实际碰撞或DEADLOCK。操作编号B为该机器人路线中从0开始的块下标。']
+    for name in names:
+        r=new[name];p=r['payload']
+        if not p['complete']:continue
+        overlap=compact_route_overlap(p['complete'],config)
+        def interval(value):return '空' if value is None else f'[{value[0]:.3f},{value[1]:.3f}]'
+        spans='；'.join(f"R{x['pair'][0]}/R{x['pair'][1]}={interval(x['left_span'])}/{interval(x['right_span'])}，重叠{x['overlap']:.3f}m" for x in overlap)
+        lines+=['',f"- {name}（{r['status']}）：{spans}。"]
+        if r['status']=='DEADLOCK':
+            blocked=[d for d in p['diagnostics'] if 'blocked by' in d]
+            excerpts=[]
+            for d in blocked[:3]:
+                operations=re.findall(r'R[0-3]:B\d+:(?:MOVE|SETUP|WELD|POST)',d)
+                excerpts.append(d.split(' blocked by')[0]+' ← '+', '.join(operations[:3]))
+            lines.append(f"  原B32依赖：{p.get('wait_for_graph',[])}；实际阻塞操作摘录："+'；'.join(excerpts)+'.')
+    lines+=['','B32提供的wait_for_graph和blocked-by操作是实际返回的阻塞信息，未新增碰撞检测器或推导调度器未报告的时间依赖。'
+        '同轨区间重叠与操作阻塞需结合阅读，不能凭几何包络证明碰撞的确定原因。','',
+        '### 结论','',
+        '已完成紧凑MRV/LPT候选、类别平均的剩余资格工作量、头部冻结训练、小中大分层采样及单提案验证。'
+        '候选覆盖下降是明确代价，早期监督只剩0%进度4条、10%进度1条；若真实反馈无有效可行配对，'
+        '新特征只能通过这批稀疏专家标签学习，不能把24次调度包装成24个Cmax排序样本。',
+        ('本轮达到可核对开发目标，但仍须补齐公平RULE首提案资料并用新独立数据验证。' if goals else
+         '本轮不支持直接进入新的正式独立实验。保留模型和负结果；后续应先解决紧凑候选与专家监督不匹配、'
+         '同状态有效Cmax反馈不足的问题，不能通过增加种子、训练轮数或独立后处理制造改进。'),'',
+        '复现（工作目录DRL）：指定venv运行scripts/run_gnn_cmax_finetune.py，依次'
+        '`--phase compact-workload-train`、`--phase compact-workload-eval`、`--phase compact-workload-report`。'
+        '已有模型和DEV记录会保留，不重复训练或调度。','']
+    with OP_REPORT.open('a',encoding='utf-8') as stream:stream.write('\n'.join(lines))
+    print('COMPACT_REPORT',feasible,'/8','construction',construction,'B32',calls_train+calls_dev,flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
@@ -2903,10 +3306,16 @@ def main():
         'delta-data','delta-report','parent-diagnose','parent-eval','parent-audit','parent-report',
         'parent-cmax-data','parent-cmax-train','parent-cmax-eval','parent-cmax-report',
         'parent-cmax-macro-train','parent-cmax-macro-eval',
-        'complete-parent-coverage','complete-parent-train','complete-parent-eval','complete-parent-report'),default='op-all')
+        'complete-parent-coverage','complete-parent-train','complete-parent-eval','complete-parent-report',
+        'compact-workload-train','compact-workload-eval','compact-workload-report'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
+    if args.phase.startswith('compact-workload-'):
+        if args.phase=='compact-workload-train':compact_workload_train()
+        elif args.phase=='compact-workload-eval':compact_workload_evaluate()
+        else:compact_workload_report()
+        return
     if args.phase.startswith('complete-parent-'):
         if args.phase=='complete-parent-coverage':complete_parent_train(coverage_only=True)
         elif args.phase=='complete-parent-train':complete_parent_train()

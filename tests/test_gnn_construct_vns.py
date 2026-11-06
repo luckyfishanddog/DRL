@@ -15,6 +15,78 @@ if str(SCRIPT_DIR) not in sys.path:
 import run_gnn_construct_vns_pilot as pilot_script
 
 
+def test_compact_mrv_lpt_flexibility_observes_forced_x_robots_and_no_neural_parent_head():
+    from mrta_search import gnn_constructor as c
+    space=c.complete_parent_space(_parents(),CONFIG,compact=True)
+    for parent in _parents():
+        expected=0
+        for pattern in space['catalog'][parent.parent_id]:
+            possibilities=1
+            for child in space['options'][pattern]:
+                possibilities*=1 if pattern.kind is SplitKind.X_SPLIT else sum(robot_is_eligible(child,r,CONFIG) for r in range(4))
+            expected+=possibilities
+        assert space['flexibility'][parent.parent_id]==expected
+    ids=tuple(p.parent_id for p in _parents())
+    scarce=sorted(ids,key=lambda p:(space['flexibility'][p],-space['original_processing'][p],p))[:2]
+    long=sorted(ids,key=lambda p:(-space['original_processing'][p],space['flexibility'][p],p))[:2]
+    assert c.compact_parent_ids(space,ids)==tuple(dict.fromkeys(scarce+long))
+    assert len(c.compact_parent_ids(space,ids,parent_limit=6))<=6
+
+
+def test_remaining_workload_is_category_averaged_normalized_and_excludes_committed_parents():
+    from mrta_search import gnn_constructor as c
+    parents=(ParentWeld('upper',(2.,9.),(8.,9.)),ParentWeld('lower',(2.,3.),(3.,3.)))
+    space=c.complete_parent_space(parents,CONFIG,compact=True)
+    # Each real X cut uses R0/R1 exclusively, even when a child is reachable
+    # from more robots geometrically; WHOLE divides upper work equally.
+    patterns=space['catalog']['upper'];xs=[p for p in patterns if p.kind is SplitKind.X_SPLIT]
+    assert xs and {p.kind for p in patterns}=={SplitKind.WHOLE,SplitKind.X_SPLIT}
+    whole=CONFIG.process_time(6.)
+    left=sum(CONFIG.process_time(space['options'][p][0].length) for p in xs)/len(xs)
+    right=sum(CONFIG.process_time(space['options'][p][1].length) for p in xs)/len(xs)
+    expected=torch.tensor([(whole/2+left)/2,(whole/2+right)/2,0.,0.])
+    assert torch.allclose(torch.tensor(space['remaining_parent_workload']['upper']),expected)
+    assert torch.allclose(c.remaining_eligible_workload(space,('lower',)),torch.tensor([0.,0.,.5,.5]))
+    assert torch.isclose(c.remaining_eligible_workload(space,('upper','lower')).sum(),torch.tensor(1.))
+    assert torch.equal(c.remaining_eligible_workload(space,()),torch.zeros(4))
+
+
+def test_remaining_feature_expansion_preserves_old_scores_freezes_encoder_and_roundtrips():
+    import io
+    import run_gnn_shared_construction as shared
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import oriented_route_state
+    source=c.CompleteParentGNN(16,4)
+    model=shared.expand_remaining_workload_model(source)
+    space=c.complete_parent_space(_parents(),CONFIG,compact=True)
+    _,blocks,_=c.complete_parent_view(space,{})
+    state=oriented_route_state(((),)*4,((),)*4,blocks,CONFIG)
+    plans=c.complete_parent_candidates(space,state,tuple(p.parent_id for p in _parents()),{},CONFIG,
+        first_limit=8,second_limit=4,parent_limit=6,include_remaining_workload=True)
+    inputs=c.complete_parent_inputs(plans)
+    with torch.no_grad():
+        emb=model.encode_static(space['graph']);rows=model.parent_action_rows(space['graph'],emb,inputs).clone()
+        repeated=torch.stack([emb[space['graph'].parent_block_indices[p]].mean(0) for p in inputs['parent_ids']])
+        assert torch.equal(rows[:,:model.hidden_dim],repeated)
+        old=source.parent_action_scores(space['graph'],source.encode_static(space['graph']),inputs)
+        assert torch.allclose(model.parent_action_head(rows).squeeze(1),old,atol=1e-6)
+    assert torch.count_nonzero(model.parent_action_head[0].weight[:,-4:])==0
+    assert all(p.requires_grad==n.startswith('parent_action_head.') for n,p in model.named_parameters())
+    before={k:v.clone() for k,v in model.state_dict().items() if not k.startswith('parent_action_head.')}
+    optimizer=torch.optim.AdamW(model.parent_action_head.parameters(),lr=1e-4)
+    (-torch.log_softmax(model.parent_action_head(rows).squeeze(1),0)[0]).backward();optimizer.step()
+    assert all(torch.equal(v,model.state_dict()[k]) for k,v in before.items())
+    branch=dict(model_type='CompleteParentGNN',hidden_dim=16,heads=4,normalize_inputs=True,
+        opportunity_features=True,parent_action_features=True,remaining_workload_features=True,
+        compact_parent_limit=6,state_dict=model.state_dict(),training=dict(epochs=10))
+    stream=io.BytesIO();shared.save_neural_checkpoint(dict(branch,compact_workload_candidate=branch),stream)
+    stream.seek(0);full=shared.read_neural_checkpoint(stream)
+    assert full['compact_workload_candidate']['training']==dict(epochs=10)
+    stream.seek(0);thin=shared.read_neural_checkpoint(stream,include_research=False)
+    loaded=shared._model_from_checkpoint(thin['compact_workload_candidate'])
+    assert loaded.remaining_workload_features and all(torch.equal(v,loaded.state_dict()[k]) for k,v in model.state_dict().items())
+
+
 def test_complete_parent_pool_covers_all_parents_and_legal_modes_without_policy_heads():
     from mrta_search import gnn_constructor as c
     from mrta_search.lns import oriented_route_state
@@ -54,10 +126,11 @@ def test_complete_parent_second_child_uses_temporary_routes_and_failed_mode_is_n
     assert state.routes==((),)*4
 
 
-def test_complete_parent_neural_mode_atomic_assignment_and_directions_enter_real_b32(monkeypatch):
+@pytest.mark.parametrize('compact',(False,True))
+def test_complete_parent_neural_mode_atomic_assignment_and_directions_enter_real_b32(monkeypatch,compact):
     from mrta_search import gnn_constructor as c
     import run_joint_oriented_repair_pilot as direct
-    model=c.CompleteParentGNN(16,4)
+    model=c.CompleteParentGNN(16,4,remaining_workload_features=compact)
     def forbidden(*args):raise AssertionError('independent old policy head was called')
     monkeypatch.setattr(model,'parent_logits',forbidden)
     monkeypatch.setattr(model,'joint_action_logits',forbidden)
