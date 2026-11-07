@@ -944,9 +944,20 @@ class NominalRouteCoordination:
         """Update the one route changed by an insertion, including neighbor flips."""
         route = _nominal_route_templates(state, robot, blocks, config)
         templates = self.templates[:robot] + (route,) + self.templates[robot + 1:]
+        return self._with_templates(templates, (robot,), config)
+
+    def with_changed_routes(self, state: OrientedRouteState, robots: tuple[int, ...], blocks, config):
+        """For a split action, sweep each affected pair once on the final prefix."""
+        if len(robots) == 1:
+            return self.with_changed_route(state, robots[0], blocks, config)
+        templates = tuple(_nominal_route_templates(state, robot, blocks, config) if robot in robots else previous
+                          for robot, previous in enumerate(self.templates))
+        return self._with_templates(templates, robots, config)
+
+    def _with_templates(self, templates, robots, config):
         intervals = tuple(
             _nominal_pair_intervals(templates[a], templates[b], config, same_rail=a // 2 == b // 2)
-            if robot in (a, b) else previous
+            if a in robots or b in robots else previous
             for (a, b), previous in zip(_NOMINAL_ROBOT_PAIRS, self.pair_intervals)
         )
         return NominalRouteCoordination(templates, intervals)

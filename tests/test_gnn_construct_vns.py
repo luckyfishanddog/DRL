@@ -2921,3 +2921,63 @@ def test_joint_assignment_head_scores_all_and_only_eligible_tuples_with_one_stat
     _, updated = model.assignment_logits(space, embeddings, occupied, blocks, {'mandatory'}, CONFIG)
     assert not torch.allclose(updated, logits)
 
+
+def test_coarse_to_fine_gnn_uses_both_heads_to_assign_and_direct(monkeypatch):
+    from mrta_search import gnn_constructor as c
+    from run_joint_oriented_repair_pilot import schedule_explicit
+
+    parents = (ParentWeld('p', (2., 9.), (6., 9.)),)
+    model = c.CoarseToFineGNN()
+    coarse_width = model.policy[0].in_features
+    direction_column = coarse_width + 4 * 64 + 1
+    monkeypatch.setattr(model.policy, 'forward', lambda rows: 100. * rows[:, -12:-11])
+    monkeypatch.setattr(model.insertion_head, 'forward', lambda rows: rows[:, direction_column:direction_column + 1])
+    trace = []
+
+    def observe(state, blocks, selected, pending, nominal, ids, rows, order, plans, fine, logits, best):
+        assert state.routes == ((),) * 4 and selected == {} and pending == {'p'}
+        assert len(order) <= c.COARSE_ASSIGNMENT_LIMIT
+        assert len(plans) <= c.COARSE_ASSIGNMENT_LIMIT * c.FINE_INSERTION_LIMIT
+        trace.append(plans[best])
+
+    result = c.construct_coarse_to_fine_gnn(parents, model, CONFIG, observer=observe)
+    assert len(trace) == 1 and trace[0].actions == result.actions
+    assert c.parent_assignment_targets(result.solution, CONFIG)[0].robots == (1,)
+    assert result.directions == ((), (1,), (), ())
+    assert schedule_explicit(result.solution, result.directions, CONFIG).schedule.status is ScheduleStatus.FEASIBLE
+
+
+def test_coarse_to_fine_never_returns_a_partial_split(monkeypatch):
+    from mrta_search import gnn_constructor as c, lns
+
+    parents = (ParentWeld('cross', (2., 4.), (2., 8.)),)
+    space = c.parent_assignment_space(parents, CONFIG)
+    model = c.CoarseToFineGNN()
+    result = c.construct_coarse_to_fine_gnn(parents, model, CONFIG, space=space)
+    assert len(result.actions) == 2
+    labels = c.parent_assignment_targets(result.solution, CONFIG)
+    assert labels[0].pattern.kind is SplitKind.Y_SPLIT
+    assert labels[0] in space.action_index
+    original = lns.joint_block_candidates
+
+    def no_second(state, block, *args, **kwargs):
+        return () if block.block_id.endswith('::1') else original(state, block, *args, **kwargs)
+
+    monkeypatch.setattr(lns, 'joint_block_candidates', no_second)
+    failure = c.construct_coarse_to_fine_gnn(parents, model, CONFIG, space=space)
+    assert failure.solution is None and failure.actions == ()
+
+
+def test_coarse_to_fine_owner_slots_keep_capacity_and_offer_different_robots():
+    from mrta_search import gnn_constructor as c
+
+    parents = tuple(ParentWeld(f'p{i}', (i, 9.), (i + .6, 9.)) for i in range(10))
+    space = c.parent_assignment_space(parents, CONFIG)
+    ids = torch.arange(len(space.actions))
+    logits = torch.tensor([-int(a.parent_id[1:]) - 100 * a.robots[0] for a in space.actions], dtype=torch.float32)
+    original = [space.actions[i] for i in c.shortlist_assignments(space, ids, logits)]
+    expanded = [space.actions[i] for i in c.shortlist_assignments(space, ids, logits, owner_alternatives=True)]
+    assert len(original) == len(expanded) == c.COARSE_ASSIGNMENT_LIMIT
+    assert all(a.robots == (0,) for a in original)
+    assert {(a.parent_id, a.robots) for a in expanded if a.robots != (0,)} == {('p0', (1,)), ('p1', (1,))}
+

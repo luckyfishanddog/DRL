@@ -3646,6 +3646,9 @@ def residual_route_coverage():
 
 RESIDUAL_METHOD = 'REFLECTED_START_ROUTE_PROGRESS'
 RESIDUAL_VARIANT = 'route_progress_cmax_candidate'
+COARSE_MODEL = ROOT / 'models/gnn_coarse_to_fine_05.pt'
+COARSE_METHODS = ('COARSE_TO_FINE_GNN', 'COARSE_TO_FINE_NO_COORDINATION')
+COARSE_OWNER_METHOD = 'COARSE_TO_FINE_OWNER_SLOTS'
 
 
 def residual_feedback_model(shared, checkpoint):
@@ -4117,9 +4120,13 @@ def residual_coverage_report():
 
 
 def _certified_assignment_groups():
+    _, config, _, archive, teachers, _, _, _ = op_sources()
+    return config, _group_certified_assignments(teachers, archive, config)
+
+
+def _group_certified_assignments(teachers, archive, config):
     from mrta_search.gnn_constructor import parent_assignment_targets
 
-    _, config, _, archive, teachers, _, _, _ = op_sources()
     groups = defaultdict(list)
     for item, saved in zip(teachers, archive['replays']):
         if (item['instance'], item['teachers'], item['source_state'], item['seed'], item['cmax']) != (
@@ -4127,7 +4134,7 @@ def _certified_assignment_groups():
             raise ValueError('teacher source does not match its retained certification record')
         labels = parent_assignment_targets(item['solution'], config)
         groups[item['geometry_key']].append((item, labels))
-    return config, groups
+    return groups
 
 
 def assignment_diagnostic():
@@ -4301,6 +4308,399 @@ def assignment_route_diagnostic():
     print('ASSIGNMENT_ROUTE_SUMMARY', json.dumps(summary, allow_nan=False), flush=True)
 
 
+@torch.no_grad()
+def coarse_teacher_examples(model, prepared, teachers, archive, groups, config):
+    """Learn any retained teacher assignment for pending parents, plus directed replay actions."""
+    from itertools import groupby
+    from mrta_reference.model import SplitKind
+    from mrta_search import gnn_constructor as c, lns
+
+    coarse, fine, checks = {}, [], []
+    votes, bounds = {}, {}
+    empty = ((),) * 4
+    fractions = (0., .05, .1, .2, .25, .4, .5, .75)
+    coverage = Counter()
+
+    def coarse_example(parents, state, blocks, selected):
+        space, embeddings = prepared[parents]
+        key = (parents, state.routes, state.directions, tuple(sorted(selected.items())))
+        if key not in coarse:
+            ids, rows = model.assignment_rows(space, embeddings, state, blocks, set(space.parent_ids) - selected.keys(), config)
+            target = votes[parents][ids]
+            if target.sum() > 0:
+                coarse[key] = (ids, rows, target / target.sum())
+            else:
+                return ids, rows
+        return coarse[key][:2]
+
+    for group in groups.values():
+        parents = group[0][0]['solution'].parents
+        space, _ = prepared[parents]
+        vote = torch.zeros(len(space.actions))
+        best = min(item['cmax'] for item, _ in group)
+        for item, assignments in group:
+            for action in assignments:
+                rare = action.pattern.kind is not SplitKind.WHOLE and not action.pattern.mandatory
+                vote[space.action_index[action]] += best / item['cmax'] * (2. if rare else 1.)
+                coverage['teacher_assignment_labels'] += 1
+        votes[parents], bounds[parents] = vote, best
+        coarse_example(parents, lns.oriented_route_state(empty, empty, {}, config), {}, {})
+
+    for teacher, saved in zip(teachers, archive['replays']):
+        if not saved.get('actions'):
+            continue
+        solution = teacher['solution']
+        parents = solution.parents
+        space, embeddings = prepared[parents]
+        targets = {a.parent_id: a for a in c.parent_assignment_targets(solution, config)}
+        sampled = {round(f * len(parents)) for f in fractions}
+        state = lns.oriented_route_state(empty, empty, {}, config)
+        blocks, selected = {}, {}
+        for step, (parent, raw_actions) in enumerate(groupby(saved['actions'], key=lambda a: a['block_id'].rsplit('::', 1)[0])):
+            assignment = targets[parent]
+            pattern = assignment.pattern
+            children = {b.block_id: b for b in space.children[pattern]}
+            local_blocks = dict(blocks, **children)
+            after = state
+            for raw in raw_actions:
+                action = op_action(raw)
+                variants, _ = lns.oriented_insert_variants(after, children[action.block_id], action.robot,
+                    action.position, local_blocks, config, keep=8)
+                after = next(candidate for candidate, inserted in variants if inserted == action)
+            if step in sampled:
+                coverage['sampled_replay_prefixes'] += 1
+                index = space.action_index[assignment]
+                ids, rows = coarse_example(parents, state, blocks, selected)
+                row = torch.where(ids == index)[0]
+                checks.append((space, ids, rows, index))
+                plans = c.assignment_insertions(space, index, state, blocks, config)
+                matches = torch.tensor([p.state.routes == after.routes and p.state.directions == after.directions
+                                        for p in plans], dtype=torch.bool)
+                if row.numel() and matches.any():
+                    coverage['exact_fine_coverage'] += 1
+                    if not matches.all():
+                        nominal = lns.NominalRouteCoordination.from_state(state, blocks, config)
+                        fine_rows, _ = c.assignment_insertion_rows(space, embeddings, state, blocks, selected, nominal,
+                            plans, rows[row].expand(len(plans), -1), config)
+                        rare = pattern.kind is not SplitKind.WHOLE and not pattern.mandatory
+                        fine.append((fine_rows, matches, bounds[parents] / teacher['cmax'] * (2. if rare else 1.)))
+                        coverage['optional_split_fine_examples'] += int(rare)
+            state = after
+            blocks.update(children)
+            selected[parent] = pattern
+        if state.routes != tuple(r.block_ids for r in solution.routes) or state.directions != teacher['directions']:
+            raise ValueError('retained teacher replay changed its directed solution')
+        coverage['replayed_teachers'] += 1
+    return [row[1:] for row in coarse.values()], fine, checks, dict(coverage)
+
+
+def fit_coarse_heads(model, coarse, fine, pairs, *, use_coordination):
+    """Fixed teacher pass, or one same-state preference pass with teacher retention."""
+    started = time.perf_counter()
+    rng = random.Random(OP_SEED)
+    epochs, batch = (3 if pairs else 6), 8
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-4 if pairs else 1e-3)
+    steps = 32 if pairs else math.ceil(max(len(coarse), len(fine)) / batch)
+    history = []
+    for epoch in range(epochs):
+        coarse_order, fine_order = list(range(len(coarse))), list(range(len(fine)))
+        rng.shuffle(coarse_order)
+        rng.shuffle(fine_order)
+        losses = Counter()
+        for step in range(steps):
+            cs = [coarse[coarse_order[(step * batch + i) % len(coarse)]] for i in range(batch)]
+            fs = [fine[fine_order[(step * batch + i) % len(fine)]] for i in range(batch)]
+            logits = model.policy(torch.cat([r for r, _ in cs])).squeeze(1)
+            coarse_loss = torch.stack([-(target * scores.log_softmax(0)).sum()
+                                       for scores, (_, target) in zip(logits.split([len(r) for r, _ in cs]), cs)]).mean()
+            logits = model.insertion_logits(torch.cat([r for r, _, _ in fs]), use_coordination=use_coordination)
+            fine_loss = torch.stack([-scores.log_softmax(0)[target].logsumexp(0) * weight
+                                     for scores, (_, target, weight) in zip(logits.split([len(r) for r, _, _ in fs]), fs)]).mean()
+            preference = coarse_loss.new_zeros(())
+            if pairs:
+                features, inserts = map(torch.stack, zip(*rng.choices(pairs, k=batch)))
+                scores = model.complete_logits(features.flatten(0, 1), inserts.flatten(0, 1),
+                    use_coordination=use_coordination).reshape(batch, 2)
+                preference = F.softplus(scores[:, 1] - scores[:, 0]).mean()
+                loss = preference + .2 * (coarse_loss + fine_loss)
+            else:
+                loss = coarse_loss + fine_loss
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1., error_if_nonfinite=True)
+            optimizer.step()
+            losses.update(coarse=float(coarse_loss.detach()), insertion=float(fine_loss.detach()),
+                          preference=float(preference.detach()))
+        record = dict(epoch=epoch+1, **{k: v / steps for k, v in losses.items()})
+        history.append(record)
+        print('COARSE_HEAD_EPOCH', 'preference' if pairs else 'teacher', use_coordination, record, flush=True)
+    return dict(epochs=epochs, updates=epochs * steps, batch=batch, history=history,
+                seconds=time.perf_counter() - started)
+
+
+def coarse_feedback_geometries(geometries):
+    tiers = {'SMALL': [], 'MEDIUM': [], 'LARGE': [], 'HIGH_WORKLOAD': []}
+    names = {'N35': 'SMALL', 'N55': 'MEDIUM', 'N85': 'LARGE', 'HIGH': 'HIGH_WORKLOAD'}
+    for item in geometries:
+        prefix = item['instance'].split('_')[0]
+        tiers[names.get(prefix, prefix)].append(item)
+    for tier, entries in tiers.items():
+        ordered = sorted(entries, key=lambda item: (len(item['solution'].parents), item['instance']))
+        for i in (0, len(ordered) // 2, len(ordered) - 1):
+            yield tier, ordered[i]
+
+
+def coarse_b32(solution, directions, config):
+    started = time.perf_counter()
+    candidate = pilot.oriented.schedule_explicit(solution, directions, config)
+    elapsed = time.perf_counter() - started
+    return coarse_schedule_values(candidate, config, elapsed)
+
+
+def coarse_schedule_values(candidate, config, elapsed):
+    schedule = candidate.schedule
+    return dict(status=schedule.status.value,
+                cmax=schedule.cmax if schedule.status is ScheduleStatus.FEASIBLE else None,
+                scheduler_seconds=elapsed, metrics=op_metrics(candidate, config),
+                wait_for_graph=schedule.wait_for_graph)
+
+
+@torch.no_grad()
+def coarse_collect_feedback(model, prepared, geometries, config):
+    """Fork a small set of actual prefixes and complete every branch with this policy."""
+    from mrta_search import gnn_constructor as c
+
+    cache = complete_schedule_cache(op_read())
+    pairs, cases = [], []
+    counts, statuses, by_tier, by_progress = Counter(), Counter(), Counter(), Counter()
+    started = time.perf_counter()
+    fractions = (0., .1, .25, .5)
+
+    def evaluate(result):
+        if result.solution is None:
+            return dict(status='CONSTRUCTION_FAILED', cmax=None, reason=result.rejection_reason, b32_calls=0)
+        raw = dict(solution=asdict(result.solution), directions=result.directions)
+        key = op_complete_key(raw)
+        new = key not in cache
+        if new:
+            cache[key] = coarse_b32(result.solution, result.directions, config)
+        counts['new_b32' if new else 'exact_reuses'] += 1
+        return dict(cache[key], b32_calls=int(new), complete=raw)
+
+    for tier, item in coarse_feedback_geometries(geometries):
+        parents = item['solution'].parents
+        space, embeddings = prepared[parents]
+        steps = {round(f * len(parents)): f for f in fractions}
+        prefixes = {}
+
+        def observe(state, blocks, selected, pending, nominal, ids, coarse_rows, order, plans, fine_rows, logits, best):
+            step = len(parents) - len(pending)
+            if step in steps:
+                prefixes[step] = (state, dict(blocks), dict(selected), nominal, ids, coarse_rows,
+                                  plans, fine_rows, logits, best)
+
+        trajectory = c.construct_coarse_to_fine_gnn(parents, model, config, space=space, embeddings=embeddings,
+                                                    observer=observe)
+        for step, prefix in prefixes.items():
+            tick = time.perf_counter()
+            state, blocks, selected, nominal, ids, coarse_rows, plans, fine_rows, logits, best = prefix
+            row_by_id = dict(zip(ids.tolist(), coarse_rows))
+            order = torch.argsort(logits, descending=True, stable=True).tolist()
+            first = space.actions[plans[best].assignment_index]
+            probes = [('preferred', plans[best], fine_rows[best])]
+
+            def different_owner(index):
+                action = space.actions[index]
+                return action.parent_id == first.parent_id and action.robots != first.robots
+
+            owner = next((i for i in order if different_owner(plans[i].assignment_index) and
+                          space.actions[plans[i].assignment_index].pattern == first.pattern), None)
+            if owner is not None:
+                probes.append(('same_parent_other_owner', plans[owner], fine_rows[owner]))
+            else:
+                coarse_order = ids[torch.argsort(model.policy(coarse_rows).squeeze(1), descending=True, stable=True)].tolist()
+                options = [i for i in coarse_order if different_owner(i)]
+                options.sort(key=lambda i: space.actions[i].pattern != first.pattern)
+                if options:
+                    index = options[0]
+                    alternatives = c.assignment_insertions(space, index, state, blocks, config)
+                    alternatives = tuple(alternatives[i] for i in c.legal_assignment_starts(alternatives, blocks, space, config))
+                    if alternatives:
+                        rows, _ = c.assignment_insertion_rows(space, embeddings, state, blocks, selected, nominal,
+                            alternatives, row_by_id[index].expand(len(alternatives), -1), config)
+                        i = int(model.insertion_logits(rows).argmax())
+                        probes.append(('same_parent_other_owner', alternatives[i], rows[i]))
+                        counts['expanded_counterfactual_owner'] += 1
+            used = {p.assignment_index for _, p, _ in probes}
+            other = next((i for i in order if plans[i].assignment_index not in used and
+                          space.actions[plans[i].assignment_index].pattern != first.pattern), None)
+            if other is not None:
+                probes.append(('other_parent_or_mode', plans[other], fine_rows[other]))
+
+            outcomes = []
+            for label, plan, _ in probes:
+                assignment = space.actions[plan.assignment_index]
+                result = trajectory if label == 'preferred' else c.construct_coarse_to_fine_gnn(
+                    parents, model, config, space=space, embeddings=embeddings, state=plan.state,
+                    selected=dict(selected, **{assignment.parent_id: assignment.pattern}))
+                outcome = evaluate(result)
+                outcomes.append(dict(outcome, label=label, pattern=asdict(assignment.pattern),
+                                     robots=assignment.robots, actions=[asdict(a) for a in plan.actions]))
+                statuses[outcome['status']] += 1
+                counts[label] += 1
+            labels = residual_feedback_pairs(outcomes)
+            for label in labels:
+                i, j = label['better'], label['worse']
+                pairs.append((torch.stack([row_by_id[probes[k][1].assignment_index] for k in (i, j)]),
+                              torch.stack([probes[k][2] for k in (i, j)])))
+                counts[label['kind']] += 1
+            by_tier[tier] += 1
+            by_progress[str(steps[step])] += 1
+            counts['states_with_pairs'] += bool(labels)
+            cases.append(dict(instance=item['instance'], tier=tier, progress=steps[step], assigned=step,
+                runtime_s=time.perf_counter() - tick, b32_calls=sum(a['b32_calls'] for a in outcomes),
+                prefix=dict(routes=state.routes, directions=state.directions, selected=[asdict(p) for p in selected.values()]),
+                outcomes=outcomes, pairs=labels))
+        print('COARSE_FEEDBACK', item['instance'], len(prefixes), dict(counts), dict(statuses), flush=True)
+    return pairs, dict(counts, states=sum(by_tier.values()), statuses=dict(statuses), tiers=dict(by_tier),
+                       progress=dict(by_progress), seconds=time.perf_counter() - started), cases
+
+
+def coarse_joint_train():
+    """Train both heads once and save the full and feature-masked policies together."""
+    import copy
+    import io
+    from mrta_search import gnn_constructor as c
+
+    if COARSE_MODEL.exists():
+        raise FileExistsError(COARSE_MODEL)
+    shared, config, checkpoint, archive, teachers, geometries, _, _ = op_sources()
+    torch.manual_seed(OP_SEED)
+    model = c.CoarseToFineGNN()
+    encoder = ('layer1.', 'layer2.', 'geometry_skip.')
+    source = checkpoint[OP_VARIANT]['state_dict']
+    model.load_state_dict({k: source[k] for k in model.state_dict() if k.startswith(encoder)}, strict=False)
+    for name, parameter in model.named_parameters():
+        if name.startswith(encoder):
+            parameter.requires_grad_(False)
+    masked = copy.deepcopy(model)
+    tick = time.perf_counter()
+    groups = _group_certified_assignments(teachers, archive, config)
+    prepared = {}
+    with torch.no_grad():
+        for item in geometries:
+            parents = item['solution'].parents
+            space = c.parent_assignment_space(parents, config)
+            prepared[parents] = (space, model.encode_static(space.graph))
+    coarse, fine, checks, coverage = coarse_teacher_examples(model, prepared, teachers, archive, groups, config)
+    coverage.update(coarse_examples=len(coarse), fine_examples=len(fine), teachers=len(teachers),
+                    geometries=len(groups), seconds=time.perf_counter() - tick)
+    print('COARSE_TEACHER_DATA', coverage, flush=True)
+    teacher_fit = [fit_coarse_heads(net, coarse, fine, (), use_coordination=aware)
+                   for net, aware in ((model, True), (masked, False))]
+    with torch.no_grad():
+        coverage['teacher_next_tuple_shortlist'] = sum(index in c.shortlist_assignments(space, ids,
+            model.policy(rows).squeeze(1)) for space, ids, rows, index in checks)
+    feedback, feedback_info, feedback_cases = coarse_collect_feedback(model.eval(), prepared, geometries, config)
+    preference_fit = [fit_coarse_heads(net, coarse, fine, feedback, use_coordination=aware) if feedback else None
+                      for net, aware in ((model, True), (masked, False))]
+    bundle = dict(training=dict(teacher_data=coverage, feedback=feedback_info, seed=OP_SEED,
+        encoder_source=OP_VARIANT, teacher_fit=teacher_fit, preference_fit=preference_fit),
+        scientific_config=config.scientific_mapping(),
+        feedback_cases=json.loads(json.dumps(feedback_cases, allow_nan=False)))
+    for net, method, aware in zip((model, masked), COARSE_METHODS, (True, False)):
+        assert all(torch.equal(value, source[key]) for key, value in net.state_dict().items() if key.startswith(encoder))
+        bundle[method] = dict(model_type='CoarseToFineGNN', hidden_dim=64, heads=4, state_dict=net.state_dict(),
+                              use_coordination=aware)
+    buffer = io.BytesIO()
+    torch.save(bundle, buffer)
+    buffer.seek(0)
+    saved = shared.read_neural_checkpoint(buffer, include_research=False)
+    for method in COARSE_METHODS:
+        shared._model_from_checkpoint(saved[method])
+    with COARSE_MODEL.open('xb') as stream:
+        stream.write(buffer.getbuffer())
+    print('COARSE_TRAIN_SUMMARY', json.dumps(bundle['training'], allow_nan=False), flush=True)
+
+
+def coarse_dev_measure(shared, parents, config, method):
+    """One deterministic proposal and at most one B32 for each method."""
+    from unittest.mock import patch
+    from mrta_search import gnn_constructor as c, lns
+
+    started = time.perf_counter()
+    pool_sizes, model_load, calls = [], 0., 0
+    solution, directions = None, None
+    outcome = dict(status='CONSTRUCTION_FAILED', cmax=None, scheduler_seconds=0., metrics={})
+    if method == 'RULE/BEAM':
+        original = pilot.oriented.schedule_explicit
+        attempts = []
+
+        def measure(sol, bits, conf, **kwargs):
+            tick = time.perf_counter()
+            candidate = original(sol, bits, conf, **kwargs)
+            attempts.append((candidate, tick - started, time.perf_counter() - tick))
+            return candidate
+
+        with patch.object(pilot.oriented, 'schedule_explicit', measure):
+            _, diagnostics = pilot.oriented.common_initial_beam(parents, config, seed=OP_EVAL_SEED,
+                interleave=True, max_reference_calls=1)
+        calls = len(attempts)
+        if attempts:
+            candidate, construct, elapsed = attempts[0]
+            solution, directions = candidate.solution, candidate.directions
+            outcome = coarse_schedule_values(candidate, config, elapsed)
+        else:
+            construct = time.perf_counter() - started
+            outcome['reason'] = diagnostics
+    else:
+        path = OP_CHECKPOINT if method == 'PARENT_JOINT' else COARSE_MODEL
+        variant = {'PARENT_JOINT': OP_VARIANT, COARSE_OWNER_METHOD: COARSE_METHODS[0]}.get(method, method)
+        entry = shared.read_neural_checkpoint(path, include_research=False)[variant]
+        model = shared._model_from_checkpoint(entry).eval()
+        model_load = time.perf_counter() - started
+        tick = time.perf_counter()
+        if method == 'PARENT_JOINT':
+            reference = c.joint_geometry(parents, c.fixed_split_patterns(parents, config), config)
+            result = c.construct_or_repair_with_gnn(reference, ((),) * 4, ((),) * 4, tuple(p.parent_id for p in parents),
+                model, config, decode_mode='parent_joint', seed=OP_EVAL_SEED, parent_candidate_limit=4)
+        else:
+            def observe(state, blocks, selected, pending, nominal, ids, coarse_rows, order, plans, fine_rows, logits, best):
+                pool_sizes.append((len(ids), len(order), len(plans)))
+
+            result = c.construct_coarse_to_fine_gnn(parents, model, config, use_coordination=entry['use_coordination'],
+                owner_alternatives=method == COARSE_OWNER_METHOD, observer=observe)
+        construct = time.perf_counter() - tick
+        solution, directions = result.solution, result.directions
+        if solution is not None:
+            outcome = coarse_b32(solution, directions, config)
+            calls = 1
+        else:
+            outcome['reason'] = result.rejection_reason
+    elapsed = time.perf_counter() - started
+    if solution is not None:
+        nominal = lns.nominal_coordination_features(solution, directions, config)
+        outcome.update(complete=dict(solution=asdict(solution), directions=directions),
+            nominal_p_move=nominal['nominal_completion'], nominal_same_rail=nominal['same_rail_order_seconds'],
+            nominal_proximity=nominal['proximity_seconds'],
+            mode_counts=dict(Counter(p.kind.value for p in solution.patterns)))
+    return dict(outcome, model_load_seconds=model_load, construction_seconds=construct,
+                total_seconds=elapsed, b32_calls=calls, pool_sizes=pool_sizes)
+
+
+def coarse_joint_dev(methods=('PARENT_JOINT', 'RULE/BEAM', *COARSE_METHODS)):
+    shared, config, _, _, _, _, entries, _ = op_sources()
+    for name, parents in sorted(entries.items()):
+        for method in methods:
+            outcome = coarse_dev_measure(shared, parents, config, method)
+            sizes = outcome.pop('pool_sizes')
+            outcome.pop('complete', None)
+            if sizes:
+                outcome['pool_median'] = tuple(statistics.median(v) for v in zip(*sizes))
+                outcome['pool_max'] = tuple(max(v) for v in zip(*sizes))
+            print('COARSE_DEV', name, method, json.dumps(outcome, allow_nan=False), flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
@@ -4312,10 +4712,17 @@ def main():
         'compact-workload-train','compact-workload-eval','compact-workload-report',
         'residual-coverage','residual-packing-repair','residual-external-parent','residual-quota-check',
         'residual-route-coverage','residual-feedback','residual-head-train','residual-dev','residual-report',
-        'assignment-diagnostic','assignment-route-diagnostic'),default='op-all')
+        'assignment-diagnostic','assignment-route-diagnostic','coarse-joint-train','coarse-joint-dev',
+        'coarse-joint-owner-dev'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
+    if args.phase=='coarse-joint-train':
+        coarse_joint_train();return
+    if args.phase=='coarse-joint-dev':
+        coarse_joint_dev();return
+    if args.phase=='coarse-joint-owner-dev':
+        coarse_joint_dev((COARSE_OWNER_METHOD,));return
     if args.phase=='assignment-diagnostic':
         assignment_diagnostic();return
     if args.phase=='assignment-route-diagnostic':

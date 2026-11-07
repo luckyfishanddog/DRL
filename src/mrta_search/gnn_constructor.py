@@ -1490,13 +1490,20 @@ class ParentAssignmentSpace:
     active_children: torch.Tensor
     modes: torch.Tensor
     processing: torch.Tensor
+    children: Mapping[SplitPattern, tuple[WeldingBlock, ...]]
+    block_nodes: Mapping[tuple[SplitPattern, str], int]
+    remaining_processing: torch.Tensor
+
+    @cached_property
+    def action_index(self):
+        return {action: index for index, action in enumerate(self.actions)}
 
 
 def parent_assignment_space(parents: Sequence[ParentWeld], config: ScientificConfig) -> ParentAssignmentSpace:
     """Prepare compact rows for all legal mode/owner tuples once per geometry."""
     from .lns import joint_block_robots
 
-    space = complete_parent_space(parents, config)
+    space = complete_parent_space(parents, config, compact=True)
     parent_ids = tuple(p.parent_id for p in space['parents'])
     actions, action_parents, child_nodes, owners, masks, modes, processing = [], [], [], [], [], [], []
     for index, parent_id in enumerate(parent_ids):
@@ -1522,7 +1529,10 @@ def parent_assignment_space(parents: Sequence[ParentWeld], config: ScientificCon
                                  torch.tensor(owners, dtype=torch.long).reshape(-1, 2),
                                  torch.tensor(masks, dtype=torch.bool).reshape(-1, 2),
                                  torch.tensor(modes, dtype=torch.float32).reshape(-1, 5),
-                                 torch.tensor(processing, dtype=torch.float32).reshape(-1, 4))
+                                 torch.tensor(processing, dtype=torch.float32).reshape(-1, 4),
+                                 space['options'], space['indices'],
+                                 torch.tensor([space['remaining_parent_workload'][p] for p in parent_ids],
+                                              dtype=torch.float32).reshape(-1, 4) / 2500.)
 
 
 class ParentAssignmentGNN(_BlockRobotGAT):
@@ -1537,11 +1547,13 @@ class ParentAssignmentGNN(_BlockRobotGAT):
 
     def assignment_logits(self, space, embeddings, state, blocks, pending, config):
         """Return indices into space.actions and batched scores for pending parents."""
+        indices, inputs = self.assignment_rows(space, embeddings, state, blocks, pending, config)
+        return indices, self.policy(inputs).squeeze(1)
+
+    def assignment_rows(self, space, embeddings, state, blocks, pending, config):
         device = embeddings.device
         pending_mask = torch.tensor([p in pending for p in space.parent_ids], device=device, dtype=torch.bool)
         indices = torch.where(pending_mask[space.action_parents.to(device)])[0]
-        if not indices.numel():
-            return indices, embeddings.new_empty(0)
         rows = []
         for robot, (route, bits) in enumerate(zip(state.routes, state.directions)):
             if route:
@@ -1559,7 +1571,210 @@ class ParentAssignmentGNN(_BlockRobotGAT):
         children = (children * space.active_children.to(device)[indices, :, None]).flatten(1)
         projected = space.processing.to(embeddings)[indices] + robot_state[:, 0]
         inputs = torch.cat((children, space.modes.to(embeddings)[indices], projected), dim=1)
-        return indices, self.policy(inputs).squeeze(1)
+        return indices, inputs
+
+
+COARSE_ASSIGNMENT_LIMIT = 8
+FINE_INSERTION_LIMIT = 6
+COORDINATION_FEATURES = 9
+
+
+class CoarseToFineGNN(ParentAssignmentGNN):
+    """One geometry encoder, an assignment logit and a complete-insertion logit."""
+
+    def __init__(self, hidden_dim: int = 64, heads: int = 4):
+        super().__init__(hidden_dim, heads)
+        self.geometry_skip = nn.Linear(NODE_DIM, hidden_dim)
+        width = self.policy[0].in_features + 9
+        self.policy = nn.Sequential(nn.Linear(width, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+        self.insertion_head = nn.Sequential(nn.Linear(width + 4 * hidden_dim + 22 + COORDINATION_FEATURES, hidden_dim),
+                                            nn.ReLU(), nn.Linear(hidden_dim, 1))
+
+    def encode_static(self, graph):
+        return super().encode_static(graph) + self.geometry_skip(graph.node_features)
+
+    def assignment_rows(self, space, embeddings, state, blocks, pending, config):
+        indices, rows = super().assignment_rows(space, embeddings, state, blocks, pending, config)
+        owners = space.owners.to(indices.device)[indices]
+        active = space.active_children.to(indices.device)[indices]
+        occupied = torch.tensor([bool(route) for route in state.routes], device=indices.device)
+        # Same-robot siblings need a pre-existing block between them to be
+        # representable as a committed split in the canonical solution.
+        keep = ~(active[:, 1] & (owners[:, 0] == owners[:, 1]) & ~occupied[owners[:, 0]])
+        indices, rows = indices[keep], rows[keep]
+        pending_mask = torch.tensor([p in pending for p in space.parent_ids], device=indices.device)
+        work = space.remaining_processing.to(rows)
+        remaining = (work[pending_mask].sum(0) - work[space.action_parents.to(indices.device)[indices]]).clamp_min(0.)
+        expected = rows[:, -4:] + remaining
+        shares = expected / expected.sum(1, keepdim=True).clamp_min(1e-6)
+        return indices, torch.cat((rows, remaining, shares, shares.amax(1, keepdim=True)), dim=1)
+
+    def insertion_logits(self, rows, *, use_coordination=True):
+        if not use_coordination:
+            rows = torch.cat((rows[:, :-COORDINATION_FEATURES],
+                              torch.zeros_like(rows[:, -COORDINATION_FEATURES:])), dim=1)
+        return self.insertion_head(rows).squeeze(1)
+
+    def complete_logits(self, coarse_rows, fine_rows, *, use_coordination=True):
+        return self.policy(coarse_rows).squeeze(1) + self.insertion_logits(fine_rows, use_coordination=use_coordination)
+
+
+def shortlist_assignments(space, indices, logits, *, owner_alternatives=False):
+    """Retain learned scores, with slots for distinct parents and mode families."""
+    order = indices[torch.argsort(logits, descending=True, stable=True)].tolist()
+    chosen, parents, kinds = [], set(), set()
+    for index in order:
+        action = space.actions[index]
+        if action.parent_id in parents:
+            continue
+        chosen.append(index)
+        parents.add(action.parent_id)
+        kinds.add(action.pattern.kind)
+        if len(chosen) == COARSE_ASSIGNMENT_LIMIT // 2:
+            break
+    for index in order:
+        kind = space.actions[index].pattern.kind
+        if kind not in kinds:
+            chosen.append(index)
+            kinds.add(kind)
+    if owner_alternatives:
+        for primary in chosen[:2]:
+            pattern = space.actions[primary].pattern
+            alternate = next((i for i in order if space.actions[i].pattern == pattern and i not in chosen), None)
+            if alternate is not None:
+                chosen.append(alternate)
+    return tuple(dict.fromkeys((*chosen, *order)))[:COARSE_ASSIGNMENT_LIMIT]
+
+
+class AssignmentInsertion(NamedTuple):
+    assignment_index: int
+    state: object
+    actions: tuple
+
+
+def assignment_insertions(space, index, state, blocks, config):
+    """Expand just one fixed-owner assignment and return only atomic parent actions."""
+    from .lns import joint_block_candidates
+
+    assignment = space.actions[index]
+    children = space.children[assignment.pattern]
+    local_blocks = dict(blocks, **{b.block_id: b for b in children})
+    branches = [(state, ())]
+    for child, robot in zip(children, assignment.robots):
+        limit = FINE_INSERTION_LIMIT if len(children) == 1 else (3 if child is children[0] else 2)
+        next_branches = []
+        for partial, actions in branches:
+            variants = joint_block_candidates(partial, child, assignment.pattern, local_blocks, config,
+                                              robot_id=robot, check_initial_feasibility=False)
+            for i in structural_child_indices(variants, limit=limit):
+                after, action = variants[i]
+                next_branches.append((after, (*actions, action)))
+        branches = next_branches
+    return tuple(AssignmentInsertion(index, after, actions) for after, actions in branches)
+
+
+def assignment_insertion_rows(space, embeddings, state, blocks, selected, nominal, plans, coarse_rows, config):
+    """Use committed and proposed geometry for local neighbors and complete outcomes."""
+    prior_nodes = {b.block_id: space.block_nodes[pattern, b.block_id]
+                   for pattern in selected.values() for b in space.children[pattern]}
+    scales = max(1., float(space.remaining_processing.sum()) * 2500. / 4.)
+    neighbor_indices, scalars, contexts = [], [], []
+    for plan in plans:
+        assignment = space.actions[plan.assignment_index]
+        new_blocks = {b.block_id: b for b in space.children[assignment.pattern]}
+        new_nodes = {b: space.block_nodes[assignment.pattern, b] for b in new_blocks}
+        after = plan.state
+        indices, local = [], []
+        for action in plan.actions:
+            route, bits = after.routes[action.robot], after.directions[action.robot]
+            k = route.index(action.block_id)
+            for j in (k - 1, k + 1):
+                if 0 <= j < len(route):
+                    neighbor = route[j]
+                    indices.append(new_nodes[neighbor] if neighbor in new_nodes else prior_nodes[neighbor])
+                else:
+                    indices.append(-1)
+            local.extend((k / max(1, len(route) - 1), float(bits[k]), bits[k-1] if k else 0.,
+                          bits[k+1] if k + 1 < len(route) else 0., len(action.neighbour_changes) / 2.))
+        if len(plan.actions) == 1:
+            indices.extend((-1, -1))
+            local.extend((0.,) * 5)
+        moves = tuple(sum(arcs) for arcs in after.arc_costs)
+        p_move = tuple(p + m for p, m in zip(after.loads, moves))
+        outcome = (*after.loads, max(after.loads), *p_move, max(p_move), sum(moves), sum(moves) - state.travel)
+        if nominal is None:
+            updated, coordination = None, (0.,) * COORDINATION_FEATURES
+        else:
+            robots = tuple(dict.fromkeys(assignment.robots))
+            updated = nominal.with_changed_routes(after, robots, dict(blocks, **new_blocks), config)
+            feature = updated.features()
+            coordination = (*feature['same_rail_order_seconds'], *feature['proximity_seconds'], feature['exposure_score'])
+        neighbor_indices.append(indices)
+        scalars.append((*local, *(v / scales for v in outcome), *(v / scales for v in coordination)))
+        contexts.append(updated)
+    neighbors = torch.tensor(neighbor_indices, dtype=torch.long, device=embeddings.device)
+    context_rows = embeddings[neighbors.clamp_min(0)] * (neighbors >= 0).unsqueeze(-1)
+    return torch.cat((coarse_rows, context_rows.flatten(1), embeddings.new_tensor(scalars)), dim=1), tuple(contexts)
+
+
+def legal_assignment_starts(plans, blocks, space, config):
+    """Prefer an exact legal start across complete parent actions, as in fixed decoding."""
+    from .direction import _initial_error
+
+    indices = []
+    for i, plan in enumerate(plans):
+        pattern = space.actions[plan.assignment_index].pattern
+        proposed = {b.block_id: b for b in space.children[pattern]}
+        points = {r: oriented_endpoints(proposed.get(route[0]) or blocks[route[0]], bits[0])[0]
+                  for r, (route, bits) in enumerate(zip(plan.state.routes, plan.state.directions)) if route}
+        if _initial_error(points, config) is None:
+            indices.append(i)
+    return tuple(indices) or tuple(range(len(plans)))
+
+
+@torch.no_grad()
+def construct_coarse_to_fine_gnn(parents, model, config, *, space=None, embeddings=None,
+                                state=None, selected=None, use_coordination=True, owner_alternatives=False, observer=None):
+    """Construct one solution, or resume a frozen rollout after a forced parent action."""
+    from .lns import NominalRouteCoordination, oriented_route_state
+
+    started = time.perf_counter()
+    space = parent_assignment_space(parents, config) if space is None else space
+    embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
+    selected = {} if selected is None else dict(selected)
+    blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
+    empty = ((),) * 4
+    state = oriented_route_state(empty, empty, blocks, config) if state is None else state
+    nominal = NominalRouteCoordination.from_state(state, blocks, config) if use_coordination else None
+    pending = set(space.parent_ids) - selected.keys()
+    actions = []
+    while pending:
+        indices, coarse_rows = model.assignment_rows(space, embeddings, state, blocks, pending, config)
+        coarse_logits = model.policy(coarse_rows).squeeze(1)
+        order = shortlist_assignments(space, indices, coarse_logits, owner_alternatives=owner_alternatives)
+        plans = tuple(plan for index in order for plan in assignment_insertions(space, index, state, blocks, config))
+        if not plans:
+            return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
+                                         rejection_reason='NO_COMPLETE_PARENT_ACTION')
+        plans = tuple(plans[i] for i in legal_assignment_starts(plans, blocks, space, config))
+        by_index = {index: i for i, index in enumerate(indices.tolist())}
+        plan_indices = [by_index[plan.assignment_index] for plan in plans]
+        fine_rows, contexts = assignment_insertion_rows(space, embeddings, state, blocks, selected, nominal, plans,
+                                                      coarse_rows[plan_indices], config)
+        logits = coarse_logits[plan_indices] + model.insertion_logits(fine_rows, use_coordination=use_coordination)
+        best = int(logits.argmax())
+        if observer is not None:
+            observer(state, blocks, selected, pending, nominal, indices, coarse_rows, order, plans, fine_rows, logits, best)
+        chosen = plans[best]
+        assignment = space.actions[chosen.assignment_index]
+        state, nominal = chosen.state, contexts[best]
+        selected[assignment.parent_id] = assignment.pattern
+        blocks.update((b.block_id, b) for b in space.children[assignment.pattern])
+        pending.remove(assignment.parent_id)
+        actions.extend(chosen.actions)
+    solution = canonicalize(parents, tuple(selected.values()), dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
+    return JointCompletionResult(solution, state.directions, tuple(actions), time.perf_counter() - started,
+                                 oriented_state=state)
 
 
 def gnn_parent_orders(space,state,pending,selected,model,config,*,proposal_graph_mode='native'):
