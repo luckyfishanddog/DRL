@@ -15,6 +15,130 @@ if str(SCRIPT_DIR) not in sys.path:
 import run_gnn_construct_vns_pilot as pilot_script
 
 
+def test_ranked_parent_budgets_keep_gnn_priority_and_two_distinct_supplements():
+    from mrta_search.gnn_constructor import compact_parent_ids
+    pending=tuple(f'p{i:02d}' for i in range(24))
+    orders=dict(gnn=pending,mrv=tuple(reversed(pending)),lpt=pending[12:]+pending[:12])
+    for limit in (4,6,8,12,16):
+        for name in ('gnn','mrv','lpt'):
+            assert compact_parent_ids({},pending,parent_limit=limit,strategy=name,orders=orders)==orders[name][:limit]
+        ids=compact_parent_ids({},pending,parent_limit=limit,strategy='gnn_mrv_lpt',orders=orders)
+        assert len(ids)==len(set(ids))==limit
+        assert ids[:limit-2]==pending[:limit-2]
+        assert ids[-2]=='p23' and ids[-1]==next(p for p in orders['lpt'] if p not in ids[:-1])
+
+
+def test_existing_parent_head_scores_all_pending_without_future_teacher_modes(monkeypatch):
+    from mrta_search import gnn_constructor as c
+    from mrta_search import lns
+    space=c.complete_parent_space(_parents(),CONFIG,compact=True)
+    _,blocks,patterns=c.complete_parent_view(space,{})
+    state=lns.oriented_route_state(((),)*4,((),)*4,blocks,CONFIG)
+    model=c.ModeJointInsertionGNN(16,4,opportunity_features=True)
+    pending=tuple(p.parent_id for p in _parents());seen=[]
+    monkeypatch.setattr(lns,'has_joint_block_candidate',lambda *a,**kw:False)
+    def score(graph,emb,ids,features):
+        assert set(ids)==set(pending) and features.shape[1]==20
+        assert {b.block_id for b in graph.blocks}==set(blocks)
+        seen.append(ids);return torch.arange(len(ids),dtype=torch.float32)
+    monkeypatch.setattr(model,'parent_logits',score)
+    monkeypatch.setattr(model,'mode_logits',lambda *a:(_ for _ in ()).throw(AssertionError('independent mode head')))
+    orders=c.gnn_parent_orders(space,state,pending,{},model,CONFIG)
+    assert len(seen)==1 and orders['gnn']==tuple(reversed(sorted(pending)))
+    assert not c.joint_parent_inputs(state,pending,blocks,patterns,CONFIG)[0]
+
+
+def test_after_parent_workload_changes_only_the_four_existing_input_columns():
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import oriented_route_state,joint_action_key
+    parents=(ParentWeld('upper',(1.,9.),(3.,9.)),ParentWeld('lower',(14.,3.),(16.,3.)))
+    space=c.complete_parent_space(parents,CONFIG,compact=True)
+    _,blocks,_=c.complete_parent_view(space,{})
+    state=oriented_route_state(((),)*4,((),)*4,blocks,CONFIG)
+    args=dict(parent_limit=4,first_limit=8,second_limit=4,include_remaining_workload=True,
+              candidate_parent_ids=('upper','lower'))
+    before=c.complete_parent_candidates(space,state,('upper','lower'),{},CONFIG,**args)
+    after=c.complete_parent_candidates(space,state,('upper','lower'),{},CONFIG,remaining_after_parent=True,**args)
+    assert [(p['pattern'],tuple(map(joint_action_key,p['actions']))) for p in before]==[(p['pattern'],tuple(map(joint_action_key,p['actions']))) for p in after]
+    for p in after:
+        expected=torch.tensor([0.,0.,.5,.5]) if p['parent_id']=='upper' else torch.tensor([.5,.5,0.,0.])
+        assert torch.equal(p['remaining_eligible_workload'],expected)
+    model=c.CompleteParentGNN(16,4,remaining_workload_features=True)
+    weights={k:v.clone() for k,v in model.state_dict().items()}
+    inputs_old=c.complete_parent_inputs(before);inputs_new=c.complete_parent_inputs(after)
+    embedded=model.encode_static(space['graph'])
+    rows_old=model.parent_action_rows(space['graph'],embedded,inputs_old)
+    rows_new=model.parent_action_rows(space['graph'],embedded,inputs_new)
+    assert torch.equal(rows_old[:,:-4],rows_new[:,:-4])
+    assert torch.equal(rows_new[:,-4:],inputs_new['remaining_eligible_workload'])
+    assert rows_new.shape[1]==model.parent_action_head[0].in_features
+    assert all(torch.equal(v,model.state_dict()[k]) for k,v in weights.items())
+
+
+def test_ranked_joint_decoder_uses_existing_parent_and_complete_heads_atomically(monkeypatch):
+    from mrta_search import gnn_constructor as c
+    parents=(ParentWeld('x',(0.,8.),(4.,8.)),)
+    model=c.CompleteParentGNN(16,4,remaining_workload_features=True);seen=[]
+    def score(graph,h,inputs):
+        assert torch.equal(inputs['remaining_eligible_workload'],torch.zeros(len(inputs['parent_ids']),4))
+        seen.append(inputs);return inputs['mode_features'][:,2]*100-inputs['child_features'][:,:,19].sum(1)
+    monkeypatch.setattr(model,'parent_action_scores',score)
+    monkeypatch.setattr(model,'mode_logits',lambda *a:(_ for _ in ()).throw(AssertionError('independent mode head')))
+    result=c.construct_complete_parent_gnn(parents,model,CONFIG,parent_limit=4,parent_strategy='gnn_mrv_lpt',remaining_after_parent=True)
+    assert len(seen)==1 and result.solution is not None and len(result.actions)==2
+    assert result.solution.patterns[0].kind is SplitKind.X_SPLIT
+    assert result.solution.routes[0].block_ids==('x::0',) and result.solution.routes[1].block_ids==('x::1',)
+
+
+def test_route_progress_decoder_keeps_the_measured_whole_variants_and_residual_rows():
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_action_key, oriented_route_state
+
+    parents = tuple(ParentWeld(f'w{i}', (1. + 2 * i, 9.), (2. + 2 * i, 9.)) for i in range(4))
+    space = c.complete_parent_space(parents, CONFIG, compact=True)
+    selected = {p.parent_id: space['catalog'][p.parent_id][0] for p in parents[:3]}
+    pending = {'w3'}
+    _, blocks, _ = c.complete_parent_view(space, selected)
+    route = tuple(space['options'][pattern][0].block_id for pattern in selected.values())
+    state = oriented_route_state((route, (), (), ()), ((0, 0, 0), (), (), ()), blocks, CONFIG)
+    model = c.CompleteParentGNN(16, 4, remaining_workload_features=True).eval()
+    model.compact_parent_limit = 16
+
+    def keys(plans):
+        return [(plan['pattern'], tuple(map(joint_action_key, plan['actions']))) for plan in plans]
+
+    with torch.inference_mode():
+        expected = c.route_progress_complete_candidates(space, state, pending, selected, model, CONFIG)
+    assert sum(p['pattern'].kind is SplitKind.WHOLE for p in expected) > 16
+    seen = []
+
+    def observe(_, __, ___, ____, plans, best):
+        seen.append(keys(plans))
+        assert torch.equal(best['remaining_eligible_workload'], torch.zeros(4))
+
+    result = c.construct_complete_parent_gnn(parents, model, CONFIG, space=space, state=state, pending=pending,
+        selected=selected, observer=observe)
+    assert result.solution is not None
+    assert seen == [keys(expected)]
+
+
+def test_residual_preferences_distinguish_cmax_and_feasibility():
+    from run_gnn_cmax_finetune import residual_feedback_pairs
+
+    outcomes = [
+        dict(status='FEASIBLE', cmax=20.),
+        dict(status='DEADLOCK', cmax=None),
+        dict(status='FEASIBLE', cmax=19.),
+        dict(status='DEADLOCK', cmax=None),
+        dict(status='NUMERIC_FAILURE', cmax=None),
+    ]
+    assert {(p['better'], p['worse'], p['kind']) for p in residual_feedback_pairs(outcomes)} == {
+        (2, 0, 'cmax'),
+        (0, 1, 'feasibility'), (0, 3, 'feasibility'),
+        (2, 1, 'feasibility'), (2, 3, 'feasibility'),
+    }
+
+
 def test_compact_mrv_lpt_flexibility_observes_forced_x_robots_and_no_neural_parent_head():
     from mrta_search import gnn_constructor as c
     space=c.complete_parent_space(_parents(),CONFIG,compact=True)

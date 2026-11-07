@@ -1,6 +1,18 @@
 # Multi-Robot Weld Allocation and Sequencing
 
-Latest GNN refinement and equivalent acceleration: all seven current-domain methods now supply supervision, including MODE_NEW, WAG, HGA and REGION_FAST_ROUTE_REORDER. Twenty-one training geometries provide 110 unique certified teacher solutions (76 executable full replays), 27 certified student-prefix continuations and 9,654 parent/insertion examples. The eight holdout geometries are previously consumed development data, not a new independent test.
+## Latest GNN research status (2026-11-07)
+
+The new `route_progress_cmax_candidate` uses one GNN to construct complete parent actions. It achieved **3/8 feasible** across 24 DEV B32 calls, with 21 DEADLOCK outcomes. The same checkpoint produced all three proposals per geometry. Paired median Cmax improvements were **-12.73% against PARENT_JOINT** and **-66.53% against RULE/BEAM**. Three-proposal construction took a median **122.68 s**, and total time was **127.89 s** versus **3.85 s** for PARENT_JOINT. The branch fell short of the development targets for independent testing.
+
+Using the existing parent head and route-based supplements at 16 parents raised exact TRAIN action coverage from 50/126 in the old six-parent experiment and 99/126 after bounded packing repair to **114/126 (90.48%)**. Removing the chosen parent from pending differentiates the four workload features across parent choices in 115/126 states. The 36 TRAIN B32 calls yielded 10 numeric Cmax pairs and 8 feasibility preferences across 7 states. The complete-action head was trained for 5 fixed epochs with the GAT and input scaling frozen.
+
+The retained three-proposal ORIGINAL_GNN, PARENT_JOINT, and RULE/BEAM results were 6/8, 7/8, and 7/8. The earlier 8/8 neural portfolio used two older GNN proposals. WAG, HGA, and REGION results are reported separately at their 60-second final-solution budgets. Historical models, MODE_NEW, and the 500-run formal results are preserved. DRL validation passed 607 tests, and the final related regression passed 168. [GNN research report](docs/GNN_INITIAL_MINCHILD05_FINAL.md)
+
+From `DRL`, use `D:\pybullet_test\.venv\Scripts\python.exe` to run `scripts/run_gnn_cmax_finetune.py` with `--phase residual-route-coverage`, `residual-feedback`, `residual-head-train`, and `residual-dev`. The new branch is stored in the existing checkpoint. [Checkpoint](models/gnn_coordination_constructor_05.pt)
+
+## Earlier multi-teacher GNN refinement (historical)
+
+Earlier GNN refinement and equivalent acceleration: all seven current-domain methods supplied supervision, including MODE_NEW, WAG, HGA and REGION_FAST_ROUTE_REORDER. Twenty-one training geometries provided 110 unique certified teacher solutions (76 executable full replays), 27 certified student-prefix continuations and 9,654 parent/insertion examples. The eight holdout geometries are previously consumed development data, not a new independent test.
 
 At the same maximum of three B32 calls, the new neural portfolio (two retained robust proposals plus one newly trained balanced proposal) and the old three-proposal comparator both certify 8/8. The new portfolio is 4/4/0 wins/ties/losses, with median paired Cmax improvement 17.616%. On the targeted HIGH_WORKLOAD_04 case, the same MODE_NEW backend and nominal 60-second budget yield 6767.835→4887.874 final Cmax (27.778% improvement; actual runtimes 60.142/60.621 seconds). This is development evidence only. The new balanced policy alone certifies 4/8; independently selecting learned modes certifies only 1/8, so learned modes remain a negative diagnostic branch.
 
@@ -8,9 +20,9 @@ Exact computation reuse preserves candidates, directions, budgets, certification
 
 All results and rejected branches: [GNN research report](docs/GNN_INITIAL_MINCHILD05_FINAL.md). No new files were created in this refinement. Both old weights and the new refinement candidate remain in the previously approved [checkpoint](models/gnn_coordination_constructor_05.pt). Use run_gnn_shared_construction.load_neural_initial_models plus neural_initial_portfolio(reference_calls=3, use_learned_modes=False) for the explicit neural experiment; read_neural_checkpoint expands full research records. MODE_NEW retains its rule initializer as the main method; the equivalent calculation speedups apply without changing its scientific decisions.
 
-## Current conclusion (2026-11-04)
+## Completed formal study (2026-11-04)
 
-Current research configuration: **minimum child length 0.50 m**, delta_x=delta_y=0.50 m, FORMAL_SCOPE_V2, and the existing B32 scheduler. The selected research method is **MODE_NEW**: common deterministic initialization → scheduling-guided parent selection → legal parent-mode adjustment → direction-aware joint insertion/reconstruction → B32 → accept only a strict Cmax improvement. There is no separate direction or WAIT optimization stage.
+Scientific configuration: **minimum child length 0.50 m**, delta_x=delta_y=0.50 m, FORMAL_SCOPE_V2, and the existing B32 scheduler. The selected method in the completed formal study was **MODE_NEW**: common deterministic initialization → scheduling-guided parent selection → legal parent-mode adjustment → direction-aware joint insertion/reconstruction → B32 → accept only a strict Cmax improvement. There is no separate direction or WAIT optimization stage.
 
 The earlier frozen-checkpoint GNN initialization study completed **135/135 method rows**. RULE/BEAM was feasible 27/27, V2-Multi4 0/27, and Shared-Multi4 6/27. GNN initial allocation and ordering were retired at that stage. GNN local repair showed a small fixed-mode gain, but the combined MODE_GNN method did not establish a useful stable gain; it is excluded from the main method. No models were retrained or changed during that earlier study; the newly authorized research is recorded above.
 

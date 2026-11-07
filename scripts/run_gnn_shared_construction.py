@@ -75,6 +75,8 @@ def _expand_neural_checkpoint(payload):
         full['complete_parent_candidate']=dict(full['complete_parent_candidate'],**metadata['complete_parent_candidate'])
     if 'compact_workload_candidate' in metadata:
         full['compact_workload_candidate']=dict(full['compact_workload_candidate'],**metadata['compact_workload_candidate'])
+    if 'route_progress_cmax_candidate' in metadata:
+        full['route_progress_cmax_candidate']=dict(full['route_progress_cmax_candidate'],**metadata['route_progress_cmax_candidate'])
     return full
 
 
@@ -92,7 +94,7 @@ def save_neural_checkpoint(checkpoint,path):
           'remaining_workload_features','compact_parent_limit')
     def split(part):
         return ({k:v for k,v in part.items() if k in keep},
-                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate','early_cmax_candidate','parent_cmax_candidate','parent_cmax_macro_il_candidate','complete_parent_candidate','compact_workload_candidate')})
+                {k:v for k,v in part.items() if k not in keep and k not in ('refinement_candidate','opportunity_cmax_candidate','early_cmax_candidate','parent_cmax_candidate','parent_cmax_macro_il_candidate','complete_parent_candidate','compact_workload_candidate','route_progress_cmax_candidate')})
     thin,main=split(checkpoint);metadata=dict(main=main)
     if 'refinement_candidate' in checkpoint:
         thin['refinement_candidate'],metadata['candidate']=split(checkpoint['refinement_candidate'])
@@ -108,6 +110,8 @@ def save_neural_checkpoint(checkpoint,path):
         thin['complete_parent_candidate'],metadata['complete_parent_candidate']=split(checkpoint['complete_parent_candidate'])
     if 'compact_workload_candidate' in checkpoint:
         thin['compact_workload_candidate'],metadata['compact_workload_candidate']=split(checkpoint['compact_workload_candidate'])
+    if 'route_progress_cmax_candidate' in checkpoint:
+        thin['route_progress_cmax_candidate'],metadata['route_progress_cmax_candidate']=split(checkpoint['route_progress_cmax_candidate'])
     thin['research_archive']=zlib.compress(json.dumps(metadata,ensure_ascii=False,allow_nan=False,
                                                     separators=(',',':')).encode('utf-8'))
     thin['research_archive_format']='zlib-json'

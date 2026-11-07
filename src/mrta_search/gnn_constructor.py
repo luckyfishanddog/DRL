@@ -723,7 +723,7 @@ def joint_opportunity_deltas(state,variants,blocks,patterns,config,*,insertion_l
 
 
 def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_limit=8,check_initial_feasibility=True,
-                        include_opportunities=False):
+                        include_opportunities=False,filter_legal_parents=True):
     from .lns import has_joint_block_candidate
     scale = max(1.0,sum(config.process_time(b.length) for b in blocks.values()))
     travel = [sum(arcs) for arcs in state.arc_costs]
@@ -736,7 +736,7 @@ def joint_parent_inputs(state, pending, blocks, patterns, config, *, insertion_l
     ids, features = [], []
     for p in sorted(pending):
         children = sorted(grouped[p],key=lambda b:b.block_id)
-        if not has_joint_block_candidate(state,children[0],patterns[p],blocks,config,
+        if filter_legal_parents and not has_joint_block_candidate(state,children[0],patterns[p],blocks,config,
                                          insertion_limit=insertion_limit,
                                          check_initial_feasibility=check_initial_feasibility):
             continue
@@ -1361,8 +1361,69 @@ def complete_parent_space(parents, config, *, compact=False):
     return space
 
 
-def compact_parent_ids(space,pending,*,parent_limit=4):
-    """MRV + original-parent LPT; no learned parent head or mode cut count bias."""
+def gnn_parent_orders(space,state,pending,selected,model,config,*,proposal_graph_mode='native'):
+    """Reuse the existing parent head on inference-available task graphs.
+
+    Retained parents use their committed modes; uncommitted parents use the
+    catalog default, never a future teacher mode. The full action pool still
+    considers every legal mode. One set of GAT weights serves both graphs.
+    """
+    _,blocks,patterns=complete_parent_view(space,selected)
+    key=tuple(patterns.values())
+    cached=space.get('parent_proposal_graph')
+    if cached is None or cached[0]!=key:
+        graph=build_block_robot_graph(tuple(sorted(blocks.values(),key=lambda b:b.block_id)),key,config,
+                                     include_parent_edges=True)
+        space['parent_proposal_graph']=(key,graph)
+    else:graph=cached[1]
+    ids,features=joint_parent_inputs(state,pending,blocks,patterns,config,
+        include_opportunities=getattr(model,'opportunity_features',False),filter_legal_parents=False)
+    if proposal_graph_mode=='native':
+        embeddings=model.contextualize_state(graph,model.encode_static(graph),state.routes,state.directions)
+        logits=model.parent_logits(graph,embeddings,ids,features)
+    elif proposal_graph_mode in ('catalog_mean','catalog_max'):
+        view,_,_=complete_parent_view(space,selected)
+        embeddings=model.contextualize_state(view,model.encode_static(space['graph']),state.routes,state.directions)
+        if proposal_graph_mode=='catalog_mean':
+            logits=model.parent_logits(space['graph'],embeddings,ids,features)
+        else:
+            contexts=[];dynamic=[];owners=[]
+            total=max(1.,sum(config.process_time(b.length) for b in blocks.values()))
+            moves=[sum(arcs) for arcs in state.arc_costs]
+            for index,parent in enumerate(ids):
+                for pattern in space['catalog'][parent]:
+                    children=space['options'][pattern]
+                    context=embeddings[[space['indices'][pattern,b.block_id] for b in children]].mean(0)
+                    row=features[index].clone()
+                    robots=((0 if pattern.rail is Rail.UPPER else 2),) if pattern.kind is SplitKind.X_SPLIT else _eligible_robots(children[0],config)
+                    row[8]=sum(config.process_time(b.length) for b in children)/total
+                    row[9]=min(state.loads[r]+moves[r] for r in robots)/total
+                    row[11]=len(children)/2
+                    contexts.append(context);dynamic.append(row);owners.append(index)
+            values=model.parent_head(torch.cat((torch.stack(contexts),model.scale_inputs(torch.stack(dynamic),'parent')),1)).squeeze(1)
+            logits=torch.stack([values[[i for i,p in enumerate(owners) if p==index]].max() for index in range(len(ids))])
+    else:raise ValueError('unknown proposal graph representation')
+    if not torch.isfinite(logits).all():raise ValueError('NONFINITE_PARENT_PROPOSAL_LOGITS')
+    gnn=tuple(ids[i] for i in sorted(range(len(ids)),key=lambda i:(-float(logits[i]),ids[i])))
+    mrv=tuple(sorted(pending,key=lambda p:(space['flexibility'][p],-space['original_processing'][p],p)))
+    lpt=tuple(sorted(pending,key=lambda p:(-space['original_processing'][p],space['flexibility'][p],p)))
+    return dict(gnn=gnn,mrv=mrv,lpt=lpt)
+
+
+def compact_parent_ids(space,pending,*,parent_limit=4,strategy=None,orders=None):
+    """Legacy MRV/LPT selection or a measured existing-head ranking."""
+    if strategy is not None:
+        if parent_limit not in (4,6,8,12,16):raise ValueError('ranked parent limit must be 4,6,8,12 or 16')
+        if strategy not in ('gnn','mrv','lpt','gnn_mrv_lpt'):raise ValueError('unknown parent proposal strategy')
+        if strategy!='gnn_mrv_lpt':return tuple(orders[strategy][:parent_limit])
+        chosen=list(orders['gnn'][:max(0,parent_limit-2)])
+        for name in ('mrv','lpt'):
+            extra=next((p for p in orders[name] if p not in chosen),None)
+            if extra is not None:chosen.append(extra)
+        for p in orders['gnn']:
+            if len(chosen)>=min(parent_limit,len(pending)):break
+            if p not in chosen:chosen.append(p)
+        return tuple(chosen[:parent_limit])
     if parent_limit not in (4,6):raise ValueError('compact parent limit must be 4 or 6')
     count=parent_limit//2
     scarce=sorted(pending,key=lambda p:(space['flexibility'][p],-space['original_processing'][p],p))[:count]
@@ -1414,7 +1475,8 @@ def structural_child_indices(variants, *, limit):
 
 
 def complete_parent_candidates(space,state,pending,selected,config,*,first_limit=16,second_limit=8,
-                               parent_limit=None,include_remaining_workload=False):
+                               parent_limit=None,include_remaining_workload=False,candidate_parent_ids=None,
+                               remaining_after_parent=False):
     """Every unassigned parent/mode gets complete bounded sequential proposals.
 
     WHOLE exposes its bounded insertion pool. Split branches retain at most
@@ -1422,9 +1484,13 @@ def complete_parent_candidates(space,state,pending,selected,config,*,first_limit
     """
     from .lns import joint_block_candidates
     plans=[]
-    parents=sorted(pending) if parent_limit is None else compact_parent_ids(space,pending,parent_limit=parent_limit)
-    remaining=remaining_eligible_workload(space,pending) if include_remaining_workload else None
+    parents=(tuple(candidate_parent_ids) if candidate_parent_ids is not None else sorted(pending)
+             if parent_limit is None else compact_parent_ids(space,pending,parent_limit=parent_limit))
+    if not set(parents)<=set(pending):raise ValueError('candidate parent is not pending')
+    remaining=remaining_eligible_workload(space,pending) if include_remaining_workload and not remaining_after_parent else None
     for parent in parents:
+        if include_remaining_workload and remaining_after_parent:
+            remaining=remaining_eligible_workload(space,set(pending)-{parent})
         for pattern in space['catalog'][parent]:
             graph,blocks,patterns=complete_parent_view(space,dict(selected,**{parent:pattern}))
             children=space['options'][pattern]
@@ -1468,6 +1534,116 @@ def complete_parent_candidates(space,state,pending,selected,config,*,first_limit
     return tuple(plans)
 
 
+def reflected_start_parent_orders(space, state, pending, selected, model, config):
+    """Score an empty prefix in equivalent coordinates with the same parent head."""
+
+    _, blocks, patterns = complete_parent_view(space, selected)
+    if any(state.routes):
+        raise ValueError('reflected startup ranking requires empty routes')
+    graph = space['parent_proposal_graph'][1]
+    ids, features = joint_parent_inputs(state, pending, blocks, patterns, config,
+        include_opportunities=model.opportunity_features, filter_legal_parents=False)
+    orders = []
+    for flip_x, flip_y in ((True, False), (False, True), (True, True)):
+        robots = [r ^ int(flip_x) ^ (2 * int(flip_y)) for r in range(4)]
+        rows = graph.node_features.clone()
+        welds = rows[:graph.robot_offset]
+        if flip_x:
+            welds[:, [2, 4, 6]] = sum(config.workspace_x) / 20 - welds[:, [2, 4, 6]]
+            welds[:, [8, 11]] *= -1
+        if flip_y:
+            welds[:, [3, 5, 7]] = sum(config.workspace_y) / 12 - welds[:, [3, 5, 7]]
+            welds[:, [9, 12]] *= -1
+        welds[:, 14:18] = welds[:, [14 + r for r in robots]]
+        nodes = torch.arange(len(rows))
+        nodes[graph.robot_offset:] = graph.robot_offset + torch.tensor(robots)
+        reflected = replace(graph, node_features=rows, edge_index=nodes[graph.edge_index])
+        columns = list(range(features.shape[1]))
+        for start in (0, 4, *range(12, len(columns), 4)):
+            columns[start:start + 4] = [start + r for r in robots]
+        embeddings = model.contextualize_state(reflected, model.encode_static(reflected), state.routes, state.directions)
+        logits = model.parent_logits(reflected, embeddings, ids, features[:, columns]).tolist()
+        orders.append(tuple(p for _, p in sorted(zip((-value for value in logits), ids))))
+    return tuple(orders)
+
+
+def route_distance_parent_orders(space, state, selected, gnn_order, config, *, gaps):
+    """Rank pending parents by distance from the current directed route for each robot."""
+    from mrta_reference.geometry import oriented_endpoints
+    from mrta_search.initialization import bounded_insertion_positions
+    from mrta_search.lns import has_joint_block_candidate
+
+    _, blocks, patterns = complete_parent_view(space, selected)
+    routes = tuple(tuple(oriented_endpoints(blocks[b], d) for b, d in zip(route, directions))
+                   for route, directions in zip(state.routes, state.directions))
+    distances = [{} for _ in routes]
+    for parent in gnn_order:
+        pattern = patterns[parent]
+        for child in space['options'][pattern]:
+            for robot in _eligible_robots(child, config):
+                if not has_joint_block_candidate(state, child, pattern, blocks, config, robot_id=robot):
+                    continue
+                route = routes[robot]
+                ends = child.start, child.end
+                if route:
+                    distance = min(math.dist(route[-1][1], point) for point in ends)
+                    if gaps:
+                        distance = min(distance, *(math.dist(point, route[0][0]) for point in ends))
+                        for position in bounded_insertion_positions(len(route), 8)[1:-1]:
+                            before, after = route[position - 1][1], route[position][0]
+                            detour = min(math.dist(before, a) + math.dist(b, after) for a, b in (ends, ends[::-1]))
+                            distance = min(distance, detour - math.dist(before, after))
+                else:
+                    boundary = config.workspace_x[robot % 2]
+                    distance = min(abs(point[0] - boundary) for point in ends)
+                distances[robot][parent] = min(distance, distances[robot].get(parent, math.inf))
+    return tuple(tuple(sorted((p for p in gnn_order if p in costs), key=costs.__getitem__)) for costs in distances)
+
+
+def supplement_parent_ids(gnn_order, supplemental_orders, limit):
+    chosen = list(gnn_order[:limit // 2])
+    selected = set(chosen)
+    rankings = [iter(order) for order in supplemental_orders]
+    while len(chosen) < limit and rankings:
+        for ranking in rankings.copy():
+            parent = next((p for p in ranking if p not in selected), None)
+            if parent is None:
+                rankings.remove(ranking)
+                continue
+            chosen.append(parent)
+            selected.add(parent)
+            if len(chosen) == limit:
+                break
+    return tuple((chosen + [p for p in gnn_order if p not in selected])[:limit])
+
+
+def route_progress_supplements(space, state, pending, selected, model, config, gnn_order):
+    """Use one parent head and geometric supplements for the current route stage."""
+    route_lengths = tuple(map(len, state.routes))
+    if not any(route_lengths):
+        return reflected_start_parent_orders(space, state, pending, selected, model, config)
+    if min(route_lengths) < 3:
+        shortest = sorted(range(4), key=lambda r: (route_lengths[r], r))[:2]
+        ends = route_distance_parent_orders(space, state, selected, gnn_order, config, gaps=False)
+        return tuple(ends[r] for r in shortest)
+    if 3 * len(pending) <= len(space['parents']):
+        return route_distance_parent_orders(space, state, selected, gnn_order, config, gaps=True)
+    ends = route_distance_parent_orders(space, state, selected, gnn_order, config, gaps=False)
+    whole = tuple(p for p in gnn_order if space['catalog'][p][0].kind is SplitKind.WHOLE)
+    return (*ends, whole)
+
+
+def route_progress_complete_candidates(space, state, pending, selected, model, config, *,
+                                       parent_limit=16, first_limit=16, second_limit=8):
+    """Generate exactly the measured whole-parent pool, with the full bounded WHOLE variants."""
+    order = gnn_parent_orders(space, state, pending, selected, model, config)['gnn']
+    supplements = route_progress_supplements(space, state, pending, selected, model, config, order)
+    ids = supplement_parent_ids(order, supplements, parent_limit)
+    return complete_parent_candidates(space, state, pending, selected, config,
+        first_limit=first_limit, second_limit=second_limit, candidate_parent_ids=ids,
+        include_remaining_workload=True, remaining_after_parent=True)
+
+
 def complete_parent_inputs(plans):
     """Collate exactly the same complete-action pool for training and decoding."""
     n=len(plans);dim=plans[0]['child_features'].shape[1]
@@ -1484,11 +1660,22 @@ def complete_parent_inputs(plans):
 
 
 def construct_complete_parent_gnn(parents,model,config,*,seed=None,space=None,state=None,selected=None,
-                                  pending=None,observer=None,forced_plan=None,parent_limit=None):
+                                  pending=None,observer=None,forced_plan=None,parent_limit=None,
+                                  parent_strategy=None,proposal_graph_mode='native',remaining_after_parent=False,
+                                  first_limit=None,second_limit=None):
     """Empty routes -> joint actions -> complete solution, with no other solver."""
     from .lns import oriented_route_state
     started=time.perf_counter();actions=[]
-    if parent_limit is None:parent_limit=getattr(model,'compact_parent_limit',None)
+    stored_parent_limit = getattr(model, 'compact_parent_limit', None)
+    if parent_limit is None:
+        parent_limit = stored_parent_limit
+    # The saved 16-parent branch uses the measured route-progress pool.
+    if parent_strategy is None and stored_parent_limit == 16:
+        parent_strategy = 'route_progress'
+    if first_limit is None:
+        first_limit = 16 if parent_strategy == 'route_progress' else 8
+    if second_limit is None:
+        second_limit = 8 if parent_strategy == 'route_progress' else 4
     compact=parent_limit is not None
     space=complete_parent_space(parents,config,compact=compact) if space is None else space
     selected={} if selected is None else dict(selected)
@@ -1500,8 +1687,18 @@ def construct_complete_parent_gnn(parents,model,config,*,seed=None,space=None,st
     with torch.inference_mode():
         embeddings=model.encode_static(space['graph'])
         while pending:
-            plans=complete_parent_candidates(space,state,pending,selected,config,
-                **dict(first_limit=8,second_limit=4,parent_limit=parent_limit,include_remaining_workload=True) if compact else {})
+            options=dict(first_limit=first_limit,second_limit=second_limit,parent_limit=parent_limit,
+                         include_remaining_workload=True,remaining_after_parent=remaining_after_parent) if compact else {}
+            if parent_strategy == 'route_progress':
+                plans = route_progress_complete_candidates(space, state, pending, selected, model, config,
+                    parent_limit=parent_limit, first_limit=first_limit, second_limit=second_limit)
+            elif parent_strategy is not None:
+                orders=gnn_parent_orders(space,state,pending,selected,model,config,proposal_graph_mode=proposal_graph_mode)
+                options['candidate_parent_ids']=compact_parent_ids(space,pending,parent_limit=parent_limit,
+                    strategy=parent_strategy,orders=orders)
+                plans=complete_parent_candidates(space,state,pending,selected,config,**options)
+            else:
+                plans=complete_parent_candidates(space,state,pending,selected,config,**options)
             if not plans:return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,'NO_COMPLETE_PARENT_ACTION',state)
             context=model.contextualize_state(complete_parent_view(space,selected)[0],embeddings,state.routes,state.directions)
             scores=model.parent_action_scores(space['graph'],context,complete_parent_inputs(plans))

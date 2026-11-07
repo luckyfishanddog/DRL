@@ -3299,6 +3299,823 @@ def compact_workload_report():
     print('COMPACT_REPORT',feasible,'/8','construction',construction,'B32',calls_train+calls_dev,flush=True)
 
 
+def residual_coverage_sweep():
+    """TRAIN-only candidate measurements. No model update or scheduling call."""
+    from mrta_search import gnn_constructor as c
+    saved=op_read()
+    existing=[r for r in saved if r['phase']=='residual_candidate_coverage']
+    if len(existing)==20 and any(r['phase']=='residual_coverage_decision' for r in saved):
+        print('Retain completed candidate sweep; no repeated measurements.',flush=True);return
+    shared,config,checkpoint,archive,teachers,_,_,_=op_sources()
+    source=shared._model_from_checkpoint(checkpoint[OP_VARIANT]).eval()
+    graphs,examples,_,preparation=op_saved_imitation(shared,config,archive,teachers)
+    raw,_=cmax_expert_macro_examples(source,graphs,examples,raw_only=True)
+    models={OP_VARIANT:source,'root':shared._model_from_checkpoint(checkpoint).eval()}
+    for name in ('refinement_candidate',EARLY_VARIANT,PARENT_CMAX_VARIANT,COMPLETE_VARIANT):
+        models[name]=shared._model_from_checkpoint(checkpoint[name]).eval()
+    strategies=('gnn','mrv','lpt','gnn_mrv_lpt');limits=(4,6,8,12,16)
+    measurements={(strategy,k):[] for strategy in strategies for k in limits}
+    source_counts=Counter();spaces={};variable_features=0;parent_ranks=[]
+    with torch.no_grad():
+        for index,e in enumerate(raw):
+            parents=e['reference'].parents
+            if parents not in spaces:spaces[parents]=c.complete_parent_space(parents,config,compact=True)
+            space=spaces[parents];pending=e['pending'];teacher=e['teacher_plan'];parent=teacher['parent_id']
+            selected={p.parent_id:p for p in e['reference'].patterns if p.parent_id not in pending}
+            pattern=next(p for p in e['reference'].patterns if p.parent_id==parent)
+            tick=time.perf_counter();orders=c.gnn_parent_orders(space,e['state'],pending,selected,source,config)
+            parent_seconds=time.perf_counter()-tick
+            parent_ranks.append(dict(case=index,fraction=e['fraction'],parent=parent,rank=orders['gnn'].index(parent)+1,
+                                     pending=len(pending),geometry_parents=len(parents)))
+            all_vectors={tuple(c.remaining_eligible_workload(space,set(pending)-{p}).tolist()) for p in pending}
+            variable_features+=len(all_vectors)>1
+            for strategy in strategies:
+                for k in limits:
+                    tick=time.perf_counter()
+                    ids=c.compact_parent_ids(space,pending,parent_limit=k,strategy=strategy,orders=orders)
+                    plans=c.complete_parent_candidates(space,e['state'],pending,selected,config,first_limit=8,second_limit=4,
+                        parent_limit=k,include_remaining_workload=True,candidate_parent_ids=ids,remaining_after_parent=True)
+                    matched=any(p['pattern']==pattern and cmax_action_key(p)==cmax_action_key(teacher) for p in plans)
+                    seconds=time.perf_counter()-tick+(parent_seconds if strategy in ('gnn','gnn_mrv_lpt') else 0.)
+                    measurements[strategy,k].append(dict(case=index,fraction=e['fraction'],parent_covered=parent in ids,
+                        complete_covered=matched,parents=len(ids),candidates=len(plans),seconds=seconds))
+            # Additional frozen-head/representation checks diagnose whether a
+            # proposed repair can possibly cross the complete-action threshold.
+            for name,model in models.items():
+                representations=('native','catalog_mean','catalog_max') if name in (OP_VARIANT,PARENT_CMAX_VARIANT,'refinement_candidate') else ('native',)
+                for representation in representations:
+                    ranked=orders if name==OP_VARIANT and representation=='native' else c.gnn_parent_orders(
+                        space,e['state'],pending,selected,model,config,proposal_graph_mode=representation)
+                    for strategy in ('gnn','gnn_mrv_lpt'):
+                        for k in limits:
+                            ids=c.compact_parent_ids(space,pending,parent_limit=k,strategy=strategy,orders=ranked)
+                            source_counts[name,representation,strategy,k]+=parent in ids
+            if index%6==5:print('RESIDUAL_COVERAGE',index+1,'/126',flush=True)
+    done={(r['method'],r['payload']['parent_limit']) for r in existing}
+    summary=[]
+    for (strategy,k),cases in measurements.items():
+        payload=dict(source_variant=OP_VARIANT,representation='native',parent_limit=k,first_limit=8,second_limit=4,
+            states=len(cases),parent_covered=sum(x['parent_covered'] for x in cases),
+            complete_covered=sum(x['complete_covered'] for x in cases),
+            actual_parents_median=statistics.median(x['parents'] for x in cases),
+            candidates_min=min(x['candidates'] for x in cases),candidates_median=statistics.median(x['candidates'] for x in cases),
+            candidates_max=max(x['candidates'] for x in cases),generation_seconds_median=statistics.median(x['seconds'] for x in cases),
+            cases=cases,timing='complete candidate generation; measured native parent ranking charged once for GNN strategies',
+            remaining_after_parent=True)
+        summary.append(dict(strategy=strategy,**{key:value for key,value in payload.items() if key!='cases'}))
+        if (strategy,k) not in done:
+            op_save(dict(phase='residual_candidate_coverage',instance='TRAIN_126',seed=OP_SEED,method=strategy,
+                status='MEASURED',b32_calls=0,payload=payload))
+    for name,representation,strategy in sorted({key[:3] for key in source_counts}):
+        op_save(dict(phase='residual_parent_diagnosis',instance='TRAIN_126',seed=OP_SEED,
+            method=name+':'+representation+':'+strategy,status='FROZEN_HEAD_MEASURED',b32_calls=0,
+            payload=dict(source_variant=name,representation=representation,strategy=strategy,
+                         parent_coverage={str(k):source_counts[name,representation,strategy,k] for k in limits})))
+    qualified=[r for r in summary if r['complete_covered']/len(raw)>=.9]
+    chosen=min(qualified,key=lambda r:(r['parent_limit'],r['candidates_median'],-r['complete_covered'])) if qualified else None
+    best=max(summary,key=lambda r:(r['complete_covered'],-r['parent_limit']))
+    op_save(dict(phase='residual_coverage_decision',instance='TRAIN_126',seed=OP_SEED,method='FULL_ACTION_90_PERCENT',
+        status='READY_FOR_FEEDBACK' if chosen else 'STOP_COVERAGE_BELOW_90',b32_calls=0,
+        payload=dict(chosen=chosen,best=best,required=math.ceil(.9*len(raw)),total=len(raw),preparation=preparation,
+            states_with_action_dependent_remaining=variable_features,parent_ranks=parent_ranks,
+            best_parent_coverage_any_checked_frozen_head=max(source_counts.values()),
+            train_b32_calls=0,dev_b32_calls=0,training_updates=0)))
+    print('RESIDUAL_DECISION',None if chosen is None else (chosen['strategy'],chosen['parent_limit']),
+          'best',best['complete_covered'],'/126','B32=0','training=0',flush=True)
+
+
+def residual_packing_repair():
+    """Diagnose the eight packing misses without increasing the parent cap."""
+    from mrta_search import gnn_constructor as c
+    rows=op_read()
+    if any(r['phase']=='residual_candidate_repair' for r in rows):
+        print('Retain existing bounded-packing diagnosis.',flush=True);return
+    shared,config,checkpoint,archive,teachers,_,_,_=op_sources()
+    source=shared._model_from_checkpoint(checkpoint[OP_VARIANT]).eval()
+    graphs,examples,_,_=op_saved_imitation(shared,config,archive,teachers)
+    raw,_=cmax_expert_macro_examples(source,graphs,examples,raw_only=True)
+    initial=next(r['payload'] for r in rows if r['phase']=='residual_candidate_coverage' and r['method']=='gnn' and r['payload']['parent_limit']==16)
+    spaces={};cases=[];recovered=[];lost=[]
+    with torch.no_grad():
+        for index,e in enumerate(raw):
+            parents=e['reference'].parents
+            if parents not in spaces:spaces[parents]=c.complete_parent_space(parents,config,compact=True)
+            space=spaces[parents];pending=e['pending'];teacher=e['teacher_plan'];parent=teacher['parent_id']
+            selected={p.parent_id:p for p in e['reference'].patterns if p.parent_id not in pending}
+            pattern=next(p for p in e['reference'].patterns if p.parent_id==parent)
+            tick=time.perf_counter();orders=c.gnn_parent_orders(space,e['state'],pending,selected,source,config)
+            ids=c.compact_parent_ids(space,pending,parent_limit=16,strategy='gnn',orders=orders)
+            # Existing full bounded pool: WHOLE retains its legal eight-position
+            # pool, split branches remain 16 x 8 rather than a full product.
+            plans=c.complete_parent_candidates(space,e['state'],pending,selected,config,first_limit=16,second_limit=8,
+                candidate_parent_ids=ids,include_remaining_workload=True,remaining_after_parent=True)
+            covered=any(p['pattern']==pattern and cmax_action_key(p)==cmax_action_key(teacher) for p in plans)
+            original=initial['cases'][index]
+            if original['complete_covered'] and not covered:lost.append(index)
+            if covered and not original['complete_covered']:recovered.append(index)
+            cases.append(dict(case=index,fraction=e['fraction'],parent_covered=parent in ids,complete_covered=covered,
+                              parents=len(ids),candidates=len(plans),seconds=time.perf_counter()-tick))
+            if index%21==20:print('RESIDUAL_PACKING_REPAIR',index+1,flush=True)
+    result=dict(source_variant=OP_VARIANT,representation='native',strategy='gnn',parent_limit=16,
+        first_limit=16,second_limit=8,whole_pool='all legal variants within existing eight positions',states=len(cases),
+        parent_covered=sum(x['parent_covered'] for x in cases),complete_covered=sum(x['complete_covered'] for x in cases),
+        candidates_min=min(x['candidates'] for x in cases),candidates_median=statistics.median(x['candidates'] for x in cases),
+        candidates_max=max(x['candidates'] for x in cases),generation_seconds_median=statistics.median(x['seconds'] for x in cases),
+        recovered_cases=recovered,lost_cases=lost,cases=cases,required=math.ceil(.9*len(cases)),
+        training_updates=0,train_b32_calls=0,dev_b32_calls=0)
+    op_save(dict(phase='residual_candidate_repair',instance='TRAIN_126',seed=OP_SEED,method='GNN16_EXISTING_BOUNDED_POOL',
+        status='STOP_COVERAGE_BELOW_90' if result['complete_covered']<result['required'] else 'READY_FOR_FEEDBACK',
+        b32_calls=0,payload=result))
+    print('RESIDUAL_PACKING_RESULT',result['complete_covered'],'/126','recovered',len(recovered),'lost',len(lost),flush=True)
+
+
+def residual_external_parent_check():
+    """Check the separately retained retrained GNN head, without RULE fusion."""
+    from mrta_search import gnn_constructor as c
+    rows=op_read()
+    if any(r['phase']=='residual_external_parent_decision' for r in rows):
+        print('Retain completed external parent-head check.',flush=True);return
+    shared,config,_,archive,teachers,_,_,_=op_sources()
+    external=shared.read_neural_checkpoint(ROOT/'models/gnn_rule_guided_constructor_05.pt')
+    source=shared._model_from_checkpoint(external['refinement_candidate']).eval()
+    graphs,examples,_,_=op_saved_imitation(shared,config,archive,teachers)
+    raw,_=cmax_expert_macro_examples(source,graphs,examples,raw_only=True)
+    counts=Counter();spaces={};prepared=[]
+    with torch.no_grad():
+        for index,e in enumerate(raw):
+            parents=e['reference'].parents
+            if parents not in spaces:spaces[parents]=c.complete_parent_space(parents,config,compact=True)
+            selected={p.parent_id:p for p in e['reference'].patterns if p.parent_id not in e['pending']}
+            orders_by_rep={}
+            for representation in ('native','catalog_mean','catalog_max'):
+                orders=c.gnn_parent_orders(spaces[parents],e['state'],e['pending'],selected,source,config,proposal_graph_mode=representation)
+                orders_by_rep[representation]=orders
+                for strategy in ('gnn','gnn_mrv_lpt'):
+                    for k in (4,6,8,12,16):
+                        ids=c.compact_parent_ids(spaces[parents],e['pending'],parent_limit=k,strategy=strategy,orders=orders)
+                        counts[representation,strategy,k]+=e['teacher_plan']['parent_id'] in ids
+            prepared.append((e,spaces[parents],selected,orders_by_rep))
+            if index%21==20:print('RETRAINED_PARENT_CHECK',index+1,flush=True)
+        for representation,strategy in sorted({key[:2] for key in counts}):
+            op_save(dict(phase='residual_parent_diagnosis',instance='TRAIN_126',seed=OP_SEED,
+                method='rule_guided_retrained:'+representation+':'+strategy,status='FROZEN_HEAD_MEASURED',b32_calls=0,
+                payload=dict(source_variant='rule_guided_retrained',representation=representation,strategy=strategy,
+                    weights_path='models/gnn_rule_guided_constructor_05.pt',weights_branch='refinement_candidate',
+                    rule_fusion_used=False,parent_coverage={str(k):counts[representation,strategy,k] for k in (4,6,8,12,16)})))
+        eligible=[key for key,value in counts.items() if value>=math.ceil(.9*len(raw))]
+        full=[]
+        for representation,strategy,k in eligible:
+            covered=0;sizes=[];times=[]
+            for e,space,selected,orders_by_rep in prepared:
+                ids=c.compact_parent_ids(space,e['pending'],parent_limit=k,strategy=strategy,orders=orders_by_rep[representation])
+                tick=time.perf_counter()
+                plans=c.complete_parent_candidates(space,e['state'],e['pending'],selected,config,first_limit=16,second_limit=8,
+                    candidate_parent_ids=ids,include_remaining_workload=True,remaining_after_parent=True)
+                target=e['teacher_plan'];pattern=next(p for p in e['reference'].patterns if p.parent_id==target['parent_id'])
+                covered+=any(p['pattern']==pattern and cmax_action_key(p)==cmax_action_key(target) for p in plans)
+                sizes.append(len(plans));times.append(time.perf_counter()-tick)
+            value=dict(source_variant='rule_guided_retrained',representation=representation,strategy=strategy,parent_limit=k,
+                parent_covered=counts[representation,strategy,k],complete_covered=covered,states=len(raw),
+                candidates_median=statistics.median(sizes),candidates_max=max(sizes),generation_seconds_median=statistics.median(times))
+            full.append(value)
+            op_save(dict(phase='residual_external_candidate_coverage',instance='TRAIN_126',seed=OP_SEED,method=representation+':'+strategy,
+                status='MEASURED',b32_calls=0,payload=value))
+    qualified=[p for p in full if p['complete_covered']>=math.ceil(.9*len(raw))]
+    op_save(dict(phase='residual_external_parent_decision',instance='TRAIN_126',seed=OP_SEED,method='RETRAINED_PARENT_HEAD_ONLY',
+        status='READY_FOR_FEEDBACK' if qualified else 'STOP_COVERAGE_BELOW_90',b32_calls=0,payload=dict(
+            best_parent_coverage=max(counts.values()),qualified=qualified,total=len(raw),required=math.ceil(.9*len(raw)),
+            rule_fusion_used=False,training_updates=0,train_b32_calls=0,dev_b32_calls=0)))
+    print('RETRAINED_PARENT_RESULT',max(counts.values()),'/126','qualified',qualified,flush=True)
+
+
+def residual_quota_check():
+    """Bounded checks of few MRV/LPT supplements, with GNN still the majority."""
+    from mrta_search import gnn_constructor as c
+    rows=op_read()
+    if any(r['phase']=='residual_quota_decision' for r in rows):
+        print('Retain measured supplement quota checks.',flush=True);return
+    shared,config,checkpoint,archive,teachers,_,_,_=op_sources()
+    external=shared.read_neural_checkpoint(ROOT/'models/gnn_rule_guided_constructor_05.pt')
+    models={OP_VARIANT:shared._model_from_checkpoint(checkpoint[OP_VARIANT]).eval(),
+            'rule_guided_retrained':shared._model_from_checkpoint(external['refinement_candidate']).eval()}
+    graphs,examples,_,_=op_saved_imitation(shared,config,archive,teachers)
+    raw,_=cmax_expert_macro_examples(models[OP_VARIANT],graphs,examples,raw_only=True)
+    settings=[(k,h) for k in (4,6,8,12,16) for h in (1,2,3) if k-2*h>=2*h]
+    counts=Counter();unions=Counter();spaces={};prepared=[]
+    def select(orders,k,h):
+        ids=list(orders['gnn'][:k-2*h])
+        for key in ('mrv','lpt'):ids.extend([p for p in orders[key] if p not in ids][:h])
+        ids.extend(p for p in orders['gnn'] if p not in ids)
+        return tuple(ids[:k])
+    with torch.no_grad():
+        for index,e in enumerate(raw):
+            parents=e['reference'].parents
+            if parents not in spaces:spaces[parents]=c.complete_parent_space(parents,config,compact=True)
+            selected={p.parent_id:p for p in e['reference'].patterns if p.parent_id not in e['pending']};ranked={}
+            for name,model in models.items():
+                orders=c.gnn_parent_orders(spaces[parents],e['state'],e['pending'],selected,model,config)
+                ranked[name]=orders;target=e['teacher_plan']['parent_id']
+                unions[name]+=target in set(orders['gnn'][:16]+orders['mrv'][:16]+orders['lpt'][:16])
+                for k,h in settings:counts[name,k,h]+=target in select(orders,k,h)
+            prepared.append((e,spaces[parents],selected,ranked))
+            if index%21==20:print('SUPPLEMENT_QUOTA_CHECK',index+1,flush=True)
+        for name in models:
+            op_save(dict(phase='residual_quota_parent_coverage',instance='TRAIN_126',seed=OP_SEED,method=name,
+                status='MEASURED',b32_calls=0,payload=dict(source_variant=name,states=len(raw),
+                    quotas=[dict(parent_limit=k,gnn_quota=k-2*h,mrv_quota=h,lpt_quota=h,parent_covered=counts[name,k,h]) for k,h in settings],
+                    union_of_three_top16_parent_coverage=unions[name],union_is_diagnostic_not_an_inference_pool=True)))
+        full=[]
+        for name,k,h in counts:
+            if counts[name,k,h]<math.ceil(.9*len(raw)):continue
+            covered=0;sizes=[]
+            for e,space,selected,ranked in prepared:
+                ids=select(ranked[name],k,h)
+                plans=c.complete_parent_candidates(space,e['state'],e['pending'],selected,config,first_limit=16,second_limit=8,
+                    candidate_parent_ids=ids,include_remaining_workload=True,remaining_after_parent=True)
+                target=e['teacher_plan'];pattern=next(p for p in e['reference'].patterns if p.parent_id==target['parent_id'])
+                covered+=any(p['pattern']==pattern and cmax_action_key(p)==cmax_action_key(target) for p in plans);sizes.append(len(plans))
+            value=dict(source_variant=name,parent_limit=k,gnn_quota=k-2*h,mrv_quota=h,lpt_quota=h,
+                parent_covered=counts[name,k,h],complete_covered=covered,states=len(raw),candidates_median=statistics.median(sizes),candidates_max=max(sizes))
+            full.append(value)
+            op_save(dict(phase='residual_quota_complete_coverage',instance='TRAIN_126',seed=OP_SEED,
+                method=name+f':{k-2*h}+{h}+{h}',status='MEASURED',b32_calls=0,payload=value))
+    qualified=[p for p in full if p['complete_covered']>=math.ceil(.9*len(raw))]
+    op_save(dict(phase='residual_quota_decision',instance='TRAIN_126',seed=OP_SEED,method='BOUNDED_SUPPLEMENT_QUOTAS',
+        status='READY_FOR_FEEDBACK' if qualified else 'STOP_COVERAGE_BELOW_90',b32_calls=0,
+        payload=dict(best_parent_coverage=max(counts.values()),qualified=qualified,states=len(raw),required=math.ceil(.9*len(raw)),
+                     training_updates=0,train_b32_calls=0,dev_b32_calls=0)))
+    print('QUOTA_CHECK_RESULT',max(counts.values()),'parent targets','qualified',qualified,flush=True)
+
+
+def residual_route_coverage():
+    """Measure route-aware bounded supplements on the same TRAIN action identities."""
+    from mrta_search import gnn_constructor as c
+
+    rows = op_read()
+    if any(r['phase'] == 'residual_route_coverage_decision' for r in rows):
+        print('Retain measured route-aware coverage.', flush=True)
+        return
+    shared, config, checkpoint, archive, teachers, _, _, _ = op_sources()
+    source = shared._model_from_checkpoint(checkpoint[OP_VARIANT]).eval()
+    graphs, examples, _, _ = op_saved_imitation(shared, config, archive, teachers)
+    raw, _ = cmax_expert_macro_examples(source, graphs, examples, raw_only=True)
+    previous = next(r['payload']['cases'] for r in rows if r['phase'] == 'residual_candidate_repair')
+    limits = (4, 6, 8, 12, 16)
+    strategies = ('ROUTE_END', 'REFLECTED_START_ROUTE_END', 'REFLECTED_START_ROUTE_PROGRESS')
+    required = math.ceil(.9 * len(raw))
+    prepared = []
+    counts = Counter()
+    stages = Counter()
+    spaces = {}
+    with torch.inference_mode():
+        for case, e in enumerate(raw):
+            reference, state, pending = (e[key] for key in ('reference', 'state', 'pending'))
+            teacher = e['teacher_plan']
+            target = teacher['parent_id']
+            pattern = next(p for p in reference.patterns if p.parent_id == target)
+            selected = {p.parent_id: p for p in reference.patterns if p.parent_id not in pending}
+            if reference.parents not in spaces:
+                spaces[reference.parents] = c.complete_parent_space(reference.parents, config, compact=True)
+            space = spaces[reference.parents]
+            tick = time.perf_counter()
+            gnn_order = c.gnn_parent_orders(space, state, pending, selected, source, config)['gnn']
+            parent_seconds = time.perf_counter() - tick
+            tick = time.perf_counter()
+            ends = c.route_distance_parent_orders(space, state, selected, gnn_order, config, gaps=False)
+            end_seconds = time.perf_counter() - tick
+            route_lengths = tuple(map(len, state.routes))
+            tick = time.perf_counter()
+            reflected = c.reflected_start_parent_orders(space, state, pending, selected, source, config) if not any(route_lengths) else ends
+            reflected_seconds = time.perf_counter() - tick if not any(route_lengths) else end_seconds
+            tick = time.perf_counter()
+            progress_orders = c.route_progress_supplements(space, state, pending, selected, source, config, gnn_order)
+            progress_seconds = time.perf_counter() - tick
+            pools = {}
+            for name, orders, seconds in zip(strategies, (ends, reflected, progress_orders),
+                                             (end_seconds, reflected_seconds, progress_seconds)):
+                for limit in limits:
+                    tick = time.perf_counter()
+                    ids = c.supplement_parent_ids(gnn_order, orders, limit)
+                    pools[name, limit] = ids, parent_seconds + seconds + time.perf_counter() - tick
+                    counts[name, limit] += target in ids
+                    stages[name, limit, e['fraction']] += target in ids
+            prepared.append((space, state, pending, selected, teacher, pattern, pools, e['fraction']))
+            if (case + 1) % 42 == 0:
+                print('ROUTE_PARENT_SCREEN', case + 1, '/', len(raw), flush=True)
+
+        for name in strategies:
+            op_save(dict(phase='residual_route_parent_screen', instance='TRAIN_126', seed=OP_SEED,
+                method=name, status='MEASURED', b32_calls=0, payload=dict(parent_coverage={k: counts[name, k] for k in limits},
+                    top16_by_fraction={fraction: stages[name, 16, fraction] for fraction in (0., .1, .25, .5, .75, .9)})))
+
+        measurements = []
+        # A missing parent cannot match the complete action. Fully measure the
+        # 16-parent variants and any smaller pool that can reach the threshold.
+        for name, limit in counts:
+            if limit != 16 and counts[name, limit] < required:
+                continue
+            cases = []
+            for case, (space, state, pending, selected, teacher, pattern, pools, fraction) in enumerate(prepared):
+                ids, parent_seconds = pools[name, limit]
+                tick = time.perf_counter()
+                plans = c.complete_parent_candidates(space, state, pending, selected, config, first_limit=16, second_limit=8,
+                    candidate_parent_ids=ids, include_remaining_workload=True, remaining_after_parent=True)
+                seconds = parent_seconds + time.perf_counter() - tick
+                match = any(p['pattern'] == pattern and cmax_action_key(p) == cmax_action_key(teacher) for p in plans)
+                cases.append(dict(case=case, fraction=fraction, parent_covered=teacher['parent_id'] in ids,
+                    complete_covered=match, parents=len(ids), candidates=len(plans), seconds=seconds))
+            payload = dict(strategy=name, parent_limit=limit, states=len(cases), parent_covered=counts[name, limit],
+                complete_covered=sum(x['complete_covered'] for x in cases),
+                actual_parents_median=statistics.median(x['parents'] for x in cases),
+                candidates_min=min(x['candidates'] for x in cases), candidates_max=max(x['candidates'] for x in cases),
+                candidates_median=statistics.median(x['candidates'] for x in cases),
+                generation_seconds_median=statistics.median(x['seconds'] for x in cases),
+                recovered=sum(x['complete_covered'] and not old['complete_covered'] for x, old in zip(cases, previous)),
+                lost=sum(not x['complete_covered'] and old['complete_covered'] for x, old in zip(cases, previous)))
+            measurements.append(payload)
+            op_save(dict(phase='residual_route_candidate_coverage', instance='TRAIN_126', seed=OP_SEED,
+                method=name, status='MEASURED', b32_calls=0, payload=dict(payload, cases=cases)))
+    qualified = [m for m in measurements if m['complete_covered'] >= required]
+    chosen = min(qualified, key=lambda m: (m['parent_limit'], m['candidates_median'], -m['complete_covered'])) if qualified else None
+    best = max(measurements, key=lambda m: (m['complete_covered'], -m['candidates_median']))
+    op_save(dict(phase='residual_route_coverage_decision', instance='TRAIN_126', seed=OP_SEED,
+        method='ROUTE_AWARE_PARENT_SUPPLEMENTS', status='READY_FOR_FEEDBACK' if chosen else 'STOP_COVERAGE_BELOW_90',
+        b32_calls=0, payload=dict(best=best, chosen=chosen, required=required, training_updates=0, train_b32_calls=0, dev_b32_calls=0)))
+    print('ROUTE_COVERAGE', best, 'required', required, 'chosen', chosen, flush=True)
+
+
+RESIDUAL_METHOD = 'REFLECTED_START_ROUTE_PROGRESS'
+RESIDUAL_VARIANT = 'route_progress_cmax_candidate'
+
+
+def residual_feedback_model(shared, checkpoint):
+    """One GNN with the measured proposal trunk and the existing complete-action head."""
+    source = shared._model_from_checkpoint(checkpoint[COMPLETE_VARIANT])
+    model = shared.expand_remaining_workload_model(source)
+    # The old complete branch had updated its GAT. Retain the proposal trunk
+    # whose coverage was measured and reuse the compatible head and scaling.
+    with torch.no_grad():
+        state = model.state_dict()
+        for name, value in checkpoint[OP_VARIANT]['state_dict'].items():
+            state[name].copy_(value)
+    model.use_dynamic_context = checkpoint[OP_VARIANT]['use_dynamic_context']
+    model.requires_grad_(False)
+    return model.eval()
+
+
+def residual_feedback_alternatives(plans, scores):
+    order = sorted(range(len(plans)), key=lambda i: (-float(scores[i]), i))
+    first = plans[order[0]]
+    first_robots = tuple(a.robot for a in first['actions'])
+    alternate = next((plans[i] for i in order[1:] if plans[i]['pattern'] == first['pattern']
+                      and tuple(a.robot for a in plans[i]['actions']) != first_robots), None)
+    other = next((plans[i] for i in order[1:] if plans[i]['pattern'] != first['pattern']), None)
+    return (first, alternate, other) if alternate is not None and other is not None else None
+
+
+def residual_feedback_pairs(outcomes):
+    pairs = [dict(better=i, worse=j, kind='cmax') for i, j in complete_cmax_pairs(outcomes)]
+    for i, a in enumerate(outcomes):
+        for j, b in enumerate(outcomes[i + 1:], i + 1):
+            if {a['status'], b['status']} == {'FEASIBLE', 'DEADLOCK'}:
+                better, worse = (i, j) if a['status'] == 'FEASIBLE' else (j, i)
+                pairs.append(dict(better=better, worse=worse, kind='feasibility'))
+    return pairs
+
+
+def residual_collect_feedback():
+    """Three legal same-state actions at four progress bins in each of three scales."""
+    from mrta_search import gnn_constructor as c
+
+    rows = op_read()
+    coverage = next((r['payload'] for r in rows if r['phase'] == 'residual_route_coverage_decision'), None)
+    if coverage is None or not coverage['chosen']:
+        print('No qualifying complete-action coverage. Do not call B32.', flush=True)
+        return
+    if any(r['phase'] == 'residual_feedback_decision' for r in rows):
+        print('Retain completed TRAIN feedback, without repeating B32.', flush=True)
+        return
+    shared, config, checkpoint, archive, teachers, _, _, _ = op_sources()
+    model = residual_feedback_model(shared, checkpoint)
+    graphs, examples, _, _ = op_saved_imitation(shared, config, archive, teachers)
+    raw, _ = cmax_expert_macro_examples(model, graphs, examples, raw_only=True)
+    limit = coverage['chosen']['parent_limit']
+    spaces = {}
+    prefixes = []
+    with torch.inference_mode():
+        for scale, minimum, maximum in (('SMALL', 0, 50), ('MEDIUM', 50, 63), ('LARGE', 63, math.inf)):
+            used = set()
+            for fraction in (0., .1, .25, .5):
+                eligible = [(case, e) for case, e in enumerate(raw)
+                            if e['fraction'] == fraction and minimum <= len(e['reference'].parents) < maximum]
+                eligible.sort(key=lambda pair: (pair[1]['reference'].parents in used,
+                    abs(pair[1]['progress'] - fraction), len(pair[1]['reference'].parents), pair[0]))
+                for case, e in eligible:
+                    reference, state, pending = (e[key] for key in ('reference', 'state', 'pending'))
+                    parents = reference.parents
+                    if parents not in spaces:
+                        spaces[parents] = c.complete_parent_space(parents, config, compact=True)
+                    space = spaces[parents]
+                    selected = {p.parent_id: p for p in reference.patterns if p.parent_id not in pending}
+                    plans = c.route_progress_complete_candidates(space, state, pending, selected, model, config,
+                        parent_limit=limit)
+                    if not plans:
+                        continue
+                    graph = c.complete_parent_view(space, selected)[0]
+                    context = model.contextualize_state(graph, model.encode_static(space['graph']), state.routes, state.directions)
+                    scores = model.parent_action_scores(space['graph'], context, c.complete_parent_inputs(plans))
+                    if not torch.isfinite(scores).all():
+                        raise ValueError('nonfinite feedback action scores')
+                    alternatives = residual_feedback_alternatives(plans, scores)
+                    if alternatives is not None:
+                        prefixes.append((scale, case, e, space, selected, alternatives))
+                        used.add(parents)
+                        break
+                else:
+                    raise ValueError(f'No retained {scale} {fraction:.0%} prefix has all three legal alternatives')
+    del graphs, examples
+    print('RESIDUAL_FEEDBACK_PREFIXES', [(scale, case, e['fraction'], len(e['reference'].parents))
+          for scale, case, e, _, _, _ in prefixes], flush=True)
+    scientific = json.loads(json.dumps(config.scientific_mapping()))
+    archived = [r for r in rows if r['phase'] == 'residual_feedback_branch']
+    calls = sum(int(r['b32_calls'] or 0) for r in archived)
+    states = []
+    for scale, case, e, space, selected, alternatives in prefixes:
+        parents, state, pending = e['reference'].parents, e['state'], e['pending']
+        identity = dict(case=case, scale=scale, fraction=e['fraction'], progress=e['progress'],
+            parents=[asdict(p) for p in parents], routes=state.routes, directions=state.directions,
+            pending=pending, selected_patterns=[asdict(selected[p]) for p in sorted(selected)])
+        prefix = json.loads(json.dumps(identity))
+        name = f'{scale}_TRAIN_{case:03d}'
+        outcomes = []
+        for label, plan in zip(('A', 'B', 'C'), alternatives):
+            action = json.loads(json.dumps(dict(pattern=asdict(plan['pattern']), actions=[asdict(a) for a in plan['actions']])))
+            tick = time.perf_counter()
+            result = c.construct_complete_parent_gnn(parents, model, config, space=space, state=plan['state'],
+                pending=set(pending) - {plan['parent_id']}, selected={**selected, plan['parent_id']: plan['pattern']},
+                parent_limit=limit, parent_strategy='route_progress', first_limit=16, second_limit=8)
+            seconds = time.perf_counter() - tick
+            outcome = dict(label=label, **action, status='CONSTRUCTION_FAILED', cmax=None, construction_seconds=seconds,
+                scheduler_seconds=0., reason=result.rejection_reason, b32_calls=0)
+            if result.solution is not None:
+                complete = dict(solution=asdict(result.solution), directions=result.directions)
+                key = op_complete_key(complete)
+                previous = next((r['payload']['outcome'] for r in archived if r['method'] == RESIDUAL_METHOD
+                    and r['payload']['scientific_config'] == scientific and r['payload']['prefix'] == prefix
+                    and all(r['payload']['outcome'][k] == action[k] for k in action)
+                    and r['payload']['outcome'].get('complete') and op_complete_key(r['payload']['outcome']['complete']) == key), None)
+                if previous is not None:
+                    outcomes.append(previous)
+                    continue
+                if calls >= 36:
+                    raise ValueError('36 TRAIN B32 calls already used')
+                tick = time.perf_counter()
+                candidate = pilot.oriented.schedule_explicit(result.solution, result.directions, config)
+                schedule_seconds = time.perf_counter() - tick
+                feasible = candidate.schedule.status is ScheduleStatus.FEASIBLE
+                metrics = op_route_metrics(complete, config)
+                if feasible:
+                    metrics.update(op_metrics(candidate, config))
+                calls += 1
+                outcome.update(status=candidate.schedule.status.value, cmax=candidate.schedule.cmax if feasible else None,
+                    scheduler_seconds=schedule_seconds, metrics=metrics, diagnostics=candidate.schedule.diagnostics,
+                    complete=complete, b32_calls=1)
+            op_save(dict(phase='residual_feedback_branch', instance=name, seed=OP_SEED, method=RESIDUAL_METHOD,
+                status=outcome['status'], cmax=outcome['cmax'], runtime_s=seconds + outcome['scheduler_seconds'],
+                b32_calls=outcome['b32_calls'], payload=dict(prefix=prefix, scientific_config=scientific, outcome=outcome)))
+            outcomes.append(outcome)
+        pairs = residual_feedback_pairs(outcomes)
+        states.append(dict(instance=name, case=case, scale=scale, fraction=e['fraction'], pairs=pairs,
+            statuses=[o['status'] for o in outcomes], cmax=[o['cmax'] for o in outcomes]))
+        print('RESIDUAL_FEEDBACK_STATE', name, e['fraction'], states[-1]['statuses'], 'pairs', len(pairs), 'B32', calls, flush=True)
+    labels = Counter(pair['kind'] for state in states for pair in state['pairs'])
+    state_count = sum(bool(s['pairs']) for s in states)
+    allowed = sum(labels.values()) >= 12 and state_count >= 6
+    op_save(dict(phase='residual_feedback_decision', instance='TRAIN_12', seed=OP_SEED, method=RESIDUAL_METHOD,
+        status='READY_FOR_HEAD_TRAINING' if allowed else 'STOP_INSUFFICIENT_PREFERENCES', b32_calls=0,
+        payload=dict(states=states, labels=dict(labels), preference_states=state_count, train_b32_calls=calls,
+                     allow_head_training=allowed, dev_b32_calls=0, training_updates=0)))
+    print('RESIDUAL_FEEDBACK_DECISION', dict(labels), 'states', state_count, 'B32', calls, 'train', allowed, flush=True)
+
+
+def residual_train_head():
+    """Fit the complete-action head on actual legal actions and same-state feedback."""
+    import io
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import joint_action_key
+
+    rows = op_read()
+    feedback = next((r['payload'] for r in rows if r['phase'] == 'residual_feedback_decision'), None)
+    if feedback is None or not feedback['allow_head_training']:
+        print('Insufficient measured same-state feedback. Do not train.', flush=True)
+        return
+    shared, config, checkpoint, archive, teachers, _, _, _ = op_sources()
+    if RESIDUAL_VARIANT in checkpoint:
+        print('Retain the trained route-progress branch.', flush=True)
+        return
+    chosen = next(r['payload']['chosen'] for r in rows if r['phase'] == 'residual_route_coverage_decision')
+    model = residual_feedback_model(shared, checkpoint)
+    graphs, examples, _, _ = op_saved_imitation(shared, config, archive, teachers)
+    raw, _ = cmax_expert_macro_examples(model, graphs, examples, raw_only=True)
+    del graphs, examples
+    preferences = {s['case']: s['pairs'] for s in feedback['states'] if s['pairs']}
+    branch_actions = defaultdict(dict)
+    for row in rows:
+        if row['phase'] == 'residual_feedback_branch':
+            outcome = row['payload']['outcome']
+            branch_actions[row['payload']['prefix']['case']][outcome['label']] = outcome
+    imitation, ranking = [], []
+    spaces, embeddings = {}, {}
+    with torch.no_grad():
+        for case, e in enumerate(raw):
+            reference, state, pending = (e[key] for key in ('reference', 'state', 'pending'))
+            parents = reference.parents
+            if parents not in spaces:
+                spaces[parents] = c.complete_parent_space(parents, config, compact=True)
+                embeddings[parents] = model.encode_static(spaces[parents]['graph'])
+            space = spaces[parents]
+            selected = {p.parent_id: p for p in reference.patterns if p.parent_id not in pending}
+            plans = c.route_progress_complete_candidates(space, state, pending, selected, model, config,
+                parent_limit=chosen['parent_limit'])
+            if not plans:
+                continue
+            graph = c.complete_parent_view(space, selected)[0]
+            context = model.contextualize_state(graph, embeddings[parents], state.routes, state.directions)
+            features = model.parent_action_rows(space['graph'], context, c.complete_parent_inputs(plans))
+            teacher = e['teacher_plan']
+            pattern = next(p for p in reference.patterns if p.parent_id == teacher['parent_id'])
+            target = next((i for i, p in enumerate(plans)
+                           if p['pattern'] == pattern and cmax_action_key(p) == cmax_action_key(teacher)), None)
+            if target is not None:
+                imitation.append((features, target))
+            if case in preferences:
+                action_rows = []
+                for label in ('A', 'B', 'C'):
+                    outcome = branch_actions[case][label]
+                    key = tuple(joint_action_key(op_action(a)) for a in outcome['actions'])
+                    index = next(i for i, p in enumerate(plans)
+                                 if asdict(p['pattern']) == outcome['pattern'] and cmax_action_key(p) == key)
+                    action_rows.append(index)
+                ranking.extend(features[[action_rows[p['better']], action_rows[p['worse']]]]
+                               for p in preferences[case])
+            if (case + 1) % 42 == 0:
+                print('RESIDUAL_HEAD_POOL', case + 1, len(imitation), len(ranking), flush=True)
+    if len(imitation) != chosen['complete_covered'] or len(ranking) != sum(feedback['labels'].values()):
+        raise ValueError('training pool does not reproduce the measured exact actions')
+
+    head = model.parent_action_head
+    head.requires_grad_(True)
+    head.train()
+    optimizer = torch.optim.AdamW(head.parameters(), lr=1e-4)
+    generator = random.Random(OP_SEED)
+    epochs, steps, batch = 5, 64, 4
+    history = []
+    started = time.perf_counter()
+    for epoch in range(epochs):
+        losses = Counter()
+        for _ in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            scores = head(torch.stack(generator.choices(ranking, k=batch))).squeeze(-1)
+            preference = F.softplus(scores[:, 1] - scores[:, 0]).mean()
+            il = torch.stack([-torch.log_softmax(head(features).squeeze(1), 0)[target]
+                              for features, target in generator.choices(imitation, k=batch)]).mean()
+            loss = preference + .1 * il
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(head.parameters(), 1., error_if_nonfinite=True)
+            optimizer.step()
+            losses.update(loss=float(loss.detach()), preference=float(preference.detach()), il=float(il.detach()))
+        history.append(dict(epoch=epoch + 1, updates=steps, **{k: v / steps for k, v in losses.items()}))
+        print('RESIDUAL_HEAD_EPOCH', history[-1], flush=True)
+    if not all(torch.equal(value, model.state_dict()[name])
+               for name, value in checkpoint[OP_VARIANT]['state_dict'].items()):
+        raise ValueError('frozen GNN trunk or scaling changed')
+    metadata = dict(seed=OP_SEED, epochs=epochs, updates=epochs * steps, batch=batch, learning_rate=1e-4,
+        loss='L_preference + 0.1 L_IL', trainable='parent_action_head', parents=chosen['parent_limit'],
+        exact_imitation_actions=len(imitation), preference_pairs=len(ranking), history=history,
+        training_seconds=time.perf_counter() - started)
+    checkpoint[RESIDUAL_VARIANT] = dict(model_type='CompleteParentGNN', hidden_dim=model.hidden_dim, heads=model.heads,
+        normalize_inputs=model.normalize_inputs, opportunity_features=True, parent_action_features=True,
+        remaining_workload_features=True, compact_parent_limit=chosen['parent_limit'], use_dynamic_context=model.use_dynamic_context,
+        scientific_config=config.scientific_mapping(), state_dict=model.state_dict(), training=metadata)
+    buffer = io.BytesIO()
+    shared.save_neural_checkpoint(checkpoint, buffer)
+    buffer.seek(0)
+    saved = shared.read_neural_checkpoint(buffer)
+    protected = [(checkpoint['state_dict'], saved['state_dict'])]
+    protected.extend((branch['state_dict'], saved[key]['state_dict']) for key, branch in checkpoint.items()
+                     if isinstance(branch, dict) and 'state_dict' in branch)
+    if not all(torch.equal(value, after[name]) for before, after in protected for name, value in before.items()):
+        raise ValueError('checkpoint tensors differ after serialization')
+    # Keep the old bytes available for ordinary write errors without adding a file.
+    original = OP_CHECKPOINT.read_bytes()
+    with OP_CHECKPOINT.open('r+b') as stream:
+        try:
+            stream.write(buffer.getbuffer())
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException:
+            stream.seek(0)
+            stream.write(original)
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+            raise
+    op_save(dict(phase='residual_head_training', instance='TRAIN_21', seed=OP_SEED, method=RESIDUAL_VARIANT,
+        status='TRAINED', runtime_s=metadata['training_seconds'], b32_calls=0, payload=metadata))
+
+
+def residual_evaluate():
+    """Use greedy, seed, and seed+1 proposals from one checkpoint branch."""
+    from mrta_search import gnn_constructor as c
+
+    rows = op_read()
+    done = {r['instance'] for r in rows if r['phase'] == 'residual_dev_evaluation'}
+    shared, config, checkpoint, _, _, _, entries, _ = op_sources()
+    if RESIDUAL_VARIANT not in checkpoint:
+        print('No trained route-progress branch. Do not evaluate DEV.', flush=True)
+        return
+    for name, parents in sorted(entries.items()):
+        if name in done:
+            continue
+        started = time.perf_counter()
+        model = shared._model_from_checkpoint(checkpoint[RESIDUAL_VARIANT]).eval()
+        load = time.perf_counter() - started
+        tick = time.perf_counter()
+        space = c.complete_parent_space(parents, config, compact=True)
+        graph_seconds = time.perf_counter() - tick
+        archived = {r['payload']['proposal_index']: r['payload'] for r in rows
+                    if r['phase'] == 'residual_dev_proposal' and r['instance'] == name}
+        attempts = []
+        for index, seed in enumerate((None, OP_EVAL_SEED, OP_EVAL_SEED + 1)):
+            if index in archived:
+                attempts.append(archived[index])
+                continue
+            tick = time.perf_counter()
+            result = c.construct_complete_parent_gnn(parents, model, config, seed=seed, space=space,
+                parent_limit=model.compact_parent_limit, parent_strategy='route_progress', first_limit=16, second_limit=8)
+            construction = time.perf_counter() - tick + (graph_seconds if index == 0 else 0.)
+            attempt = dict(proposal_index=index, seed=seed, decode='greedy' if seed is None else 'sample',
+                construction_seconds=construction, status='CONSTRUCTION_FAILED', cmax=None, scheduler_seconds=0.,
+                b32_calls=0, reason=result.rejection_reason)
+            if result.solution is not None:
+                raw = dict(solution=asdict(result.solution), directions=result.directions)
+                clock = time.perf_counter()
+                candidate = pilot.oriented.schedule_explicit(result.solution, result.directions, config)
+                seconds = time.perf_counter() - clock
+                feasible = candidate.schedule.status is ScheduleStatus.FEASIBLE
+                metrics = op_route_metrics(raw, config)
+                if feasible:
+                    metrics.update(op_metrics(candidate, config))
+                attempt.update(**raw, status=candidate.schedule.status.value, scheduler_seconds=seconds,
+                    cmax=candidate.schedule.cmax if feasible else None, metrics=metrics,
+                    diagnostics=candidate.schedule.diagnostics, b32_calls=1)
+            attempt.update(seconds=time.perf_counter() - tick, elapsed=time.perf_counter() - started)
+            op_save(dict(phase='residual_dev_proposal', instance=name, seed=OP_EVAL_SEED, method=RESIDUAL_VARIANT,
+                status=attempt['status'], cmax=attempt['cmax'], runtime_s=attempt['seconds'],
+                b32_calls=attempt['b32_calls'], payload=attempt))
+            attempts.append(attempt)
+        total = load + sum(a['construction_seconds'] + a['scheduler_seconds'] for a in attempts)
+        info = dict(attempts=attempts, model_load_seconds=load, runtime_s=total, actual_runtime_s=time.perf_counter()-started,
+            reused_b32_seconds=0., source_variant=RESIDUAL_VARIANT, b32_calls=0)
+        # The proposal rows already carry the physical B32 call counts.
+        op_save_measured('residual_dev_evaluation', name, RESIDUAL_VARIANT, info)
+
+
+def residual_coverage_report():
+    """Record the measured stop, without inventing a trained or DEV result."""
+    heading='## 2026-11-06 GNN父候选覆盖修复与动作后剩余工作量'
+    if heading in OP_REPORT.read_text(encoding='utf-8'):
+        print('Retain existing residual coverage report.',flush=True);return
+    rows=op_read();coverage=[r for r in rows if r['phase']=='residual_candidate_coverage']
+    decision=next(r['payload'] for r in rows if r['phase']=='residual_coverage_decision')
+    repair=next(r['payload'] for r in rows if r['phase']=='residual_candidate_repair')
+    external=next(r['payload'] for r in rows if r['phase']=='residual_external_parent_decision')
+    quotas=next(r['payload'] for r in rows if r['phase']=='residual_quota_decision')
+    if len(coverage)!=20:raise ValueError('all twenty candidate configurations must be measured')
+    if decision['chosen'] or repair['complete_covered']>=repair['required'] or external['qualified'] or quotas['qualified']:
+        raise ValueError('coverage passed: finish preference collection before writing a stopped-stage report')
+    shared,config,_,_,_,_,entries,development=op_sources();names=sorted(entries)
+    historical={}
+    for label,phase,method in (
+        ('ORIGINAL_GNN_MULTI3','parent_cmax_macro_evaluation','ORIGINAL_GNN_MULTI3'),
+        ('PARENT_JOINT_MULTI3','parent_cmax_macro_evaluation','PARENT_JOINT_MULTI3'),
+        ('RULE/BEAM_MAX3','parent_cmax_macro_evaluation','RULE/BEAM'),
+        ('WAG_60S','evaluation','WAG'),('HGA_60S','evaluation','HGA')):
+        historical[label]={r['instance']:r for r in rows if r['phase']==phase and r['method']==method and r['seed']==str(OP_EVAL_SEED)}
+    region={}
+    for name in names:
+        source=next((r for r in development if r['instance']==name and r['seed']==OP_EVAL_SEED and r['method']=='REGION_FAST_ROUTE_REORDER'),None)
+        if source is None:continue
+        state=(source.get('details') or {}).get('final_state')
+        if state:
+            _,_,geometry,_,_=shared.research_restore(state,config)
+            expected=tuple(sorted(tuple(sorted((p.start,p.end))) for p in entries[name]))
+            if geometry!=expected:raise ValueError('REGION geometry does not match the eight DEV cases')
+        region[name]=source
+    historical['REGION_60S']=region
+    number=lambda v:'—' if v in (None,'') else f'{float(v):.3f}'
+    good=lambda r:r['status']=='FEASIBLE' and r['cmax'] not in (None,'')
+    best=decision['best'];diagnoses=[r['payload'] for r in rows if r['phase']=='residual_parent_diagnosis']
+    model_names=sorted({r['source_variant'] for r in diagnoses})
+    lines=['',heading,'',
+        f"**本轮停在候选覆盖阶段：最好完整动作覆盖{repair['complete_covered']}/126={100*repair['complete_covered']/126:.2f}%，"
+        f"低于90%所需的{repair['required']}/126。未训练、未采集偏好、未运行新GNN的DEV；本轮新增实验B32=0。**",'',
+        '使用指定D:\\pybullet_test\\.venv\\Scripts\\python.exe，在DRL工作目录执行，CPU单线程。'
+        '核对了引用聊天和本地最新记录；本地DRL属于根仓库codex/project-cleanup工作区，未把它称为已核实的GitHub main，'
+        '未切换、重置或清理既有修改。复用当前源码、CSV和报告，没有新增文件，也没有写入模型checkpoint。','',
+        '### 实际代码修改与完整动作匹配','',
+        'gnn_constructor.py新增现有父头排序和有界选择入口。默认实验使用PARENT_JOINT对应的opportunity_cmax_candidate：'
+        '同一个既有GAT/父头在原生图中给全部pending父打分，不增加父预测网络。已提交父使用实际已选模式，'
+        '待分配父仅使用部署可取得的默认模式来构造提案图，不读取未来教师模式；完整动作池仍遍历入选父的所有合法模式。'
+        '移除了提案排序中“默认模式首子不可插就跳过父”的粗筛，实际动作的资格、插入、方向及初始冲突规则仍由原joint_block_candidates判断。','',
+        '分别测试GNN、MRV、LPT、GNN优先+MRV/LPT补充，父上限4/6/8/12/16。'
+        '组合策略保留GNN前K−2，再补一条不同的MRV和LPT父，不足时用GNN次序补齐。'
+        'MRV采用现有全合法目录资格灵活性F，LPT采用原始父加工时间；并未用教师目标ID决定候选。'
+        '动作匹配同时要求SplitPattern（父ID、kind、t、point_id、mandatory、rail）和每个子动作的block_id、robot、position、direction、neighbour_changes完全一致，'
+        '父ID命中不等于完整动作命中。','',
+        'run_gnn_cmax_finetune.py追加四个TRAIN诊断入口及报告入口，全部复用现有状态、教师重放和CSV；'
+        'tests/test_gnn_construct_vns.py增加父头复用、各规模选择、动作后特征和整父提交回归。原有模型入口保持原语义，'
+        '不将新特征直接套到旧2/8结果上冒充新实验。','',
+        '### 126个TRAIN状态的20组实测','',
+        '主表使用首子8/次子4、WHOLE最多8个代表。均为实际生成的完整动作；126个状态全部计入分母，包括没有匹配动作的状态。'
+        '耗时是单状态候选生成，GNN策略计入一次实测父排序成本；它不是完整解构造或B32耗时。','',
+        '|策略|父上限|实际父数中位|父覆盖/126|完整动作覆盖/126|候选数中位/最大|生成中位/ms|',
+        '|---|---:|---:|---:|---:|---:|---:|']
+    labels=dict(gnn='GNN',mrv='MRV',lpt='LPT',gnn_mrv_lpt='GNN+MRV/LPT')
+    for r in coverage:
+        p=r['payload']
+        lines.append(f"|{labels[r['method']]}|{p['parent_limit']}|{p['actual_parents_median']}|{p['parent_covered']}|{p['complete_covered']}|"
+            f"{p['candidates_median']}/{p['candidates_max']}|{1000*p['generation_seconds_median']:.3f}|")
+    lines+=['',f"主表最好为{labels[best['strategy']]}、K={best['parent_limit']}，完整动作{best['complete_covered']}/126。"
+        f"该配置父覆盖{best['parent_covered']}/126，另有{best['parent_covered']-best['complete_covered']}个完整动作在有界子池中缺失。",'',
+        '### 有针对性的修复与边界','',
+        f"复用既有完整有界池：父仍为GNN Top-16，拆分16×8分支，WHOLE保留原8位置内合法方向变体。"
+        f"恢复{len(repair['recovered_cases'])}个漏项，丢失原已覆盖动作{len(repair['lost_cases'])}个，完整覆盖"
+        f"{repair['complete_covered']}/126={100*repair['complete_covered']/126:.2f}%。"
+        f"候选数min/median/max={repair['candidates_min']}/{repair['candidates_median']}/{repair['candidates_max']}，"
+        f"生成中位{repair['generation_seconds_median']:.6f}s/状态。没有枚举所有子动作笛卡尔积，也未增加父上限。",'',
+        '这一诊断比上轮6父MRV/LPT的50/126=39.68%有所提高，但仍不是合格训练配置。'
+        '增大子池不能找回父头在Top-16之前已排除的26个教师父任务；当前父覆盖100/126就是这一固定提案规则的上限。','',
+        '还分别检查已有父头与原生图、全部合法模式平均表示、逐模式父头评分取max三种表示。'
+        '这些都是既有父头的读法，没有增加mode_head或新网络，未将多个模型的候选合并成一个假想新模型。','',
+        '|已有父头来源|原生GNN Top16|原生GNN+补充 Top16|模式表示修复最好父覆盖|',
+        '|---|---:|---:|---:|']
+    for name in model_names:
+        values=[r for r in diagnoses if r['source_variant']==name]
+        native={r['strategy']:r['parent_coverage']['16'] for r in values if r['representation']=='native'}
+        mode=[r['parent_coverage']['16'] for r in values if r['representation']!='native']
+        lines.append(f"|{name}|{native.get('gnn','—')}|{native.get('gnn_mrv_lpt','—')}|{max(mode) if mode else '未测'}|")
+    lines+=['',f"另对GNN主集合配少量MRV/LPT名额（包括12+2+2、10+3+3等）做TRAIN检查，最好父覆盖"
+        f"{quotas['best_parent_coverage']}/126，仍不足{repair['required']}/126。独立文件中的RULE_GUIDED_GNN_RETRAINED只取其父头、"
+        f"不用规则融合，最好也只有{external['best_parent_coverage']}/126。没有用更大父池或把教师动作注入候选来凑90%。",'',
+        '已保存教师重放在construction_replay中按最终教师路线的最早未插位置恢复动作次序。'
+        '该次序是离线标签恢复次序，并不是已证明的唯一最优父选择。部署端不能访问最终教师路线；'
+        '当前结果定位的是既有父排序与这些真实重放标签不匹配，不能通过把未来教师顺序传给提案器解决。','',
+        '### 动作后的四维剩余工作量','',
+        '新入口remaining_after_parent=True对每个候选父计算remaining_eligible_workload(space,pending−{parent_id})，'
+        '按父复用到其模式/机器人/位置/方向完整动作。原四机P、MOVE、最大P、最大P+MOVE、插入与方向输入全部保留。'
+        'CompleteParentGNN.parent_action_rows继续使用原四维拼接接口；头部维数和原归一化不变，不新增GAT层或独立网络。',
+        f"126个状态中，{decision['states_with_action_dependent_remaining']}个状态的不同剩余父选择会产生至少两种事后工作量向量。"
+        '单元测试确认只替换现有最后四列，其他动作特征和全部模型张量不变。'
+        '同父的不同机器人动作仍共享该剩余分布，这是pending减同一父的定义；机器人差异由动作后的P/MOVE及路线特征区分。'
+        '资格分布相同比例时，不同父也可能得到相同归一化向量。该向量是决策代理，不是严格Cmax下界。','',
+        '### 为什么本轮没有训练、反馈和新DEV结果','',
+        f"90%门槛要求至少{repair['required']}/126个完整动作，实际最好{repair['complete_covered']}/126。"
+        '按本轮明确停止条件，未进行任何预热或IL扩训，未继续旧六父模型训练，没有创建无有效监督的新checkpoint分支。'
+        '新增TRAIN B32=0、DEV B32=0、Cmax排序对=0、可行性偏好对=0、训练更新=0；这里的0表示后续阶段未开展，'
+        '不是又花36次B32得到0标签。旧24次反馈不混用，新阶段的12偏好对/至少6状态要求尚未进入核查。','',
+        '|DEV几何|本轮新GNN结果|本轮Cmax|构造/B32耗时|',
+        '|---|---|---|---|']
+    for name in names:lines.append(f'|{name}|未运行：候选覆盖未过|不适用|未测|')
+    lines+=['','未运行不计为0/8失败，不填虚构Cmax或运行时间。下面只复用已有结果：前三列为最多3次B32的初始构造，'
+        '后三列为60秒完整求解质量参考，绝不是本轮新模型结果或等预算优越性证据。','',
+        '|几何|ORIGINAL_GNN_MULTI3|PARENT_JOINT_MULTI3|RULE/BEAM_MAX3|WAG_60S|HGA_60S|REGION_60S|',
+        '|---|---:|---:|---:|---:|---:|---:|']
+    for name in names:
+        lines.append('|'+name+'|'+ '|'.join(number(table[name]['cmax']) if name in table else '缺失' for table in historical.values())+'|')
+    lines+=['','|已有方法|可行/已保存案例|历史总耗时中位/s|口径|','|---|---:|---:|---|']
+    for label,table in historical.items():
+        times=[float(r['runtime_s']) for r in table.values() if r['runtime_s'] not in (None,'')]
+        lines.append(f"|{label}|{sum(good(r) for r in table.values())}/{len(table)}|{number(statistics.median(times) if times else None)}|"
+            +('60秒终解，仅参考' if label.endswith('60S') else '最多3次B32初始构造')+'|')
+    lines+=['','本轮与所有对照的配对Cmax改善均无法计算，因为没有新的完整方案和调度结果。'
+        '相对PARENT_JOINT的完整构造效率也未测，不能把0.272s单状态候选耗时与3.850s三提案总耗时相除，'
+        '也不能沿用旧COMPACT的2/8作为新特征的性能。','',
+        '### 结论与复现','',
+        '本轮实际完成了候选排序/完整动作覆盖实验、有界池修复、动作后剩余特征改动和回归。'
+        '90%覆盖未通过，主算法竞争力目标尚未实现，不具备进入新独立测试的条件。'
+        '下一步应先修复部署可用父提案与教师重放优先级的匹配，不能继续仅训练完整动作头来弥补已被父池删除的动作，'
+        '也不应以增加层数、随机种子或后处理绕过当前数据问题。',
+        '所有历史模型、CSV、MODE_NEW、WAG/HGA、ScientificConfig、FORMAL_SCOPE_V2和B32均保留。'
+        'README已将8/8旧组合结果标为历史组合证据，最新状态是覆盖阶段停止。','',
+        '复现工作目录DRL，使用指定venv运行scripts/run_gnn_cmax_finetune.py：'
+        '`--phase residual-coverage`、`--phase residual-packing-repair`、`--phase residual-external-parent`、'
+        '`--phase residual-quota-check`、`--phase residual-report`。已保存的本轮测量会保留，不自动重复或调用训练/B32。','']
+    with OP_REPORT.open('a',encoding='utf-8') as stream:stream.write('\n'.join(lines))
+    print('RESIDUAL_REPORT','STOP_BELOW_90',repair['complete_covered'],'/126','new_B32=0',flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
@@ -3307,10 +4124,30 @@ def main():
         'parent-cmax-data','parent-cmax-train','parent-cmax-eval','parent-cmax-report',
         'parent-cmax-macro-train','parent-cmax-macro-eval',
         'complete-parent-coverage','complete-parent-train','complete-parent-eval','complete-parent-report',
-        'compact-workload-train','compact-workload-eval','compact-workload-report'),default='op-all')
+        'compact-workload-train','compact-workload-eval','compact-workload-report',
+        'residual-coverage','residual-packing-repair','residual-external-parent','residual-quota-check',
+        'residual-route-coverage','residual-feedback','residual-head-train','residual-dev','residual-report'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
+    if args.phase=='residual-coverage':
+        residual_coverage_sweep();return
+    if args.phase=='residual-packing-repair':
+        residual_packing_repair();return
+    if args.phase=='residual-external-parent':
+        residual_external_parent_check();return
+    if args.phase=='residual-quota-check':
+        residual_quota_check();return
+    if args.phase=='residual-route-coverage':
+        residual_route_coverage();return
+    if args.phase=='residual-feedback':
+        residual_collect_feedback();return
+    if args.phase=='residual-head-train':
+        residual_train_head();return
+    if args.phase=='residual-dev':
+        residual_evaluate();return
+    if args.phase=='residual-report':
+        residual_coverage_report();return
     if args.phase.startswith('compact-workload-'):
         if args.phase=='compact-workload-train':compact_workload_train()
         elif args.phase=='compact-workload-eval':compact_workload_evaluate()
