@@ -8,6 +8,7 @@ import random
 from typing import Mapping, Sequence
 
 from mrta_reference.geometry import (
+    _axis_band_interval,
     finite_x_split_validator,
     oriented_endpoints,
     robot_is_eligible,
@@ -15,8 +16,10 @@ from mrta_reference.geometry import (
 from mrta_reference.model import (
     CandidateMove,
     CanonicalSolution,
+    Operation,
     OperationKind,
     ParentWeld,
+    RobotRoute,
     Route,
     ScheduleResult,
     ScientificConfig,
@@ -24,6 +27,7 @@ from mrta_reference.model import (
     SplitPattern,
     WeldingBlock,
 )
+from mrta_reference.scheduler import build_operation_templates
 from mrta_reference.solution import block_map, canonicalize
 
 from .direction import DirectionVectors, _initial_error
@@ -865,83 +869,113 @@ def oriented_route_lower_bound(state: OrientedRouteState) -> float:
     return max((p + sum(arcs) for p, arcs in zip(state.loads, state.arc_costs)), default=0.0)
 
 
-def nominal_coordination_features(solution, directions, config):
-    """Score a complete candidate before B32, without dispatching or delaying it.
+_NOMINAL_ROBOT_PAIRS = tuple(itertools.combinations(range(4), 2))
+_Intervals = tuple[tuple[float, float], ...]
 
-    All four independent routes start at zero. Continuous proximity and
-    same-rail order exposure are measured on those nominal timelines. Union
-    durations avoid counting simultaneous conflicts multiple times per robot.
-    P+M+exposure is a ranking heuristic, NOT a wait estimate, feasibility test,
-    or bound on coordinated makespan. It intentionally has no fitted weight.
-    """
-    from mrta_reference.geometry import _axis_band_interval
-    from mrta_reference.model import RobotRoute
-    from mrta_reference.scheduler import build_operation_templates
+
+def _nominal_route_templates(state, robot, blocks, config):
+    route = RobotRoute(robot, tuple(blocks[b] for b in state.routes[robot]), state.directions[robot])
+    return build_operation_templates(route, config)
+
+
+def _nominal_pair_intervals(first_ops, second_ops, config, *, same_rail):
+    proximity, order = [], []
+    eps = config.numeric_epsilon
+    i = j = 0
+    # Each route is contiguous and ordered: sweep overlapping phases.
+    while i < len(first_ops) and j < len(second_ops):
+        a, b = first_ops[i], second_ops[j]
+        lo, hi = max(a.start_time, b.start_time), min(a.end_time, b.end_time)
+        if hi > lo + eps:
+            pa, pb = a.point_at(lo), b.point_at(lo)
+            va = tuple((y - x) / a.duration for x, y in zip(a.start, a.end))
+            vb = tuple((y - x) / b.duration for x, y in zip(b.start, b.end))
+            near = (0.0, hi - lo)
+            for axis, limit in ((0, config.interference_dx), (1, config.interference_dy)):
+                near = _axis_band_interval(va[axis] - vb[axis], pa[axis] - pb[axis], limit + eps, *near)
+                if near is None or near[1] <= near[0]:
+                    near = None
+                    break
+            if near is not None:
+                proximity.append((lo + near[0], lo + near[1]))
+            if same_rail:
+                # The first robot is the left robot (0 or 2).
+                d0 = pa[0] + config.interference_dx - pb[0] - eps
+                velocity = va[0] - vb[0]
+                d1 = d0 + velocity * (hi - lo)
+                if max(d0, d1) > 0.0:
+                    start, end = lo, hi
+                    if d0 <= 0.0:
+                        start = lo - d0 / velocity
+                    elif d1 <= 0.0:
+                        end = lo - d0 / velocity
+                    order.append((start, end))
+        if a.end_time <= b.end_time:
+            i += 1
+        else:
+            j += 1
+    return tuple(proximity), tuple(order)
+
+
+def _nominal_union_seconds(intervals):
+    total = 0.0
+    end = -math.inf
+    for start, stop in sorted(intervals):
+        total += max(0.0, stop - max(start, end))
+        end = max(end, stop)
+    return total
+
+
+@dataclass(frozen=True)
+class NominalRouteCoordination:
+    """Operation templates and pair exposures for a partial directed route set."""
+
+    templates: tuple[tuple[Operation, ...], ...]
+    pair_intervals: tuple[tuple[_Intervals, _Intervals], ...]
+
+    @classmethod
+    def from_state(cls, state: OrientedRouteState, blocks, config):
+        templates = tuple(_nominal_route_templates(state, robot, blocks, config) for robot in range(4))
+        intervals = tuple(_nominal_pair_intervals(templates[a], templates[b], config, same_rail=a // 2 == b // 2)
+                          for a, b in _NOMINAL_ROBOT_PAIRS)
+        return cls(templates, intervals)
+
+    def with_changed_route(self, state: OrientedRouteState, robot: int, blocks, config):
+        """Update the one route changed by an insertion, including neighbor flips."""
+        route = _nominal_route_templates(state, robot, blocks, config)
+        templates = self.templates[:robot] + (route,) + self.templates[robot + 1:]
+        intervals = tuple(
+            _nominal_pair_intervals(templates[a], templates[b], config, same_rail=a // 2 == b // 2)
+            if robot in (a, b) else previous
+            for (a, b), previous in zip(_NOMINAL_ROBOT_PAIRS, self.pair_intervals)
+        )
+        return NominalRouteCoordination(templates, intervals)
+
+    def features(self):
+        """Union exposures per robot on simultaneous, no-wait timelines."""
+        completion = tuple(ops[-1].end_time if ops else 0.0 for ops in self.templates)
+        proximity = [[] for _ in range(4)]
+        order = [[] for _ in range(4)]
+        for (a, b), (near, crossing) in zip(_NOMINAL_ROBOT_PAIRS, self.pair_intervals):
+            proximity[a].extend(near)
+            proximity[b].extend(near)
+            order[a].extend(crossing)
+            order[b].extend(crossing)
+        exposure = tuple(_nominal_union_seconds(near + crossing) for near, crossing in zip(proximity, order))
+        return dict(nominal_completion=completion, nominal_cmax=max(completion),
+                    total_nominal_time=sum(completion), exposure_seconds=exposure,
+                    proximity_seconds=tuple(_nominal_union_seconds(v) for v in proximity),
+                    same_rail_order_seconds=tuple(_nominal_union_seconds(v) for v in order),
+                    exposure_score=max(t + e for t, e in zip(completion, exposure)))
+
+
+def nominal_coordination_features(solution, directions, config):
+    """Evaluate the nominal ranking features for a complete directed solution."""
     from mrta_reference.scope import FORMAL_SCOPE_V2
+
     blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
     state = oriented_route_state(tuple(r.block_ids for r in solution.routes), directions, blocks, config)
-    templates = tuple(build_operation_templates(RobotRoute(r, tuple(blocks[b] for b in route),
-                                                           state.directions[r]), config)
-                      for r, route in enumerate(state.routes))
-    completion = tuple(ops[-1].end_time if ops else 0.0 for ops in templates)
-    proximity = [[] for _ in range(4)]
-    order = [[] for _ in range(4)]
-    eps = config.numeric_epsilon
-    for first_robot in range(4):
-        for second_robot in range(first_robot + 1, 4):
-            first_ops, second_ops = templates[first_robot], templates[second_robot]
-            i = j = 0
-            # Each route is contiguous and ordered: sweep overlapping phases.
-            while i < len(first_ops) and j < len(second_ops):
-                a, b = first_ops[i], second_ops[j]
-                lo, hi = max(a.start_time, b.start_time), min(a.end_time, b.end_time)
-                if hi > lo + eps:
-                    pa, pb = a.point_at(lo), b.point_at(lo)
-                    va = tuple((y-x)/a.duration for x, y in zip(a.start, a.end))
-                    vb = tuple((y-x)/b.duration for x, y in zip(b.start, b.end))
-                    near = (0.0, hi-lo)
-                    for axis, limit in ((0, config.interference_dx), (1, config.interference_dy)):
-                        near = _axis_band_interval(va[axis]-vb[axis], pa[axis]-pb[axis],
-                                                   limit+eps, *near)
-                        if near is None or near[1] <= near[0]:
-                            near = None
-                            break
-                    if near is not None:
-                        interval = (lo+near[0], lo+near[1])
-                        proximity[first_robot].append(interval)
-                        proximity[second_robot].append(interval)
-                    if first_robot // 2 == second_robot // 2:
-                        # first_robot is the left robot (0 or 2).
-                        d0 = pa[0] + config.interference_dx - pb[0] - eps
-                        velocity = va[0] - vb[0]
-                        d1 = d0 + velocity*(hi-lo)
-                        if max(d0, d1) > 0.0:
-                            start, end = lo, hi
-                            if d0 <= 0.0:
-                                start = lo-d0/velocity
-                            elif d1 <= 0.0:
-                                end = lo-d0/velocity
-                            order[first_robot].append((start, end))
-                            order[second_robot].append((start, end))
-                if a.end_time <= b.end_time:
-                    i += 1
-                else:
-                    j += 1
-
-    def union_seconds(intervals):
-        total = 0.0
-        end = -math.inf
-        for start, stop in sorted(intervals):
-            total += max(0.0, stop-max(start, end))
-            end = max(end, stop)
-        return total
-
-    exposure = tuple(union_seconds(proximity[r]+order[r]) for r in range(4))
-    return dict(nominal_completion=completion, nominal_cmax=max(completion),
-                total_nominal_time=sum(completion), exposure_seconds=exposure,
-                proximity_seconds=tuple(union_seconds(v) for v in proximity),
-                same_rail_order_seconds=tuple(union_seconds(v) for v in order),
-                exposure_score=max(t+e for t,e in zip(completion, exposure)))
+    return NominalRouteCoordination.from_state(state, blocks, config).features()
 
 
 def oriented_insert_variants(

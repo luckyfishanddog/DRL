@@ -558,6 +558,47 @@ def test_nominal_coordination_counts_same_rail_order_and_unions_overlaps():
     assert features['exposure_seconds'] == pytest.approx((2, 2, 2, 0))
 
 
+def test_nominal_coordination_updates_only_the_inserted_route_and_its_pairs(monkeypatch):
+    from mrta_reference.model import SplitPattern
+    from mrta_search import lns
+
+    config = replace(FAST, t_pre=0, t_post=0)
+    parents = (ParentWeld('a', (0, 6), (2, 6)), ParentWeld('b', (4, 9), (6, 9)),
+               ParentWeld('c', (4, 6.1), (6, 6.1)), ParentWeld('d', (3, 4), (5, 4)),
+               ParentWeld('extra', (4, 6), (6, 6)))
+    initial_routes = (('a::whole',), ('b::whole',), ('c::whole',), ('d::whole',))
+    inserted_routes = (('extra::whole', 'a::whole'), *initial_routes[1:])
+    inserted_bits = ((0, 1), (0,), (0,), (0,))
+    solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
+                            dict(enumerate(inserted_routes)), config)
+    blocks = block_map(solution, config)
+    before = lns.oriented_route_state(initial_routes, ((0,),) * 4, blocks, config)
+    inserted = lns.oriented_route_state(inserted_routes, inserted_bits, blocks, config)
+    original = lns.NominalRouteCoordination.from_state(before, blocks, config)
+    expected = lns.nominal_coordination_features(solution, inserted_bits, config)
+    build = lns.build_operation_templates
+    sweep = lns._nominal_pair_intervals
+    rebuilt, recomputed = [], []
+
+    def build_route(route, config):
+        rebuilt.append(route.robot_id)
+        return build(route, config)
+
+    def sweep_pair(first, second, config, *, same_rail):
+        recomputed.append((first[0].robot_id, second[0].robot_id))
+        return sweep(first, second, config, same_rail=same_rail)
+
+    monkeypatch.setattr(lns, 'build_operation_templates', build_route)
+    monkeypatch.setattr(lns, '_nominal_pair_intervals', sweep_pair)
+    updated = original.with_changed_route(inserted, 0, blocks, config)
+    assert rebuilt == [0]
+    assert recomputed == [(0, 1), (0, 2), (0, 3)]
+    assert all(updated.templates[r] is original.templates[r] for r in (1, 2, 3))
+    assert updated.features() == expected
+    assert expected['same_rail_order_seconds'][2:] == pytest.approx((2, 2))
+    assert expected['proximity_seconds'][0] > 0
+
+
 def test_followup_proxy_and_two_direction_versions_keep_distinct_regret_structures():
     from collections import Counter
     from mrta_search import lns

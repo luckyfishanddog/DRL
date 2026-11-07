@@ -1393,10 +1393,10 @@ def parent_assignment_targets(solution: CanonicalSolution, config: ScientificCon
 
 def decode_parent_assignments(
     parents: Sequence[ParentWeld], assignments: Sequence[ParentAssignment], config: ScientificConfig,
-    *, decision_observer=None,
+    *, coordination_aware: bool = False, decision_observer=None,
 ) -> JointCompletionResult:
-    """Insert each fixed assignment, longest processing time first, without dispatching."""
-    from .lns import joint_block_candidates, joint_block_robots, oriented_route_state
+    """Insert fixed assignments in LPT order with optional nominal coordination scoring."""
+    from .lns import NominalRouteCoordination, joint_block_candidates, joint_block_robots, oriented_route_state
 
     started = time.perf_counter()
     pending = {parent.parent_id for parent in parents}
@@ -1425,10 +1425,11 @@ def decode_parent_assignments(
 
     empty = ((),) * 4
     state = oriented_route_state(empty, empty, blocks, config)
+    nominal = NominalRouteCoordination.from_state(state, blocks, config) if coordination_aware else None
     actions, deferred = [], []
 
     def insert(block, pattern, robot):
-        nonlocal state
+        nonlocal state, nominal
         # Partial heads may conflict before a later block supplies a new head.
         # The common generator prefers exact legal starts whenever available.
         variants = joint_block_candidates(state, block, pattern, blocks, config, robot_id=robot,
@@ -1436,7 +1437,7 @@ def decode_parent_assignments(
         if not variants:
             raise ValueError(f'{block.parent_id}: same-robot siblings require a separating block')
 
-        def score(row):
+        def travel_score(row):
             candidate, action = row
             route, bits = candidate.routes[robot], candidate.directions[robot]
             first, _ = oriented_endpoints(blocks[route[0]], bits[0])
@@ -1446,7 +1447,16 @@ def decode_parent_assignments(
             shortfall = max(0., side[robot] * first[0] + inward_x[robot ^ 1] + config.interference_dx)
             return travel + shortfall / config.empty_speed, travel, action.position, bits
 
-        state, action = min(variants, key=score)
+        if nominal is None:
+            state, action = min(variants, key=travel_score)
+        else:
+            def coordinated_candidate(row):
+                updated = nominal.with_changed_route(row[0], robot, blocks, config)
+                features = updated.features()
+                score = (features['exposure_score'], max(features['same_rail_order_seconds']), *travel_score(row))
+                return score, row, updated
+
+            _, (state, action), nominal = min(map(coordinated_candidate, variants), key=lambda candidate: candidate[0])
         actions.append(action)
 
     for parent_id in sorted(pending, key=priorities.__getitem__):

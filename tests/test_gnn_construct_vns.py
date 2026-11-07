@@ -2817,8 +2817,32 @@ def test_fast_assignment_decode_preserves_ownership_and_passes_explicit_directio
     assert len([op for op in schedule.operations if op.kind is OperationKind.WELD]) == len(parents)
 
 
-def test_fast_assignment_decode_keeps_split_siblings_and_requires_complete_valid_ownership():
+def test_coordination_aware_assignment_selects_direction_by_nominal_exposure():
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import nominal_coordination_features
+    from run_joint_oriented_repair_pilot import schedule_explicit
+
+    parents = (ParentWeld('left', (0., 9.), (8., 9.)), ParentWeld('right', (9., 9.), (3., 9.)))
+    labels = tuple(c.ParentAssignment(p.parent_id, p, (r,))
+                   for r, p in enumerate(c.fixed_split_patterns(parents, CONFIG)))
+    original = c.decode_parent_assignments(parents, labels, CONFIG)
+    coordinated = c.decode_parent_assignments(parents, labels, CONFIG, coordination_aware=True)
+    assert c.parent_assignment_targets(coordinated.solution, CONFIG) == labels
+    assert original.solution.routes == coordinated.solution.routes
+    assert original.directions == ((0,), (0,), (), ())
+    assert coordinated.directions == ((0,), (1,), (), ())
+    old = nominal_coordination_features(original.solution, original.directions, CONFIG)
+    new = nominal_coordination_features(coordinated.solution, coordinated.directions, CONFIG)
+    assert old['same_rail_order_seconds'][0] > 0
+    assert new['same_rail_order_seconds'] == (0.,) * 4
+    assert new['exposure_score'] < old['exposure_score']
+    assert schedule_explicit(coordinated.solution, coordinated.directions, CONFIG).schedule.status is ScheduleStatus.FEASIBLE
+
+
+@pytest.mark.parametrize('coordination_aware', (False, True))
+def test_fast_assignment_decode_keeps_split_siblings_and_requires_complete_valid_ownership(coordination_aware):
     from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.model import Rail
     from mrta_search import gnn_constructor as c
 
     long = ParentWeld('long', (2., 5.7), (10., 6.3))
@@ -2828,21 +2852,27 @@ def test_fast_assignment_decode_keeps_split_siblings_and_requires_complete_valid
     split = next(p for p in catalog['long'] if p.kind is SplitKind.Y_SPLIT)
     split_label = c.ParentAssignment('long', split, (0, 0))
     separator = c.ParentAssignment('other', catalog['other'][0], (0,))
-    decoded = c.decode_parent_assignments(parents, (split_label, separator), CONFIG)
+    decoded = c.decode_parent_assignments(parents, (split_label, separator), CONFIG,
+                                          coordination_aware=coordination_aware)
     route = decoded.solution.routes[0].block_ids
     assert set(route) == {'long::0', 'long::1', 'other::whole'}
     assert route[1] == 'other::whole'
     assert c.parent_assignment_targets(decoded.solution, CONFIG) == (split_label, separator)
 
     with pytest.raises(ValueError, match='separating block'):
-        c.decode_parent_assignments((long,), (split_label,), CONFIG)
+        c.decode_parent_assignments((long,), (split_label,), CONFIG, coordination_aware=coordination_aware)
     with pytest.raises(ValueError, match='one assignment per parent'):
         c.decode_parent_assignments(parents, (separator, separator), CONFIG)
     with pytest.raises(ValueError, match='one assignment per parent'):
         c.decode_parent_assignments(parents, (split_label,), CONFIG)
     x_split = next(p for p in catalog['long'] if p.kind is SplitKind.X_SPLIT)
+    x_owners = (0, 1) if x_split.rail is Rail.UPPER else (2, 3)
+    x_labels = (c.ParentAssignment('long', x_split, x_owners), separator)
+    x_decoded = c.decode_parent_assignments(parents, x_labels, CONFIG, coordination_aware=coordination_aware)
+    assert c.parent_assignment_targets(x_decoded.solution, CONFIG) == x_labels
     with pytest.raises(ValueError, match='illegal assignment'):
-        c.decode_parent_assignments(parents, (c.ParentAssignment('long', x_split, (1, 0)), separator), CONFIG)
+        c.decode_parent_assignments(parents, (c.ParentAssignment('long', x_split, x_owners[::-1]), separator),
+                                    CONFIG, coordination_aware=coordination_aware)
 
 
 def test_joint_assignment_head_scores_all_and_only_eligible_tuples_with_one_static_encoding(monkeypatch):

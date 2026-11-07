@@ -4116,6 +4116,20 @@ def residual_coverage_report():
     print('RESIDUAL_REPORT','STOP_BELOW_90',repair['complete_covered'],'/126','new_B32=0',flush=True)
 
 
+def _certified_assignment_groups():
+    from mrta_search.gnn_constructor import parent_assignment_targets
+
+    _, config, _, archive, teachers, _, _, _ = op_sources()
+    groups = defaultdict(list)
+    for item, saved in zip(teachers, archive['replays']):
+        if (item['instance'], item['teachers'], item['source_state'], item['seed'], item['cmax']) != (
+                saved['instance'], saved['teachers'], saved['source_state'], saved['source_seed'], saved['cmax']):
+            raise ValueError('teacher source does not match its retained certification record')
+        labels = parent_assignment_targets(item['solution'], config)
+        groups[item['geometry_key']].append((item, labels))
+    return config, groups
+
+
 def assignment_diagnostic():
     """Decode the best certified assignment per TRAIN geometry, read-only."""
     from mrta_reference.geometry import blocks_for_pattern
@@ -4123,17 +4137,11 @@ def assignment_diagnostic():
     from mrta_search import gnn_constructor as c
     from mrta_search.lns import oriented_route_lower_bound
 
-    _, config, _, archive, teachers, _, _, _ = op_sources()
-    groups = defaultdict(list)
+    config, groups = _certified_assignment_groups()
     teacher_modes, best_modes, teacher_cuts = Counter(), Counter(), Counter()
     teacher_loads = []
-    for item, saved in zip(teachers, archive['replays']):
-        if (item['instance'], item['teachers'], item['source_state'], item['seed'], item['cmax']) != (
-                saved['instance'], saved['teachers'], saved['source_state'], saved['source_seed'], saved['cmax']):
-            raise ValueError('teacher source does not match its retained certification record')
+    for item, labels in (pair for group in groups.values() for pair in group):
         solution = item['solution']
-        labels = c.parent_assignment_targets(solution, config)
-        groups[item['geometry_key']].append((item, labels))
         parents = {p.parent_id: p for p in solution.parents}
         loads = [0.] * 4
         for parent_id, pattern, robots in labels:
@@ -4233,7 +4241,7 @@ def assignment_diagnostic():
     paired = [r['degradation_percent'] for r in rows if r['cmax'] is not None]
     summary = dict(geometries=len(rows), b32_calls=len(rows), feasible=len(paired),
         median_degradation_percent=statistics.median(paired) if paired else None,
-        teacher_solutions=len(teachers), physical_parents=physical_parents, teacher_labels=label_count,
+        teacher_solutions=len(teacher_loads), physical_parents=physical_parents, teacher_labels=label_count,
         legal_teacher_labels=legal_label_count, joint_conflicts=joint_conflicts,
         mode_or_cut_conflicts=mode_conflicts, same_mode_owner_conflicts=owner_conflicts,
         teacher_modes=mode_counts(teacher_modes), best_modes=mode_counts(best_modes), teacher_cuts=dict(teacher_cuts),
@@ -4251,6 +4259,48 @@ def assignment_diagnostic():
     print('ASSIGNMENT_SUMMARY', json.dumps(summary, allow_nan=False), flush=True)
 
 
+def assignment_route_diagnostic():
+    """Compare two deterministic route scores on the same certified TRAIN assignments."""
+    from mrta_search.gnn_constructor import decode_parent_assignments, parent_assignment_targets
+    from mrta_search.lns import nominal_coordination_features
+
+    config, groups = _certified_assignment_groups()
+    methods = ('original', 'conflict_aware')
+    rows = []
+    for group in groups.values():
+        best, assignments = min(group, key=lambda pair: pair[0]['cmax'])
+        parents = best['solution'].parents
+        row = dict(instance=best['instance'], teacher_cmax=best['cmax'])
+        for name, aware in zip(methods, (False, True)):
+            decoded = decode_parent_assignments(parents, assignments, config, coordination_aware=aware)
+            if parent_assignment_targets(decoded.solution, config) != assignments:
+                raise ValueError(f"{best['instance']}: decoded patterns, cuts or owners changed")
+            tick = time.perf_counter()
+            scheduled = pilot.oriented.schedule_explicit(decoded.solution, decoded.directions, config).schedule
+            b32_seconds = time.perf_counter() - tick
+            cmax = scheduled.cmax if scheduled.status is ScheduleStatus.FEASIBLE else None
+            features = nominal_coordination_features(decoded.solution, decoded.directions, config)
+            row[name] = dict(status=scheduled.status.value, cmax=cmax,
+                degradation_percent=None if cmax is None else 100. * (cmax / best['cmax'] - 1.),
+                construction_seconds=decoded.inference_seconds, b32_seconds=b32_seconds,
+                wait_for_graph=scheduled.wait_for_graph,
+                nominal_cmax=features['nominal_cmax'], exposure_score=features['exposure_score'],
+                nominal_same_rail_seconds=sum(features['same_rail_order_seconds']) / 2.)
+        rows.append(row)
+        print('ASSIGNMENT_ROUTE_DIAGNOSTIC', json.dumps(row, allow_nan=False), flush=True)
+
+    summary = dict(geometries=len(rows), b32_calls=len(methods) * len(rows))
+    for name in methods:
+        attempts = [row[name] for row in rows]
+        feasible = [a['degradation_percent'] for a in attempts if a['status'] == ScheduleStatus.FEASIBLE.value]
+        summary[name] = dict(feasible=len(feasible), feasible_percent=100. * len(feasible) / len(rows),
+            deadlock=sum(a['status'] == ScheduleStatus.DEADLOCK.value for a in attempts),
+            median_degradation_percent=statistics.median(feasible) if feasible else None,
+            median_construction_seconds=statistics.median(a['construction_seconds'] for a in attempts),
+            median_b32_seconds=statistics.median(a['b32_seconds'] for a in attempts))
+    print('ASSIGNMENT_ROUTE_SUMMARY', json.dumps(summary, allow_nan=False), flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
@@ -4262,12 +4312,14 @@ def main():
         'compact-workload-train','compact-workload-eval','compact-workload-report',
         'residual-coverage','residual-packing-repair','residual-external-parent','residual-quota-check',
         'residual-route-coverage','residual-feedback','residual-head-train','residual-dev','residual-report',
-        'assignment-diagnostic'),default='op-all')
+        'assignment-diagnostic','assignment-route-diagnostic'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
     if args.phase=='assignment-diagnostic':
         assignment_diagnostic();return
+    if args.phase=='assignment-route-diagnostic':
+        assignment_route_diagnostic();return
     if args.phase=='residual-coverage':
         residual_coverage_sweep();return
     if args.phase=='residual-packing-repair':
