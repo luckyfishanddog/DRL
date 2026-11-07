@@ -4116,6 +4116,141 @@ def residual_coverage_report():
     print('RESIDUAL_REPORT','STOP_BELOW_90',repair['complete_covered'],'/126','new_B32=0',flush=True)
 
 
+def assignment_diagnostic():
+    """Decode the best certified assignment per TRAIN geometry, read-only."""
+    from mrta_reference.geometry import blocks_for_pattern
+    from mrta_reference.model import OperationKind, SplitKind
+    from mrta_search import gnn_constructor as c
+    from mrta_search.lns import oriented_route_lower_bound
+
+    _, config, _, archive, teachers, _, _, _ = op_sources()
+    groups = defaultdict(list)
+    teacher_modes, best_modes, teacher_cuts = Counter(), Counter(), Counter()
+    teacher_loads = []
+    for item, saved in zip(teachers, archive['replays']):
+        if (item['instance'], item['teachers'], item['source_state'], item['seed'], item['cmax']) != (
+                saved['instance'], saved['teachers'], saved['source_state'], saved['source_seed'], saved['cmax']):
+            raise ValueError('teacher source does not match its retained certification record')
+        solution = item['solution']
+        labels = c.parent_assignment_targets(solution, config)
+        groups[item['geometry_key']].append((item, labels))
+        parents = {p.parent_id: p for p in solution.parents}
+        loads = [0.] * 4
+        for parent_id, pattern, robots in labels:
+            teacher_modes[pattern.kind.value, pattern.mandatory] += 1
+            if pattern.point_id is not None:
+                family = pattern.kind.value if pattern.rail is None else f'{pattern.kind.value}/{pattern.rail.value}'
+                teacher_cuts[f'{family}/{pattern.point_id}'] += 1
+            for block, robot in zip(blocks_for_pattern(parents[parent_id], pattern, config), robots):
+                loads[robot] += config.process_time(block.length)
+        teacher_loads.append(loads)
+
+    old_pool = next(row['payload']['cases'] for row in op_read()
+                    if row['phase'] == 'residual_route_candidate_coverage' and row['method'] == RESIDUAL_METHOD)
+    fractions = (0., .1, .25, .5, .75, .9)
+    model = c.ParentAssignmentGNN().eval()
+    rows, score_times = [], []
+    label_count = legal_label_count = physical_parents = 0
+    joint_conflicts = mode_conflicts = owner_conflicts = 0
+    for group in groups.values():
+        best, assignments = min(group, key=lambda pair: pair[0]['cmax'])
+        parents = best['solution'].parents
+        prefixes = []
+        decoded = c.decode_parent_assignments(parents, assignments, config,
+            decision_observer=lambda state, blocks, pending: prefixes.append((state, blocks, pending)))
+        tick = time.perf_counter()
+        scheduled = pilot.oriented.schedule_explicit(decoded.solution, decoded.directions, config).schedule
+        b32_seconds = time.perf_counter() - tick
+
+        tick = time.perf_counter()
+        space = c.parent_assignment_space(parents, config)
+        space_seconds = time.perf_counter() - tick
+        with torch.inference_mode():
+            tick = time.perf_counter()
+            embeddings = model.encode_static(space.graph)
+            encode_seconds = time.perf_counter() - tick
+            counts, seconds = [], []
+            for state, blocks, pending in prefixes:
+                tick = time.perf_counter()
+                indices, logits = model.assignment_logits(space, embeddings, state, blocks, pending, config)
+                indices[logits.argmax()].item()
+                seconds.append(time.perf_counter() - tick)
+                counts.append(len(indices))
+                if not torch.isfinite(logits).all():
+                    raise ValueError('non-finite joint assignment scores')
+        score_times.extend(seconds)
+
+        # Check both cross-mode disagreements and competing ownership labels
+        # under the same physical split, independently of endpoint convention.
+        legal = set(space.actions)
+        by_parent = defaultdict(lambda: defaultdict(set))
+        for item, labels in group:
+            by_id = {p.parent_id: p for p in item['solution'].parents}
+            occurrences = Counter()
+            for parent_id, pattern, robots in labels:
+                label_count += 1
+                legal_label_count += c.ParentAssignment(parent_id, pattern, robots) in legal
+                parent = by_id[parent_id]
+                endpoints = tuple(sorted((parent.start, parent.end)))
+                occurrence = occurrences[endpoints]
+                occurrences[endpoints] += 1
+                reverse = parent.start != endpoints[0]
+                cut = pattern.t if not reverse or pattern.t is None else 1. - pattern.t
+                mode = (pattern.kind, pattern.rail, None if cut is None else round(cut, 12))
+                owners = robots[::-1] if reverse and pattern.kind is SplitKind.Y_SPLIT else robots
+                by_parent[endpoints, occurrence][mode].add(owners)
+        physical_parents += len(by_parent)
+        for labels in by_parent.values():
+            mode_conflicts += len(labels) > 1
+            owner_conflicts += any(len(owners) > 1 for owners in labels.values())
+            joint_conflicts += sum(map(len, labels.values())) > 1
+
+        best_modes.update((p.kind.value, p.mandatory) for _, p, _ in assignments)
+        cmax = scheduled.cmax if scheduled.status is ScheduleStatus.FEASIBLE else None
+        row = dict(instance=best['instance'], parents=len(parents), length_m=sum(p.length for p in parents),
+            teachers=len(group), teacher=best['teacher'], teacher_seed=best['seed'], teacher_cmax=best['cmax'],
+            status=scheduled.status.value, cmax=cmax,
+            degradation_percent=None if cmax is None else 100. * (cmax / best['cmax'] - 1.),
+            construction_seconds=decoded.inference_seconds, b32_seconds=b32_seconds,
+            loads=decoded.oriented_state.loads, move_seconds=decoded.oriented_state.travel,
+            route_lower_bound=oriented_route_lower_bound(decoded.oriented_state),
+            wait_seconds=sum(op.duration for op in scheduled.operations if op.kind is OperationKind.WAIT),
+            welded=sum(op.kind is OperationKind.WELD for op in scheduled.operations), blocks=len(decoded.actions),
+            wait_for=scheduled.wait_for_graph, diagnostics=scheduled.diagnostics,
+            recovery_rollouts=scheduled.recovery_rollouts, actions_start=counts[0], actions_scored=sum(counts),
+            progress_counts=[counts[round(f * len(parents))] for f in fractions],
+            space_seconds=space_seconds, encode_seconds=encode_seconds, scoring_seconds=sum(seconds))
+        rows.append(row)
+        print('ASSIGNMENT_DIAGNOSTIC', json.dumps(row, allow_nan=False), flush=True)
+
+    def distribution(values):
+        return dict(min=min(values), median=statistics.median(values), max=max(values))
+
+    def mode_counts(counts):
+        return {kind + ('_MANDATORY' if mandatory else ''): count for (kind, mandatory), count in counts.items()}
+
+    new_counts = [count for row in rows for count in row['progress_counts']]
+    paired = [r['degradation_percent'] for r in rows if r['cmax'] is not None]
+    summary = dict(geometries=len(rows), b32_calls=len(rows), feasible=len(paired),
+        median_degradation_percent=statistics.median(paired) if paired else None,
+        teacher_solutions=len(teachers), physical_parents=physical_parents, teacher_labels=label_count,
+        legal_teacher_labels=legal_label_count, joint_conflicts=joint_conflicts,
+        mode_or_cut_conflicts=mode_conflicts, same_mode_owner_conflicts=owner_conflicts,
+        teacher_modes=mode_counts(teacher_modes), best_modes=mode_counts(best_modes), teacher_cuts=dict(teacher_cuts),
+        teacher_loads=[dict(distribution(list(loads)), total=sum(loads)) for loads in zip(*teacher_loads)],
+        archived_complete_pool=distribution([x['candidates'] for x in old_pool]),
+        new_assignment_pool=distribution(new_counts),
+        archived_pool_by_progress=[distribution([x['candidates'] for x in old_pool if x['fraction'] == f]) for f in fractions],
+        new_pool_by_progress=[distribution([r['progress_counts'][i] for r in rows]) for i in range(len(fractions))],
+        scoring_seconds_per_step=distribution(score_times))
+    for field in ('construction_seconds', 'b32_seconds', 'space_seconds', 'encode_seconds', 'scoring_seconds',
+                  'actions_start', 'actions_scored'):
+        summary[field] = distribution([r[field] for r in rows])
+    summary['inference_seconds'] = distribution([r['space_seconds'] + r['encode_seconds'] + r['scoring_seconds'] for r in rows])
+    summary['decode_b32_seconds'] = distribution([r['construction_seconds'] + r['b32_seconds'] for r in rows])
+    print('ASSIGNMENT_SUMMARY', json.dumps(summary, allow_nan=False), flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
@@ -4126,10 +4261,13 @@ def main():
         'complete-parent-coverage','complete-parent-train','complete-parent-eval','complete-parent-report',
         'compact-workload-train','compact-workload-eval','compact-workload-report',
         'residual-coverage','residual-packing-repair','residual-external-parent','residual-quota-check',
-        'residual-route-coverage','residual-feedback','residual-head-train','residual-dev','residual-report'),default='op-all')
+        'residual-route-coverage','residual-feedback','residual-head-train','residual-dev','residual-report',
+        'assignment-diagnostic'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
+    if args.phase=='assignment-diagnostic':
+        assignment_diagnostic();return
     if args.phase=='residual-coverage':
         residual_coverage_sweep();return
     if args.phase=='residual-packing-repair':

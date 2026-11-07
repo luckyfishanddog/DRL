@@ -2787,3 +2787,107 @@ def test_joint_existence_does_not_build_or_sort_direction_variants(monkeypatch):
     monkeypatch.setattr(lns,'oriented_insert_variants',forbidden)
     assert lns.has_joint_block_candidate(state,block,patterns[block.parent_id],blocks,CONFIG)
 
+
+def test_fast_assignment_decode_preserves_ownership_and_passes_explicit_directions_to_b32(monkeypatch):
+    from mrta_reference import scheduler
+    from mrta_search import gnn_constructor as c
+    from run_joint_oriented_repair_pilot import schedule_explicit
+
+    parents = (ParentWeld('left', (1., 9.), (3., 9.)),
+               ParentWeld('right', (2., 9.), (18., 9.)),
+               ParentWeld('lower', (1., 2.), (4., 2.)))
+    owners = {'left': 0, 'right': 1, 'lower': 2}
+    labels = tuple(c.ParentAssignment(p.parent_id, p, (owners[p.parent_id],))
+                   for p in c.fixed_split_patterns(parents, CONFIG))
+    decoded = c.decode_parent_assignments(parents, labels, CONFIG)
+    reversed_input = c.decode_parent_assignments(parents[::-1], labels[::-1], CONFIG)
+    assert decoded.solution == reversed_input.solution
+    assert decoded.directions == reversed_input.directions
+    assert decoded.actions[0].block_id == 'right::whole'
+    assert c.parent_assignment_targets(decoded.solution, CONFIG) == labels
+    assert decoded.directions[1] == (1,)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('an explicit direction must never invoke route direction optimization')
+
+    monkeypatch.setattr(scheduler, 'optimize_directions', unexpected)
+    schedule = schedule_explicit(decoded.solution, decoded.directions, CONFIG).schedule
+    assert schedule.status is ScheduleStatus.FEASIBLE
+    assert schedule.directions == decoded.directions
+    assert len([op for op in schedule.operations if op.kind is OperationKind.WELD]) == len(parents)
+
+
+def test_fast_assignment_decode_keeps_split_siblings_and_requires_complete_valid_ownership():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_search import gnn_constructor as c
+
+    long = ParentWeld('long', (2., 5.7), (10., 6.3))
+    other = ParentWeld('other', (3., 9.), (4., 9.))
+    parents = (long, other)
+    catalog = build_legal_pattern_catalog(parents, CONFIG, FORMAL_SCOPE_V2)
+    split = next(p for p in catalog['long'] if p.kind is SplitKind.Y_SPLIT)
+    split_label = c.ParentAssignment('long', split, (0, 0))
+    separator = c.ParentAssignment('other', catalog['other'][0], (0,))
+    decoded = c.decode_parent_assignments(parents, (split_label, separator), CONFIG)
+    route = decoded.solution.routes[0].block_ids
+    assert set(route) == {'long::0', 'long::1', 'other::whole'}
+    assert route[1] == 'other::whole'
+    assert c.parent_assignment_targets(decoded.solution, CONFIG) == (split_label, separator)
+
+    with pytest.raises(ValueError, match='separating block'):
+        c.decode_parent_assignments((long,), (split_label,), CONFIG)
+    with pytest.raises(ValueError, match='one assignment per parent'):
+        c.decode_parent_assignments(parents, (separator, separator), CONFIG)
+    with pytest.raises(ValueError, match='one assignment per parent'):
+        c.decode_parent_assignments(parents, (split_label,), CONFIG)
+    x_split = next(p for p in catalog['long'] if p.kind is SplitKind.X_SPLIT)
+    with pytest.raises(ValueError, match='illegal assignment'):
+        c.decode_parent_assignments(parents, (c.ParentAssignment('long', x_split, (1, 0)), separator), CONFIG)
+
+
+def test_joint_assignment_head_scores_all_and_only_eligible_tuples_with_one_static_encoding(monkeypatch):
+    from itertools import product
+    from mrta_reference.geometry import blocks_for_pattern, build_legal_pattern_catalog
+    from mrta_reference.model import Rail
+    from mrta_search import gnn_constructor as c, lns
+
+    parents = (ParentWeld('optional', (14., 6.2), (2., 5.8)),
+               ParentWeld('mandatory', (1., 9.), (1., 3.)))
+    catalog = build_legal_pattern_catalog(parents, CONFIG, FORMAL_SCOPE_V2)
+    expected = set()
+    for parent in parents:
+        for pattern in catalog[parent.parent_id]:
+            blocks = blocks_for_pattern(parent, pattern, CONFIG)
+            robots = ((0, 1),) if pattern.rail is Rail.UPPER else ((2, 3),) if pattern.rail is Rail.LOWER else product(
+                *(tuple(r for r in range(4) if robot_is_eligible(b, r, CONFIG)) for b in blocks))
+            expected.update(c.ParentAssignment(parent.parent_id, pattern, owners) for owners in robots)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('joint ownership scoring must never generate an insertion state or re-encode the graph')
+
+    monkeypatch.setattr(lns, 'joint_block_candidates', unexpected)
+    space = c.parent_assignment_space(parents, CONFIG)
+    assert set(space.actions) == expected
+    assert len(space.actions) == len(expected)
+    assert {a.pattern.kind for a in space.actions} == set(SplitKind)
+    model = c.ParentAssignmentGNN()
+    embeddings = model.encode_static(space.graph)
+    assert embeddings.shape == (len(space.graph.node_features), 64)
+    assert model.layer1.heads == model.layer2.heads == 4
+    monkeypatch.setattr(model, 'encode_static', unexpected)
+    empty = ((),) * 4
+    state = lns.oriented_route_state(empty, empty, {}, CONFIG)
+    ids, scores = model.assignment_logits(space, embeddings, state, {}, set(catalog), CONFIG)
+    assert ids.tolist() == list(range(len(expected)))
+    assert scores.shape == (len(expected),) and torch.isfinite(scores).all()
+    subset, logits = model.assignment_logits(space, embeddings, state, {}, {'mandatory'}, CONFIG)
+    assert all(space.actions[i].parent_id == 'mandatory' for i in subset.tolist())
+    assert torch.allclose(logits, scores[subset])
+    assert model.assignment_logits(space, embeddings, state, {}, set(), CONFIG)[1].numel() == 0
+
+    placed = blocks_for_pattern(parents[0], catalog['optional'][0], CONFIG)[0]
+    blocks = {placed.block_id: placed}
+    occupied = lns.oriented_route_state(((placed.block_id,), (), (), ()), ((0,), (), (), ()), blocks, CONFIG)
+    _, updated = model.assignment_logits(space, embeddings, occupied, blocks, {'mandatory'}, CONFIG)
+    assert not torch.allclose(updated, logits)
+

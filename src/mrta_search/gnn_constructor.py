@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import cached_property
+from itertools import product
 import math
 import time
-from typing import Mapping, Sequence
+from typing import Mapping, NamedTuple, Sequence
 
 import torch
 from torch import nn
@@ -19,6 +20,7 @@ from mrta_ranker.model import SparseGATLayer
 from mrta_reference.geometry import (
     blocks_for_pattern,
     build_legal_pattern_catalog,
+    oriented_endpoints,
     robot_is_eligible,
     whole_eligible_rails,
 )
@@ -223,18 +225,11 @@ def build_block_robot_graph(
     )
 
 
-class BlockAssignmentGNN(nn.Module):
-    """Two-layer, hidden-64 GAT with a lightweight dynamic assignment head."""
-
+class _BlockRobotGAT(nn.Module):
     def __init__(self, hidden_dim: int = 64, heads: int = 4) -> None:
         super().__init__()
         self.layer1 = SparseGATLayer(NODE_DIM, hidden_dim, heads)
         self.layer2 = SparseGATLayer(hidden_dim, hidden_dim, heads)
-        self.policy = nn.Sequential(
-            nn.Linear(2 * hidden_dim + DYNAMIC_DIM, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
 
     def encode_static(self, graph: BlockRobotGraph) -> torch.Tensor:
         hidden = torch.nn.functional.elu(
@@ -242,6 +237,18 @@ class BlockAssignmentGNN(nn.Module):
                         incoming_edges=graph.incoming_edges)
         )
         return self.layer2(hidden, graph.edge_index, graph.edge_type,incoming_edges=graph.incoming_edges)
+
+
+class BlockAssignmentGNN(_BlockRobotGAT):
+    """Two-layer, hidden-64 GAT with a lightweight dynamic assignment head."""
+
+    def __init__(self, hidden_dim: int = 64, heads: int = 4) -> None:
+        super().__init__(hidden_dim, heads)
+        self.policy = nn.Sequential(
+            nn.Linear(2 * hidden_dim + DYNAMIC_DIM, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def action_logits(
         self,
@@ -1359,6 +1366,190 @@ def complete_parent_space(parents, config, *, compact=False):
         space.update(flexibility=flexibility,remaining_parent_workload=workload,
             original_processing={p.parent_id:config.process_time(p.length) for p in parents})
     return space
+
+
+class ParentAssignment(NamedTuple):
+    """A legal mode and its owners in blocks_for_pattern order (spatial for X)."""
+
+    parent_id: str
+    pattern: SplitPattern
+    robots: tuple[int, ...]
+
+
+def _blocks_by_parent(blocks):
+    grouped = {}
+    for block in blocks.values():
+        grouped.setdefault(block.parent_id, []).append(block)
+    return grouped
+
+
+def parent_assignment_targets(solution: CanonicalSolution, config: ScientificConfig) -> tuple[ParentAssignment, ...]:
+    """Read ownership from a complete solution without preserving its route order."""
+    children = _blocks_by_parent(block_map(solution, config, scope=FORMAL_SCOPE_V2))
+    owners = assignment_targets(solution)
+    return tuple(ParentAssignment(p.parent_id, p, tuple(owners[b.block_id] for b in children[p.parent_id]))
+                 for p in solution.patterns)
+
+
+def decode_parent_assignments(
+    parents: Sequence[ParentWeld], assignments: Sequence[ParentAssignment], config: ScientificConfig,
+    *, decision_observer=None,
+) -> JointCompletionResult:
+    """Insert each fixed assignment, longest processing time first, without dispatching."""
+    from .lns import joint_block_candidates, joint_block_robots, oriented_route_state
+
+    started = time.perf_counter()
+    pending = {parent.parent_id for parent in parents}
+    assigned = {action.parent_id: action for action in assignments}
+    if len(assigned) != len(assignments) or assigned.keys() != pending:
+        raise ValueError('exactly one assignment per parent is required')
+    if any(action.parent_id != action.pattern.parent_id for action in assignments):
+        raise ValueError('assignment and pattern parent differ')
+    patterns = tuple(assigned[p].pattern for p in sorted(assigned))
+    blocks = block_map(JointGeometry(tuple(parents), patterns), config, scope=FORMAL_SCOPE_V2)
+    children = _blocks_by_parent(blocks)
+    priorities = {}
+    inward_x = [-math.inf] * 4
+    side = (1, -1, 1, -1)
+    for parent_id, pattern, robots in assignments:
+        siblings = children[parent_id]
+        choices = [joint_block_robots(block, pattern, config) for block in siblings]
+        if len(robots) != len(siblings):
+            raise ValueError(f'{parent_id}: one owner per selected block is required')
+        for block, robot, eligible in zip(siblings, robots, choices):
+            if robot not in eligible or not robot_is_eligible(block, robot, config):
+                raise ValueError(f'illegal assignment {block.block_id} -> R{robot}')
+            inward_x[robot] = max(inward_x[robot], side[robot] * block.start[0], side[robot] * block.end[0])
+        priorities[parent_id] = (-sum(config.process_time(b.length) for b in siblings),
+                                 math.prod(map(len, choices)), parent_id)
+
+    empty = ((),) * 4
+    state = oriented_route_state(empty, empty, blocks, config)
+    actions, deferred = [], []
+
+    def insert(block, pattern, robot):
+        nonlocal state
+        # Partial heads may conflict before a later block supplies a new head.
+        # The common generator prefers exact legal starts whenever available.
+        variants = joint_block_candidates(state, block, pattern, blocks, config, robot_id=robot,
+                                          check_initial_feasibility=False)
+        if not variants:
+            raise ValueError(f'{block.parent_id}: same-robot siblings require a separating block')
+
+        def score(row):
+            candidate, action = row
+            route, bits = candidate.routes[robot], candidate.directions[robot]
+            first, _ = oriented_endpoints(blocks[route[0]], bits[0])
+            travel = sum(candidate.arc_costs[robot])
+            # Prefer room at the start for a partner to traverse its range.
+            # This distance term ranks candidates without rejecting overlaps.
+            shortfall = max(0., side[robot] * first[0] + inward_x[robot ^ 1] + config.interference_dx)
+            return travel + shortfall / config.empty_speed, travel, action.position, bits
+
+        state, action = min(variants, key=score)
+        actions.append(action)
+
+    for parent_id in sorted(pending, key=priorities.__getitem__):
+        if decision_observer is not None:
+            decision_observer(state, blocks, frozenset(pending))
+        _, pattern, robots = assigned[parent_id]
+        for block, robot in zip(children[parent_id], robots):
+            route = state.routes[robot]
+            if len(route) == 1 and blocks[route[0]].parent_id == parent_id:
+                # Adjacent siblings would be merged by canonicalization.
+                deferred.append((block, pattern, robot))
+            else:
+                insert(block, pattern, robot)
+        pending.remove(parent_id)
+    for block, pattern, robot in deferred:
+        insert(block, pattern, robot)
+
+    solution = canonicalize(parents, patterns, dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
+    return JointCompletionResult(solution, state.directions, tuple(actions), time.perf_counter() - started,
+                                 oriented_state=state)
+
+
+@dataclass(frozen=True)
+class ParentAssignmentSpace:
+    graph: BlockRobotGraph
+    parent_ids: tuple[str, ...]
+    actions: tuple[ParentAssignment, ...]
+    action_parents: torch.Tensor
+    child_nodes: torch.Tensor
+    owners: torch.Tensor
+    active_children: torch.Tensor
+    modes: torch.Tensor
+    processing: torch.Tensor
+
+
+def parent_assignment_space(parents: Sequence[ParentWeld], config: ScientificConfig) -> ParentAssignmentSpace:
+    """Prepare compact rows for all legal mode/owner tuples once per geometry."""
+    from .lns import joint_block_robots
+
+    space = complete_parent_space(parents, config)
+    parent_ids = tuple(p.parent_id for p in space['parents'])
+    actions, action_parents, child_nodes, owners, masks, modes, processing = [], [], [], [], [], [], []
+    for index, parent_id in enumerate(parent_ids):
+        for pattern in space['catalog'][parent_id]:
+            children = space['options'][pattern]
+            nodes = tuple(space['indices'][pattern, b.block_id] for b in children)
+            times = tuple(config.process_time(b.length) / 2500. for b in children)
+            for robots in product(*(joint_block_robots(b, pattern, config) for b in children)):
+                actions.append(ParentAssignment(parent_id, pattern, robots))
+                action_parents.append(index)
+                child_nodes.append(nodes if len(nodes) == 2 else (*nodes, 0))
+                owners.append(robots if len(robots) == 2 else (*robots, 0))
+                masks.append((True, len(robots) == 2))
+                modes.append([float(pattern.kind is kind) for kind in SplitKind]
+                             + [float(pattern.mandatory), pattern.t if pattern.t is not None else .5])
+                loads = [0.] * 4
+                for robot, seconds in zip(robots, times):
+                    loads[robot] += seconds
+                processing.append(loads)
+    return ParentAssignmentSpace(space['graph'], parent_ids, tuple(actions),
+                                 torch.tensor(action_parents, dtype=torch.long),
+                                 torch.tensor(child_nodes, dtype=torch.long).reshape(-1, 2),
+                                 torch.tensor(owners, dtype=torch.long).reshape(-1, 2),
+                                 torch.tensor(masks, dtype=torch.bool).reshape(-1, 2),
+                                 torch.tensor(modes, dtype=torch.float32).reshape(-1, 5),
+                                 torch.tensor(processing, dtype=torch.float32).reshape(-1, 4))
+
+
+class ParentAssignmentGNN(_BlockRobotGAT):
+    """Shared two-layer GAT and a single score for each legal joint action."""
+
+    def __init__(self, hidden_dim: int = 64, heads: int = 4) -> None:
+        super().__init__(hidden_dim, heads)
+        # Each child sees its own and its robot's embeddings, plus seven state
+        # features from its robot and that robot's same-rail partner.
+        self.policy = nn.Sequential(nn.Linear(4 * hidden_dim + 4 * 7 + 5 + 4, hidden_dim),
+                                    nn.ReLU(), nn.Linear(hidden_dim, 1))
+
+    def assignment_logits(self, space, embeddings, state, blocks, pending, config):
+        """Return indices into space.actions and batched scores for pending parents."""
+        device = embeddings.device
+        pending_mask = torch.tensor([p in pending for p in space.parent_ids], device=device, dtype=torch.bool)
+        indices = torch.where(pending_mask[space.action_parents.to(device)])[0]
+        if not indices.numel():
+            return indices, embeddings.new_empty(0)
+        rows = []
+        for robot, (route, bits) in enumerate(zip(state.routes, state.directions)):
+            if route:
+                head, _ = oriented_endpoints(blocks[route[0]], bits[0])
+                _, tail = oriented_endpoints(blocks[route[-1]], bits[-1])
+            else:
+                head = tail = _home(robot, config)
+            rows.append((state.loads[robot] / 2500., sum(state.arc_costs[robot]) / 2500.,
+                         head[0] / 20., head[1] / 12., tail[0] / 20., tail[1] / 12., float(bool(route))))
+        robot_state = embeddings.new_tensor(rows)
+        owners = space.owners.to(device)[indices]
+        children = torch.cat((embeddings[space.child_nodes.to(device)[indices]],
+                              embeddings[space.graph.robot_offset + owners],
+                              robot_state[owners], robot_state[owners ^ 1]), dim=-1)
+        children = (children * space.active_children.to(device)[indices, :, None]).flatten(1)
+        projected = space.processing.to(embeddings)[indices] + robot_state[:, 0]
+        inputs = torch.cat((children, space.modes.to(embeddings)[indices], projected), dim=1)
+        return indices, self.policy(inputs).squeeze(1)
 
 
 def gnn_parent_orders(space,state,pending,selected,model,config,*,proposal_graph_mode='native'):

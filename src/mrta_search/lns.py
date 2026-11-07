@@ -1040,12 +1040,18 @@ def joint_action_key(action: OrientedInsertionAction) -> tuple:
             tuple(tuple(change) for change in action.neighbour_changes))
 
 
-def _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit):
-    """Common robot/position pool, including direction-independent sibling pruning."""
-    robots = [r for r in range(4) if robot_is_eligible(block, r, config)]
+def joint_block_robots(block, pattern, config):
+    """Eligible owners for a block, with spatial ownership for formal X splits."""
     if pattern.kind is SplitKind.X_SPLIT:
-        robots = [(0 if pattern.rail.value == "UPPER" else 2) + int(block.block_id.endswith("::1"))]
-    for robot in robots:
+        return ((0 if pattern.rail.value == "UPPER" else 2) + int(block.block_id.endswith("::1")),)
+    return tuple(r for r in range(4) if robot_is_eligible(block, r, config))
+
+
+def _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit, robot_id=None):
+    """Common robot/position pool, including direction-independent sibling pruning."""
+    for robot in joint_block_robots(block, pattern, config):
+        if robot_id is not None and robot != robot_id:
+            continue
         route = state.routes[robot]
         for position in bounded_insertion_positions(len(route), insertion_limit):
             if any(blocks[route[i]].parent_id == block.parent_id and route[i] != block.block_id
@@ -1067,9 +1073,7 @@ def has_joint_block_candidate(state, block, pattern, blocks, config, *,
     points = None
     unchanged_legal = None
     legal_heads = {}
-    for robot, position in _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit):
-        if robot_id is not None and robot!=robot_id:
-            continue
+    for robot, position in _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit, robot_id):
         # Match oriented_insert_variants' validation for malformed forced X
         # assignments, after the same position/sibling filtering.
         if not robot_is_eligible(block, robot, config):
@@ -1104,7 +1108,7 @@ def joint_block_candidates(
     state: OrientedRouteState, block: WeldingBlock, pattern: SplitPattern,
     blocks: Mapping[str, WeldingBlock], config: ScientificConfig, *,
     insertion_limit: int = 8, first_only: bool = False, check_initial_feasibility: bool = True,
-    prefer_legal_start_recovery: bool = True,
+    prefer_legal_start_recovery: bool = True, robot_id: int | None = None,
 ):
     """Shared student/teacher-replay action set, including neighbour flips.
 
@@ -1113,7 +1117,7 @@ def joint_block_candidates(
     label or future schedule is accepted by this function.
     """
     rows = []
-    for robot, position in _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit):
+    for robot, position in _joint_insertion_locations(state, block, pattern, blocks, config, insertion_limit, robot_id):
         variants, _ = oriented_insert_variants(state, block, robot, position, blocks, config,
                                                max_evaluations=8, keep=8,
                                                check_initial_feasibility=check_initial_feasibility)
