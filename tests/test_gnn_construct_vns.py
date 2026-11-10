@@ -2981,3 +2981,75 @@ def test_coarse_to_fine_owner_slots_keep_capacity_and_offer_different_robots():
     assert all(a.robots == (0,) for a in original)
     assert {(a.parent_id, a.robots) for a in expanded if a.robots != (0,)} == {('p0', (1,)), ('p1', (1,))}
 
+
+def test_vnext_expands_one_learned_assignment_and_directs_without_exact_scans(monkeypatch):
+    from mrta_search import gnn_constructor as c, lns
+    from run_joint_oriented_repair_pilot import schedule_explicit
+
+    parents = (ParentWeld('p', (2., 9.), (2.6, 9.)),)
+    model = c.VNextGNN()
+    direction = 4 * 64 + 5
+    monkeypatch.setattr(model.policy, 'forward', lambda rows: 100. * rows[:, -12:-11])
+    monkeypatch.setattr(model.insertion_head, 'forward', lambda rows: rows[:, direction:direction + 1])
+    original = lns.joint_block_candidates
+    expanded = []
+
+    def record(state, block, pattern, blocks, config, **kwargs):
+        expanded.append(kwargs['robot_id'])
+        return original(state, block, pattern, blocks, config, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('VNext inference invoked the exact B teacher')
+
+    monkeypatch.setattr(lns, 'joint_block_candidates', record)
+    monkeypatch.setattr(lns.NominalRouteCoordination, 'from_state', forbidden)
+    result = c.construct_vnext_gnn(parents, model, CONFIG)
+    assert expanded == [1]
+    assert c.parent_assignment_targets(result.solution, CONFIG)[0].robots == (1,)
+    assert result.directions == ((), (1,), (), ())
+    assert schedule_explicit(result.solution, result.directions, CONFIG).schedule.status is ScheduleStatus.FEASIBLE
+
+
+def test_vnext_delays_same_robot_split_and_commits_both_children(monkeypatch):
+    from mrta_search import gnn_constructor as c, lns
+
+    parents = (ParentWeld('seam', (2., 5.7), (10., 6.3)),
+               ParentWeld('separator', (3., 9.), (3.6, 9.)))
+    model = c.VNextGNN()
+    original_logits = model.assignment_logits
+
+    def scores(space, embeddings, state, blocks, pending, config):
+        indices, _ = original_logits(space, embeddings, state, blocks, pending, config)
+        weights = []
+        for i in indices.tolist():
+            action = space.actions[i]
+            target = action.parent_id == 'seam' and action.pattern.kind is SplitKind.Y_SPLIT
+            separator = action.parent_id == 'separator' and action.robots == (0,)
+            weights.append(2. if target and action.robots == (0, 0) else float(separator))
+        return indices, torch.tensor(weights)
+
+    monkeypatch.setattr(model, 'assignment_logits', scores)
+    commits = []
+    result = c.construct_vnext_gnn(parents, model, CONFIG,
+                                   decision_observer=lambda assignment, actions, state: commits.append((assignment, actions)))
+    assert [a.parent_id for a, _ in commits] == ['separator', 'seam']
+    assert commits[1][0].robots == (0, 0) and len(commits[1][1]) == 2
+    assert result.solution.routes[0].block_ids[1] == 'separator::whole'
+    assert c.parent_assignment_targets(result.solution, CONFIG)[0].pattern.kind is SplitKind.Y_SPLIT
+    original_candidates = lns.joint_block_candidates
+
+    def no_second(state, block, *args, **kwargs):
+        return () if block.block_id.endswith('::1') else original_candidates(state, block, *args, **kwargs)
+
+    monkeypatch.setattr(lns, 'joint_block_candidates', no_second)
+    failed = c.construct_vnext_gnn(parents, model, CONFIG)
+    assert failed.solution is None and [a.block_id for a in failed.actions] == ['separator::whole']
+
+
+def test_vnext_b_distillation_accepts_near_ties():
+    from run_gnn_cmax_finetune import vnext_rank_targets
+
+    target = vnext_rank_targets(((10., 3., 5., 0), (10.2, 3.1, 5.2, 1), (11., 1., 2., 0)))
+    assert target[0] == target[1] and target[1] > target[2]
+    assert target.sum().item() == pytest.approx(1.)
+

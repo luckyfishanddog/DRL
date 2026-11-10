@@ -32,13 +32,13 @@ CONFIG=pilot.CONFIG
 
 
 def _model_from_checkpoint(checkpoint):
-    from mrta_search.gnn_constructor import CoarseToFineGNN,CoordinationJointInsertionGNN,ModeJointInsertionGNN,CompleteParentGNN
+    from mrta_search.gnn_constructor import CoarseToFineGNN,CoordinationJointInsertionGNN,ModeJointInsertionGNN,CompleteParentGNN,VNextGNN
     model_types={'JointInsertionGNN':JointInsertionGNN,
                  'CoordinationJointInsertionGNN':CoordinationJointInsertionGNN,
                  'ModeJointInsertionGNN':ModeJointInsertionGNN,'CompleteParentGNN':CompleteParentGNN}
     kind=checkpoint.get('model_type','JointInsertionGNN')
-    if kind == 'CoarseToFineGNN':
-        model = CoarseToFineGNN(checkpoint.get('hidden_dim', 64), checkpoint.get('heads', 4))
+    if kind in ('CoarseToFineGNN', 'VNextGNN'):
+        model = (VNextGNN if kind == 'VNextGNN' else CoarseToFineGNN)(checkpoint.get('hidden_dim', 64), checkpoint.get('heads', 4))
         model.load_state_dict(checkpoint['state_dict'], strict=True)
         return model
     if kind not in model_types:

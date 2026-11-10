@@ -1393,7 +1393,7 @@ def parent_assignment_targets(solution: CanonicalSolution, config: ScientificCon
 
 def decode_parent_assignments(
     parents: Sequence[ParentWeld], assignments: Sequence[ParentAssignment], config: ScientificConfig,
-    *, coordination_aware: bool = False, decision_observer=None,
+    *, coordination_aware: bool = False, decision_observer=None, insertion_observer=None,
 ) -> JointCompletionResult:
     """Insert fixed assignments in LPT order with optional nominal coordination scoring."""
     from .lns import NominalRouteCoordination, joint_block_candidates, joint_block_robots, oriented_route_state
@@ -1456,7 +1456,11 @@ def decode_parent_assignments(
                 score = (features['exposure_score'], max(features['same_rail_order_seconds']), *travel_score(row))
                 return score, row, updated
 
-            _, (state, action), nominal = min(map(coordinated_candidate, variants), key=lambda candidate: candidate[0])
+            ranked = map(coordinated_candidate, variants)
+            if insertion_observer is not None:
+                ranked = tuple(ranked)
+                insertion_observer(state, pattern, variants, tuple(score for score, _, _ in ranked))
+            _, (state, action), nominal = min(ranked, key=lambda candidate: candidate[0])
         actions.append(action)
 
     for parent_id in sorted(pending, key=priorities.__getitem__):
@@ -1579,16 +1583,12 @@ FINE_INSERTION_LIMIT = 6
 COORDINATION_FEATURES = 9
 
 
-class CoarseToFineGNN(ParentAssignmentGNN):
-    """One geometry encoder, an assignment logit and a complete-insertion logit."""
-
+class _JointAssignmentGNN(ParentAssignmentGNN):
     def __init__(self, hidden_dim: int = 64, heads: int = 4):
         super().__init__(hidden_dim, heads)
         self.geometry_skip = nn.Linear(NODE_DIM, hidden_dim)
         width = self.policy[0].in_features + 9
         self.policy = nn.Sequential(nn.Linear(width, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
-        self.insertion_head = nn.Sequential(nn.Linear(width + 4 * hidden_dim + 22 + COORDINATION_FEATURES, hidden_dim),
-                                            nn.ReLU(), nn.Linear(hidden_dim, 1))
 
     def encode_static(self, graph):
         return super().encode_static(graph) + self.geometry_skip(graph.node_features)
@@ -1608,6 +1608,15 @@ class CoarseToFineGNN(ParentAssignmentGNN):
         expected = rows[:, -4:] + remaining
         shares = expected / expected.sum(1, keepdim=True).clamp_min(1e-6)
         return indices, torch.cat((rows, remaining, shares, shares.amax(1, keepdim=True)), dim=1)
+
+
+class CoarseToFineGNN(_JointAssignmentGNN):
+    """One geometry encoder, an assignment logit and a complete-insertion logit."""
+
+    def __init__(self, hidden_dim: int = 64, heads: int = 4):
+        super().__init__(hidden_dim, heads)
+        width = self.policy[0].in_features + 4 * hidden_dim + 22 + COORDINATION_FEATURES
+        self.insertion_head = nn.Sequential(nn.Linear(width, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
 
     def insertion_logits(self, rows, *, use_coordination=True):
         if not use_coordination:
@@ -1773,6 +1782,136 @@ def construct_coarse_to_fine_gnn(parents, model, config, *, space=None, embeddin
         pending.remove(assignment.parent_id)
         actions.extend(chosen.actions)
     solution = canonicalize(parents, tuple(selected.values()), dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
+    return JointCompletionResult(solution, state.directions, tuple(actions), time.perf_counter() - started,
+                                 oriented_state=state)
+
+
+_VNEXT_LOCAL_COLUMNS = (8, 9, 10, 11, 16, 19, 20, 21, 22, 23, 24, 28)
+_VNEXT_FEATURE_DIM = len(_VNEXT_LOCAL_COLUMNS) + 8
+_VNEXT_TIME_SAMPLES = 12
+
+
+class VNextGNN(_JointAssignmentGNN):
+    """Assignment and distilled directed insertion with a shared geometry encoder."""
+
+    def __init__(self, hidden_dim: int = 64, heads: int = 4):
+        super().__init__(hidden_dim, heads)
+        self.insertion_head = nn.Sequential(nn.Linear(4 * hidden_dim + _VNEXT_FEATURE_DIM, hidden_dim),
+                                            nn.ReLU(), nn.Linear(hidden_dim, 1))
+        for name, size in (('assignment', self.policy[0].in_features), ('insertion', _VNEXT_FEATURE_DIM)):
+            self.register_buffer(name + '_mean', torch.zeros(size))
+            self.register_buffer(name + '_scale', torch.ones(size))
+
+    def assignment_scores(self, rows):
+        return self.policy((rows - self.assignment_mean) / self.assignment_scale).squeeze(1)
+
+    def assignment_logits(self, space, embeddings, state, blocks, pending, config):
+        indices, rows = self.assignment_rows(space, embeddings, state, blocks, pending, config)
+        return indices, self.assignment_scores(rows)
+
+    def insertion_logits(self, embeddings, indices, features):
+        neighbors = embeddings[indices.clamp_min(0)] * (indices >= 0).unsqueeze(-1)
+        normalized = (features - self.insertion_mean) / self.insertion_scale
+        return self.insertion_head(torch.cat((neighbors.flatten(1), normalized), dim=1)).squeeze(1)
+
+
+def _sample_directed_positions(states, robot, endpoints, weld_seconds, config, times):
+    """Sample MOVE/SETUP/WELD/POST geometry at a fixed grid, without pair sweeps."""
+    xy = torch.tensor([[endpoints[b, d] for b, d in zip(s.routes[robot], s.directions[robot])]
+                       for s in states], dtype=torch.float32)
+    weld = torch.tensor([[weld_seconds[b] for b in s.routes[robot]] for s in states], dtype=torch.float32)
+    moves = torch.tensor([(0., *s.arc_costs[robot]) for s in states], dtype=torch.float32)
+    process = weld + config.t_pre + config.t_post
+    completion = (process + moves).cumsum(1)
+    start = completion - process
+    t = times.expand(len(states), -1).contiguous()
+    slot = torch.searchsorted(completion.contiguous(), t, right=True).clamp_max(weld.shape[1] - 1)
+    gather = slot[:, :, None].expand(-1, -1, 2)
+    begin, end = xy[:, :, 0], xy[:, :, 1]
+    previous = torch.cat((begin[:, :1], end[:, :-1]), dim=1).gather(1, gather)
+    begin, end = begin.gather(1, gather), end.gather(1, gather)
+    begin_time, move_time = start.gather(1, slot), moves.gather(1, slot)
+    move_fraction = ((t - begin_time + move_time) / move_time.clamp_min(1e-6)).clamp(0., 1.)
+    weld_fraction = ((t - begin_time - config.t_pre) / weld.gather(1, slot)).clamp(0., 1.)
+    moving = previous + move_fraction.unsqueeze(-1) * (begin - previous)
+    processing = begin + weld_fraction.unsqueeze(-1) * (end - begin)
+    points = torch.where((t < begin_time).unsqueeze(-1), moving, processing)
+    return points, t < completion[:, -1:], start, start + config.t_pre + weld
+
+
+def vnext_insertion_inputs(graph, state, variants, blocks, config):
+    """Directed local context plus fixed-size samples of nominal relative positions."""
+    indices, local = joint_candidate_inputs(graph, state, variants, blocks, config)
+    robot = variants[0][1].robot
+    states = tuple(after for after, _ in variants)
+    horizon = max(1., max(p + sum(arcs) for after in states for p, arcs in zip(after.loads, after.arc_costs)))
+    times = (torch.arange(_VNEXT_TIME_SAMPLES, dtype=torch.float32) + .5) * (horizon / _VNEXT_TIME_SAMPLES)
+    endpoints = {(b, d): oriented_endpoints(block, d) for b, block in blocks.items() for d in (0, 1)}
+    weld_seconds = {b: block.length / config.weld_speed for b, block in blocks.items()}
+    xy, active, starts, finishes = _sample_directed_positions(states, robot, endpoints, weld_seconds, config, times)
+    gap_deficit = torch.zeros_like(active, dtype=torch.float32)
+    near_same, near_cross = torch.zeros_like(active), torch.zeros_like(active)
+    valid_gap = torch.full_like(gap_deficit, 20.)
+    for other in range(4):
+        if other == robot or not state.routes[other]:
+            continue
+        peer, present, _, _ = _sample_directed_positions((state,), other, endpoints, weld_seconds, config, times)
+        delta = peer - xy
+        simultaneous = active & present
+        near = simultaneous & (delta[:, :, 0].abs() <= config.interference_dx) & (delta[:, :, 1].abs() <= config.interference_dy)
+        if other == robot ^ 1:
+            gap = delta[:, :, 0] * (1 if robot % 2 == 0 else -1)
+            valid_gap = torch.where(simultaneous, gap, valid_gap)
+            gap_deficit = (config.interference_dx - gap).clamp_min(0.) * simultaneous
+            near_same = near
+        else:
+            near_cross |= near
+    positions = torch.tensor([a.position for _, a in variants]).unsqueeze(1)
+    dynamics = torch.stack(((gap_deficit > 0).float().mean(1), gap_deficit.mean(1) / 20.,
+        valid_gap.amin(1) / 20., near_same.float().mean(1), near_cross.float().mean(1),
+        starts.gather(1, positions).squeeze(1) / horizon, finishes.gather(1, positions).squeeze(1) / horizon,
+        torch.tensor([s.loads[robot] / horizon for s in states])), dim=1)
+    return indices, torch.cat((local[:, _VNEXT_LOCAL_COLUMNS], dynamics), dim=1)
+
+
+@torch.no_grad()
+def construct_vnext_gnn(parents, model, config, *, decision_observer=None):
+    """Choose one assignment, then direct its children as a single commit."""
+    from .lns import joint_block_candidates, oriented_route_state
+
+    started = time.perf_counter()
+    space = parent_assignment_space(parents, config)
+    embeddings = model.encode_static(space.graph)
+    blocks, nodes, selected, actions = {}, {}, [], []
+    state = oriented_route_state(((),) * 4, ((),) * 4, blocks, config)
+    pending = set(space.parent_ids)
+    while pending:
+        indices, logits = model.assignment_logits(space, embeddings, state, blocks, pending, config)
+        if not len(indices):
+            return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
+                                         rejection_reason='NO_LEGAL_ASSIGNMENT')
+        assignment = space.actions[int(indices[logits.argmax()])]
+        children = space.children[assignment.pattern]
+        local_blocks = {**blocks, **{b.block_id: b for b in children}}
+        local_nodes = {**nodes, **{b.block_id: space.block_nodes[assignment.pattern, b.block_id] for b in children}}
+        graph = replace(space.graph, block_index=local_nodes)
+        after, inserted = state, []
+        for child, robot in zip(children, assignment.robots):
+            variants = joint_block_candidates(after, child, assignment.pattern, local_blocks, config,
+                                              robot_id=robot, check_initial_feasibility=False)
+            if not variants:
+                return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
+                                             rejection_reason='NO_COMPLETE_PARENT_ACTION')
+            ix, features = vnext_insertion_inputs(graph, after, variants, local_blocks, config)
+            after, action = variants[int(model.insertion_logits(embeddings, ix, features).argmax())]
+            inserted.append(action)
+        if decision_observer is not None:
+            decision_observer(assignment, tuple(inserted), after)
+        state, blocks, nodes = after, local_blocks, local_nodes
+        selected.append(assignment.pattern)
+        actions.extend(inserted)
+        pending.remove(assignment.parent_id)
+    solution = canonicalize(parents, selected, dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
     return JointCompletionResult(solution, state.directions, tuple(actions), time.perf_counter() - started,
                                  oriented_state=state)
 

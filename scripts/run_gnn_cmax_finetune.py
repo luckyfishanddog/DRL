@@ -249,7 +249,7 @@ def op_graph_key(reference):
     return (tuple((p.parent_id,p.start,p.end) for p in reference.parents),reference.patterns)
 
 
-def op_saved_imitation(shared,config,archive,teachers):
+def op_saved_imitation(shared,config,archive,teachers,*,include_opportunities=True):
     """Reuse retained actions/continuations, with ZERO new teacher scheduling."""
     from mrta_search import gnn_constructor as c
     from mrta_search.lns import joint_action_key
@@ -257,7 +257,8 @@ def op_saved_imitation(shared,config,archive,teachers):
     for item in teachers:
         bounds[item['geometry_key']]=min(bounds.get(item['geometry_key'],float('inf')),item['cmax'])
     def absorb(reference,routes,directions,pending,actions,weight,target):
-        graph,steps,_=c.prepare_joint_teacher_steps(reference,routes,directions,pending,actions,config,include_opportunities=True)
+        graph,steps,_=c.prepare_joint_teacher_steps(reference,routes,directions,pending,actions,config,
+            include_opportunities=include_opportunities)
         key=op_graph_key(reference);graphs.setdefault(key,graph);raw_steps.extend(steps)
         for step in steps:
             prefix=(key,step['state_routes'],step['state_directions'],step['pending_parent_ids'])
@@ -295,7 +296,7 @@ def op_saved_imitation(shared,config,archive,teachers):
             continuations+=1
         finish(local)
     for example in examples:
-        if example['kind']!='insertion':continue
+        if not include_opportunities or example['kind']!='insertion':continue
         step=example['step'];key=example['graph_key'];graph=graphs[key]
         gkey=tuple(sorted(tuple(sorted((p[1],p[2]))) for p in key[0]))
         total=max(1.,sum(config.process_time(b.length) for b in graph.blocks))
@@ -3649,6 +3650,7 @@ RESIDUAL_VARIANT = 'route_progress_cmax_candidate'
 COARSE_MODEL = ROOT / 'models/gnn_coarse_to_fine_05.pt'
 COARSE_METHODS = ('COARSE_TO_FINE_GNN', 'COARSE_TO_FINE_NO_COORDINATION')
 COARSE_OWNER_METHOD = 'COARSE_TO_FINE_OWNER_SLOTS'
+VNEXT_MODEL = ROOT / 'models/gnn_vnext_05.pt'
 
 
 def residual_feedback_model(shared, checkpoint):
@@ -4701,6 +4703,356 @@ def coarse_joint_dev(methods=('PARENT_JOINT', 'RULE/BEAM', *COARSE_METHODS)):
             print('COARSE_DEV', name, method, json.dumps(outcome, allow_nan=False), flush=True)
 
 
+def vnext_rank_targets(scores):
+    """Distill B's lexicographic order, grouping sub-second near ties."""
+    order = sorted(range(len(scores)), key=scores.__getitem__)
+    rank = torch.empty(len(scores), dtype=torch.float32)
+    group, anchor = 0, scores[order[0]]
+    for index in order:
+        score = scores[index]
+        if any(abs(a - b) > .5 for a, b in zip(anchor[:3], score[:3])):
+            group += 1
+            anchor = score
+        rank[index] = -float(group)
+    return rank.softmax(0)
+
+
+def vnext_pattern(raw):
+    from mrta_reference.model import Rail, SplitKind, SplitPattern
+
+    return SplitPattern(raw['parent_id'], SplitKind(raw['kind']), raw['t'], raw['point_id'], raw['mandatory'],
+                        None if raw['rail'] is None else Rail(raw['rail']))
+
+
+@torch.no_grad()
+def vnext_training_samples(shared, config, teachers, archive, old_rows, prior):
+    from dataclasses import replace
+    from mrta_reference.model import ParentWeld
+    from mrta_search import gnn_constructor as c, lns
+
+    started = time.perf_counter()
+    groups = _group_certified_assignments(teachers, archive, config)
+    samples, teacher_votes, by_name, by_geometry = {}, {}, {}, {}
+    coverage = Counter()
+    for group in groups.values():
+        first = group[0][0]
+        parents = first['solution'].parents
+        samples[parents] = dict(space=c.parent_assignment_space(parents, config), coarse={}, fine=[], preference=[])
+        by_name[first['instance']] = parents
+        by_geometry[tuple((p.parent_id, p.start, p.end) for p in parents)] = parents
+        best = min(item['cmax'] for item, _ in group)
+        teacher_votes[parents] = [(best / item['cmax'], {a.parent_id: a for a in actions}) for item, actions in group]
+        coverage['teacher_labels'] += sum(len(actions) for _, actions in group)
+
+    def geometry(parents, patterns):
+        space = samples[parents]['space']
+        blocks = {b.block_id: b for pattern in patterns for b in space.children[pattern]}
+        nodes = {b.block_id: space.block_nodes[pattern, b.block_id]
+                 for pattern in patterns for b in space.children[pattern]}
+        return blocks, replace(space.graph, block_index=nodes)
+
+    def coarse_example(parents, state, patterns, blocks):
+        data = samples[parents]
+        key = (state.routes, state.directions, tuple(sorted(patterns, key=lambda p: p.parent_id)))
+        if key in data['coarse']:
+            return
+        space = data['space']
+        pending = frozenset(space.parent_ids) - {p.parent_id for p in patterns}
+        owners = {b: r for r, route in enumerate(state.routes) for b in route}
+        committed = tuple(c.ParentAssignment(p.parent_id, p, tuple(owners[b.block_id] for b in space.children[p]))
+                          for p in patterns if all(b.block_id in owners for b in space.children[p]))
+        target = [0.] * len(space.actions)
+        for quality, labels in teacher_votes[parents]:
+            matches = sum(labels[a.parent_id] == a for a in committed)
+            weight = quality * ((matches + 2.) / (len(committed) + 2.)) ** 2
+            for p in pending:
+                target[space.action_index[labels[p]]] += weight
+        data['coarse'][key] = (state, blocks, pending, torch.tensor(target))
+
+    def fine_example(parents, state, patterns, variants, scores, weight, source):
+        if len(variants) < 2:
+            return
+        target = vnext_rank_targets(scores)
+        if target.min() == target.max():
+            return
+        blocks, graph = geometry(parents, patterns)
+        indices, features = c.vnext_insertion_inputs(graph, state, variants, blocks, config)
+        samples[parents]['fine'].append((indices, features, target, weight, tuple(score[0] for score in scores)))
+        coverage[source] += 1
+        coverage['ranked_insertion_candidates'] += len(variants)
+
+    def rank_prefix(parents, state, patterns, assignment, source):
+        space = samples[parents]['space']
+        visible = (*patterns, assignment.pattern)
+        blocks, _ = geometry(parents, visible)
+        for child, robot in zip(space.children[assignment.pattern], assignment.robots):
+            variants = lns.joint_block_candidates(state, child, assignment.pattern, blocks, config,
+                                                   robot_id=robot, check_initial_feasibility=False)
+            if not variants:
+                break
+            context = lns.NominalRouteCoordination.from_state(state, blocks, config)
+            scores = []
+            for after, action in variants:
+                features = context.with_changed_route(after, robot, blocks, config).features()
+                scores.append((features['exposure_score'], max(features['same_rail_order_seconds']),
+                               sum(after.arc_costs[robot]), action.position, after.directions[robot]))
+            fine_example(parents, state, visible, variants, scores, 1., source)
+            state = variants[min(range(len(variants)), key=scores.__getitem__)][0]
+
+    # Reuse B's already measured quality to weight its recorded teacher trajectories.
+    section = OP_REPORT.read_text(encoding='utf-8').split('固定教师分配的冲突感知定向插入', 1)[1].split('\n## ', 1)[0]
+    history = {cols[0]: cols for line in section.splitlines() if line.startswith('|')
+               if len(cols := line.strip('|').split('|')) == 10 and cols[6] in ('F', 'D')}
+    fractions = (0., .05, .1, .2, .25, .4, .5, .75)
+    for group in groups.values():
+        best, labels = min(group, key=lambda pair: pair[0]['cmax'])
+        parents = best['solution'].parents
+        patterns = {a.parent_id: a.pattern for a in labels}
+        row = history[best['instance']]
+        weight = min(1., float(row[1]) / float(row[7])) if row[6] == 'F' else .5
+        sampled = {round(f * len(parents)) for f in fractions}
+
+        def parent_prefix(state, _, pending):
+            if len(parents) - len(pending) in sampled:
+                visible = tuple(p for parent, p in patterns.items() if parent not in pending)
+                blocks, _ = geometry(parents, visible)
+                coarse_example(parents, state, visible, blocks)
+
+        def inserted(state, pattern, variants, scores):
+            placed = {b.rsplit('::', 1)[0] for route in state.routes for b in route}
+            placed.add(pattern.parent_id)
+            visible = tuple(p for parent, p in patterns.items() if parent in placed)
+            fine_example(parents, state, visible, variants, scores, weight, 'b_rank_states')
+
+        c.decode_parent_assignments(parents, labels, config, coordination_aware=True,
+                                    decision_observer=parent_prefix, insertion_observer=inserted)
+        coverage['b_trajectories'] += 1
+    print('VNEXT_B_LABELS', dict(coverage), flush=True)
+
+    # Historical covered identities are replayed from the saved steps, without
+    # regenerating the old sixteen-parent pools or calling B32.
+    graphs, examples, _, preparation = op_saved_imitation(shared, config, archive, teachers, include_opportunities=False)
+    raw, _ = cmax_expert_macro_examples(None, graphs, examples, raw_only=True)
+    measured = next(r['payload']['cases'] for r in old_rows if r['phase'] == 'residual_route_candidate_coverage'
+                    and r['method'] == RESIDUAL_METHOD)
+    coverage['historical_prefixes'] = len(measured)
+    for row in measured:
+        if not row['complete_covered']:
+            continue
+        e = raw[row['case']]
+        parents, state, pending = e['reference'].parents, e['state'], e['pending']
+        visible = tuple(p for p in e['reference'].patterns if p.parent_id not in pending)
+        label = e['teacher_plan']
+        pattern = next(p for p in e['reference'].patterns if p.parent_id == label['parent_id'])
+        assignment = c.ParentAssignment(pattern.parent_id, pattern, tuple(a.robot for a in label['actions']))
+        rank_prefix(parents, state, visible, assignment, 'covered_prefix_rank_states')
+        coverage['historical_covered_prefixes'] += 1
+
+    for example in examples:
+        if example['kind'] != 'insertion' or example['step']['parent_target'] is None:
+            continue
+        key, step = example['graph_key'], example['step']
+        parents = by_geometry[key[0]]
+        pending = set(step['pending_parent_ids'])
+        if len(parents) - len(pending) not in {round(f * len(parents)) for f in fractions}:
+            continue
+        visible = tuple(p for p in key[1] if p.parent_id not in pending)
+        blocks, _ = geometry(parents, visible)
+        state = lns.oriented_route_state(step['state_routes'], step['state_directions'], blocks, config)
+        coarse_example(parents, state, visible, blocks)
+    del graphs, examples, raw
+
+    def add_feedback(parents, prefix, visible, outcomes, pairs, *, distill_prefix):
+        blocks, _ = geometry(parents, visible)
+        state = lns.oriented_route_state(prefix['routes'], prefix['directions'], blocks, config)
+        space = samples[parents]['space']
+        pending = frozenset(space.parent_ids) - {p.parent_id for p in visible}
+        assignments = []
+        for outcome in outcomes:
+            pattern = vnext_pattern(outcome['pattern'])
+            owners = {a['block_id']: a['robot'] for a in outcome['actions']}
+            assignments.append(c.ParentAssignment(pattern.parent_id, pattern,
+                tuple(owners[b.block_id] for b in space.children[pattern])))
+        valid_pairs = []
+        for pair in pairs:
+            good, bad = (space.action_index[assignments[pair[k]]] for k in ('better', 'worse'))
+            if good != bad:
+                valid_pairs.append((good, bad, pair['kind']))
+        if valid_pairs:
+            samples[parents]['preference'].append((state, blocks, pending, valid_pairs))
+        if distill_prefix:
+            rank_prefix(parents, state, visible, assignments[0], 'student_prefix_rank_states')
+        coarse_example(parents, state, visible, blocks)
+
+    for case in prior['feedback_cases']:
+        prefix = case['prefix']
+        visible = tuple(vnext_pattern(p) for p in prefix['selected'])
+        add_feedback(by_name[case['instance']], prefix, visible, case['outcomes'], case['pairs'], distill_prefix=True)
+    branches = defaultdict(list)
+    for row in old_rows:
+        if row['phase'] == 'residual_feedback_branch' and row['method'] == RESIDUAL_METHOD:
+            prefix, outcome = row['payload']['prefix'], row['payload']['outcome']
+            branches[prefix['case']].append((prefix, outcome))
+    for group in branches.values():
+        prefix = group[0][0]
+        parents = tuple(ParentWeld(p['parent_id'], tuple(p['start']), tuple(p['end'])) for p in prefix['parents'])
+        visible = tuple(vnext_pattern(p) for p in prefix['selected_patterns'])
+        outcomes = sorted((outcome for _, outcome in group), key=lambda o: o['label'])
+        add_feedback(parents, prefix, visible, outcomes, residual_feedback_pairs(outcomes), distill_prefix=False)
+
+    return samples, dict(coverage, teacher_solutions=len(teachers), geometries=len(samples),
+        replays=preparation['teachers_reused'], retained_continuations=preparation['prefix_continuations_reused'],
+        coarse_examples=sum(len(data['coarse']) for data in samples.values()),
+        insertion_examples=sum(len(data['fine']) for data in samples.values()),
+        sample_seconds=time.perf_counter() - started)
+
+
+def vnext_coarse_rows(model, data, embeddings, config):
+    for state, blocks, pending, votes in data['coarse'].values():
+        indices, rows = model.assignment_rows(data['space'], embeddings, state, blocks, pending, config)
+        target = votes[indices]
+        if target.sum() > 0:
+            yield rows, target / target.sum()
+
+
+@torch.no_grad()
+def vnext_insertion_agreement(model, samples):
+    count, hits, regret = 0, 0, []
+    for data in samples.values():
+        embeddings = model.encode_static(data['space'].graph)
+        fine = data['fine']
+        sizes = [len(ix) for ix, _, _, _, _ in fine]
+        logits = model.insertion_logits(embeddings, torch.cat([x[0] for x in fine]),
+                                        torch.cat([x[1] for x in fine])).split(sizes)
+        for scores, (_, _, target, _, exact) in zip(logits, fine):
+            picked = int(scores.argmax())
+            count += 1
+            hits += int(target[picked] == target.max())
+            regret.append(exact[picked] - min(exact))
+    return dict(states=count, top_group=hits, median_b_score_gap=statistics.median(regret))
+
+
+def fit_vnext(model, samples, config):
+    """One fixed joint fit. Prefix data and input scaling are TRAIN only."""
+    started = time.perf_counter()
+    with torch.no_grad():
+        assignment_rows = []
+        for data in samples.values():
+            embeddings = model.encode_static(data['space'].graph)
+            assignment_rows.extend(rows for rows, _ in vnext_coarse_rows(model, data, embeddings, config))
+        for name, rows in (('assignment', torch.cat(assignment_rows)),
+                           ('insertion', torch.cat([f[1] for data in samples.values() for f in data['fine']]))):
+            mean, scale = rows.mean(0), rows.std(0, unbiased=False).clamp_min(.05)
+            getattr(model, name + '_mean').copy_(mean)
+            getattr(model, name + '_scale').copy_(scale)
+        # Preserve the warm-start assignment logits under the fitted scaling.
+        first = model.policy[0]
+        first.bias.add_(first.weight @ model.assignment_mean)
+        first.weight.mul_(model.assignment_scale)
+    del assignment_rows, rows
+    before = vnext_insertion_agreement(model, samples)
+    encoder = ('layer1.', 'layer2.', 'geometry_skip.')
+    parameters = list(model.named_parameters())
+    optimizer = torch.optim.AdamW([
+        dict(params=[p for name, p in parameters if name.startswith(encoder)], lr=5e-5),
+        dict(params=[p for name, p in parameters if not name.startswith(encoder)], lr=1e-3),
+    ])
+    order = list(samples)
+    rng = random.Random(OP_SEED)
+    epochs, history, used_pairs = 8, [], Counter()
+    for epoch in range(epochs):
+        rng.shuffle(order)
+        metrics = Counter()
+        for parents in order:
+            data = samples[parents]
+            embeddings = model.encode_static(data['space'].graph)
+            coarse = list(vnext_coarse_rows(model, data, embeddings, config))
+            logits = model.assignment_scores(torch.cat([row for row, _ in coarse])).split([len(row) for row, _ in coarse])
+            imitation = torch.stack([-(target * logit.log_softmax(0)).sum()
+                                     for logit, (_, target) in zip(logits, coarse)]).mean()
+
+            fine = data['fine']
+            logits = model.insertion_logits(embeddings, torch.cat([x[0] for x in fine]),
+                torch.cat([x[1] for x in fine])).split([len(x[0]) for x in fine])
+            insertion = torch.stack([-(target * logit.log_softmax(0)).sum() * weight
+                                     for logit, (_, _, target, weight, _) in zip(logits, fine)]).mean()
+
+            comparisons = []
+            for state, blocks, pending, pairs in data['preference']:
+                ids, scores = model.assignment_logits(data['space'], embeddings, state, blocks, pending, config)
+                positions = {index: k for k, index in enumerate(ids.tolist())}
+                for better, worse, kind in pairs:
+                    if better in positions and worse in positions:
+                        comparisons.append(scores[positions[worse]] - scores[positions[better]])
+                        if epoch == 0:
+                            used_pairs[kind] += 1
+            preference = F.softplus(torch.stack(comparisons)).mean() if comparisons else imitation.new_zeros(())
+            loss = imitation + insertion + .5 * preference
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+            optimizer.step()
+            metrics.update(assignment=float(imitation.detach()), insertion=float(insertion.detach()),
+                           preference=float(preference.detach()))
+        record = dict(epoch=epoch + 1, **{key: value / len(samples) for key, value in metrics.items()})
+        history.append(record)
+        print('VNEXT_EPOCH', json.dumps(record), flush=True)
+    after = vnext_insertion_agreement(model, samples)
+    return dict(epochs=epochs, updates=epochs * len(samples), pairs=dict(used_pairs), history=history,
+                b_agreement_before=before, b_agreement_after=after, seconds=time.perf_counter() - started)
+
+
+def vnext_dev(shared, config, entries):
+    from mrta_search import gnn_constructor as c
+
+    for name, parents in sorted(entries.items()):
+        tick = time.perf_counter()
+        model = shared._model_from_checkpoint(shared.read_neural_checkpoint(VNEXT_MODEL, include_research=False)).eval()
+        load_seconds = time.perf_counter() - tick
+        result = c.construct_vnext_gnn(parents, model, config)
+        if result.solution is None:
+            outcome = dict(status='CONSTRUCTION_FAILED', cmax=None, scheduler_seconds=0., metrics={},
+                           wait_for_graph=(), reason=result.rejection_reason, b32_calls=0)
+        else:
+            outcome = coarse_b32(result.solution, result.directions, config)
+            outcome['b32_calls'] = 1
+            outcome['modes'] = dict(Counter(pattern.kind.value for pattern in result.solution.patterns))
+        outcome.update(instance=name, model_load_seconds=load_seconds,
+                       construction_seconds=result.inference_seconds, total_seconds=time.perf_counter() - tick)
+        print('VNEXT_DEV', json.dumps(outcome, allow_nan=False), flush=True)
+
+
+def run_vnext():
+    import io
+    from mrta_search import gnn_constructor as c
+
+    if VNEXT_MODEL.exists():
+        raise FileExistsError(VNEXT_MODEL)
+    shared, config, _, archive, teachers, _, entries, _ = op_sources()
+    prior = shared.read_neural_checkpoint(COARSE_MODEL, include_research=False)
+    torch.manual_seed(OP_SEED)
+    model = c.VNextGNN()
+    source = prior[COARSE_METHODS[0]]['state_dict']
+    prefix = ('layer1.', 'layer2.', 'geometry_skip.', 'policy.')
+    model.load_state_dict({k: source[k] for k in model.state_dict() if k.startswith(prefix)}, strict=False)
+    samples, preparation = vnext_training_samples(shared, config, teachers, archive, op_read(), prior)
+    print('VNEXT_DATA', json.dumps(preparation), flush=True)
+    training = fit_vnext(model, samples, config)
+    training['updated_gat_tensors'] = sum(not torch.equal(value, source[name]) for name, value in model.state_dict().items()
+                                          if name.startswith(('layer1.', 'layer2.')))
+    bundle = dict(model_type='VNextGNN', hidden_dim=64, heads=4, state_dict=model.state_dict(),
+                  scientific_config=config.scientific_mapping(), training=training, preparation=preparation,
+                  seed=OP_SEED)
+    buffer = io.BytesIO()
+    torch.save(bundle, buffer)
+    buffer.seek(0)
+    shared._model_from_checkpoint(shared.read_neural_checkpoint(buffer, include_research=False))
+    with VNEXT_MODEL.open('xb') as stream:
+        stream.write(buffer.getbuffer())
+    print('VNEXT_TRAIN', json.dumps(training, allow_nan=False), flush=True)
+    vnext_dev(shared, config, entries)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--phase',choices=('all','train','dev','op-all','op-data','op-train','op-eval','op-report',
@@ -4713,10 +5065,12 @@ def main():
         'residual-coverage','residual-packing-repair','residual-external-parent','residual-quota-check',
         'residual-route-coverage','residual-feedback','residual-head-train','residual-dev','residual-report',
         'assignment-diagnostic','assignment-route-diagnostic','coarse-joint-train','coarse-joint-dev',
-        'coarse-joint-owner-dev'),default='op-all')
+        'coarse-joint-owner-dev','vnext'),default='op-all')
     args=parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(SETTINGS['seed'])
+    if args.phase=='vnext':
+        run_vnext();return
     if args.phase=='coarse-joint-train':
         coarse_joint_train();return
     if args.phase=='coarse-joint-dev':
