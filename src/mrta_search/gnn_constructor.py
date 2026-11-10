@@ -1502,6 +1502,26 @@ class ParentAssignmentSpace:
     def action_index(self):
         return {action: index for index, action in enumerate(self.actions)}
 
+    @cached_property
+    def workload_profiles(self):
+        """Processing profiles from legal whole/split and owner tuples."""
+        profiles = []
+        for parent in range(len(self.parent_ids)):
+            work = self.processing[self.action_parents == parent].unique(dim=0)
+            forced_robot = work.amin(dim=0)
+            residual = (work - forced_robot).reshape(-1, 2, 2)
+            rail_totals = residual.sum(dim=2, keepdim=True)
+            forced_rail = rail_totals.amin(dim=0)
+            # Attribute rail-restricted work to the robots of each legal tuple.
+            # Any remaining work can shift between the tuple alternatives.
+            restricted = (residual * (forced_rail / rail_totals.clamp_min(1e-8))).flatten(1)
+            minimum = float(work.sum(dim=1).min())
+            forced_fraction = float(forced_robot.sum() + forced_rail.sum()) / minimum
+            profiles.append((forced_fraction, minimum, parent, residual.flatten(1), restricted, forced_robot))
+        order = tuple((parent, work, restricted) for _, _, parent, work, restricted, _ in
+                      sorted(profiles, key=lambda p: (-p[0], -p[1], p[2])))
+        return torch.stack([profile[-1] for profile in profiles]), order
+
 
 def parent_assignment_space(parents: Sequence[ParentWeld], config: ScientificConfig) -> ParentAssignmentSpace:
     """Prepare compact rows for all legal mode/owner tuples once per geometry."""
@@ -1555,6 +1575,19 @@ class ParentAssignmentGNN(_BlockRobotGAT):
         return indices, self.policy(inputs).squeeze(1)
 
     def assignment_rows(self, space, embeddings, state, blocks, pending, config):
+        indices, features = self.assignment_features(space, embeddings, state, blocks, pending, config)
+        return indices, self.embed_assignment_rows(space, embeddings, indices, features)
+
+    @staticmethod
+    def embed_assignment_rows(space, embeddings, indices, features):
+        owners = space.owners.to(indices.device)[indices]
+        context = features[:, :28].reshape(-1, 2, 14)
+        children = torch.cat((embeddings[space.child_nodes.to(indices.device)[indices]],
+                              embeddings[space.graph.robot_offset + owners], context), dim=-1)
+        children = (children * space.active_children.to(indices.device)[indices, :, None]).flatten(1)
+        return torch.cat((children, features[:, 28:]), dim=1)
+
+    def assignment_features(self, space, embeddings, state, blocks, pending, config):
         device = embeddings.device
         pending_mask = torch.tensor([p in pending for p in space.parent_ids], device=device, dtype=torch.bool)
         indices = torch.where(pending_mask[space.action_parents.to(device)])[0]
@@ -1569,10 +1602,7 @@ class ParentAssignmentGNN(_BlockRobotGAT):
                          head[0] / 20., head[1] / 12., tail[0] / 20., tail[1] / 12., float(bool(route))))
         robot_state = embeddings.new_tensor(rows)
         owners = space.owners.to(device)[indices]
-        children = torch.cat((embeddings[space.child_nodes.to(device)[indices]],
-                              embeddings[space.graph.robot_offset + owners],
-                              robot_state[owners], robot_state[owners ^ 1]), dim=-1)
-        children = (children * space.active_children.to(device)[indices, :, None]).flatten(1)
+        children = torch.cat((robot_state[owners], robot_state[owners ^ 1]), dim=-1).flatten(1)
         projected = space.processing.to(embeddings)[indices] + robot_state[:, 0]
         inputs = torch.cat((children, space.modes.to(embeddings)[indices], projected), dim=1)
         return indices, inputs
@@ -1581,20 +1611,54 @@ class ParentAssignmentGNN(_BlockRobotGAT):
 COARSE_ASSIGNMENT_LIMIT = 8
 FINE_INSERTION_LIMIT = 6
 COORDINATION_FEATURES = 9
+_WORKLOAD_FEATURES = 24
+
+
+@torch.no_grad()
+def _forecast_workload(space, indices, projected, state, pending_mask):
+    """One greedy pass over remaining parents, batched across candidate actions."""
+    if not len(indices):
+        return projected.new_empty((0, _WORKLOAD_FEATURES))
+    candidate_parents = space.action_parents.to(indices.device)[indices]
+    current = projected.new_tensor(state.loads).expand_as(projected) / 2500.
+    move = projected.new_tensor([sum(arcs) for arcs in state.arc_costs]).expand_as(projected) / 2500.
+    forced_robot, order = space.workload_profiles
+    forced_robot = forced_robot.to(projected)
+    forced = (forced_robot[pending_mask].sum(0) - forced_robot[candidate_parents]).clamp_min(0.)
+    expected = projected + move + forced
+    pending = pending_mask.tolist()
+    for parent, work, rail_work in order:
+        if not pending[parent]:
+            continue
+        work, rail_work = work.to(projected), rail_work.to(projected)
+        proposals = expected[:, None, :] + work
+        peak = proposals.amax(dim=2)
+        # Among equally good peaks, prefer lower total squared load.
+        spread = proposals.square().sum(dim=2).masked_fill(peak != peak.amin(1, keepdim=True), math.inf)
+        selected = spread.argmin(dim=1)
+        remaining = (candidate_parents != parent)[:, None]
+        expected += work[selected] * remaining
+        forced += rail_work[selected] * remaining
+    flexible = (expected - projected - move - forced).clamp_min(0.)
+    peak = expected.amax(1, keepdim=True)
+    same_rail_gap = expected[:, ::2] - expected[:, 1::2]
+    return torch.cat((current, move, forced, flexible, expected, peak,
+                      peak - expected.amin(1, keepdim=True), same_rail_gap), dim=1)
 
 
 class _JointAssignmentGNN(ParentAssignmentGNN):
-    def __init__(self, hidden_dim: int = 64, heads: int = 4):
+    def __init__(self, hidden_dim: int = 64, heads: int = 4, *, workload_lookahead: bool = False):
         super().__init__(hidden_dim, heads)
         self.geometry_skip = nn.Linear(NODE_DIM, hidden_dim)
-        width = self.policy[0].in_features + 9
+        self.workload_lookahead = workload_lookahead
+        width = self.policy[0].in_features + (_WORKLOAD_FEATURES if workload_lookahead else 9)
         self.policy = nn.Sequential(nn.Linear(width, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
 
     def encode_static(self, graph):
         return super().encode_static(graph) + self.geometry_skip(graph.node_features)
 
-    def assignment_rows(self, space, embeddings, state, blocks, pending, config):
-        indices, rows = super().assignment_rows(space, embeddings, state, blocks, pending, config)
+    def assignment_features(self, space, embeddings, state, blocks, pending, config):
+        indices, rows = super().assignment_features(space, embeddings, state, blocks, pending, config)
         owners = space.owners.to(indices.device)[indices]
         active = space.active_children.to(indices.device)[indices]
         occupied = torch.tensor([bool(route) for route in state.routes], device=indices.device)
@@ -1603,6 +1667,9 @@ class _JointAssignmentGNN(ParentAssignmentGNN):
         keep = ~(active[:, 1] & (owners[:, 0] == owners[:, 1]) & ~occupied[owners[:, 0]])
         indices, rows = indices[keep], rows[keep]
         pending_mask = torch.tensor([p in pending for p in space.parent_ids], device=indices.device)
+        if self.workload_lookahead:
+            forecast = _forecast_workload(space, indices, rows[:, -4:], state, pending_mask)
+            return indices, torch.cat((rows, forecast), dim=1)
         work = space.remaining_processing.to(rows)
         remaining = (work[pending_mask].sum(0) - work[space.action_parents.to(indices.device)[indices]]).clamp_min(0.)
         expected = rows[:, -4:] + remaining
@@ -1794,8 +1861,8 @@ _VNEXT_TIME_SAMPLES = 12
 class VNextGNN(_JointAssignmentGNN):
     """Assignment and distilled directed insertion with a shared geometry encoder."""
 
-    def __init__(self, hidden_dim: int = 64, heads: int = 4):
-        super().__init__(hidden_dim, heads)
+    def __init__(self, hidden_dim: int = 64, heads: int = 4, *, workload_lookahead: bool = False):
+        super().__init__(hidden_dim, heads, workload_lookahead=workload_lookahead)
         self.insertion_head = nn.Sequential(nn.Linear(4 * hidden_dim + _VNEXT_FEATURE_DIM, hidden_dim),
                                             nn.ReLU(), nn.Linear(hidden_dim, 1))
         for name, size in (('assignment', self.policy[0].in_features), ('insertion', _VNEXT_FEATURE_DIM)):

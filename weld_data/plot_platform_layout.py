@@ -6,8 +6,9 @@
 每个净距多次试排，选取矩形占用面积最大的结果。
 焊缝按板面 U/V 投影。投影长度不超过 0.001 mm 的线段跳过，连续的近切向
 线段沿原顶点合成一条折线焊缝。
-用 --split train 或 --split test 导出 JSONL。导出时保留 165-SR2A 的第 9 号
-直线焊缝，删去同一母焊缝两端的弧线。其他焊缝的连续短弧按 0.5 m 规则处理。
+用 --split all 导出三个互相去重的 JSONL。保留 165-SR2A 的第 9 号直线焊缝，
+删去同一母焊缝两端的弧线。500 mm 仅用于裁剪长直段两端的短弧，
+最终直线任务统一过滤不足 50 mm 的线段。
 """
 
 from __future__ import annotations
@@ -43,9 +44,15 @@ TOLERANCE_MM = 0.001
 TOLERANCE_M = 1e-10
 MIN_CONTINUATION_COS = cos(radians(30))
 MIN_CURVED_LENGTH_MM = 500.0
+MIN_WELD_LENGTH_MM = 50.0
 FIT_TOLERANCE_MM = 30.0
 FIT_SAMPLE_MM = 0.5
-DATASET_SEEDS = {"train": range(2026111001, 2026111013), "test": range(2026111013, 2026111017)}
+GEOMETRY_TOLERANCE_M = 1e-6
+DATASET_SEEDS = {
+    "train": (*range(2026111001, 2026111013), *range(2026111101, 2026111129)),
+    "validation": tuple(range(2026111201, 2026111211)),
+    "test": (*range(2026111013, 2026111017), *range(2026111301, 2026111317)),
+}
 PLATE_FILL = "#DBEDE2"
 PLATE_EDGE = "#49775E"
 BOX_EDGE = "#506B8B"
@@ -191,7 +198,7 @@ def dataset_weld_paths(part: LayoutPart) -> list[list[WeldPath]]:
     for path in planar_weld_paths(welds):
         raw, numbers = path.uv_mm, path.numbers
         if len(numbers) == 1:
-            paths.append([path])
+            paths.append([WeldPath(numbers, raw, float(np.linalg.norm(raw[1] - raw[0])))])
             continue
 
         chord = raw[-1] - raw[0]
@@ -200,8 +207,6 @@ def dataset_weld_paths(part: LayoutPart) -> list[list[WeldPath]]:
             continue
 
         lengths = np.linalg.norm(np.diff(raw, axis=0), axis=1)
-        if lengths.sum() < MIN_CURVED_LENGTH_MM:
-            continue
         middle = int(lengths.argmax())
         if lengths[middle] >= MIN_CURVED_LENGTH_MM and np.linalg.norm(chord) > TOLERANCE_MM:
             start = middle if lengths[:middle].sum() < MIN_CURVED_LENGTH_MM else 0
@@ -221,7 +226,8 @@ def dataset_weld_paths(part: LayoutPart) -> list[list[WeldPath]]:
                 source = tuple(number for number, span in zip(numbers, overlap) if span > 1e-6)
             segments.append(WeldPath(source, np.array([a, b]), float(np.linalg.norm(b - a))))
         paths.append(segments)
-    return paths
+    retained = [[segment for segment in group if segment.length_mm >= MIN_WELD_LENGTH_MM] for group in paths]
+    return [group for group in retained if group]
 
 
 def split_free_space(free: list[Box], used: Box) -> list[Box]:
@@ -334,26 +340,103 @@ def dataset_record(placements: list[Placement], welds: dict[str, list[list[WeldP
             "total_weld_length_xy_m": total_length, "parts": parts, "parents": parents}
 
 
-def export_dataset(parts: list[LayoutPart], split: str, seeds: list[int], gaps: list[float],
-                   workbook: Path, output_dir: Path) -> None:
-    def held_out(name: str) -> bool:
-        return name.startswith(("145-", "804-")) or name == "642-BL14A"
+def held_out(name: str) -> bool:
+    return name.startswith(("145-", "804-")) or name == "642-BL14A"
 
-    library = [part for part in parts if held_out(part.ident) == (split == "test")]
-    if not library:
-        raise ValueError(f"{split} 没有可用的小组立型号")
-    welds = {part.ident: dataset_weld_paths(part) for part in library}
-    rows = []
-    for index, (spacing, seed) in enumerate(product(gaps, seeds), 1):
-        placements = pack_platform(library, seed, spacing)
-        if not placements:
-            raise ValueError(f"净距 {spacing:g} m 时，平台放不下任何型号")
-        record = dataset_record(placements, welds, f"{split}_{index:02d}", seed, spacing, workbook)
-        rows.append(json.dumps(record, ensure_ascii=False, allow_nan=False))
+
+def layout_geometry(record: dict) -> tuple:
+    parts = sorted((part["model_id"], part["rotation_deg"], tuple(part["bounds_xyxy_m"]))
+                   for part in record["parts"])
+    welds = sorted(tuple(sorted((tuple(weld["start"]), tuple(weld["end"])))) for weld in record["parents"])
+    return (tuple((model, angle) for model, angle, _ in parts),
+            np.asarray([bounds for _, _, bounds in parts]).reshape(-1, 4),
+            np.asarray(welds).reshape(-1, 4))
+
+
+def _same_coordinates(a: np.ndarray, b: np.ndarray, *, labels=None, undirected=False) -> bool:
+    if a.shape != b.shape:
+        return False
+    if np.allclose(a, b, atol=GEOMETRY_TOLERANCE_M, rtol=0):
+        return True
+    # Nearly tied coordinates can swap the lexicographic order. Compare those
+    # geometries by a one-to-one match of the actual coordinates.
+    close = np.max(np.abs(a[:, None] - b), axis=2) <= GEOMETRY_TOLERANCE_M
+    if undirected:
+        close |= np.max(np.abs(a[:, None] - b[:, [2, 3, 0, 1]]), axis=2) <= GEOMETRY_TOLERANCE_M
+    if labels is not None:
+        for i, j in np.argwhere(close):
+            close[i, j] = labels[i] == labels[j]
+    if not close.any(axis=1).all() or not close.any(axis=0).all():
+        return False
+    options = [np.flatnonzero(row).tolist() for row in close]
+    matched = {}
+
+    def match(i, visited):
+        for j in options[i]:
+            if j in visited:
+                continue
+            visited.add(j)
+            if j not in matched or match(matched[j], visited):
+                matched[j] = i
+                return True
+        return False
+
+    return all(match(i, set()) for i in range(len(a)))
+
+
+def same_layout(first: tuple, second: tuple) -> bool:
+    labels, bounds, welds = first
+    other_labels, other_bounds, other_welds = second
+    return ((labels == other_labels and _same_coordinates(bounds, other_bounds, labels=labels))
+            or _same_coordinates(welds, other_welds, undirected=True))
+
+
+def export_dataset(parts: list[LayoutPart], split: str, seeds: list[int] | None, gaps: list[float],
+                   workbook: Path, output_dir: Path) -> None:
+    splits = tuple(DATASET_SEEDS) if split == "all" else (split,)
+    geometries, used_seeds = [], set()
+    for name in DATASET_SEEDS.keys() - set(splits):
+        path = output_dir / f"{name}.jsonl"
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                record = json.loads(line)
+                geometries.append(layout_geometry(record))
+                used_seeds.add(record["geometry_seed"])
+
+    next_seed = max(*used_seeds, *(seeds or ()), *(seed for group in DATASET_SEEDS.values() for seed in group)) + 1
+    welds = {part.ident: dataset_weld_paths(part) for part in parts}
+    datasets = {}
+    for name in splits:
+        library = [part for part in parts if held_out(part.ident) == (name == "test")]
+        if not library:
+            raise ValueError(f"{name} 没有可用的小组立型号")
+        rows, duplicates = [], 0
+        for index, (spacing, seed) in enumerate(product(gaps, seeds or DATASET_SEEDS[name]), 1):
+            for _ in range(128):
+                if seed in used_seeds:
+                    seed = next_seed
+                    next_seed += 1
+                used_seeds.add(seed)
+                placements = pack_platform(library, seed, spacing)
+                if not placements:
+                    raise ValueError(f"净距 {spacing:g} m 时，平台放不下任何型号")
+                record = dataset_record(placements, welds, f"{name}_{index:02d}", seed, spacing, workbook)
+                geometry = layout_geometry(record)
+                if any(same_layout(geometry, other) for other in geometries):
+                    duplicates += 1
+                    continue
+                geometries.append(geometry)
+                rows.append(json.dumps(record, ensure_ascii=False, allow_nan=False))
+                break
+            else:
+                raise ValueError(f"{name} 仅生成 {len(rows)} 组唯一排样，第 {index} 组试用 128 个种子均重复")
+        datasets[name] = rows
+        print(f"{name} 生成 {len(rows)} 组唯一排样，跳过 {duplicates} 组重复", flush=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"{split}.jsonl"
-    output.write_text("\n".join(rows) + "\n", encoding="utf-8", newline="\n")
-    print(f"已导出 {len(rows)} 组排样到 {output.resolve()}")
+    for name, rows in datasets.items():
+        output = output_dir / f"{name}.jsonl"
+        output.write_text("\n".join(rows) + "\n", encoding="utf-8", newline="\n")
+        print(f"已导出 {len(rows)} 组排样到 {output.resolve()}")
 
 
 def label_position(box: Box, paths: list[np.ndarray], ident: str, points_per_meter: float):
@@ -445,9 +528,11 @@ def main() -> None:
     parser.add_argument("workbook", type=Path, nargs="?", default=PROJECT_DIR / "C_layout_geometry.xlsx")
     parser.add_argument("--seed", type=int, action="append", help="随机种子，可重复指定")
     parser.add_argument("--spacing", type=float, action="append", help=f"件间净距（m），可重复指定，默认 {SPACING:g}")
-    parser.add_argument("--split", choices=tuple(DATASET_SEEDS), help="导出训练集或测试集 JSONL")
+    parser.add_argument("--split", choices=("all", *DATASET_SEEDS), help="导出训练、验证及测试 JSONL")
     parser.add_argument("--output-dir", type=Path, help="指定 PNG 或 JSONL 的输出目录")
     args = parser.parse_args()
+    if args.split == "all" and args.seed:
+        parser.error("--split all 使用各集合的默认种子；自定义种子需指定单一集合")
     gaps = list(dict.fromkeys(args.spacing or [SPACING]))
     if any(not isfinite(spacing) or spacing <= 0 for spacing in gaps):
         parser.error("件间净距须为正数")
@@ -457,7 +542,7 @@ def main() -> None:
             raise ValueError("工作簿中没有小组立")
         if args.split:
             output_dir = args.output_dir or PROJECT_DIR.parent / "data" / "weld_layout"
-            seeds = list(dict.fromkeys(args.seed or DATASET_SEEDS[args.split]))
+            seeds = list(dict.fromkeys(args.seed)) if args.seed else None
             export_dataset(parts, args.split, seeds, gaps, args.workbook, output_dir)
             return
         welds = {part.ident: planar_weld_paths(part.welds) for part in parts}
