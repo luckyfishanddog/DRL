@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import itertools
 import math
 import random
 import time
 from typing import Mapping, Sequence
+
+import numpy as np
+from numba import njit
 
 from mrta_reference.geometry import (
     blocks_for_pattern,
@@ -48,11 +52,11 @@ class AdaptedWAGConfig:
     p: float = 0.50
     imax: int = 500
     factorial_window: int = 5
-    factorial_mode: str = "COMMON_MODEL_BOUNDED"
+    factorial_mode: str = "PAPER_EXACT"
     max_windows: int = 8
     max_factorial_calls: int = 30720
-    max_wag_variants: int = 10
-    max_route_combinations_per_wag: int = 3
+    max_wag_variants: int | None = None
+    max_route_combinations_per_wag: int | None = None
 
     def __post_init__(self) -> None:
         if min(
@@ -61,14 +65,31 @@ class AdaptedWAGConfig:
             self.factorial_window,
             self.max_windows,
             self.max_factorial_calls,
-            self.max_wag_variants,
-            self.max_route_combinations_per_wag,
         ) <= 0:
             raise ValueError("WAG integer parameters must be positive")
+        if any(value is not None and value <= 0 for value in
+               (self.max_wag_variants, self.max_route_combinations_per_wag)):
+            raise ValueError("debug candidate bounds must be positive or None")
         if not 0.0 < self.p <= 1.0:
             raise ValueError("p must be in (0,1]")
         if self.factorial_mode not in {"PAPER_EXACT", "COMMON_MODEL_BOUNDED"}:
             raise ValueError("unknown factorial mode")
+
+
+
+def _canonicalize_cached(parents, patterns, routes, config, *, scope=None):
+    if isinstance(routes, Mapping):
+        normalized_routes = tuple(Route(r, tuple(routes.get(r, ()))) for r in range(4))
+    else:
+        normalized_routes = tuple(routes)
+    return _canonical_assignment(tuple(parents), tuple(patterns), normalized_routes, config, scope)
+
+
+@lru_cache(maxsize=8192)
+def _canonical_assignment(parents, patterns, routes, config, scope):
+    # Same full canonicalizer and safeguards, once per identical input.
+    return canonicalize(parents, patterns, routes, config, scope=scope)
+
 
 
 def _initial_patterns(
@@ -141,6 +162,491 @@ def _home(robot: int, config: ScientificConfig) -> tuple[float, float]:
     return (x, y)
 
 
+@njit
+def _array_route_cost(route, travel, processing):
+    if len(route) == 0:
+        return 0.0
+    a = b = processing[route[0]]
+    for k in range(1, len(route)):
+        old, new = route[k - 1], route[k]
+        a, b = (min(a + travel[old, new, 0, 0], b + travel[old, new, 1, 0]) + processing[new],
+                min(a + travel[old, new, 0, 1], b + travel[old, new, 1, 1]) + processing[new])
+    return min(a, b)
+
+
+@njit
+def _route_prefix_suffix(route, travel, processing):
+    """Costs conditional on the boundary direction; both ends stay free."""
+    n = len(route)
+    prefix = np.zeros((n + 1, 2))
+    suffix = np.zeros((n + 1, 2))
+    for k in range(n):
+        node = route[k]
+        if k == 0:
+            prefix[k + 1, :] = processing[node]
+        else:
+            old = route[k - 1]
+            for d in range(2):
+                prefix[k + 1, d] = processing[node] + min(
+                    prefix[k, 0] + travel[old, node, 0, d],
+                    prefix[k, 1] + travel[old, node, 1, d])
+    for k in range(n - 1, -1, -1):
+        node = route[k]
+        for d in range(2):
+            suffix[k, d] = processing[node]
+            if k + 1 < n:
+                new = route[k + 1]
+                suffix[k, d] += min(travel[node, new, d, 0] + suffix[k + 1, 0],
+                                    travel[node, new, d, 1] + suffix[k + 1, 1])
+    return prefix, suffix
+
+
+@njit
+def _splice_cost(route, prefix, suffix, start, stop, inserted, travel, processing):
+    """Exact O(len(inserted)) replacement, including the two boundary arcs."""
+    a, b = prefix[start, 0], prefix[start, 1]
+    old = route[start - 1] if start else -1
+    for node in inserted:
+        if old < 0:
+            a = b = processing[node]
+        else:
+            a, b = (min(a + travel[old, node, 0, 0], b + travel[old, node, 1, 0]) + processing[node],
+                    min(a + travel[old, node, 0, 1], b + travel[old, node, 1, 1]) + processing[node])
+        old = node
+    if stop == len(route):
+        return min(a, b)
+    if old < 0:
+        return min(suffix[stop, 0], suffix[stop, 1])
+    new = route[stop]
+    return min(a + travel[old, new, 0, 0] + suffix[stop, 0],
+               a + travel[old, new, 0, 1] + suffix[stop, 1],
+               b + travel[old, new, 1, 0] + suffix[stop, 0],
+               b + travel[old, new, 1, 1] + suffix[stop, 1])
+
+
+@njit
+def _interval_costs(route, travel, processing):
+    """Min-plus 2x2 summaries for every unchanged contiguous segment."""
+    n = len(route)
+    result = np.full((n, n, 2, 2), np.inf)
+    for i in range(n):
+        result[i, i, 0, 0] = result[i, i, 1, 1] = processing[route[i]]
+        for j in range(i + 1, n):
+            old, new = route[j - 1], route[j]
+            for first in range(2):
+                for last in range(2):
+                    result[i, j, first, last] = processing[new] + min(
+                        result[i, j - 1, first, 0] + travel[old, new, 0, last],
+                        result[i, j - 1, first, 1] + travel[old, new, 1, last])
+    return result
+
+
+@njit
+def _join_segment(a, b, old, route, matrices, lo, hi, reverse, travel):
+    if hi <= lo:
+        return a, b, old
+    first = route[hi - 1] if reverse else route[lo]
+    if old < 0:
+        a = b = 0.0
+    else:
+        a, b = (min(a + travel[old, first, 0, 0], b + travel[old, first, 1, 0]),
+                min(a + travel[old, first, 0, 1], b + travel[old, first, 1, 1]))
+    if reverse:
+        # Reverse order AND complement endpoint directions. Euclidean empty
+        # travel is symmetric, so this is the exact reversed segment matrix.
+        c = min(a + matrices[lo, hi - 1, 1, 1], b + matrices[lo, hi - 1, 1, 0])
+        d = min(a + matrices[lo, hi - 1, 0, 1], b + matrices[lo, hi - 1, 0, 0])
+        return c, d, route[lo]
+    c = min(a + matrices[lo, hi - 1, 0, 0], b + matrices[lo, hi - 1, 1, 0])
+    d = min(a + matrices[lo, hi - 1, 0, 1], b + matrices[lo, hi - 1, 1, 1])
+    return c, d, route[hi - 1]
+
+
+@njit
+def _two_opt_array(route, travel, processing, consider_final_edge):
+    current = route.copy()
+    cost = _array_route_cost(current, travel, processing)
+    upper = len(current) if consider_final_edge else max(0, len(current) - 1)
+    while True:
+        summaries = _interval_costs(current, travel, processing)
+        changed = False
+        for left in range(max(0, upper - 1)):
+            for right in range(left + 1, upper):
+                a, b, old = _join_segment(0., 0., -1, current, summaries, 0, left, False, travel)
+                a, b, old = _join_segment(a, b, old, current, summaries, left, right + 1, True, travel)
+                a, b, old = _join_segment(a, b, old, current, summaries, right + 1, len(current), False, travel)
+                value = min(a, b)
+                if value < cost - 1.e-9:
+                    current[left:right + 1] = current[left:right + 1][::-1]
+                    cost, changed = value, True
+                    break
+            if changed:
+                break
+        if not changed:
+            return current
+
+
+@njit
+def _factorial_array(route, travel, processing, permutations, size, final_edge,
+                     exact, max_windows, max_calls):
+    current = route.copy()
+    n = len(current)
+    if n < 2:
+        return current, 0, 0, False, False
+    last = n - size - (0 if final_edge else 1)
+    count = max(0, last + 1)
+    window_hit = not exact and count > max_windows
+    if not exact:
+        count = min(count, max_windows)
+    calls = windows = 0
+    best_perm = np.empty(size, np.int64)
+    inserted = np.empty(size, np.int64)
+    while True:
+        changed = False
+        for start in range(count):
+            prefix, suffix = _route_prefix_suffix(current, travel, processing)
+            best_cost = min(prefix[n, 0], prefix[n, 1])
+            windows += 1
+            found = False
+            for permutation in permutations:
+                if not exact and calls + 2 ** size > max_calls:
+                    return current, calls, windows, window_hit, True
+                calls += 2 ** size
+                for k in range(size):
+                    inserted[k] = current[start + permutation[k]]
+                value = _splice_cost(current, prefix, suffix, start, start + size,
+                                     inserted, travel, processing)
+                if value < best_cost - 1.e-9:
+                    best_cost, found = value, True
+                    best_perm[:] = inserted
+            if found:
+                current[start:start + size] = best_perm
+                changed = True
+                break
+        if not exact or not changed:
+            return current, calls, windows, window_hit, False
+
+
+@njit
+def _farthest_array(ids, travel, processing, endpoint_x):
+    if len(ids) == 0:
+        return ids.copy()
+    pending = list(ids)
+    first = pending[0]
+    for node in pending:
+        if endpoint_x[node] > endpoint_x[first]:
+            first = node
+    # Resolve equal x with the lexicographic block-id index, like the reference.
+    for node in pending:
+        if (endpoint_x[node] == endpoint_x[first] and node > first):
+            first = node
+    current = np.array([first], np.int64)
+    pending.remove(first)
+    one = np.empty(1, np.int64)
+    while pending:
+        prefix, suffix = _route_prefix_suffix(current, travel, processing)
+        before = min(prefix[len(current), 0], prefix[len(current), 1])
+        far_delta, selected, position = -np.inf, -1, 0
+        for node in pending:
+            one[0] = node
+            delta, best_position = np.inf, 0
+            for k in range(len(current) + 1):
+                value = _splice_cost(current, prefix, suffix, k, k, one, travel, processing) - before
+                if value < delta:
+                    delta, best_position = value, k
+            if delta > far_delta or (delta == far_delta and node > selected):
+                far_delta, selected, position = delta, node, best_position
+        current = np.concatenate((current[:position], np.array([selected]), current[position:]))
+        pending.remove(selected)
+    return current
+
+
+@lru_cache(maxsize=32)
+def _route_tables(blocks: tuple[WeldingBlock, ...], config: ScientificConfig):
+    ids = tuple(block.block_id for block in blocks)
+    points = np.array([(block.start, block.end) for block in blocks], dtype=float).reshape((-1, 2, 2))
+    processing = np.array([config.process_time(block.length) for block in blocks])
+    travel = np.empty((len(blocks), len(blocks), 2, 2))
+    for d in range(2):
+        for e in range(2):
+            delta = points[:, 1 - d, None, :] - points[None, :, e, :]
+            travel[:, :, d, e] = np.sqrt(np.sum(delta * delta, axis=-1)) / config.empty_speed
+    return ids, {name: i for i, name in enumerate(ids)}, points, travel, processing
+
+
+def _tables_for(blocks, config):
+    return _route_tables(tuple(blocks[k] for k in sorted(blocks)), config)
+
+
+@lru_cache(maxsize=8)
+def _permutations(size):
+    return np.array(tuple(itertools.permutations(range(size))), dtype=np.int64)
+
+
+@njit
+def _direction_array(route, travel, processing, first):
+    n = len(route)
+    bits = np.zeros(n, np.int64)
+    if not n:
+        return 0., bits
+    back = np.zeros((n, 2), np.int64)
+    values = np.full(2, np.inf)
+    values[first] = processing[route[0]]
+    ranks = np.array([0, 1], np.int64)
+    for k in range(1, n):
+        old, new = route[k - 1], route[k]
+        next_values = np.empty(2)
+        for d in range(2):
+            a, b = values[0] + travel[old, new, 0, d], values[1] + travel[old, new, 1, d]
+            previous = 0 if a < b or (a == b and ranks[0] <= ranks[1]) else 1
+            back[k, d] = previous
+            next_values[d] = min(a, b) + processing[new]
+        if ranks[back[k, 0]] <= ranks[back[k, 1]]:
+            ranks[0], ranks[1] = 0, 1
+        else:
+            ranks[0], ranks[1] = 1, 0
+        values = next_values
+    last = 0 if values[0] < values[1] or (values[0] == values[1] and ranks[0] < ranks[1]) else 1
+    value = values[last]
+    bits[n - 1] = last
+    for k in range(n - 1, 0, -1):
+        bits[k - 1] = back[k, bits[k]]
+    return value, bits
+
+
+@njit
+def _numeric_templates(route, bits, points, processing, empty_speed, pre, post):
+    # duration,x0,y0,x1,y1,start,end,node,kind (MOVE=0,SETUP=1,WELD=2,POST=3,WAIT=4)
+    ops = np.zeros((4 * len(route), 9))
+    count, cursor = 0, 0.
+    for k in range(len(route)):
+        node, direction = route[k], bits[k]
+        start, end = points[node, direction], points[node, 1 - direction]
+        if k:
+            old = points[route[k - 1], 1 - bits[k - 1]]
+            duration = math.sqrt((old[0] - start[0]) ** 2 + (old[1] - start[1]) ** 2) / empty_speed
+            ops[count] = np.array([duration, old[0], old[1], start[0], start[1], cursor, cursor + duration, node, 0.])
+            count += 1
+            cursor += duration
+        for kind in range(1, 4):
+            duration = pre if kind == 1 else post if kind == 3 else processing[node] - pre - post
+            a = end if kind == 3 else start
+            b = start if kind == 1 else end
+            ops[count] = np.array([duration, a[0], a[1], b[0], b[1], cursor, cursor + duration, node, float(kind)])
+            count += 1
+            cursor += duration
+    return ops[:count]
+
+
+@njit
+def _numeric_conflict(a, b, ra, rb, dx, dy, eps):
+    lo, hi = max(a[5], b[5]), min(a[6], b[6])
+    if hi < lo:
+        return False
+    near_lo, near_hi = lo, hi
+    for axis in range(2):
+        va = (a[axis + 3] - a[axis + 1]) / a[0] if a[0] else 0.
+        vb = (b[axis + 3] - b[axis + 1]) / b[0] if b[0] else 0.
+        slope = va - vb
+        intercept = a[axis + 1] - va * a[5] - b[axis + 1] + vb * b[5]
+        if axis == 0 and ra // 2 == rb // 2:
+            sign = 1. if ra % 2 == 0 else -1.
+            if max(sign * (slope * lo + intercept), sign * (slope * hi + intercept)) + dx > eps:
+                return True
+        limit = (dx if axis == 0 else dy) + eps
+        if abs(slope) <= 1.e-15:
+            if abs(intercept) > limit:
+                near_hi = -np.inf
+        else:
+            t0, t1 = (-limit - intercept) / slope, (limit - intercept) / slope
+            near_lo, near_hi = max(near_lo, min(t0, t1)), min(near_hi, max(t0, t1))
+    return near_lo <= near_hi
+
+
+@njit
+def _numeric_forbidden(a, b, ra, rb, ready, dx, dy, eps, order):
+    duration = a[0]
+    constraints = np.empty((10, 3))
+    constraints[0] = (1., -1., 0.)
+    constraints[1] = (-1., 1., duration)
+    constraints[2] = (0., -1., -b[5])
+    constraints[3] = (0., 1., b[6])
+    constraints[4] = (-1., 0., -max(ready, b[5] - duration))
+    constraints[5] = (1., 0., b[6])
+    count = 6
+    for axis in range(1 if order else 2):
+        vc = (a[axis + 3] - a[axis + 1]) / duration if duration else 0.
+        vf = (b[axis + 3] - b[axis + 1]) / b[0] if b[0] else 0.
+        constant = a[axis + 1] - b[axis + 1] + vf * b[5]
+        if order:
+            sign = 1. if ra % 2 == 0 else -1.
+            constraints[count] = (sign * vc, sign * (vf - vc), sign * constant + dx - eps)
+            count += 1
+        else:
+            limit = (dx if axis == 0 else dy) + eps
+            constraints[count] = (-vc, vc - vf, limit - constant)
+            constraints[count + 1] = (vc, vf - vc, limit + constant)
+            count += 2
+    low, high = np.inf, -np.inf
+    for i in range(count):
+        for j in range(i + 1, count):
+            determinant = constraints[i, 0] * constraints[j, 1] - constraints[j, 0] * constraints[i, 1]
+            if abs(determinant) <= 1.e-15:
+                continue
+            s = (constraints[i, 2] * constraints[j, 1] - constraints[j, 2] * constraints[i, 1]) / determinant
+            t = (constraints[i, 0] * constraints[j, 2] - constraints[j, 0] * constraints[i, 2]) / determinant
+            valid = True
+            for k in range(count):
+                if constraints[k, 0] * s + constraints[k, 1] * t > constraints[k, 2] + eps:
+                    valid = False
+                    break
+            if valid:
+                low, high = min(low, s), max(high, s)
+    return low, high
+
+
+@njit
+def _numeric_follow(fixed, following, rf, rr, dx, dy, eps):
+    output = np.empty((2 * len(following), 9))
+    count, ready, total_wait = 0, 0., 0.
+    for op in following:
+        intervals = np.empty((2 * len(fixed), 2))
+        n = 0
+        for other in fixed:
+            if other[6] < ready - eps * max(1., abs(ready), abs(other[6])):
+                continue
+            if rr % 2 == 0:
+                separated = max(op[1], op[3]) + dx + eps < min(other[1], other[3])
+            else:
+                separated = max(other[1], other[3]) + dx + eps < min(op[1], op[3])
+            if separated:
+                continue
+            for order in (True, False):
+                lo, hi = _numeric_forbidden(op, other, rr, rf, ready, dx, dy, eps, order)
+                if lo <= hi:
+                    intervals[n] = (lo, hi)
+                    n += 1
+        start = ready
+        for _ in range(n + 2):
+            furthest = -np.inf
+            for j in range(n):
+                if intervals[j, 0] <= start <= intervals[j, 1]:
+                    furthest = max(furthest, intervals[j, 1])
+            if furthest == -np.inf:
+                break
+            start = max(np.nextafter(furthest, np.inf), furthest + eps * max(1., abs(furthest)))
+        candidate = op.copy()
+        candidate[5], candidate[6] = start, start + op[0]
+        wait = op.copy()
+        wait[0], wait[3], wait[4], wait[5], wait[6], wait[8] = start - ready, op[1], op[2], ready, start, 4.
+        for other in fixed:
+            if _numeric_conflict(candidate, other, rr, rf, dx, dy, eps):
+                return output[:0], np.inf
+            if start > ready and _numeric_conflict(wait, other, rr, rf, dx, dy, eps):
+                return output[:0], np.inf
+        if start > ready + eps:
+            output[count] = wait
+            count += 1
+            total_wait += start - ready
+        output[count] = candidate
+        count += 1
+        ready = candidate[6]
+    return output[:count], total_wait
+
+
+@njit
+def _priority_arrays(routes, travel, processing, points, parameters):
+    """Same two-priority rule as WAG, plus four-robot initial/cross checks.
+
+    This is a native scorer: no dispatch tree, recovery, certification or B32.
+    """
+    speed, pre, post, dx, dy, eps = parameters
+    directions = [np.empty(0, np.int64) for _ in range(4)]
+    operations = [np.empty((0, 9)) for _ in range(4)]
+    completion = np.zeros(4)
+    for left in (0, 2):
+        right = left + 1
+        best, bit0, bit1 = np.inf, np.empty(0, np.int64), np.empty(0, np.int64)
+        for first0 in range(2 if len(routes[left]) else 1):
+            c0, d0 = _direction_array(routes[left], travel, processing, first0)
+            for first1 in range(2 if len(routes[right]) else 1):
+                c1, d1 = _direction_array(routes[right], travel, processing, first1)
+                if len(d0) and len(d1):
+                    a, b = points[routes[left][0], d0[0]], points[routes[right][0], d1[0]]
+                    if a[0] + dx > b[0] + eps:
+                        continue
+                    if abs(a[0] - b[0]) <= dx + eps and abs(a[1] - b[1]) <= dy + eps:
+                        continue
+                if c0 + c1 < best:
+                    best, bit0, bit1 = c0 + c1, d0, d1
+        if not math.isfinite(best):
+            return np.inf, directions, operations, completion
+        directions[left], directions[right] = bit0, bit1
+        a = _numeric_templates(routes[left], bit0, points, processing, speed, pre, post)
+        b = _numeric_templates(routes[right], bit1, points, processing, speed, pre, post)
+        if not len(a) or not len(b):
+            operations[left], operations[right] = a, b
+        else:
+            followed, wait = _numeric_follow(a, b, left, right, dx, dy, eps)
+            reverse, reverse_wait = np.empty((0, 9)), np.inf
+            if not math.isfinite(wait) or wait > 0.:
+                reverse, reverse_wait = _numeric_follow(b, a, right, left, dx, dy, eps)
+            if not math.isfinite(wait) and not math.isfinite(reverse_wait):
+                return np.inf, directions, operations, completion
+            forward_cmax = max(a[-1, 6], followed[-1, 6]) if math.isfinite(wait) else np.inf
+            reverse_cmax = max(b[-1, 6], reverse[-1, 6]) if math.isfinite(reverse_wait) else np.inf
+            if reverse_cmax < forward_cmax:
+                operations[left], operations[right] = reverse, b
+            else:
+                operations[left], operations[right] = a, followed
+    for r in range(4):
+        completion[r] = operations[r][-1, 6] if len(operations[r]) else 0.
+    # A native feasible score must not hide interference across the two rails.
+    for r in range(2):
+        for s in range(2, 4):
+            if not len(routes[r]) or not len(routes[s]):
+                continue
+            a, b = points[routes[r][0], directions[r][0]], points[routes[s][0], directions[s][0]]
+            if abs(a[0] - b[0]) <= dx + eps and abs(a[1] - b[1]) <= dy + eps:
+                return np.inf, directions, operations, completion
+            j = 0
+            for aop in operations[r]:
+                while j < len(operations[s]) and operations[s][j, 6] < aop[5]:
+                    j += 1
+                k = j
+                while k < len(operations[s]) and operations[s][k, 5] <= aop[6]:
+                    if _numeric_conflict(aop, operations[s][k], r, s, dx, dy, eps):
+                        return np.inf, directions, operations, completion
+                    k += 1
+    return max(completion), directions, operations, completion
+
+
+def _schedule_from_arrays(value, directions, operations, completion, ids, policy):
+    from mrta_reference.model import Operation, OperationKind, ScheduleResult, ScheduleStatus
+    vectors = tuple(tuple(int(d) for d in route) for route in directions)
+    if not math.isfinite(value):
+        return ScheduleResult(ScheduleStatus.DEADLOCK, directions=vectors,
+                              diagnostics=("native priority schedule blocked or initial order infeasible",),
+                              reference_policy_id=policy)
+    kinds = (OperationKind.MOVE, OperationKind.SETUP, OperationKind.WELD, OperationKind.POST, OperationKind.WAIT)
+    result = tuple(Operation(f"R{r}:NATIVE:{k}", r, kinds[int(op[8])], float(op[5]), float(op[6]),
+                             (float(op[1]), float(op[2])), (float(op[3]), float(op[4])), k, ids[int(op[7])])
+                   for r, route in enumerate(operations) for k, op in enumerate(route))
+    return ScheduleResult(ScheduleStatus.FEASIBLE, result, float(value), tuple(float(x) for x in completion),
+                          directions=vectors, reference_policy_id=policy)
+
+
+def priority_schedule(solution, config):
+    """Shared lightweight four-robot native objective for the two baselines."""
+    blocks = block_map(solution, config)
+    ids, index, points, travel, processing = _tables_for(blocks, config)
+    routes = [np.array([index[b] for b in route.block_ids], np.int64) for route in solution.routes]
+    parameters = np.array([config.empty_speed, config.t_pre, config.t_post,
+                           config.interference_dx, config.interference_dy, config.numeric_epsilon])
+    return _schedule_from_arrays(*_priority_arrays(routes, travel, processing, points, parameters),
+                                 ids, "NATIVE_PRIORITY_FOUR_ROBOTS")
+
+
 def nearest_addition(
     block_ids: Sequence[str],
     robot: int,
@@ -169,32 +675,10 @@ def farthest_insertion(
     blocks: Mapping[str, WeldingBlock],
     config: ScientificConfig,
 ) -> tuple[str, ...]:
-    if not block_ids:
-        return ()
-    first = max(
-        block_ids,
-        key=lambda item: (
-            max(blocks[item].start[0], blocks[item].end[0]), item
-        ),
-    )
-    route = [first]
-    pending = set(block_ids) - {first}
-    while pending:
-        before = _route_cost(route, blocks, config)
-        best_by_edge = []
-        for block_id in sorted(pending):
-            insertions = []
-            for position in range(len(route) + 1):
-                candidate = route[:position] + [block_id] + route[position:]
-                insertions.append(
-                    (_route_cost(candidate, blocks, config) - before, position)
-                )
-            least_delta, position = min(insertions)
-            best_by_edge.append((least_delta, block_id, position))
-        _, selected, position = max(best_by_edge, key=lambda item: (item[0], item[1]))
-        route.insert(position, selected)
-        pending.remove(selected)
-    return tuple(route)
+    ids, index, points, travel, processing = _tables_for(blocks, config)
+    nodes = np.array([index[name] for name in block_ids], dtype=np.int64)
+    result = _farthest_array(nodes, travel, processing, points[:, :, 0].max(axis=1))
+    return tuple(ids[i] for i in result)
 
 
 def two_opt(
@@ -204,22 +688,10 @@ def two_opt(
     *,
     consider_final_edge: bool,
 ) -> tuple[str, ...]:
-    current = tuple(route)
-    current_cost = _route_cost(current, blocks, config)
-    changed = True
-    while changed:
-        changed = False
-        upper = len(current) if consider_final_edge else max(0, len(current) - 1)
-        for left in range(max(0, upper - 1)):
-            for right in range(left + 1, upper):
-                candidate = current[:left] + tuple(reversed(current[left : right + 1])) + current[right + 1 :]
-                cost = _route_cost(candidate, blocks, config)
-                if (cost, candidate) < (current_cost - 1.0e-12, current):
-                    current, current_cost, changed = candidate, cost, True
-                    break
-            if changed:
-                break
-    return current
+    ids, index, _, travel, processing = _tables_for(blocks, config)
+    nodes = np.array([index[name] for name in route], dtype=np.int64)
+    result = _two_opt_array(nodes, travel, processing, consider_final_edge)
+    return tuple(ids[i] for i in result)
 
 
 def factorial_edge_combination(
@@ -235,55 +707,24 @@ def factorial_edge_combination(
     deadline: float | None = None,
     accounting: BaselineAccounting | None = None,
 ) -> tuple[tuple[str, ...], int, int]:
-    """Enumerate the paper permutation/direction neighborhood for each window."""
-    current = tuple(route)
-    if len(current) < 2:
-        return current, 0, 0
-    size = min(window_size, len(current))
-    last_start = len(current) - size
-    if not consider_final_edge:
-        last_start -= 1
-    starts = list(range(max(0, last_start) + 1))
-    if not exact:
-        if len(starts) > max_windows and accounting is not None:
-            accounting.factorial_window_cap_hits += 1
-        starts = starts[:max_windows]
-    calls = 0
-    windows = 0
-    changed = True
-    while changed:
-        changed = False
-        for start in starts:
-            if deadline is not None and time.perf_counter() >= deadline:
-                return current, calls, windows
-            windows += 1
-            stop = start + size
-            original = current[start:stop]
-            best = current
-            best_cost = _route_cost(current, blocks, config)
-            for permutation in itertools.permutations(original):
-                if deadline is not None and time.perf_counter() >= deadline:
-                    return current, calls, windows
-                direction_combinations = 2 ** len(permutation)
-                if not exact and calls + direction_combinations > max_factorial_calls:
-                    if accounting is not None:
-                        accounting.factorial_call_cap_hits += 1
-                    return current, calls, windows
-                calls += direction_combinations
-                candidate = current[:start] + permutation + current[stop:]
-                cost = _route_cost(candidate, blocks, config)
-                if (cost, candidate) < (best_cost - 1.0e-12, best):
-                    best, best_cost = candidate, cost
-            if best != current:
-                current = best
-                changed = True
-                break
-        if not exact:
-            break
-    return current, calls, windows
+    """Exact orientation DP on each permutation, touching only its window."""
+    if deadline is not None and time.perf_counter() >= deadline:
+        return tuple(route), 0, 0
+    ids, index, _, travel, processing = _tables_for(blocks, config)
+    nodes = np.array([index[name] for name in route], dtype=np.int64)
+    size = min(window_size, len(nodes))
+    if size < 2:
+        return tuple(route), 0, 0
+    result, calls, windows, window_hit, call_hit = _factorial_array(
+        nodes, travel, processing, _permutations(size), size, consider_final_edge,
+        exact, max_windows, max_factorial_calls)
+    if accounting is not None:
+        accounting.factorial_window_cap_hits += int(window_hit)
+        accounting.factorial_call_cap_hits += int(call_hit)
+    return tuple(ids[i] for i in result), calls, windows
 
 
-def improved_route_set(
+def _improved_route_set_uncached(
     block_ids: Sequence[str],
     robot: int,
     blocks: Mapping[str, WeldingBlock],
@@ -294,49 +735,40 @@ def improved_route_set(
     accounting: BaselineAccounting | None = None,
 ) -> tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], int]:
     exact = wag_config.factorial_mode == "PAPER_EXACT"
+    calls = 0
+    def improve(route, final_edge):
+        nonlocal calls
+        while True:
+            before = _route_cost(route, blocks, config)
+            route = two_opt(route, blocks, config, consider_final_edge=final_edge)
+            route, count, _ = factorial_edge_combination(
+                route, blocks, config, window_size=wag_config.factorial_window,
+                consider_final_edge=final_edge, exact=exact, max_windows=wag_config.max_windows,
+                max_factorial_calls=wag_config.max_factorial_calls, deadline=deadline, accounting=accounting)
+            calls += count
+            if _route_cost(route, blocks, config) >= before - 1.e-9:
+                return route
     nearest = nearest_addition(block_ids, robot, blocks, config)
     farthest = farthest_insertion(block_ids, blocks, config)
+    i_r1 = improve(nearest, True)
+    i_r2 = improve(farthest, False)
+    i_r3 = improve(i_r2, True)
+    return (i_r1, i_r2, i_r3), calls
 
-    i_r1 = two_opt(nearest, blocks, config, consider_final_edge=True)
-    i_r1, calls1, _ = factorial_edge_combination(
-        i_r1,
-        blocks,
-        config,
-        window_size=wag_config.factorial_window,
-        consider_final_edge=True,
-        exact=exact,
-        max_windows=wag_config.max_windows,
-        max_factorial_calls=wag_config.max_factorial_calls,
-        deadline=deadline,
-        accounting=accounting,
-    )
-    i_r2 = two_opt(farthest, blocks, config, consider_final_edge=False)
-    i_r2, calls2, _ = factorial_edge_combination(
-        i_r2,
-        blocks,
-        config,
-        window_size=wag_config.factorial_window,
-        consider_final_edge=False,
-        exact=exact,
-        max_windows=wag_config.max_windows,
-        max_factorial_calls=wag_config.max_factorial_calls,
-        deadline=deadline,
-        accounting=accounting,
-    )
-    i_r3 = two_opt(i_r2, blocks, config, consider_final_edge=True)
-    i_r3, calls3, _ = factorial_edge_combination(
-        i_r3,
-        blocks,
-        config,
-        window_size=wag_config.factorial_window,
-        consider_final_edge=True,
-        exact=exact,
-        max_windows=wag_config.max_windows,
-        max_factorial_calls=wag_config.max_factorial_calls,
-        deadline=deadline,
-        accounting=accounting,
-    )
-    return (i_r1, i_r2, i_r3), calls1 + calls2 + calls3
+
+@lru_cache(maxsize=8192)
+def _improved_routes_cached(assigned, robot, config, settings):
+    blocks = {b.block_id: b for b in assigned}
+    return _improved_route_set_uncached(tuple(blocks), robot, blocks, config, settings)
+
+
+def improved_route_set(block_ids, robot, blocks, config, wag_config, *, deadline=None, accounting=None):
+    if deadline is not None and time.perf_counter() >= deadline:
+        return ((tuple(block_ids),) * 3), 0
+    # Construction depends on the assignment set, not on its inherited order.
+    # Repeated WAGs and unchanged robot assignments therefore reuse exact routes.
+    assigned = tuple(blocks[name] for name in sorted(block_ids))
+    return _improved_routes_cached(assigned, robot, config, wag_config)
 
 
 def _balanced_boundary_assign(
@@ -370,7 +802,7 @@ def generate_wag_assignments(
     patterns: Sequence[SplitPattern],
     config: ScientificConfig,
     *,
-    max_variants: int,
+    max_variants: int | None,
     accounting: BaselineAccounting | None = None,
     scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
@@ -447,17 +879,22 @@ def generate_wag_assignments(
         routes = tuple(
             Route(robot, tuple(route_lists[robot])) for robot in range(4)
         )
-        solution = canonicalize(
+        solution = _canonicalize_cached(
             parents, patterns, routes, config, scope=scope
         )
         if solution.canonical_hash not in seen:
             seen.add(solution.canonical_hash)
             result.append(solution)
-        if len(result) >= max_variants:
+        if max_variants is not None and len(result) >= max_variants:
             if offset_index + 1 < len(offsets) and accounting is not None:
                 accounting.wag_variant_cap_hits += 1
             break
     return tuple(result)
+
+
+@lru_cache(maxsize=512)
+def _wag_assignments_cached(parents, patterns, config, max_variants, scope):
+    return generate_wag_assignments(parents, patterns, config, max_variants=max_variants, scope=scope)
 
 
 def _route_combinations(
@@ -468,7 +905,7 @@ def _route_combinations(
     deadline: float,
     accounting: BaselineAccounting | None = None,
     scope: FormalScope | None = None,
-) -> tuple[list[CanonicalSolution], int]:
+) -> tuple[list[tuple[float, tuple[tuple[str, ...], ...]]], int]:
     blocks = block_map(assignment, config)
     variants = []
     factorial_calls = 0
@@ -485,18 +922,23 @@ def _route_combinations(
         variants.append(route_set)
         factorial_calls += calls
     combinations = []
+    costs = [[_route_cost(route, blocks, config) for route in route_set] for route_set in variants]
+    has_split = any(pattern.kind is not SplitKind.WHOLE for pattern in assignment.patterns)
     for indices in itertools.product(range(3), repeat=4):
-        routes = tuple(Route(robot, variants[robot][indices[robot]]) for robot in range(4))
-        solution = canonicalize(
-            assignment.parents, assignment.patterns, routes, config, scope=scope
-        )
-        cost = max(
-            (_route_cost(route.block_ids, blocks, config) for route in routes),
-            default=0.0,
-        )
-        combinations.append((cost, indices, solution))
-    combinations.sort(key=lambda item: (item[0], item[1], item[2].canonical_hash))
-    return [item[2] for item in combinations], factorial_calls
+        routes = tuple(variants[robot][indices[robot]] for robot in range(4))
+        cost = max(costs[robot][indices[robot]] for robot in range(4))
+        candidate = routes
+        if has_split and any(a.split('::', 1)[0] == b.split('::', 1)[0]
+                             for route in routes for a, b in zip(route, route[1:])):
+            # Adjacent split siblings are merged by the existing canonicalizer.
+            # Its reduced setup/post time must be reflected BEFORE pruning.
+            candidate = _canonicalize_cached(assignment.parents, assignment.patterns, dict(enumerate(routes)),
+                                     config, scope=scope)
+            actual_blocks = block_map(candidate, config)
+            cost = max(_route_cost(r.block_ids, actual_blocks, config) for r in candidate.routes)
+        combinations.append((cost, indices, candidate))
+    combinations.sort(key=lambda item: (item[0], item[1]))
+    return [(item[0], item[2]) for item in combinations], factorial_calls
 
 
 def _same_rail_neighbors(robot: int) -> tuple[int, ...]:
@@ -539,7 +981,7 @@ def wag_move_candidates(
         routes[heavy_robot].remove(block_id)
         routes[destination].append(block_id)
         result.append(
-            canonicalize(
+            _canonicalize_cached(
                 solution.parents,
                 solution.patterns,
                 {robot: tuple(route) for robot, route in enumerate(routes)},
@@ -587,7 +1029,7 @@ def wag_swap_candidates(
         ri = routes[neighbor].index(right)
         routes[heavy_robot][li], routes[neighbor][ri] = right, left
         result.append(
-            canonicalize(
+            _canonicalize_cached(
                 solution.parents,
                 solution.patterns,
                 {robot: tuple(route) for robot, route in enumerate(routes)},
@@ -604,7 +1046,7 @@ def wag_lns_candidates(
     rng: random.Random,
     *,
     p: float,
-    max_variants: int,
+    max_variants: int | None,
     scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
     routes = [list(route.block_ids) for route in solution.routes]
@@ -641,17 +1083,14 @@ def wag_lns_candidates(
             robot = min(eligible, key=lambda item: (loads[item], item))
         routes[robot].append(block_id)
         loads[robot] += config.process_time(blocks[block_id].length)
-    base = canonicalize(
+    base = _canonicalize_cached(
         solution.parents,
         solution.patterns,
         {robot: tuple(route) for robot, route in enumerate(routes)},
         config,
         scope=scope,
     )
-    return generate_wag_assignments(
-        solution.parents, solution.patterns, config, max_variants=max_variants,
-        scope=scope,
-    ) + (base,)
+    return _wag_assignments_cached(solution.parents, solution.patterns, config, max_variants, scope) + (base,)
 
 
 def toggle_optional_y(
@@ -730,6 +1169,11 @@ def _evaluate_routed_assignment(
     *,
     source: str,
 ) -> None:
+    key = assignment.patterns, tuple(tuple(sorted(r.block_ids)) for r in assignment.routes)
+    if not hasattr(evaluator, '_wag_routed_assignments'):
+        evaluator._wag_routed_assignments = set()
+    if key in evaluator._wag_routed_assignments:
+        return
     construction_started = time.perf_counter()
     combinations, factorial_calls = _route_combinations(
         assignment,
@@ -743,14 +1187,45 @@ def _evaluate_routed_assignment(
     evaluator.accounting.construction_time += elapsed
     evaluator.accounting.factorial_local_search_time += elapsed
     evaluator.accounting.cheap_candidate_operations += factorial_calls
-    for index, candidate in enumerate(
-        combinations[: wag_config.max_route_combinations_per_wag]
-    ):
+    native = getattr(evaluator, 'candidate_evaluator', None) is priority_schedule
+    if native:
+        if not hasattr(evaluator, '_wag_native_contexts'):
+            evaluator._wag_native_contexts = {}
+        context = evaluator._wag_native_contexts.get(assignment.patterns)
+        if context is None:
+            _, index, points, travel, processing = _tables_for(_blocks_for(
+                assignment.parents, assignment.patterns, scientific_config), scientific_config)
+            parameters = np.array([scientific_config.empty_speed, scientific_config.t_pre, scientific_config.t_post,
+                                   scientific_config.interference_dx, scientific_config.interference_dy,
+                                   scientific_config.numeric_epsilon])
+            context = index, points, travel, processing, parameters, {}, set()
+            evaluator._wag_native_contexts[assignment.patterns] = context
+        index, points, travel, processing, parameters, encoded, scored = context
+    for index, (lower, routes) in enumerate(combinations):
         if evaluator.expired:
             break
+        # Free-end process/travel omits only nonnegative waiting.
+        if evaluator.best is not None and lower >= evaluator.best.metrics.cmax + 1.e-8:
+            break
+        if native and not isinstance(routes, CanonicalSolution):
+            table_index, points, travel, processing, parameters, encoded, scored = context
+            if routes in scored:
+                continue
+            arrays = []
+            for route in routes:
+                if route not in encoded:
+                    encoded[route] = np.array([table_index[b] for b in route], np.int64)
+                arrays.append(encoded[route])
+            value = _priority_arrays(arrays, travel, processing, points, parameters)[0]
+            scored.add(routes)
+            if not math.isfinite(value) or (evaluator.best is not None and value >= evaluator.best.metrics.cmax - 1.e-8):
+                continue
+        candidate = routes if isinstance(routes, CanonicalSolution) else _canonicalize_cached(
+            assignment.parents, assignment.patterns, dict(enumerate(routes)), scientific_config,
+            scope=evaluator.scope if evaluator.scope.x_split_rule_id else None)
         evaluator.evaluate(candidate, source=f"{source}_ROUTE_COMBINATION_{index}")
-    if len(combinations) > wag_config.max_route_combinations_per_wag:
-        evaluator.accounting.route_combination_cap_hits += 1
+    if not evaluator.expired:
+        evaluator._wag_routed_assignments.add(key)
 
 
 def run_adapted_wag_vns(
@@ -824,8 +1299,6 @@ def run_adapted_wag_vns(
                 evaluator,
                 source=f"WAG_INITIAL_{index}",
             )
-            if evaluator.best is not None:
-                break
     initialization_time = time.perf_counter() - init_started
     initial_candidate = evaluator.best
     initial_reference_calls = evaluator.accounting.reference_calls
@@ -837,6 +1310,9 @@ def run_adapted_wag_vns(
         and iterations < wag_config.imax
     ):
         iterations += 1
+        if iterations % 50 == 0:
+            print('WAG_PROGRESS', iterations, round(evaluator.elapsed, 3),
+                  evaluator.best.metrics.cmax if evaluator.best else None, flush=True)
         best_solution = evaluator.best.solution
         if repaired_access:
             transition_started = evaluator.elapsed

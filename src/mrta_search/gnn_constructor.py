@@ -593,6 +593,8 @@ class JointCompletionResult:
     inference_seconds: float
     rejection_reason: str | None = None
     oriented_state: object | None = None
+    # Beam decoding returns complete plans here; the caller selects with B32.
+    candidates: tuple[JointCompletionResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2022,10 +2024,107 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     return plans, scores
 
 
-def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, selected, rng,
-                          deadline, step_observer, decision_observer):
+@dataclass(frozen=True)
+class _VNextPartialState:
+    state: object
+    selected: dict
+    blocks: dict
+    nodes: dict
+    pending: frozenset
+    score: float = 0.
+    actions: tuple = ()
+    decisions: tuple = ()
+
+
+def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, state, selected,
+                               deadline, step_observer, decision_observer):
+    """Keep two global directed partial plans, using only the existing GNN scores."""
     from .lns import oriented_route_state
 
+    started = time.perf_counter()
+    space = parent_assignment_space(parents, config) if space is None else space
+    embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
+    selected = {} if selected is None else dict(selected)
+    blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
+    nodes = {b.block_id: space.block_nodes[pattern, b.block_id]
+             for pattern in selected.values() for b in space.children[pattern]}
+    state = oriented_route_state(((),) * 4, ((),) * 4, blocks, config) if state is None else state
+    beam = [_VNextPartialState(state, selected, blocks, nodes, frozenset(space.parent_ids) - selected.keys())]
+    while any(partial.pending for partial in beam):
+        expanded, failures = [], []
+        for partial in beam:
+            if not partial.pending:
+                expanded.append(partial)
+                continue
+            if deadline is not None and time.perf_counter() >= deadline:
+                return JointCompletionResult(None, None, partial.actions, time.perf_counter() - started,
+                                             rejection_reason='TIME_LIMIT')
+            try:
+                plans, scores = vnext_joint_actions(space, embeddings, model, partial.state, partial.blocks,
+                                                    partial.nodes, partial.pending, config)
+                if not plans:
+                    raise ValueError('NO_COMPLETE_PARENT_ACTION')
+                if not torch.isfinite(scores).all():
+                    raise ValueError('NONFINITE_JOINT_SCORES')
+            except (ValueError, ArithmeticError) as error:
+                failures.append(f'{error}; pending={sorted(partial.pending)}')
+                continue
+            if step_observer is not None:
+                step_observer(partial.state, partial.selected, plans, scores)
+            log_probs = scores.log_softmax(0)
+            for index in torch.argsort(scores, descending=True, stable=True)[:2].tolist():
+                plan = plans[index]
+                assignment = space.actions[plan.assignment_index]
+                children = space.children[assignment.pattern]
+                decisions = (*partial.decisions, (assignment, plan.actions, plan.state)) if decision_observer else ()
+                expanded.append(_VNextPartialState(
+                    plan.state, {**partial.selected, assignment.parent_id: assignment.pattern},
+                    {**partial.blocks, **{b.block_id: b for b in children}},
+                    {**partial.nodes, **{b.block_id: space.block_nodes[assignment.pattern, b.block_id] for b in children}},
+                    partial.pending - {assignment.parent_id}, partial.score + float(log_probs[index]),
+                    (*partial.actions, *plan.actions), decisions))
+        if not expanded:
+            return JointCompletionResult(None, None, beam[0].actions, time.perf_counter() - started,
+                                         rejection_reason=' | '.join(failures))
+        beam = []
+        for partial in sorted(expanded, key=lambda p: -p.score):
+            if any(partial.selected == kept.selected and partial.state.routes == kept.state.routes
+                   and partial.state.directions == kept.state.directions for kept in beam):
+                continue
+            beam.append(partial)
+            if len(beam) == 2:
+                break
+    completed, failures = [], []
+    for partial in beam:
+        try:
+            solution = canonicalize(parents, partial.selected.values(), dict(enumerate(partial.state.routes)),
+                                    config, scope=FORMAL_SCOPE_V2)
+            if tuple(route.block_ids for route in solution.routes) != partial.state.routes:
+                raise ValueError('CANONICALIZATION_CHANGED_DIRECTED_ROUTES')
+        except (ValueError, ArithmeticError) as error:
+            failures.append(str(error))
+            continue
+        completed.append(JointCompletionResult(solution, partial.state.directions, partial.actions,
+                                               time.perf_counter() - started, oriented_state=partial.state))
+        if decision_observer is not None and len(completed) == 1:
+            for decision in partial.decisions:
+                decision_observer(*decision)
+    if not completed:
+        return JointCompletionResult(None, None, beam[0].actions, time.perf_counter() - started,
+                                     rejection_reason=' | '.join(failures))
+    return replace(completed[0], candidates=tuple(completed), inference_seconds=time.perf_counter() - started)
+
+
+def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, selected, rng,
+                          deadline, step_observer, decision_observer, beam_width=1):
+    from .lns import oriented_route_state
+
+    if beam_width == 2:
+        if rng is not None:
+            raise ValueError('width-two joint construction is deterministic; rng must be None')
+        return _construct_vnext_joint_beam(parents, model, config, space=space, embeddings=embeddings,
+                                           state=state, selected=selected, deadline=deadline,
+                                           step_observer=step_observer, decision_observer=decision_observer)
     started = time.perf_counter()
     space = parent_assignment_space(parents, config) if space is None else space
     embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
@@ -2072,14 +2171,18 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
 
 @torch.no_grad()
 def construct_vnext_gnn(parents, model, config, *, decision_observer=None, space=None, embeddings=None,
-                        state=None, selected=None, rng=None, deadline=None, step_observer=None):
-    """Choose one assignment, then direct its children as a single commit."""
+                        state=None, selected=None, rng=None, deadline=None, step_observer=None, beam_width=1):
+    """Construct greedily (width one), or return up to two global joint beam plans."""
     from .lns import joint_block_candidates, oriented_route_state
 
+    if beam_width not in (1, 2):
+        raise ValueError('supported joint beam widths are 1 and 2')
     if getattr(model, 'joint_weights', None) is not None:
         return _construct_vnext_joint(parents, model, config, space=space, embeddings=embeddings, state=state,
                                       selected=selected, rng=rng, deadline=deadline, step_observer=step_observer,
-                                      decision_observer=decision_observer)
+                                      decision_observer=decision_observer, beam_width=beam_width)
+    if beam_width != 1:
+        raise ValueError('width-two construction requires the joint VNext scoring model')
     started = time.perf_counter()
     space = parent_assignment_space(parents, config)
     embeddings = model.encode_static(space.graph)

@@ -250,7 +250,136 @@ def test_wag_optional_y_toggle_uses_only_legal_pattern():
     _assert_valid(toggled, config)
 
 
-def test_common_model_bounded_defaults_preserve_paper_parameters():
+def test_wag_defaults_preserve_paper_parameters_without_candidate_caps():
     config = AdaptedWAGConfig()
     assert (config.n, config.p, config.imax, config.factorial_window) == (10, 0.5, 500, 5)
-    assert config.factorial_mode == "COMMON_MODEL_BOUNDED"
+    assert config.factorial_mode == "PAPER_EXACT"
+    assert config.max_wag_variants is None
+    assert config.max_route_combinations_per_wag is None
+
+
+def test_incremental_splices_and_reversed_segments_match_full_direction_dp():
+    import numpy as np
+    from mrta_baselines import wag_vns as w
+    rng = random.Random(812)
+    config = ScientificConfig()
+    parents = tuple(ParentWeld(str(i), (rng.uniform(1., 18.), rng.uniform(8., 11.)),
+                               (rng.uniform(1., 18.), rng.uniform(8., 11.))) for i in range(8))
+    blocks = _blocks_for(parents, _initial_patterns(parents, config), config)
+    ids, _, _, travel, processing = w._tables_for(blocks, config)
+    nodes = np.arange(len(ids), dtype=np.int64)
+    prefix, suffix = w._route_prefix_suffix(nodes, travel, processing)
+    matrices = w._interval_costs(nodes, travel, processing)
+    for lo in range(len(ids) + 1):
+        for hi in range(lo, len(ids) + 1):
+            inserted = nodes[lo:hi][::-1].copy()
+            expected = w._route_cost(ids[:lo] + tuple(ids[i] for i in inserted) + ids[hi:], blocks, config)
+            assert w._splice_cost(nodes, prefix, suffix, lo, hi, inserted, travel, processing) == pytest.approx(expected, abs=1e-8)
+            a, b, old = w._join_segment(0., 0., -1, nodes, matrices, 0, lo, False, travel)
+            a, b, old = w._join_segment(a, b, old, nodes, matrices, lo, hi, True, travel)
+            a, b, old = w._join_segment(a, b, old, nodes, matrices, hi, len(nodes), False, travel)
+            assert min(a, b) == pytest.approx(expected, abs=1e-8)
+
+
+def test_five_edge_factorial_matches_full_order_and_direction_enumeration():
+    import itertools
+    import math
+    from mrta_baselines import wag_vns as w
+    config = ScientificConfig()
+    parents = tuple(ParentWeld(str(i), (x, 8. + i % 2), (x + .7, 9. + i % 2))
+                    for i, x in enumerate((7., 1., 11., 3., 14.)))
+    blocks = _blocks_for(parents, _initial_patterns(parents, config), config)
+    best = math.inf
+    for order in itertools.permutations(blocks):
+        for bits in itertools.product((0, 1), repeat=5):
+            value = sum(config.process_time(blocks[n].length) for n in order)
+            value += sum(math.dist((blocks[a].end, blocks[a].start)[da],
+                                   (blocks[b].start, blocks[b].end)[db]) / config.empty_speed
+                         for a, b, da, db in zip(order, order[1:], bits, bits[1:]))
+            best = min(best, value)
+    result, calls, _ = factorial_edge_combination(tuple(blocks), blocks, config, window_size=5,
+                                                 consider_final_edge=True, exact=True,
+                                                 max_windows=1, max_factorial_calls=1)
+    assert w._route_cost(result, blocks, config) == pytest.approx(best, abs=1e-8)
+    assert calls >= 3840
+
+
+def test_all_81_combinations_can_win_beyond_the_old_top_three(monkeypatch):
+    from types import SimpleNamespace
+    from mrta_baselines import wag_vns as w
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_baselines.common import BaselineAccounting
+    config = ScientificConfig()
+    parents = _parents()
+    assignment = generate_wag_assignments(parents, _initial_patterns(parents, config), config, max_variants=1)[0]
+    routes = tuple(r.block_ids for r in assignment.routes)
+    monkeypatch.setattr(w, '_route_combinations', lambda *args, **kwargs: ([(0., routes)] * 81, 0))
+    class Evaluator:
+        deadline, expired, best, scope = float('inf'), False, None, FORMAL_SCOPE_V2
+        accounting = BaselineAccounting()
+        count = 0
+        def evaluate(self, solution, *, source):
+            self.count += 1
+            self.best = SimpleNamespace(metrics=SimpleNamespace(cmax=200. - self.count))
+    evaluator = Evaluator()
+    w._evaluate_routed_assignment(assignment, config, AdaptedWAGConfig(), evaluator, source='all')
+    assert evaluator.count == 81
+    assert evaluator.best.metrics.cmax == 119.
+
+
+def test_combination_lower_bound_accounts_for_canonical_sibling_merge(monkeypatch):
+    from mrta_baselines import wag_vns as w
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.model import CanonicalSolution
+    from mrta_reference.solution import canonicalize
+    config = ScientificConfig()
+    parents = (ParentWeld('p', (1., 5.9), (5., 7.)), ParentWeld('q', (7., 9.), (8., 9.)))
+    catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+    patterns = (next(p for p in catalog['p'] if p.kind is SplitKind.Y_SPLIT), catalog['q'][0])
+    solution = canonicalize(parents, patterns,
+                            {0: ('p::0', 'q::whole', 'p::1'), 1: (), 2: (), 3: ()},
+                            config, scope=FORMAL_SCOPE_V2)
+    def adjacent(ids, robot, *args, **kwargs):
+        route = ('p::0', 'p::1', 'q::whole') if robot == 0 else ()
+        return (route, route, route), 0
+    monkeypatch.setattr(w, 'improved_route_set', adjacent)
+    combinations, _ = w._route_combinations(solution, config, AdaptedWAGConfig(),
+                                            deadline=float('inf'), scope=FORMAL_SCOPE_V2)
+    assert len(combinations) == 81
+    bound, normalized = combinations[0]
+    assert isinstance(normalized, CanonicalSolution)
+    assert next(p for p in normalized.patterns if p.parent_id == 'p').kind is SplitKind.WHOLE
+    actual = block_map(normalized, config)
+    assert bound == pytest.approx(w._route_cost(normalized.routes[0].block_ids, actual, config), abs=1e-8)
+
+
+def test_compiled_priority_follow_matches_existing_ess_including_wait():
+    import math
+    import numpy as np
+    from mrta_baselines import wag_vns as w
+    from mrta_reference.model import RobotRoute
+    from mrta_reference.scheduler import build_operation_templates, earliest_safe_start
+    config = ScientificConfig()
+    parents = tuple(ParentWeld(f'p{i}', (x, 9.), (x + 1., 9.))
+                    for i, x in enumerate((1., 7., 3., 10., 6., 14.)))
+    blocks = _blocks_for(parents, _initial_patterns(parents, config), config)
+    ids, _, points, travel, processing = w._tables_for(blocks, config)
+    a, b = np.arange(3, dtype=np.int64), np.arange(3, 6, dtype=np.int64)
+    _, da = w._direction_array(a, travel, processing, 0)
+    _, db = w._direction_array(b, travel, processing, 0)
+    na = w._numeric_templates(a, da, points, processing, config.empty_speed, config.t_pre, config.t_post)
+    nb = w._numeric_templates(b, db, points, processing, config.empty_speed, config.t_pre, config.t_post)
+    result, wait = w._numeric_follow(na, nb, 0, 1, config.interference_dx,
+                                     config.interference_dy, config.numeric_epsilon)
+    fixed = build_operation_templates(RobotRoute(0, tuple(blocks[ids[i]] for i in a), tuple(da)), config)
+    following = build_operation_templates(RobotRoute(1, tuple(blocks[ids[i]] for i in b), tuple(db)), config)
+    ready = waited = 0.
+    for operation in following:
+        start, _, _ = earliest_safe_start(operation, ready, fixed, config)
+        assert math.isfinite(start)
+        waited += start - ready
+        ready = start + operation.duration
+    assert wait > 0.
+    assert wait == pytest.approx(waited, abs=1e-7)
+    assert result[-1, 6] == pytest.approx(ready, abs=1e-7)

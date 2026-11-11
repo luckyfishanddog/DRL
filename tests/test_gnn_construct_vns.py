@@ -3141,3 +3141,186 @@ def test_weld_layout_writer_preserves_rows_when_extending_existing_columns():
     assert rows[0]['native_cmax_s'] == ''
     assert all(rows[1][field] == value for field, value in latest.items())
 
+
+def _controlled_vnext_beam(monkeypatch, failed_robots=()):
+    from types import SimpleNamespace
+    from mrta_search import gnn_constructor as c, lns
+
+    parents = (ParentWeld('p0', (2., 9.), (2.6, 9.)), ParentWeld('p1', (4., 9.), (4.6, 9.)))
+    model = SimpleNamespace(joint_weights=torch.zeros(6), encode_static=lambda graph: None)
+    visits = []
+
+    def proposals(space, embeddings, model, state, blocks, nodes, pending, config):
+        assert set(blocks) == set(nodes) == {b for route in state.routes for b in route}
+        assert len(pending) + len(blocks) == len(parents)
+        visits.append(state)
+        first_robot = next((r for r, route in enumerate(state.routes) if 'p0::whole' in route), None)
+        if first_robot in failed_robots:
+            return (), torch.empty(0)
+        parent = min(pending)
+        plans = []
+        for robot in (0, 1):
+            index = next(i for i, a in enumerate(space.actions)
+                         if a.parent_id == parent and a.pattern.kind is SplitKind.WHOLE and a.robots == (robot,))
+            assignment = space.actions[index]
+            child, = space.children[assignment.pattern]
+            local = {**blocks, child.block_id: child}
+            after, action = lns.joint_block_candidates(state, child, assignment.pattern, local, config,
+                                                       robot_id=robot, check_initial_feasibility=False)[0]
+            plans.append(c.VNextJointAction(index, after, (action,), torch.empty(0), torch.empty(0)))
+        # Raw cumulative logits would keep both R1 branches; normalized scores
+        # retain the confident R1 prefix and one R0 prefix.
+        scores = [0.2, 0.] if parent == 'p0' else ([100., 100.] if first_robot == 0 else [1000., 990.])
+        return tuple(plans), torch.tensor(scores)
+
+    monkeypatch.setattr(c, 'vnext_joint_actions', proposals)
+    return parents, model, visits
+
+
+def test_vnext_width_one_preserves_greedy_and_width_two_ranks_global_log_probabilities(monkeypatch):
+    from mrta_search import gnn_constructor as c
+    import mrta_reference.scheduler as scheduler
+
+    parents, model, visits = _controlled_vnext_beam(monkeypatch)
+    monkeypatch.setattr(scheduler, 'reference_schedule_formal',
+                        lambda *a, **k: pytest.fail('B32 evaluated a partial construction state'))
+    greedy = c.construct_vnext_gnn(parents, model, CONFIG)
+    explicit = c.construct_vnext_gnn(parents, model, CONFIG, beam_width=1)
+    assert (greedy.solution, greedy.directions, greedy.actions) == (explicit.solution, explicit.directions, explicit.actions)
+    assert not greedy.candidates and greedy.solution.routes[0].block_ids == ('p1::whole', 'p0::whole')
+    visits.clear()
+    beam = c.construct_vnext_gnn(parents, model, CONFIG, beam_width=2)
+    assert len(visits) == 3 and len(beam.candidates) == 2
+    first_owners = [next(r for r, route in enumerate(plan.solution.routes) if 'p0::whole' in route.block_ids)
+                    for plan in beam.candidates]
+    assert first_owners == [1, 0]
+    assert all(len(plan.actions) == len(parents) for plan in beam.candidates)
+
+
+@pytest.mark.parametrize('failed_robots', ((0,), (0, 1)))
+def test_vnext_beam_discards_only_the_unextendable_paths(monkeypatch, failed_robots):
+    from mrta_search import gnn_constructor as c
+
+    parents, model, _ = _controlled_vnext_beam(monkeypatch, failed_robots)
+    result = c.construct_vnext_gnn(parents, model, CONFIG, beam_width=2)
+    if failed_robots == (0,):
+        assert result.solution is not None and len(result.actions) == 2
+        assert all('p0::whole' in p.solution.routes[1].block_ids for p in result.candidates)
+    else:
+        assert result.solution is None and not result.candidates
+        assert 'NO_COMPLETE_PARENT_ACTION' in result.rejection_reason and 'p1' in result.rejection_reason
+
+
+def test_vnext_beam_deduplicates_convergent_states_but_preserves_directions(monkeypatch):
+    from types import SimpleNamespace
+    from mrta_search import gnn_constructor as c, lns
+
+    parents = (ParentWeld('p0', (2., 9.), (2.6, 9.)), ParentWeld('p1', (4., 9.), (4.6, 9.)))
+    model = SimpleNamespace(joint_weights=torch.zeros(6), encode_static=lambda graph: None)
+
+    def proposals(space, embeddings, model, state, blocks, nodes, pending, config):
+        plans = []
+        options = [(parent, 0) for parent in sorted(pending)] if len(pending) == 2 else [(min(pending), 0), (min(pending), 1)]
+        for parent, direction in options:
+            index = next(i for i, a in enumerate(space.actions)
+                         if a.parent_id == parent and a.pattern.kind is SplitKind.WHOLE and a.robots == (0,))
+            child, = space.children[space.actions[index].pattern]
+            local = {**blocks, child.block_id: child}
+            route = tuple(sorted(local))
+            bits = tuple(direction if b == child.block_id else 0 for b in route)
+            after = lns.oriented_route_state((route, (), (), ()), (bits, (), (), ()), local, config)
+            action = lns.OrientedInsertionAction(child.block_id, 0, route.index(child.block_id), direction)
+            plans.append(c.VNextJointAction(index, after, (action,), torch.empty(0), torch.empty(0)))
+        return tuple(plans), torch.tensor([0., -1.]) if len(pending) == 1 else torch.zeros(2)
+
+    monkeypatch.setattr(c, 'vnext_joint_actions', proposals)
+    result = c.construct_vnext_gnn(parents, model, CONFIG, beam_width=2)
+    assert len(result.candidates) == 2
+    a, b = result.candidates
+    assert a.solution.patterns == b.solution.patterns and a.solution.routes == b.solution.routes
+    assert a.directions != b.directions
+
+
+def test_vnext_beam_real_joint_actions_preserve_complete_parents_loads_and_directions():
+    from mrta_search import gnn_constructor as c
+
+    torch.manual_seed(12)
+    parents = (ParentWeld('seam', (2., 5.7), (10., 6.3)), ParentWeld('separator', (3., 9.), (3.6, 9.)))
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True).eval()
+    result = c.construct_vnext_gnn(parents, model, CONFIG, beam_width=2)
+    assert result.solution is not None and 1 <= len(result.candidates) <= 2
+    for candidate in result.candidates:
+        blocks = block_map(candidate.solution, CONFIG, scope=FORMAL_SCOPE_V2)
+        assert set(blocks) == {a.block_id for a in candidate.actions}
+        assert {p.parent_id for p in candidate.solution.patterns} == {p.parent_id for p in parents}
+        for robot, route in enumerate(candidate.solution.routes):
+            assert len(route.block_ids) == len(candidate.directions[robot])
+            assert candidate.oriented_state.loads[robot] == pytest.approx(sum(CONFIG.process_time(blocks[b].length) for b in route.block_ids))
+            assert all(robot_is_eligible(blocks[b], robot, CONFIG) for b in route.block_ids)
+
+
+@pytest.mark.parametrize('outcomes, expected', (
+    (((ScheduleStatus.FEASIBLE, 100.), (ScheduleStatus.FEASIBLE, 90.)), 1),
+    (((ScheduleStatus.DEADLOCK, None), (ScheduleStatus.FEASIBLE, 120.)), 1),
+    (((ScheduleStatus.FEASIBLE, 100.), (ScheduleStatus.DEADLOCK, None)), 0),
+    (((ScheduleStatus.DEADLOCK, 123.), (ScheduleStatus.INFEASIBLE, None)), 0),
+))
+def test_complete_gnn_beam_selects_only_final_b32_results(monkeypatch, outcomes, expected):
+    from types import SimpleNamespace
+    import run_gnn_weld_layout as experiment
+
+    solution = _solution()
+    candidates = tuple(experiment.gnn.JointCompletionResult(solution,
+                       tuple(tuple(bit for _ in r.block_ids) for r in solution.routes), (), 90.) for bit in (0, 1))
+    clock = [0.]
+    monkeypatch.setattr(experiment, 'time', SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(experiment.gnn, 'parent_assignment_space', lambda *a: SimpleNamespace(graph=None))
+    builds, calls, chosen = [], [], []
+
+    def build(*args, **kwargs):
+        assert kwargs['beam_width'] == 2 and kwargs.get('deadline') is None
+        clock[0] += 90.
+        builds.append(kwargs)
+        return replace(candidates[0], candidates=candidates)
+
+    def schedule(result):
+        calls.append(result)
+        status, cmax = outcomes[len(calls) - 1]
+        return ScheduleResult(status, cmax=cmax, diagnostics=('actual failure',))
+
+    monkeypatch.setattr(experiment, 'build_joint', build)
+    monkeypatch.setattr(experiment, 'b32', schedule)
+    monkeypatch.setattr(experiment, 'repair_prefix', lambda *a: pytest.fail('beam construction invoked reconstruction'))
+    row, stats = experiment.complete_gnn(_parents(), SimpleNamespace(encode_static=lambda g: None), 1, (),
+                                        reconstruct=False, beam_width=2,
+                                        result_observer=lambda result, schedule: chosen.append(result))
+    assert len(builds) == 1 and row['b32_calls'] == len(calls) == 2 and stats == (1, 0, 0)
+    assert row['runtime_s'] == row['construct_s'] == 90.
+    assert chosen == [candidates[expected]]
+    assert row['status'] == outcomes[expected][0].value
+    assert row['cmax_s'] == (outcomes[expected][1] if outcomes[expected][0] is ScheduleStatus.FEASIBLE else None)
+    if row['cmax_s'] is None:
+        assert 'DEADLOCK' in row['diagnostic'] and 'INFEASIBLE' in row['diagnostic']
+
+
+def test_complete_gnn_beam_reuses_identical_complete_plan_evaluation(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_weld_layout as experiment
+
+    result = experiment.gnn.JointCompletionResult(_solution(), ((),) * 4, (), 0.)
+    monkeypatch.setattr(experiment.gnn, 'parent_assignment_space', lambda *a: SimpleNamespace(graph=None))
+    monkeypatch.setattr(experiment, 'build_joint', lambda *a, **k: replace(result, candidates=(result, result)))
+    calls = []
+
+    def schedule(result):
+        calls.append(result)
+        return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100.)
+
+    monkeypatch.setattr(experiment, 'b32', schedule)
+    model = SimpleNamespace(encode_static=lambda graph: None)
+    seen = {}
+    row, _ = experiment.complete_gnn(_parents(), model, 1, (), reconstruct=False, beam_width=2, evaluation_cache=seen)
+    assert row['b32_calls'] == len(calls) == 1
+    row, _ = experiment.complete_gnn(_parents(), model, 1, (), reconstruct=False, beam_width=2, evaluation_cache=seen)
+    assert row['b32_calls'] == 0 and len(calls) == 1
+

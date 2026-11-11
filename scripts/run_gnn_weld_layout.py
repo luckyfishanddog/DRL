@@ -27,6 +27,7 @@ from mrta_reference.scheduler import build_operation_templates, earliest_safe_st
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
 from mrta_baselines import AdaptedHGAConfig, AdaptedWAGConfig, run_adapted_hga_v2, run_adapted_wag_vns_v2
+from mrta_baselines.wag_vns import priority_schedule
 from mrta_search import gnn_constructor as gnn, lns
 from mrta_search.direction import _fixed_first_dp
 from mrta_search.initialization import build_oriented_insertion_beam
@@ -37,20 +38,27 @@ DATA = ROOT / 'data' / 'weld_layout'
 MODEL = ROOT / 'models' / 'gnn_weld_layout.pt'
 RESULTS = ROOT / 'results' / 'gnn_weld_layout_comparison.csv'
 FINAL_RESULTS = ROOT / 'results' / 'new_dataset_final'
+BEAM_VALIDATION_CSV = FINAL_RESULTS / 'gnn_beam2_validation.csv'
+BEAM_VALIDATION_FIELDS = ('layout_id', 'method', 'status', 'cmax_s',
+                          'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
+                          'move_s', 'runtime_s', 'b32_calls', 'cmax_change_vs_width1_s',
+                          'cmax_change_vs_width1_pct', 'diagnostic')
 CONFIG = ScientificConfig()
 SEED = 20261110
 TEST_SEEDS = (20261110, 20261111, 20261112)
 CHECKPOINTS = (5., 30., 60.)
 BASELINES = {
-    'WAG+VNS': (run_adapted_wag_vns_v2, AdaptedWAGConfig, 'wag_vns_results.csv'),
-    'HGA': (run_adapted_hga_v2, AdaptedHGAConfig, 'hga_results.csv'),
+    'WAG+VNS': (run_adapted_wag_vns_v2, AdaptedWAGConfig, 'wag_vns_results_optimized.csv'),
+    'HGA': (run_adapted_hga_v2, AdaptedHGAConfig, 'hga_results_optimized.csv'),
 }
-BASELINE_ITERATIONS = {'WAG+VNS': 500, 'HGA': 30}
-HGA_TEST_COUNT = 4
+BASELINE_ITERATIONS = {'WAG+VNS': 500, 'HGA': 200000}
 RESULT_FIELDS = ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'runtime_s', 'construct_s',
                  'cmax_5_s', 'cmax_30_s', 'cmax_60_s', 'native_cmax_s', 'native_cmax_5_s',
                  'native_cmax_30_s', 'native_cmax_60_s', 'max_processing_s', 'move_s', 'wait_s',
                  'b32_calls', 'diagnostic', 'source')
+OPTIMIZED_FIELDS = ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'native_cmax_s',
+                    'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
+                    'move_s', 'wait_s', 'runtime_s', 'iterations', 'b32_calls', 'diagnostic', 'source')
 BEAM_SEED = 202611041
 
 
@@ -119,12 +127,8 @@ def native_result(operations, directions, policy):
 
 
 def hga_cycle_time(solution, config):
-    """Liu et al.'s min-max tour time for one fixed working area."""
-    blocks = route_blocks(solution, config)
-    directions = tuple(optimize_directions(route, config).orientations for route in blocks)
-    operations = tuple(build_operation_templates(RobotRoute(r, route, bits), config)
-                       for r, (route, bits) in enumerate(zip(blocks, directions)))
-    return native_result(operations, directions, 'HGA_PAPER_CYCLE_FOUR_ROBOTS')
+    """Four-robot adaptation: priority scheduling includes MOVE and WAIT."""
+    return priority_schedule(solution, config)
 
 
 def _wag_x_view(operation, config):
@@ -152,46 +156,11 @@ def _wag_follow_route(fixed, following, config):
 
 
 def wag_priority_schedule(solution, config):
-    """Lee et al.'s sequential priority rule on each independent rail."""
-    blocks = route_blocks(solution, config)
-    directions, schedules = [], []
-    policy = 'WAG_PAPER_PRIORITY_TWO_RAILS'
-    for left in (0, 2):
-        right = left + 1
-        pair = blocks[left:right + 1]
-        options = [tuple(_fixed_first_dp(route, first, config) for first in (0, 1)) if route else ((0., ()),)
-                   for route in pair]
-        chosen = []
-        for (m0, d0), (m1, d1) in product(*options):
-            if d0 and d1:
-                x0 = oriented_endpoints(pair[0][0], d0[0])[0][0]
-                x1 = oriented_endpoints(pair[1][0], d1[0])[0][0]
-                if x0 + config.interference_dx > x1 + config.numeric_epsilon:
-                    continue
-            chosen.append((m0 + m1, d0, d1))
-        if not chosen:
-            return ScheduleResult(ScheduleStatus.INFEASIBLE, diagnostics=(f'WAG initial order R{left}/R{right}',),
-                                  reference_policy_id=policy)
-        _, d0, d1 = min(chosen)
-        directions.extend((d0, d1))
-        a, b = (build_operation_templates(RobotRoute(r, route, bits), config)
-                for r, route, bits in zip((left, right), pair, (d0, d1)))
-        if not a or not b:
-            schedules.extend((a, b))
-            continue
-        forward = _wag_follow_route(a, b, config)
-        reverse = _wag_follow_route(b, a, config) if forward is None or forward[1] else None
-        if forward is None and reverse is None:
-            return ScheduleResult(ScheduleStatus.DEADLOCK, diagnostics=(f'WAG fixed priorities blocked R{left}/R{right}',),
-                                  reference_policy_id=policy)
-        if reverse is not None and (forward is None or max(b[-1].end_time, reverse[2]) < max(a[-1].end_time, forward[2])):
-            schedules.extend((reverse[0], b))
-        else:
-            schedules.extend((a, forward[0]))
-    return native_result(schedules, tuple(directions), policy)
+    """Shared implementation of the paper priority rule on both rails."""
+    return priority_schedule(solution, config)
 
 
-NATIVE_EVALUATORS = {'WAG+VNS': wag_priority_schedule, 'HGA': hga_cycle_time}
+NATIVE_EVALUATORS = {'WAG+VNS': priority_schedule, 'HGA': priority_schedule}
 
 
 def baseline_run(parents, method, seed, budget, checkpoints, *, iterations=None, candidate_evaluator=None):
@@ -219,8 +188,22 @@ def baseline_job(job):
                 status=schedule.status.value if schedule else 'NO_NATIVE_SOLUTION',
                 cmax_s=schedule.cmax if schedule else None, runtime_s=time.perf_counter() - started,
                 b32_calls=int(schedule is not None), diagnostic=diagnostic,
-                source=f'PAPER_OBJECTIVE_{result.iterations}', native_cmax_s=best.schedule.cmax if best else None,
-                **{f'native_cmax_{int(t)}_s': result.checkpoints[t] for t in CHECKPOINTS}, **final_metrics(schedule))
+                source='OPTIMIZED_ITERATIONS', iterations=result.iterations,
+                native_cmax_s=best.schedule.cmax if best else None,
+                **baseline_metrics(best, schedule))
+
+
+def baseline_metrics(best, schedule):
+    if best is None:
+        return {}
+    blocks = block_map(best.solution, CONFIG, scope=FORMAL_SCOPE_V2)
+    loads = {f'processing_r{r.robot_id}_s': sum(CONFIG.process_time(blocks[b].length) for b in r.block_ids)
+             for r in best.solution.routes}
+    move = sum(math.dist(oriented_endpoints(blocks[route.block_ids[k - 1]], best.directions[r][k - 1])[1],
+                              oriented_endpoints(blocks[route.block_ids[k]], best.directions[r][k])[0]) / CONFIG.empty_speed
+               for r, route in enumerate(best.solution.routes) for k in range(1, len(route.block_ids)))
+    wait = sum(op.duration for op in schedule.operations if op.kind is OperationKind.WAIT) if schedule else None
+    return dict(**loads, move_s=move, wait_s=wait)
 
 
 def read_rows(path):
@@ -231,15 +214,16 @@ def read_rows(path):
 
 
 def write_rows(path, rows, *, append=False):
+    fields = OPTIMIZED_FIELDS if isinstance(path.name, str) and path.name.endswith('_optimized.csv') else RESULT_FIELDS
     needs_header = not append or not path.exists() or not path.stat().st_size
     if append and not needs_header:
         with path.open(encoding='utf-8', newline='') as stream:
             header = next(csv.reader(stream))
-        if header != list(RESULT_FIELDS):
+        if header != list(fields):
             rows = read_rows(path) + list(rows)
             append, needs_header = False, True
     with path.open('a' if append else 'w', encoding='utf-8', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=RESULT_FIELDS)
+        writer = csv.DictWriter(stream, fieldnames=fields)
         if needs_header:
             writer.writeheader()
         writer.writerows(rows)
@@ -260,36 +244,27 @@ def retained_rows(method):
                        source='RETAINED_DETERMINISTIC')
 
 
-def run_baselines(workers, only=None):
-    FINAL_RESULTS.mkdir(parents=True, exist_ok=True)
-    rule_path = FINAL_RESULTS / 'rule_beam_results.csv'
-    if not rule_path.exists():
-        write_rows(rule_path, retained_rows('RULE/BEAM'))
-    layouts = load_layouts('test')
-    hga_layouts = {name for name, _ in layouts[:HGA_TEST_COUNT]}
+def run_baselines(workers, only=None, *, split='validation', representative=False):
+    layouts = load_layouts(split)
+    seeds = TEST_SEEDS
+    if representative:
+        ordered = sorted(layouts, key=lambda item: (len(item[1]), item[0]))
+        layouts = [ordered[0], ordered[len(ordered) // 2], ordered[-1]]
+        seeds = (SEED,)
     paths = {method: FINAL_RESULTS / settings[2] for method, settings in BASELINES.items() if only in (None, method)}
     done = set()
     for path in paths.values():
         rows = read_rows(path)
-        if rows and ('native_cmax_s' not in rows[0] or any(row['source'] == 'RUN' for row in rows)):
-            for row in rows:
-                if row['source'] == 'RUN':
-                    row['source'] = 'SUPERSEDED_60S'
-                elif row['source'].startswith('ITERATIONS_'):
-                    row['source'] = 'B32_ADAPTED_' + row['source']
-            write_rows(path, rows)
         done.update((row['layout_id'], row['method'], int(row['seed'])) for row in rows
-                    if row['source'].startswith('PAPER_OBJECTIVE_'))
-    jobs = [(layout, method, seed) for layout in layouts for seed in TEST_SEEDS for method in paths
-            if (method != 'HGA' or layout[0] in hga_layouts) and (layout[0], method, seed) not in done]
+                    if row['source'] == 'OPTIMIZED_ITERATIONS')
+    jobs = [(layout, method, seed) for layout in layouts for seed in seeds for method in paths
+            if (layout[0], method, seed) not in done]
     with ProcessPoolExecutor(max_workers=workers, initializer=configure_cpu) as executor:
         futures = [executor.submit(baseline_job, job) for job in jobs]
         for future in as_completed(futures):
             row = future.result()
+            print('BASELINE', json.dumps(row), flush=True)
             write_rows(paths[row['method']], [row], append=True)
-            print('BASELINE', row['method'], row['layout_id'], row['seed'], row['status'], row['cmax_s'], flush=True)
-    if only == 'WAG+VNS':
-        write_comparison()
 
 
 FINAL_MODEL = ROOT / 'models' / 'gnn_weld_layout_final.pt'
@@ -559,31 +534,40 @@ def repair_prefix(result, space, rng):
 
 
 @torch.no_grad()
-def complete_gnn(parents, model, seed, checkpoints, *, reconstruct):
+def complete_gnn(parents, model, seed, checkpoints, *, reconstruct, beam_width=1,
+                 evaluation_cache=None, result_observer=None):
+    if reconstruct and beam_width != 1:
+        raise ValueError('the width-two experiment uses construction only')
     started = time.perf_counter()
     repair_rng = Random(seed + 1)
     space = gnn.parent_assignment_space(parents, CONFIG)
     embeddings = model.encode_static(space.graph)
     calls = repairs = accepted = 0
-    seen, events = {}, []
+    seen = {} if evaluation_cache is None else evaluation_cache
+    events = []
     best_result = best_schedule = None
+    failed_result = failed_schedule = None
+    failures = []
     status = 'NO_COMPLETE_SOLUTION'
     diagnostic = ''
 
     def consider(result):
-        nonlocal best_result, best_schedule, calls, status, diagnostic
+        nonlocal best_result, best_schedule, failed_result, failed_schedule, calls, status, diagnostic
         if result.solution is None:
             diagnostic = result.rejection_reason or 'NO_COMPLETE_SOLUTION'
             return False
         schedule, called = evaluate_once(result, seen)
         calls += int(called)
-        status = schedule.status.value
         elapsed = time.perf_counter() - started
         if not schedule.feasible:
-            details = schedule.diagnostics[0] if schedule.diagnostics else ''
-            if schedule.wait_for_graph:
-                details += ' | blockers=' + str(schedule.wait_for_graph)
-            diagnostic = f'{schedule.status.value} {details}'
+            if failed_result is None:
+                failed_result, failed_schedule = result, schedule
+                status = schedule.status.value
+                details = schedule.diagnostics[0] if schedule.diagnostics else ''
+                if schedule.wait_for_graph:
+                    details += ' | blockers=' + str(schedule.wait_for_graph)
+                diagnostic = f'{schedule.status.value} {details}'
+            failures.append(f'{schedule.status.value}: ' + ' | '.join(schedule.diagnostics))
             return False
         if best_schedule is not None and schedule.cmax >= best_schedule.cmax - 1e-8:
             return False
@@ -591,9 +575,10 @@ def complete_gnn(parents, model, seed, checkpoints, *, reconstruct):
         events.append((elapsed, schedule.cmax))
         return True
 
-    result = build_joint(parents, model, space=space, embeddings=embeddings)
+    result = build_joint(parents, model, space=space, embeddings=embeddings, beam_width=beam_width)
     initial_seconds = time.perf_counter() - started
-    consider(result)
+    for candidate in result.candidates or (result,):
+        consider(candidate)
     if reconstruct and best_result is not None:
         for _ in range(2):
             partial = repair_prefix(best_result, space, repair_rng)
@@ -605,13 +590,86 @@ def complete_gnn(parents, model, seed, checkpoints, *, reconstruct):
                                    selected=selected, rng=repair_rng)
             accepted += int(consider(repaired))
 
+    if best_schedule is None and len(failures) > 1:
+        diagnostic += ' | candidates: ' + ' / '.join(failures)
     row = dict(status='FEASIBLE' if best_schedule else status,
                cmax_s=best_schedule.cmax if best_schedule else None, runtime_s=time.perf_counter() - started,
                construct_s=initial_seconds, b32_calls=calls, diagnostic='' if best_schedule else diagnostic,
                source=GNN_RESULT_SOURCE, **final_metrics(best_schedule))
     row.update({f'cmax_{int(t)}_s': min((c for elapsed, c in events if elapsed <= t), default=None)
                 for t in checkpoints})
+    if result_observer is not None:
+        result_observer(best_result or failed_result or result, best_schedule or failed_schedule)
     return row, (1, repairs, accepted)
+
+
+def beam_validation_metrics(result):
+    """Full-plan processing and directed MOVE, also for B32 failures."""
+    if result.solution is None:
+        return {}
+    state = result.oriented_state
+    if state is None:
+        state = lns.oriented_route_state(tuple(r.block_ids for r in result.solution.routes), result.directions,
+                                         block_map(result.solution, CONFIG, scope=FORMAL_SCOPE_V2), CONFIG)
+    return dict(**{f'processing_r{r}_s': value for r, value in enumerate(state.loads)}, move_s=state.travel)
+
+
+def beam_validation_job(layout):
+    name, parents = layout
+    rows, selected, seen = [], {}, {}
+    started = time.perf_counter()
+    result = rule_beam(parents)
+    schedule, called = evaluate_once(result, seen)
+    rows.append(dict(layout_id=name, method='RULE/BEAM',
+                     status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
+                     cmax_s=schedule.cmax if schedule and schedule.feasible else None,
+                     runtime_s=time.perf_counter() - started, b32_calls=int(called),
+                     diagnostic=(' | '.join(schedule.diagnostics) if not schedule.feasible else '')
+                     if schedule else result.rejection_reason, **beam_validation_metrics(result)))
+    for width in (1, 2):
+        def retain(result, schedule):
+            selected[width] = result
+
+        row, _ = complete_gnn(parents, worker_model, SEED, (), reconstruct=False, beam_width=width,
+                              evaluation_cache=seen, result_observer=retain)
+        rows.append(dict(layout_id=name, method=f'GNN_WIDTH{width}',
+                         **{key: row[key] for key in ('status', 'cmax_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+                         **beam_validation_metrics(selected[width])))
+    if rows[1]['cmax_s'] is not None and rows[2]['cmax_s'] is not None:
+        delta = rows[2]['cmax_s'] - rows[1]['cmax_s']
+        rows[2].update(cmax_change_vs_width1_s=delta,
+                       cmax_change_vs_width1_pct=100. * delta / rows[1]['cmax_s'])
+    for row in rows:
+        print('BEAM_VALIDATION', json.dumps(row), flush=True)
+    # Existing insertion actions provide a compact decision trace without log files.
+    for width, result in selected.items():
+        if result.solution is not None:
+            blocks = block_map(result.solution, CONFIG, scope=FORMAL_SCOPE_V2)
+            modes = {p.parent_id: p.kind.value for p in result.solution.patterns}
+            trace = [(blocks[a.block_id].parent_id, modes[blocks[a.block_id].parent_id],
+                      a.robot, a.position, a.direction) for a in result.actions]
+            print('BEAM_DECISIONS', name, width, json.dumps(trace[:12]), flush=True)
+    return rows
+
+
+def beam_validation(workers):
+    """One deterministic run per method on VALIDATION; no training or time limit."""
+    saved = torch.load(FINAL_MODEL, map_location='cpu', weights_only=True)
+    weights = pickle.dumps(saved['state_dict'])
+    layouts = load_layouts('validation')
+    with BEAM_VALIDATION_CSV.open('a', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=BEAM_VALIDATION_FIELDS)
+        if not stream.tell():
+            writer.writeheader()
+        done = {(row['layout_id'], row['method']) for row in read_rows(BEAM_VALIDATION_CSV)}
+        jobs = [layout for layout in layouts if not all((layout[0], method) in done
+                                                       for method in ('RULE/BEAM', 'GNN_WIDTH1', 'GNN_WIDTH2'))]
+        with ProcessPoolExecutor(max_workers=workers, initializer=configure_joint_worker,
+                                 initargs=(weights,)) as executor:
+            for rows in executor.map(beam_validation_job, jobs):
+                writer.writerows(row for row in rows if (row['layout_id'], row['method']) not in done)
+                stream.flush()
+    print('BEAM_VALIDATION_CSV', BEAM_VALIDATION_CSV, flush=True)
 
 
 def validation_job(layout):
@@ -714,7 +772,7 @@ def test(workers):
 
 def write_comparison():
     layouts = load_layouts('test')
-    hga_layouts = {name for name, _ in layouts[:HGA_TEST_COUNT]}
+    hga_layouts = {name for name, _ in layouts}
     rows = [row for name in ('rule_beam_results.csv', 'wag_vns_results.csv', 'hga_results.csv', 'gnn_results.csv')
             for row in read_rows(FINAL_RESULTS / name)
             if (row['method'] not in BASELINES or row['source'].startswith('PAPER_OBJECTIVE_'))
@@ -722,22 +780,76 @@ def write_comparison():
             and (row['method'] != 'HGA' or row['layout_id'] in hga_layouts)]
     rows.sort(key=lambda row: (row['layout_id'], int(row['seed']), row['method']))
     write_rows(FINAL_RESULTS / 'final_comparison.csv', rows)
-    print('COMPARISON', len(rows), 'available rows of', (5 * len(layouts) + HGA_TEST_COUNT) * len(TEST_SEEDS), flush=True)
+    print('COMPARISON', len(rows), 'available rows of', 6 * len(layouts) * len(TEST_SEEDS), flush=True)
+
+
+def summarize_optimized_baselines():
+    """Read the two result files and retained references; never rewrite history."""
+    rows = [r for _, _, name in BASELINES.values() for r in read_rows(FINAL_RESULTS / name)
+            if r['source'] == 'OPTIMIZED_ITERATIONS']
+    references = read_rows(BEAM_VALIDATION_CSV)
+    references += read_rows(FINAL_RESULTS / 'rule_beam_results.csv')
+    references += [r for r in read_rows(FINAL_RESULTS / 'gnn_results.csv')
+                   if r['source'] == GNN_RESULT_SOURCE or r['method'] == 'GNN_VNEXT']
+    def average(values):
+        return sum(values) / len(values) if values else None
+    summaries = []
+    for split in ('validation', 'test'):
+        for method in BASELINES:
+            selected = [r for r in rows if r['method'] == method and r['layout_id'].startswith(split + '_')]
+            if not selected:
+                continue
+            feasible = [r for r in selected if r['status'] == 'FEASIBLE']
+            cmax = [float(r['cmax_s']) for r in feasible]
+            times = [float(r['runtime_s']) for r in selected]
+            summary = dict(split=split, method=method, runs=len(selected), feasible=len(feasible),
+                           median_cmax_s=median(cmax) if cmax else None, mean_cmax_s=average(cmax),
+                           mean_runtime_s=average(times), max_runtime_s=max(times),
+                           iterations=sorted({int(r['iterations']) for r in selected}),
+                           b32_calls=sum(int(r['b32_calls']) for r in selected),
+                           processing_mean_s=[average([float(r[f'processing_r{i}_s']) for r in feasible]) for i in range(4)],
+                           move_mean_s=average([float(r['move_s']) for r in feasible]),
+                           wait_mean_s=average([float(r['wait_s']) for r in feasible]))
+            print('BASELINE_SUMMARY', json.dumps(summary), flush=True)
+            summaries.append(summary)
+            comparison_methods = ('RULE/BEAM', 'GNN_WIDTH1') if split == 'validation' else (
+                'RULE/BEAM', 'GNN_VNEXT', *JOINT_METHODS)
+            for other in comparison_methods:
+                pool = [r for r in references if r['method'] == other]
+                pairs = []
+                for row in feasible:
+                    candidates = [r for r in pool if r['layout_id'] == row['layout_id']
+                                  and (not r.get('seed') or int(r['seed']) == int(row['seed']))]
+                    if candidates and candidates[-1]['status'] == 'FEASIBLE':
+                        pairs.append((float(row['cmax_s']), float(candidates[-1]['cmax_s'])))
+                delta = [a - b for a, b in pairs]
+                print('BASELINE_PAIRED', json.dumps(dict(split=split, method=method, reference=other,
+                      common_feasible=len(pairs), wins=sum(d < -1.e-8 for d in delta),
+                      ties=sum(abs(d) <= 1.e-8 for d in delta), losses=sum(d > 1.e-8 for d in delta),
+                      median_delta_s=median(delta) if pairs else None,
+                      median_change_pct=median([100. * (a - b) / b for a, b in pairs]) if pairs else None)), flush=True)
+    return summaries
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
+    parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
+    parser.add_argument('--representative', action='store_true', help='small/median/large layouts, first seed only')
     args = parser.parse_args()
     configure_cpu()
     if args.stage == 'baselines':
-        run_baselines(args.workers, args.method)
+        run_baselines(args.workers, args.method, split=args.split, representative=args.representative)
     elif args.stage == 'train':
         train(args.workers)
     elif args.stage == 'test':
         test(args.workers)
+    elif args.stage == 'beam-validation':
+        beam_validation(args.workers)
+    elif args.stage == 'baseline-summary':
+        summarize_optimized_baselines()
     else:
         write_comparison()
 
