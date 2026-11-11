@@ -3324,3 +3324,143 @@ def test_complete_gnn_beam_reuses_identical_complete_plan_evaluation(monkeypatch
     row, _ = experiment.complete_gnn(_parents(), model, 1, (), reconstruct=False, beam_width=2, evaluation_cache=seen)
     assert row['b32_calls'] == 0 and len(calls) == 1
 
+
+def test_cmax_value_old_checkpoint_loads_and_only_new_head_trains():
+    import io
+    import run_gnn_weld_layout as experiment
+
+    saved = torch.load(experiment.FINAL_MODEL, map_location='cpu', weights_only=True)
+    model = experiment.joint_model(saved['state_dict'])
+    original = {k: v.clone() for k, v in model.state_dict().items()}
+    assert model.cmax_value_head is None and model.load_state_dict(original).missing_keys == []
+    model.enable_cmax_value()
+    assert all(p.requires_grad == name.startswith('cmax_value_head.') for name, p in model.named_parameters())
+    optimizer = torch.optim.AdamW(model.cmax_value_head.parameters(), lr=.001)
+    features = torch.randn(3, model.cmax_value_head[0].in_features)
+    for _ in range(3):
+        scores = model.cmax_values(features)
+        loss = torch.nn.functional.softplus(scores[1] - scores[0])
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    assert any(torch.count_nonzero(p) for p in model.cmax_value_head[-1].parameters())
+    assert all(torch.equal(value, model.state_dict()[key]) for key, value in original.items())
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    buffer.seek(0)
+    restored = experiment.joint_model(torch.load(buffer, weights_only=True), cmax_value=True)
+    assert torch.equal(model.cmax_values(features), restored.cmax_values(features))
+
+
+def test_cmax_value_diversity_uses_mode_owner_and_another_parent(monkeypatch):
+    from types import SimpleNamespace
+    from mrta_search import gnn_constructor as c
+
+    parents, model, visits = _controlled_vnext_beam(monkeypatch)
+    space = c.parent_assignment_space(parents, CONFIG)
+    indices = [next(i for i, a in enumerate(space.actions)
+                    if a.parent_id == parent and a.pattern.kind is SplitKind.WHOLE and a.robots == (robot,))
+               for parent, robot in (('p0', 0), ('p0', 0), ('p0', 1), ('p1', 0))]
+    states = [SimpleNamespace(routes=((str(i),), (), (), ()), directions=((i % 2,), (), (), ())) for i in range(4)]
+    plans = tuple(c.VNextJointAction(index, state, (), torch.empty(0), torch.empty(0)) for index, state in zip(indices, states))
+    assert c.vnext_value_candidate_indices(space, plans, torch.tensor([4., 3., 2., 1.])) == (0, 2, 3)
+    assert c.vnext_value_candidate_indices(space, plans[:2], torch.tensor([2., 1.])) == (0, 1)
+    duplicate = (plans[0], plans[0])
+    assert c.vnext_value_candidate_indices(space, duplicate, torch.tensor([2., 1.])) == (0,)
+
+
+def test_cmax_value_full_split_features_match_training_and_constructor(monkeypatch):
+    from mrta_search import gnn_constructor as c, lns
+
+    torch.manual_seed(43)
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True, cmax_value=True).eval()
+    parents = (ParentWeld('seam', (2., 5.7), (10., 6.3)),)
+    space = c.parent_assignment_space(parents, CONFIG)
+    target = next(i for i, a in enumerate(space.actions) if a.pattern.kind is SplitKind.Y_SPLIT and a.robots == (0, 2))
+    monkeypatch.setattr(c, 'shortlist_assignments', lambda *a, **k: (target,))
+    expected, actual = [], []
+
+    def observe(state, selected, plans, scores):
+        assert all(len(p.actions) == len(p.insertion_features) == 2 for p in plans)
+        keep = c.vnext_value_candidate_indices(space, plans, scores)
+        expected.append(model.cmax_value_inputs(space, model.encode_static(space.graph), state, {'seam'},
+                                                tuple(plans[i] for i in keep), scores[list(keep)]))
+
+    original = model.cmax_values
+
+    def score(features):
+        actual.append(features.clone())
+        return original(features)
+
+    monkeypatch.setattr(model, 'cmax_values', score)
+    result = c.construct_vnext_gnn(parents, model, CONFIG, space=space, step_observer=observe)
+    assert result.solution is not None and len(result.actions) == 2
+    assert len(actual) == len(expected) == 1 and torch.equal(actual[0], expected[0])
+    assert actual[0].shape[1] == model.cmax_value_head[0].in_features > 300
+
+
+def test_cmax_value_zero_head_preserves_legacy_width_one_then_changes_actual_choice(monkeypatch):
+    from mrta_search import gnn_constructor as c
+
+    torch.manual_seed(10)
+    parents = (ParentWeld('p', (2., 9.), (2.6, 9.)),)
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True).eval()
+    legacy = c.construct_vnext_gnn(parents, model, CONFIG)
+    model.enable_cmax_value()
+    zero = c.construct_vnext_gnn(parents, model, CONFIG)
+    assert (legacy.solution, legacy.directions, legacy.actions) == (zero.solution, zero.directions, zero.actions)
+    monkeypatch.setattr(model, 'cmax_values', lambda features: torch.arange(len(features), dtype=torch.float32))
+    reranked = c.construct_vnext_gnn(parents, model, CONFIG)
+    assert (reranked.solution.routes, reranked.directions) != (legacy.solution.routes, legacy.directions)
+
+
+def test_cmax_value_b32_preferences_ignore_both_failed_partial_cmax():
+    from run_gnn_weld_layout import value_preferences
+
+    failed = ScheduleResult(ScheduleStatus.DEADLOCK, cmax=1.)
+    infeasible = ScheduleResult(ScheduleStatus.INFEASIBLE, cmax=2.)
+    good = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100.)
+    bad = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=120.)
+    assert value_preferences([failed, infeasible]) == []
+    assert value_preferences([failed, good, bad]) == [(1, 0, 'feasibility'), (2, 0, 'feasibility'), (1, 2, 'cmax')]
+    assert value_preferences([good, good]) == []
+    assert value_preferences([None, good]) == []
+
+
+def test_cmax_value_collector_uses_three_real_prefixes_and_only_original_continuations(monkeypatch):
+    import run_gnn_weld_layout as experiment
+    from mrta_search import gnn_constructor as c
+
+    experiment.configure_cpu()
+    torch.manual_seed(19)
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True).eval()
+    monkeypatch.setattr(experiment, 'worker_model', model, raising=False)
+    parents = tuple(ParentWeld(f'p{i}', (1. + i * 2., 9. if i < 4 else 3.),
+                               (1.6 + i * 2., 9. if i < 4 else 3.)) for i in range(8))
+    builds, evaluated = [], []
+    original = experiment.build_joint
+
+    def build(*args, **kwargs):
+        assert args[1].cmax_value_head is None and kwargs['beam_width'] == 1 and kwargs.get('deadline') is None
+        builds.append(kwargs)
+        return original(*args, **kwargs)
+
+    def b32(result):
+        key = experiment.plan_key(result.solution, result.directions)
+        assert key not in evaluated
+        evaluated.append(key)
+        return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=max(result.oriented_state.loads) + result.oriented_state.travel)
+
+    monkeypatch.setattr(experiment, 'build_joint', build)
+    monkeypatch.setattr(experiment, 'b32', b32)
+    monkeypatch.setattr(experiment, 'rule_beam', lambda *a: pytest.fail('repeated RULE teacher'))
+    monkeypatch.setattr(experiment, 'baseline_run', lambda *a: pytest.fail('repeated WAG/HGA teacher'))
+    sample = experiment.collect_value_branches(('train_fixture', parents))
+    assert [group['assigned_parents'] for group in sample['groups']] == [2, 4, 6]
+    assert len(sample['rows']) == 9 and len(builds) == 10 and builds[0].get('state') is None
+    assert len(evaluated) == sum(row['b32_calls'] for row in sample['rows']) <= 9
+    for group in sample['groups']:
+        assert len(group['pending']) + len(group['selected']) == len(parents)
+        assert len(group['candidates']) == group['features'].shape[0] == 3
+        assert group['features'].shape[1] == model.policy[0].in_features + c._VNEXT_VALUE_EXTRA_DIM
+

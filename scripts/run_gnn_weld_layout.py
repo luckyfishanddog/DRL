@@ -268,6 +268,12 @@ def run_baselines(workers, only=None, *, split='validation', representative=Fals
 
 
 FINAL_MODEL = ROOT / 'models' / 'gnn_weld_layout_final.pt'
+CMAX_VALUE_MODEL = ROOT / 'models' / 'gnn_weld_layout_cmax_value.pt'
+CMAX_VALUE_RESULTS = FINAL_RESULTS / 'gnn_cmax_value_results.csv'
+CMAX_VALUE_FIELDS = ('split', 'layout_id', 'method', 'epoch', 'fraction', 'assigned_parents', 'candidate',
+                     'parent_id', 'mode', 'robots', 'status', 'cmax_s',
+                     'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
+                     'max_processing_s', 'move_s', 'runtime_s', 'b32_calls', 'diagnostic')
 TRAIN_BUDGET = 12.
 EPOCHS = 6
 VALIDATE_EPOCHS = (2, 4, 6)
@@ -279,8 +285,8 @@ def configure_cpu():
     torch.set_num_threads(1)
 
 
-def joint_model(weights=None):
-    model = gnn.VNextGNN(workload_lookahead=True, joint_actions=True)
+def joint_model(weights=None, *, cmax_value=False):
+    model = gnn.VNextGNN(workload_lookahead=True, joint_actions=True, cmax_value=cmax_value)
     if weights is None:
         saved = torch.load(MODEL, map_location='cpu', weights_only=True)
         missing, extra = model.load_state_dict(saved['models']['GNN_VNEXT_WORKLOAD']['state_dict'], strict=False)
@@ -831,9 +837,271 @@ def summarize_optimized_baselines():
     return summaries
 
 
+def value_preferences(schedules):
+    """Reuse the existing B32 preference rule, only within one saved prefix."""
+    pairs = []
+    for first in range(len(schedules)):
+        for second in range(first + 1, len(schedules)):
+            winner, kind = better_branch(schedules[first], schedules[second])
+            if winner is not None:
+                indices = (first, second)
+                pairs.append((indices[winner], indices[1 - winner], kind))
+    return pairs
+
+
+@torch.no_grad()
+def collect_value_branches(layout):
+    name, parents = layout
+    started = time.perf_counter()
+    model = worker_model
+    if model.cmax_value_head is not None:
+        raise ValueError('TRAIN continuation labels must use the original frozen GNN')
+    model.requires_grad_(False)
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    embeddings = model.encode_static(space.graph)
+    depths = {math.ceil(len(parents) * fraction): fraction for fraction in (.25, .50, .75)}
+    prefixes = []
+
+    def observe(state, selected, plans, scores):
+        if len(selected) in depths:
+            indices = gnn.vnext_value_candidate_indices(space, plans, scores)
+            chosen = tuple(plans[i] for i in indices)
+            pending = set(space.parent_ids) - selected.keys()
+            features = model.cmax_value_inputs(space, embeddings, state, pending, chosen, scores[list(indices)])
+            prefixes.append((state, dict(selected), chosen, features.cpu()))
+
+    original = build_joint(parents, model, space=space, embeddings=embeddings,
+                           beam_width=1, step_observer=observe)
+    original_seconds = time.perf_counter() - started
+    groups, rows, seen = [], [], {}
+    for state, selected, plans, features in prefixes:
+        fraction = depths[len(selected)]
+        schedules, descriptions = [], []
+        for index, plan in enumerate(plans, 1):
+            branch_started = time.perf_counter()
+            assignment = space.actions[plan.assignment_index]
+            result = build_joint(parents, model, space=space, embeddings=embeddings, beam_width=1,
+                                 state=plan.state, selected={**selected, assignment.parent_id: assignment.pattern})
+            schedule, called = evaluate_once(result, seen)
+            elapsed = time.perf_counter() - branch_started
+            diagnostic = (' | '.join(schedule.diagnostics) if not schedule.feasible else '') if schedule else result.rejection_reason
+            row = dict(split='train', layout_id=name, method='FROZEN_GNN_BRANCH', fraction=fraction,
+                       assigned_parents=len(selected), candidate=index, parent_id=assignment.parent_id,
+                       mode=assignment.pattern.kind.value, robots=str(assignment.robots),
+                       status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
+                       cmax_s=schedule.cmax if schedule and schedule.feasible else None,
+                       runtime_s=elapsed, b32_calls=int(called), diagnostic=diagnostic,
+                       **beam_validation_metrics(result))
+            rows.append(row)
+            schedules.append(schedule)
+            descriptions.append(dict(parent_id=assignment.parent_id, kind=assignment.pattern.kind.value,
+                                     rail=assignment.pattern.rail.value if assignment.pattern.rail else None,
+                                     t=assignment.pattern.t, point_id=assignment.pattern.point_id, robots=assignment.robots,
+                                     actions=[dict(block_id=a.block_id, robot=a.robot, position=a.position,
+                                                   direction=a.direction, neighbour_changes=a.neighbour_changes)
+                                              for a in plan.actions]))
+        groups.append(dict(fraction=fraction, assigned_parents=len(selected), routes=state.routes,
+                           directions=state.directions, loads=state.loads, arc_costs=state.arc_costs,
+                           selected=[dict(parent_id=p.parent_id, kind=p.kind.value,
+                                          rail=p.rail.value if p.rail else None, t=p.t, point_id=p.point_id, mandatory=p.mandatory)
+                                     for p in selected.values()],
+                           pending=tuple(sorted(set(space.parent_ids) - selected.keys())),
+                           features=features, candidates=descriptions, preferences=value_preferences(schedules)))
+    return dict(layout_id=name, parents=len(parents), groups=groups, rows=rows,
+                original_construct_s=original_seconds, original_complete=original.solution is not None,
+                original_diagnostic=original.rejection_reason, runtime_s=time.perf_counter() - started)
+
+
+def value_reference_rows(split='validation'):
+    if split == 'validation':
+        return [dict(split=split, **{k: row[k] for k in CMAX_VALUE_FIELDS if k != 'split' and k in row})
+                for row in read_rows(BEAM_VALIDATION_CSV) if row['method'] in ('RULE/BEAM', 'GNN_WIDTH1')]
+    # TEST is read only after the fixed VALIDATION acceptance conditions pass.
+    rule = [r for r in read_rows(FINAL_RESULTS / 'rule_beam_results.csv') if r['method'] == 'RULE/BEAM']
+    old = [dict(r, method='GNN_WIDTH1') for r in read_rows(FINAL_RESULTS / 'gnn_results.csv')
+           if r['method'] == 'GNN_JOINT' and r['source'] == GNN_RESULT_SOURCE]
+    chosen = {}
+    for row in (*rule, *old):
+        chosen.setdefault((row['layout_id'], row['method']), row)
+    return [dict(split=split, **{k: row[k] for k in CMAX_VALUE_FIELDS if k != 'split' and k in row})
+            for row in chosen.values()]
+
+
+def save_cmax_value(saved):
+    """The two requested artifacts also retain enough TRAIN data to resume."""
+    rows = [row for layout in saved['training'] for row in layout['rows']]
+    rows += [row for epoch in saved.get('validation', {}).values() for row in epoch]
+    rows += saved.get('test', [])
+    for row in rows:
+        if all(row.get(f'processing_r{r}_s') not in (None, '') for r in range(4)):
+            row['max_processing_s'] = max(float(row[f'processing_r{r}_s']) for r in range(4))
+    torch.save(saved, CMAX_VALUE_MODEL)
+    with CMAX_VALUE_RESULTS.open('w', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=CMAX_VALUE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def configure_value_worker(serialized):
+    configure_cpu()
+    global worker_model
+    worker_model = joint_model(pickle.loads(serialized), cmax_value=True).eval()
+    worker_model.requires_grad_(False)
+
+
+def value_validation_job(job):
+    (name, parents), split, epoch, seen = job
+    chosen = []
+    row, _ = complete_gnn(parents, worker_model, SEED, (), reconstruct=False, beam_width=1,
+                          evaluation_cache=seen, result_observer=lambda result, schedule: chosen.append(result))
+    row = dict(split=split, layout_id=name, method='GNN_CMAX_VALUE', epoch=epoch,
+               **{k: row[k] for k in ('status', 'cmax_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+               **beam_validation_metrics(chosen[0]))
+    print('CMAX_VALUE_EVAL', json.dumps(row), flush=True)
+    return row, seen
+
+
+def validate_value_model(model, epoch, caches, split='validation'):
+    layouts = load_layouts(split)
+    jobs = [(layout, split, epoch, caches.setdefault(layout[0], {})) for layout in layouts]
+    weights = pickle.dumps(model.state_dict())
+    # Serial validation keeps measured inference runtimes comparable to Width=1.
+    with ProcessPoolExecutor(max_workers=1, initializer=configure_value_worker, initargs=(weights,)) as executor:
+        results = list(executor.map(value_validation_job, jobs))
+    for layout, (_, seen) in zip(layouts, results):
+        caches[layout[0]] = seen
+    return [row for row, _ in results]
+
+
+def cmax_value_summary(rows, references):
+    feasible = [row for row in rows if row['status'] == 'FEASIBLE']
+
+    def peak(row):
+        if all(row.get(f'processing_r{r}_s') not in ('', None) for r in range(4)):
+            return max(float(row[f'processing_r{r}_s']) for r in range(4))
+        return float(row['max_processing_s'])
+
+    summary = dict(feasible=len(feasible), runs=len(rows), b32_calls=sum(int(r['b32_calls']) for r in rows),
+                   median_cmax_s=median(float(r['cmax_s']) for r in feasible) if feasible else None,
+                   median_runtime_s=median(float(r['runtime_s']) for r in rows),
+                   median_max_processing_s=median(peak(r) for r in feasible) if feasible else None,
+                   median_move_s=median(float(r['move_s']) for r in feasible) if feasible else None)
+    paired = {}
+    for method in ('RULE/BEAM', 'GNN_WIDTH1'):
+        lookup = {r['layout_id']: r for r in references if r['method'] == method}
+        pairs = [(row, lookup[row['layout_id']]) for row in feasible
+                 if row['layout_id'] in lookup and lookup[row['layout_id']]['status'] == 'FEASIBLE']
+        deltas = [float(a['cmax_s']) - float(b['cmax_s']) for a, b in pairs]
+        paired[method] = dict(common=len(pairs), wins=sum(d < -1e-6 for d in deltas),
+                              ties=sum(abs(d) <= 1e-6 for d in deltas), losses=sum(d > 1e-6 for d in deltas),
+                              median_cmax_change_pct=median(100. * (float(a['cmax_s']) / float(b['cmax_s']) - 1.)
+                                                            for a, b in pairs) if pairs else None,
+                              median_max_processing_delta_s=median(peak(a) - peak(b) for a, b in pairs) if pairs else None,
+                              median_move_delta_s=median(float(a['move_s']) - float(b['move_s']) for a, b in pairs) if pairs else None)
+    summary['paired'] = paired
+    return summary
+
+
+def value_model_key(summary):
+    rule = summary['paired']['RULE/BEAM']
+    cmax = rule['median_cmax_change_pct']
+    return (summary['feasible'], -(cmax if cmax is not None else math.inf),
+            -(summary['median_max_processing_s'] if summary['median_max_processing_s'] is not None else math.inf),
+            -(summary['median_move_s'] if summary['median_move_s'] is not None else math.inf),
+            -summary['median_runtime_s'])
+
+
+def cmax_value_experiment(workers):
+    if CMAX_VALUE_MODEL.exists():
+        saved = torch.load(CMAX_VALUE_MODEL, map_location='cpu', weights_only=True)
+    else:
+        original = torch.load(FINAL_MODEL, map_location='cpu', weights_only=True)
+        saved = dict(base_state_dict=original['state_dict'], training=[], history=[], validation={},
+                     selected_epoch=None, completed_epoch=0, epochs=6, seed=SEED)
+    done = {row['layout_id'] for row in saved['training']}
+    jobs = [layout for layout in load_layouts('train') if layout[0] not in done]
+    if jobs:
+        weights = pickle.dumps(saved['base_state_dict'])
+        with ProcessPoolExecutor(max_workers=workers, initializer=configure_joint_worker, initargs=(weights,)) as executor:
+            futures = [executor.submit(collect_value_branches, layout) for layout in jobs]
+            for future in as_completed(futures):
+                sample = future.result()
+                saved['training'].append(sample)
+                save_cmax_value(saved)
+                print('CMAX_VALUE_TRAIN_DATA', sample['layout_id'], 'groups', len(sample['groups']),
+                      'branches', len(sample['rows']), 'B32', sum(r['b32_calls'] for r in sample['rows']),
+                      'seconds', sample['runtime_s'], flush=True)
+    samples = sorted(saved['training'], key=lambda s: s['layout_id'])
+    groups = [group for sample in samples for group in sample['groups']]
+    trainable = [group for group in groups if group['preferences']]
+    if not trainable:
+        raise ValueError('no actual B32 preference pairs were obtained')
+    torch.manual_seed(SEED)
+    model = joint_model(saved['base_state_dict'])
+    model.enable_cmax_value()
+    optimizer = torch.optim.AdamW(model.cmax_value_head.parameters(), lr=1e-3, weight_decay=1e-4)
+    if saved['completed_epoch']:
+        model.load_state_dict(saved['last_state_dict'])
+        optimizer.load_state_dict(saved['optimizer_state_dict'])
+    else:
+        inputs = torch.cat([group['features'] for group in groups])
+        model.cmax_value_mean.copy_(inputs.mean(0))
+        model.cmax_value_scale.copy_(inputs.std(0, unbiased=False).clamp_min(.05))
+    caches = {}
+    references = value_reference_rows()
+    for epoch in range(saved['completed_epoch'] + 1, saved['epochs'] + 1):
+        model.train()
+        order = list(range(len(trainable)))
+        Random(SEED + epoch).shuffle(order)
+        losses = []
+        for index in order:
+            group = trainable[index]
+            scores = model.cmax_values(group['features'])
+            good, bad = zip(*[(a, b) for a, b, _ in group['preferences']])
+            loss = F.softplus(scores[list(bad)] - scores[list(good)]).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach()))
+        record = dict(epoch=epoch, ranking_loss=sum(losses) / len(losses))
+        if epoch in (2, 4, 6):
+            rows = validate_value_model(model.eval(), epoch, caches)
+            saved['validation'][epoch] = rows
+            summary = cmax_value_summary(rows, references)
+            record['validation'] = summary
+            if saved['selected_epoch'] is None or value_model_key(summary) > value_model_key(saved['selected_summary']):
+                saved['selected_epoch'], saved['selected_summary'] = epoch, summary
+                saved['state_dict'] = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        saved['history'].append(record)
+        saved['completed_epoch'] = epoch
+        saved['last_state_dict'] = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        saved['optimizer_state_dict'] = optimizer.state_dict()
+        save_cmax_value(saved)
+        print('CMAX_VALUE_EPOCH', json.dumps(record), flush=True)
+    saved['base_parameters_unchanged'] = all(torch.equal(value, saved['state_dict'][key])
+                                             for key, value in saved['base_state_dict'].items())
+    rule = saved['selected_summary']['paired']['RULE/BEAM']
+    # Use no invented tolerance for "not above RULE": a nonpositive paired median.
+    saved['acceptance'] = dict(feasible=saved['selected_summary']['feasible'] >= 7,
+                               paired_cmax=rule['median_cmax_change_pct'] is not None and rule['median_cmax_change_pct'] < 0.,
+                               wins=rule['common'] > 0 and rule['wins'] >= rule['losses'],
+                               processing=rule['median_max_processing_delta_s'] is not None
+                                          and rule['median_max_processing_delta_s'] <= CONFIG.numeric_epsilon,
+                               runtime=saved['selected_summary']['median_runtime_s'] <= 20.)
+    save_cmax_value(saved)
+    print('CMAX_VALUE_SELECTED', saved['selected_epoch'], json.dumps(saved['selected_summary']),
+          'acceptance', json.dumps(saved['acceptance']), 'frozen_body', saved['base_parameters_unchanged'], flush=True)
+    if all(saved['acceptance'].values()) and not saved.get('test'):
+        model.load_state_dict(saved['state_dict'])
+        model.requires_grad_(False)
+        saved['test'] = validate_value_model(model.eval(), saved['selected_epoch'], {}, split='test')
+        save_cmax_value(saved)
+        print('CMAX_VALUE_TEST', json.dumps(cmax_value_summary(saved['test'], value_reference_rows('test'))), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -850,6 +1118,8 @@ def main():
         beam_validation(args.workers)
     elif args.stage == 'baseline-summary':
         summarize_optimized_baselines()
+    elif args.stage == 'cmax-value':
+        cmax_value_experiment(args.workers)
     else:
         write_comparison()
 
