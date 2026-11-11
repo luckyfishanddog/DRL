@@ -1,207 +1,33 @@
-# Multi-Robot Weld Allocation and Sequencing
+# 双滑轨四机器人焊缝分配与排序
 
-## Latest GNN research status (2026-11-07)
+本项目联合决定父焊缝的合法拆分、四机器人归属、路线顺序和焊接方向，以 B32 调度返回的 Cmax 为优化目标。当前数据来自真实小组立排样，TRAIN、VALIDATION、TEST 分别包含 40、10、20 个排样和 3,749、936、2,060 条父焊缝。所有最终父焊缝的平面长度至少为 50 mm，TEST 的构件型号独立于训练侧。
 
-The new `route_progress_cmax_candidate` uses one GNN to construct complete parent actions. It achieved **3/8 feasible** across 24 DEV B32 calls, with 21 DEADLOCK outcomes. The same checkpoint produced all three proposals per geometry. Paired median Cmax improvements were **-12.73% against PARENT_JOINT** and **-66.53% against RULE/BEAM**. Three-proposal construction took a median **122.68 s**, and total time was **127.89 s** versus **3.85 s** for PARENT_JOINT. The branch fell short of the development targets for independent testing.
+## 正式模型
 
-Using the existing parent head and route-based supplements at 16 parents raised exact TRAIN action coverage from 50/126 in the old six-parent experiment and 99/126 after bounded packing repair to **114/126 (90.48%)**. Removing the chosen parent from pending differentiates the four workload features across parent choices in 115/126 states. The 36 TRAIN B32 calls yielded 10 numeric Cmax pairs and 8 feasibility preferences across 7 states. The complete-action head was trained for 5 fixed epochs with the GAT and input scaling frozen.
+实验共用 `ScientificConfig()`、`FORMAL_SCOPE_V2` 和原 B32。每个 canonical 焊接块的加工时间为 `20 + L/0.0108 + 30` 秒，空走速度为 0.20 m/s，合法拆分的子焊缝最短 0.50 m。机器人的完成时间包括加工、相邻任务间空走和调度等待。
 
-The retained three-proposal ORIGINAL_GNN, PARENT_JOINT, and RULE/BEAM results were 6/8, 7/8, and 7/8. The earlier 8/8 neural portfolio used two older GNN proposals. WAG, HGA, and REGION results are reported separately at their 60-second final-solution budgets. Historical models, MODE_NEW, and the 500-run formal results are preserved. DRL validation passed 607 tests, and the final related regression passed 168. [GNN research report](docs/GNN_INITIAL_MINCHILD05_FINAL.md)
+## 方法
 
-From `DRL`, use `D:\pybullet_test\.venv\Scripts\python.exe` to run `scripts/run_gnn_cmax_finetune.py` with `--phase residual-route-coverage`, `residual-feedback`, `residual-head-train`, and `residual-dev`. The new branch is stored in the existing checkpoint. [Checkpoint](models/gnn_coordination_constructor_05.pt)
+- RULE/BEAM 用原单提案构造，作为快速基线。
+- WAG+VNS 保留 `n=10`、`p=0.50`、`Imax=500`，用各轨的固定优先级顺序调度计分。HGA 用固定作业区的最长路线周期时间计分，执行 30 次子代迭代，范围为 TEST 前四个排样。两者的 5、30、60 秒观测值为各自搜索目标，选出的最终方案各评价一次 B32。
+- 改进 GNN 在至多 8 个联合分配候选上先执行有向插入，再比较实际局部负载、空走和协调风险。TRAIN 使用 RULE/BEAM、WAG+VNS、HGA 教师及同前缀 B32 偏好。每组实验完成一次联合构造，重构版最多继续两轮瓶颈重构，记录完整流程的实际耗时。5、30、60 秒列保留时间观测值。
 
-## Earlier multi-teacher GNN refinement (historical)
+## 运行
 
-Earlier GNN refinement and equivalent acceleration: all seven current-domain methods supplied supervision, including MODE_NEW, WAG, HGA and REGION_FAST_ROUTE_REORDER. Twenty-one training geometries provided 110 unique certified teacher solutions (76 executable full replays), 27 certified student-prefix continuations and 9,654 parent/insertion examples. The eight holdout geometries are previously consumed development data, not a new independent test.
-
-At the same maximum of three B32 calls, the new neural portfolio (two retained robust proposals plus one newly trained balanced proposal) and the old three-proposal comparator both certify 8/8. The new portfolio is 4/4/0 wins/ties/losses, with median paired Cmax improvement 17.616%. On the targeted HIGH_WORKLOAD_04 case, the same MODE_NEW backend and nominal 60-second budget yield 6767.835→4887.874 final Cmax (27.778% improvement; actual runtimes 60.142/60.621 seconds). This is development evidence only. The new balanced policy alone certifies 4/8; independently selecting learned modes certifies only 1/8, so learned modes remain a negative diagnostic branch.
-
-Exact computation reuse preserves candidates, directions, budgets, certification and acceptance. Fixed-20-iteration MODE_NEW replay across three scales measures 1.153–1.250× speedups with identical solutions and traces. A later exact GNN parent-pool membership optimization gives another separately measured 1.50× construction speedup; these factors must not be multiplied. A projection LRU failed real cold-cache scheduling measurements and was removed. The existing checkpoint now keeps exact tensors and compressed safe JSON diagnostics, reducing inference reads from about 0.4 seconds to 0.008 seconds. Complete project+DRL regression: **625 passed**.
-
-All results and rejected branches: [GNN research report](docs/GNN_INITIAL_MINCHILD05_FINAL.md). No new files were created in this refinement. Both old weights and the new refinement candidate remain in the previously approved [checkpoint](models/gnn_coordination_constructor_05.pt). Use run_gnn_shared_construction.load_neural_initial_models plus neural_initial_portfolio(reference_calls=3, use_learned_modes=False) for the explicit neural experiment; read_neural_checkpoint expands full research records. MODE_NEW retains its rule initializer as the main method; the equivalent calculation speedups apply without changing its scientific decisions.
-
-## Completed formal study (2026-11-04)
-
-Scientific configuration: **minimum child length 0.50 m**, delta_x=delta_y=0.50 m, FORMAL_SCOPE_V2, and the existing B32 scheduler. The selected method in the completed formal study was **MODE_NEW**: common deterministic initialization → scheduling-guided parent selection → legal parent-mode adjustment → direction-aware joint insertion/reconstruction → B32 → accept only a strict Cmax improvement. There is no separate direction or WAIT optimization stage.
-
-The earlier frozen-checkpoint GNN initialization study completed **135/135 method rows**. RULE/BEAM was feasible 27/27, V2-Multi4 0/27, and Shared-Multi4 6/27. GNN initial allocation and ordering were retired at that stage. GNN local repair showed a small fixed-mode gain, but the combined MODE_GNN method did not establish a useful stable gain; it is excluded from the main method. No models were retrained or changed during that earlier study; the newly authorized research is recorded above.
-
-The complete **162/162** development ablation was feasible throughout. MODE_NEW versus FIXED_NEW was 5/1/3 wins/ties/losses, with median geometry improvement **0.517%**. Selection of MODE_NEW preceded generation of the independent test geometries.
-
-The independent experiment completed **500/500 actual runs**, using 20 new geometries, five seeds, five methods and a 60-second evaluation budget. MODE_NEW and FIXED_NEW were feasible **95/100** each; WAG, HGA and REGION_FAST_ROUTE_REORDER were **100/100** each. All ten failures on HIGH_WORKLOAD_04 remain recorded. On the **19 complete geometry pairs**, relative improvements are positive when MODE_NEW has lower Cmax:
-
-|Comparator|Wins/ties/losses|Median Cmax improvement|
-|---|---:|---:|
-|FIXED_NEW|17/0/2|+0.342%|
-|WAG|9/0/10|−0.128%|
-|HGA|19/0/0|+2.398%|
-|REGION_FAST_ROUTE_REORDER|7/0/12|−0.335%|
-
-Parent-mode adjustment has a modest independent benefit over its fixed-mode ablation. These results **do not establish overall superiority over WAG or REGION**, and the lower feasibility also limits the comparison with HGA. In HIGH_WORKLOAD, two successful geometries still trail WAG, and one geometry fails initialization in all five seeds. The main method and parameters remain fixed; this independent set is now consumed. The original follow-up covered the HIGH_WORKLOAD_04 diagnosis and manuscript materials. The newly authorized GNN research above is a separate development study and does not revise the completed independent results.
-
-Primary report for manuscript preparation: [project final report, 2026-11-04](docs/PROJECT_FINAL_REPORT_20261104.md). Supporting materials: [MODE_NEW technical note, pseudocode and Mermaid flowchart](docs/MODE_NEW_ALGORITHM_TECHNICAL_NOTE.md), [HIGH_WORKLOAD_04 root-cause evidence and limits](docs/HIGH_WORKLOAD_04_ROOT_CAUSE.md), and [the formal median-record schedule timeline](docs/figures/MODE_NEW_typical_schedule_timeline.png).
-
-HIGH_WORKLOAD_04 diagnosis confirms bounded initialization exhaustion before the 60-second deadline. The stored TIME_LIMIT_NO_FEASIBLE label conflates initialization failure with time expiry; no behavior or raw result was changed. Failed candidate routes and blocking traces were not retained, so a specific same-rail deadlock or direction conflict cannot be established from the available records.
-
-Original stage records remain available: [independent experiment report](docs/FINAL_PARENT_MODE_JOINT_RECONSTRUCTION.md), [GNN stopping decision](docs/GNN_INITIAL_MINCHILD05_FINAL.md), [2×2 ablation and development route timelines](docs/PARENT_MODE_JOINT_RECONSTRUCTION_05.md). Raw independent geometry, results and timelines: [500-run CSV](results/final_parent_mode_joint_reconstruction_05.csv).
-
-Final complete regression across project-root and DRL tests: **555 passed in 74.97 s**. Two historical fixtures now explicitly request their original 0.20 m child minimum; the current 0.50 m rule and all experiment results are unchanged.
-
-Historical execution command for the completed experiments, retained as a record rather than a current next step. The 135 GNN rows, 162 development runs and 500 formal runs are complete; do not rerun them for diagnosis or manuscript preparation:
+在 `D:\pybullet_test\MRTA_GA\DRL` 中执行。
 
 ```powershell
-& 'D:\pybullet_test\.venv\Scripts\python.exe' scripts/run_gnn_multi_initial.py --final-stage all --workers 4
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py baselines --method HGA
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py baselines --method 'WAG+VNS'
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py train
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py test
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py summary
 ```
 
-All existing runs, including failures, remain preserved. The historical runner's resume support does not imply that another experiment is pending. Historical CONFIG=0.20 is preserved; the completed formal stages explicitly use CONFIG_05=ScientificConfig(). Earlier section titles mentioning 0.50 m can refer to split-window size, and must not be taken as proof of a 0.50 m child minimum. Historical configurations, datasets, checkpoints and results below remain separate from this minimum-child-0.50 experiment.
+## 新数据实验
 
-## Historical work (preserved)
+上一轮新 TEST 上，RULE/BEAM、原始 GNN_VNEXT 和负载感知 GNN_VNEXT 的单提案 B32 可行数分别为 16/20、17/20、16/20。可行 Cmax 中位分别为 6,901.0、8,733.4、8,053.3 秒。详细结果与本轮实验进度见 [新排样实验报告](docs/GNN_WELD_LAYOUT_EXPERIMENT.md)。
 
-Historical work and results: [experiment record](docs/DRL已完成工作与实验结果.md).
+完整流程设置下，两种联合 GNN 各完成 20 个 TEST 排样和三个种子的 60 次运行，均为 48/60 B32 可行。可行 Cmax 中位分别为 7,319.3 s、7,224.6 s，总耗时中位分别为 9.14 s、9.84 s。重构版相对 RULE/BEAM 的配对 Cmax 中位高 4.34%。当前汇总使用完整流程结果。
 
-Parent-mode reconstruction traces are stored as [gzip-compressed JSON Lines](results/parent_mode_reconstruction_20261030.jsonl.gz). The study script reads and appends to this file directly. Historical references to the plain JSONL name refer to the same records.
-
-Historical proposal (2026-10-26): [joint graph-policy construction and conflict-related reconstruction](docs/多机器人焊缝分配与排序实验方案.md). The revised plan contains primary literature and official GitHub sources, a concrete joint-insertion/partial-reconstruction design, common-domain comparisons with HGA/WAG, and implementation mapping to existing files. It is a proposed method, not a trained replacement or a superiority claim. A fresh 18-evaluation replay of the existing six DEV instances reproduced the current weakness: RULE+GNN-order has 2 wins/4 losses versus RULE (median Cmax +0.51%); the existing joint model has 1 win/4 losses plus one DEADLOCK (median +2.96% on the five successful pairs). No new files or model weights were created, and solver defaults are unchanged. The historical stages below retain their original scope.
-
-FORMAL_SCOPE_V2 active: WHOLE / Y_SPLIT / X_SPLIT.
-
-Historical expanded-window setting: **delta_x=delta_y=0.50 m**, child minimum **0.20 m**, interference_dx/dy **0.50 m**. Old ±0.2 cuts and legal MIDPOINT remain; new ±0.5 cuts use distinct OUTER identities. By=[5.5,6.5] is a task-layer rail coverage assumption; no URDF/IK reachability claim. Historical development sensitivity: [Y/X range change](docs/YX_SPLIT_RANGE_05_CHANGE.md). The current child minimum is 0.50 m, as stated above.
-
-The Phase3-Z and Phase4-0/0B/1A/1B/1C evidence below is **historical delta_x=delta_y=0.20**, including M192 pool validation and all MLP labels/checkpoints. It does not establish performance in the expanded domain. Historical ranker tools explicitly retain 0.20; do not use those labels for formal 0.50 training.
-
-- Production ALNS: M192 (144 atomic + 48 LNS), Kdp8 / Kref2 / Kref_total4; heuristic C2/C4.
-- Candidate generation material loss: closed relative to the audited finite pool; M192 passed native 60-second development selection.
-- Historical Phase4-1C completed; Top-K aligned material/pairwise objectives evaluated. Offline gate **FAIL**; native MLP smoke **SKIPPED / 0 runs**. Production stays heuristic.
-- Phase4-1C best: **V2 / NEW-MLP-C2**. ALL C2 Top8 capture 0% → 47.10%; C4 Top2 median capture stays 0%. C4 zero capture 79.31% → 62.07%. LARGE C2/C4 median capture stays 0%; its zero capture improves 75% → 66.67%, while cross-workbook ranking failure persists.
-- Pairwise V3 C2 capture is 14.26%, below V2 47.10%. C4 hard training uses 3,097 existing candidates; V2 BOTH helps MEDIUM Top2 capture (0% → 66.74%) but does not improve ALL median capture. No loss/architecture search followed the failure.
-- Historical Phase4-1B remains **FAIL**. Its checkpoints, scaler, result JSON and report remain unchanged; 0 native MLP smoke runs.
-- Historical V1 MLP-C2 material Top8 capture median: 0% → 30.89%. End-to-end C4 Top2 capture median: 0% for every variant. Native MLP smoke was skipped under the specified offline criterion.
-- Fixed workbook split: 17 TRAIN / 6 DEV / 8 ORACLE_DEV_CONSUMED. Dataset: 98 TRAIN / 36 DEV states, 14,893 labeled candidates, numeric failure 0. Four missing TRAIN EARLY states remain missing; no future backfill.
-- Historical V1 fixed-model follow-up: LARGE MLP-C2 Top8 capture median is 92.24% in TRAIN vs 0% in DEV; 10/12 DEV material states miss improvement before C4. MEDIUM captures improvement in 4/6 states at Top8, then loses all four at C4. Both stages need attention; GAT: NOT YET.
-- TWO_OPT_STAR remains OFF. V2_VALIDATION is consumed; final ID_TEST remains sealed.
-
-Scientific rules: [FORMAL_SCOPE_V2](docs/DRL已完成工作与实验结果.md) and [实验方案](docs/多机器人焊缝分配与排序实验方案.md).
-Current evidence: [offline pool/materiality](docs/DRL已完成工作与实验结果.md), [native production pool and MLP split](docs/DRL已完成工作与实验结果.md), [V1 failure and cleanup](docs/DRL已完成工作与实验结果.md), [Top-K objective results](docs/DRL已完成工作与实验结果.md), [Phase4-1C result JSON](data/development/phase4_1c_mlp_results.json).
-Historical formal Phase3-Z remains FAIL / 179 of 180 certified; no final-test superiority claim is made.
-
-## Run locally
-
-From `D:\pybullet_test\MRTA_GA\DRL`, use `D:\pybullet_test\.venv\Scripts\python.exe`.
-
-```powershell
-$env:PYTHONPATH=(Join-Path (Get-Location) 'src')
-& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -m pytest -q -p no:cacheprovider
-```
-
-The Phase4-1C workflow uses the existing `scripts/train_mlp_ranker.py`: `audit` reads V1 checkpoints and DEV score distributions; `rank` trains fixed V2/V3, evaluates all four combinations and runs native smoke only if all three strict gate conditions pass; `rank-finish` writes the single result JSON/report summary. The completed run failed the gate and stopped before native smoke. Training uses the original whole-workbook whitelist and unchanged TRAIN-only scaler. No trajectory, scheduler, candidate generator or reference label collection is part of the offline workflow.
-
-Models: V1 `models/mlp_c2.pt` / `models/mlp_c4.pt` remain failure evidence. V2 classification checkpoints are `models/mlp_c2_material_v2.pt` / `models/mlp_c4_material_v2.pt`; V3 pairwise checkpoints are `models/mlp_c2_rank_v2.pt` / `models/mlp_c4_rank_v2.pt`. All reuse `models/mlp_scalers.npz`. `LearnedRanker(variant, model_version="material_v2")` selects V2; `model_version="rank_v2"` selects V3; legacy `"v1"` remains the optional interface default. None is recommended for production after the failed gate.
-
-Historical Phase4-1C verification: `pytest -q -p no:cacheprovider` passed 281 tests. Existing-state native API replay matched 216 offline selections with 0 new direction/reference calls. Best V2 C2 feature extraction/scaler/forward/ranking median was 97.76 ms/state in replay; its share of a real 60-second run is unmeasured.
-
-Scientific modules remain independent of PyTorch. Optional training dependencies are in the `ranker` extra. Workbook paths are relative to `../ppo`; physical directory names do not define data roles.
-
-Current sensitivity entry point (same environment): `python -B scripts/run_ppo_smoke.py --yx-range catalog`, then `--yx-range run --workers 4`. All static statistics and 24 A/D raw run records stay in the single report; resume skips recorded runs. Production remains heuristic.
-
-Current A/D sensitivity completed: **24/24 certified at 60 s**, numeric failure / certifier mismatch **0**; final full regression **299 passed**. D vs A paired Cmax median change: SMALL +13.40%, MEDIUM −6.20%, LARGE −4.46%; ALL mean Cmax rises 1.59%, so no overall superiority claim. M192 and heuristic ranking remain unchanged. Only A/D are retained per the latest instruction.
-
-## SMALL_30_39 application-scale recheck
-
-Three static-selected instances from distinct consumed-development workbooks have actual **N=35**. All **18/18 native 60-second A/D runs certified**, with numeric/certifier errors **0**; full pytest **303 passed**. This chapter remains separate from historical N26 SMALL and N55/N85 results.
-
-Nine pairs: **4 improved / 3 tied / 2 worse**; paired relative median **0%**, mean **−3.66%**; mean Cmax 2540.199→2464.717 s. S1 (X-rich) changes **+55.17%, +6.77%, −7.63%**; S2 improves all three; S3 stays at initialization Cmax. The deterioration persists for one geometry, not for all N35 instances. S1 has similar initialization but weaker C4 certification/search gains. Targeted I3 replay identifies serial fallback using only R0/R2; the better A initial solution was rebuilt and certified in D.
-
-Next: retain 0.5 as the task model, investigate I3 initialization robustness and S1 C2/C4/reference selection at fixed M192 before broader learning. No MLP/GAT training or parameter changes were made. Complete per-run initialization, four-robot loads, outer-cut usage and failure diagnostics are appended to [the existing range report](docs/YX_SPLIT_RANGE_05_CHANGE.md).
-
-
-## Initialization and S1 screening follow-up (0.50 m)
-
-Four native S1 pools contain 44 certified ≥0.5% improvements; C2 retains 3 and C4 retains 1. Whole-pool direction-feasible certification is 70.38%, versus 17.24% in C2 and 12.50% in C4. Prioritize C2 screening, then C4; no pool-size or scheduler change.
-
-A geometry-only clearance partition replaces the fifth construction when explicitly enabled, within the original 5/5/1 initialization budgets and existing bounded direction attempts. It fixes I3's serial fallback, but is **not recommended as the default**: all 16 fresh paired 60-second runs certified; I3 improves in both seeds, S1 improves slightly/moderately but both improved runs have zero search Cmax gain, S2 worsens 39.67%/21.70%, and N55 improves slightly. Production initialization stays **BASELINE**, with heuristic C2/C4. No MLP/GAT training.
-
-Report and raw diagnostics: [initialization and screening results](docs/DRL已完成工作与实验结果.md), [fixed states and actual labels](data/development/s1_screening_diagnostic.sqlite). Historical results remain unchanged. Final full regression: **317 passed**.
-
-## Coordination-aware C2 development result (0.50 m)
-
-The optional `COORDINATION_AWARE_C2` preserves family access and the cheap-score backbone, with at most two load-competitive Pareto slots using same-rail X-overlap and first-task order risk. `BASELINE_C2` remains the production default.
-
-On the four existing S1 states, C2 material selections increased 3→4 while unchanged C4 retained 1→1. Across nine additional N35/N55/N85 consumed-development states, C2 certified rate increased 30.56%→43.06%, material selections 7/49→9/49 and DEADLOCK 48/72→39/72; unchanged C4 retained 2/49 in both cases. In 24 fresh native 60-second runs, all certified and all 12 paired Cmax@60 values tied exactly. Coordination scoring used 1.150 s across its twelve runs (0.160% of wall-clock budgets), with no M/K/reference-budget change.
-
-Production therefore remains baseline initialization + `BASELINE_C2` + heuristic C4. The inexpensive proxy is retained only as a development ablation. Evidence now supports collecting new 0.50-domain TRAIN/DEV labels for a ranking-aligned MLP-C2 study, with C4 trained on the real C2 hard distribution; no MLP/GAT training was started here. Details: [coordination-aware C2 report](docs/DRL已完成工作与实验结果.md) and the existing [raw diagnostic database](data/development/s1_screening_diagnostic.sqlite). Full regression: **320 passed**.
-
-## Region-cooperative initialization (0.50 m)
-
-`REGION_COOPERATIVE_INITIALIZATION` is an optional, deterministic replacement for the low-contribution `SPATIAL_SPREAD` slot. It jointly assigns flexible welds to rails, selects load-dominant X boundaries with overlap as a soft risk, and applies bounded nearest/farthest insertion plus two 2-opt passes. The original five-slot/Kinit/fallback/reference limits remain unchanged; the production default switch remains off.
-
-All **10/10 zero-search** and **48/48 real 60-second** consumed-development runs certified. Region+HEURISTIC versus baseline+HEURISTIC is **9/3/0 wins/ties/losses**, median Cmax change **−4.56%**. Region+GAT versus Region+HEURISTIC is **6/2/4**, median **−0.07%** and mean **+0.14%**; frozen GAT V05 has no stable independent gain on the stronger seed. I3 is repaired, S2 improves instead of regressing, S1 still falls back, and the roughly 50% initial improvements on N55-I6/N85-I9 are followed by little or no further search improvement.
-
-Because the upgraded method was developed only on consumed-development workbooks, production remains `BASELINE` until new independent workbooks are available. The frozen region method is the candidate for that test. Results: [region-cooperative initialization report](docs/DRL已完成工作与实验结果.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`.
-
-## CRRR structural-neighborhood result (0.50 m)
-
-`Critical-Rail Region Reallocation` is implemented as an explicit, default-off structural LNS source. It uses certified WAIT/WELD timelines or critical same-rail load boundaries to jointly reassign/reorder 2–6 spatially related parents. Enabling it preserves **M192 = 144 atomic + 40 original LNS + 8 CRRR** and does not change REGION initialization, GAT V05, C2/C4, SA, direction DP, B32, certifier or the split model.
-
-All 24 new consumed-development 60-second runs certified. CRRR+HEURISTIC versus original REGION+HEURISTIC is **2/8/2**, median 0.00%, mean **+1.60%**, including a **+20.95%** S1 regression. CRRR+GAT versus original REGION+GAT is **1/7/4**, median 0.00%, mean -0.62%; its only win is I5 seed 20261702 (-22.81%), while the other I5 seed worsens +7.20%. Across 2272 CRRR attempts, 1855 are unique, 88 reach C2, 44 reach C4/B32, 27 are accepted, but only **3 strictly reduce Cmax**, all on I5. Four-state offline replay confirms useful S1/I5 candidates exist but the frozen online funnel often misses them.
-
-Decision: **CRRR is not a default neighborhood** and the enhanced search is not frozen as a new paper method. The code remains an optional ablation; no further GAT training or neighborhood stacking follows from this development result. Complete evidence: [CRRR search results](docs/DRL已完成工作与实验结果.md). Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
-
-### CRRR C2 access follow-up
-
-The default-off `CRRR_ACCESS_C2` preserves the original four-family access and can replace at most one non-protected Top8 slot using a fixed, pre-direction comparison of projected process load, route-travel delta, same-rail overlap and first-task order risk. Offline replay retains the known improving S1/I5 CRRR candidates without injecting I6/I9 candidates; only I5 improves the known Top8 certified bound.
-
-All 12 new consumed-development 60-second runs certified. CRRR C2 access rises from 32 to 71 selections, but C4 remains 10 and all ten B32 results are `DEADLOCK`; CRRR accepted moves and strict Cmax improvements are both zero. Versus the original CRRR heuristic it is **1/11/0**, median 0.00%; the sole difference has no access injection or CRRR C4 evaluation and is not attributable to CRRR. Versus REGION+original LNS it remains **2/8/2**, median 0.00%, mean **+1.54%**, with the same **+20.95%** S1 regression. Decision: `CRRR_ACCESS_C2` and CRRR stay default-off, and no further CRRR score tuning is justified. Evidence: [CRRR C2 access results](docs/DRL已完成工作与实验结果.md). Current regression: **334 passed**.
-
-## Equivalent LNS computation acceleration (0.50 m)
-
-The optional `lns_incremental_scoring` path removes repeated four-route load and directed-travel recomputation inside the unchanged original LNS repair. It caches route processing terms and adjacent directed arcs, updates only the affected route/arcs, and preserves the original floating-point accumulation order. The switch defaults to off; REGION initialization, 144 atomic + 48 LNS, C2/C4, SA, direction DP, B32, certifier and all evaluation budgets are unchanged.
-
-WHOLE/Y/X unit replay and native fixed-iteration N35/N55/N85 replay match candidate identities/order, C2 Top8, direction, C4 Top2, B32, SA and final solutions exactly. Single-process microbenchmarks show **3.09×–4.71×** LNS-repair and **1.22×–2.39×** complete candidate-generation speedups. In 24 instrumented 60-second consumed-development runs, all certify; accelerated versus legacy is **3/9/0 wins/ties/losses**, median Cmax change **0.00%**, mean **−1.82%**, worst **0.00%**. Iterations rise 133→202, search references 460→696, and strict Cmax decreases 33→37. Gains occur on one S1 seed and both I5 seeds; all N85 pairs tie.
-
-Decision: retain the equivalent acceleration as a default-off candidate for new independent validation. It improves real search opportunity without changing decisions, but does not close the historical HGA/WAG gap and is not a new search-method contribution. Evidence: [LNS equivalent acceleration report](docs/DRL已完成工作与实验结果.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. Project-root regression: **372 passed, 1 skipped, 3 subtests passed**.
-
-## Upgraded independent five-method comparison (0.50 m)
-
-The frozen independent-test methods are `BASELINE_HEURISTIC`, `REGION_FAST_HEURISTIC`, `REGION_FAST_GAT_V05`, `ADAPTED_HGA_V2`, and `ADAPTED_WAG_VNS_V2`. Fifteen new geometries were produced by the verified original `generate_welds.py` and PPO source workbook using previously unused geometry seeds 20262001--20262015. Exact geometry identities have zero overlap with 2,942 indexed historical geometries. Static selection produced five N35, five N55, and LARGE N85/N83/N77/N85/N85 without trimming or solver-result selection.
-
-All **375/375 real 60-second runs** completed. BASELINE, REGION_FAST_HEURISTIC, REGION_FAST_GAT and WAG certified 75/75; HGA certified 73/75, with two unretried `TIME_LIMIT_NO_FEASIBLE` runs on the hardest LARGE workbook. At workbook-level five-seed medians, REGION_FAST_HEURISTIC versus BASELINE is **11/4/0**, median **-2.25%**, mean **-8.86%**. Frozen GAT versus the identical REGION+FAST skeleton is **8/2/5**, median **-0.23%**, mean **-4.28%**; its workbook bootstrap median interval crosses zero, so it is not a stable independent gain.
-
-Against WAG, REGION_FAST_HEURISTIC is **7/0/8** (median +0.10%, mean +13.68%) and REGION_FAST_GAT is **8/0/7** (median -0.29%, mean +7.82%). MEDIUM and the high-work-content LARGE_04 remain serious weaknesses; on LARGE_04, WAG median Cmax is 6663.3 s versus 10562.3 s for REGION_FAST_HEURISTIC and 10355.4 s for GAT. The enhanced deterministic configuration is therefore frozen as the principal GRC-ALNS method, while GAT V05 remains a learning ablation rather than the claimed source of stable superiority. The evidence supports robust improvement over original ALNS, not uniform superiority over HGA/WAG. Full results: [upgraded independent comparison](docs/DRL已完成工作与实验结果.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`. DRL regression: **335 passed**; project-root plus DRL discovery: **707 passed, 1 skipped, 3 subtests passed**.
-
-## First runnable GRC-ALNS (0.50 m)
-
-The new workbook-isolated dataset contains **98 TRAIN states / 11,924 candidates** and **34 DEV states / 4,184 candidates**, with **590/356 material positives** and zero numeric failures. It keeps the existing 17 TRAIN / 6 DEV workbook split; missing EARLY states are not backfilled. The historical 0.20 dataset and checkpoints are unchanged.
-
-Fixed 0.50-domain MLP-C2/C4 and a two-layer, four-head, hidden-64 GAT are now optional rankers. GAT fuses one cached parent-weld/robot static graph per instance with order-sensitive before/after route summaries; C2 has no candidate direction/reference input, while C4 receives only direction-stage features. Production remains heuristic.
-
-On DEV, heuristic→GAT C2 material capture is **8.99%→14.61%**, certified rate **31.99%→42.28%**, and material zero-capture **43.75%→37.50%**. C4 capture is **2.25%→4.78%**, but much of the C2 gain is still lost. Removing weld-weld edges leaves every reported stratified Top-K metric unchanged, so this first version does not establish an incremental graph-relation benefit.
-
-The required 18 native 60-second development runs all have certified Cmax@60 and zero numeric failures. Relative to heuristic, MLP is **1/0/5** and GAT **3/0/3** wins/ties/losses: GAT loses both N35 pairs, wins both N55 pairs, and splits N85. GAT ranking consumes 30.896 s across its six 60-second runs (8.58% of their wall-clock budgets). Therefore GAT is retained as a runnable development/paper method, but is **not recommended as production default**. Full evidence and per-tier tables: [GRC-ALNS first results](docs/DRL已完成工作与实验结果.md); raw candidates, labels, offline metrics and run records: `data/development/graph_ranker_dataset_v05.sqlite`.
-
-Final regression after GRC integration: **323 passed** with `pytest -q -p no:cacheprovider`.
-
-## GRC-ALNS V2 (0.50 m)
-
-V05 inference now batches block projection and reuses exact ordered-route summaries. Across all 34 saved DEV states, scores agree within `1.19e-7`, C2 Top8/C4 Top2 identities and order are unchanged, and candidate scoring is **3.04× faster** overall.
-
-`gat_v06.pt` replaces the telescoping adjacency mean with real consecutive-weld transition tokens and gives C4 its own trainable transition/route/fusion adapter. C4 adapter gradient is nonzero and C4 training leaves C2 outputs unchanged. The independently trained `gat_v06_no_weld_edges.pt` differs on 24/34 C2 and 10/34 C4 Top-K selections, but full-graph DEV C4 material capture exceeds the ablation by only **0.28 percentage points**; graph-relation benefit remains weak.
-
-In the complete 48-run consumed-development matrix, all runs certify with zero numeric failures. V06 versus heuristic is **6/2/4 wins/ties/losses**, median Cmax change **−0.01%** (N35 **2/1/1**, N55 **2/0/2**, N85 **2/1/1**). V06 performs 144 iterations and 606 reference calls versus heuristic 133/488, but DEV material capture is below V05 at both C2 (13.48% vs 14.61%) and C4 (3.65% vs 4.78%), and large opposite-direction instance effects persist. Production therefore remains heuristic; V05 acceleration is retained, while V06 is development-only. Full evidence: [GRC-ALNS V2 results](docs/DRL已完成工作与实验结果.md). Final regression: **326 passed**.
-
-## B32 hard deadline and initialization diagnosis (2026-10)
-
-Timed GRC-ALNS runs now use one Windows `spawn` B32 worker per solver run. Process start-up, IPC and GAT/MLP model loading share the same absolute wall-clock budget; a B32 call that reaches the deadline is terminated and is not relabelled as `DEADLOCK`, `FEASIBLE`, or a numeric failure. The parent returns only its last independently certified incumbent. If no certified initialization exists, it returns `INITIALIZATION_FAILED` with no fabricated Cmax. Untimed/direct evaluation remains unchanged. In a forced test with a 0.35 s run budget and a 3 s B32 delay, the solver returned in 0.360 s (0.010 s overshoot) with the certified incumbent. Fixed N35-S2 5 s smokes returned certified HEURISTIC/GAT V05 results in 5.038/5.019 s; the GAT model and existing batched C2/C4 interfaces remain intact.
-
-`MEDIUM_02` and `LARGE_04` were minimally replayed without reopening the 375-run matrix. Their balanced candidates are canonical and robot-eligible; the REGION candidates pass direction DP, then the baseline dispatch blocks one same-rail robot behind already fixed partner operations. The fixed limited-discrepancy recovery performs up to 32 complete rollouts and still returns `DEADLOCK`; most failed candidates have `frontier_exhausted=False`. This is evidence of a legal candidate not found feasible by the bounded dispatch policy, not proof of physical or mathematical infeasibility. `RAIL_SERIAL_BOOTSTRAP` wins only because one active robot per rail removes those same-rail ordering conflicts and is the sole independently certified fallback. No B32 scientific-policy change was made.
-
-The default-off SAME_RAIL initialization remains unchanged. It evaluates upper/lower boundaries jointly, replaces one existing five-candidate slot, and adds no B32 call. Its three improving development geometries combine 13/7/3 legal same-rail task migrations with four-route reordering, so the observed benefit is coupled assignment/route/direction repair rather than load balancing alone; it still lacks new independent confirmation. CRRR and JRRB remain historical default-off negative results and are not being redeveloped.
-
-Existing selection statistics already expose C2/C4 selections, duplicates, B32 status and ranker timing. Trajectory payloads now also persist the scheduler's existing recovery provenance (`baseline_deadlock`, rollout budget/use, branch points and frontier exhaustion) plus hard-deadline terminations and worker start-up time. The highest-value next GAT step is therefore to train/evaluate C4 specifically on the real C2-selected hard distribution, separating bounded-dispatch `DEADLOCK` risk from certified Cmax improvement, rather than adding network depth or another neighborhood. Regression: DRL **348 passed**; project root **372 passed, 1 skipped, 3 subtests passed**.
-
-## Final independent coordination comparison (2026-10)
-
-Twenty previously unused PPO-generated workbooks (five SMALL, MEDIUM, LARGE, and statically selected HIGH_WORKLOAD) were frozen before solver access. The complete matrix contains **300/300 real 60-second runs**: three solver seeds × `REGION_FAST_HEURISTIC`, `REGION_FAST_ROUTE_REORDER`, `REGION_FAST_SAME_RAIL`, frozen HGA, and frozen WAG. The three ALNS variants certified 60/60 each; HGA and WAG certified 58/60 and 57/60, respectively. Full DRL regression is **351 passed**.
-
-At workbook-level three-seed medians, ROUTE_REORDER versus REGION_FAST is **2/18/0** wins/ties/losses, median **0.00%**, mean **−2.37%**, worst **0.00%**. It reduces serial fallback from 20% to 15% and improves one MEDIUM and one HIGH_WORKLOAD workbook without changing robot assignment or evaluation budgets. SAME_RAIL is **2/17/1**, median **0.00%**, mean **−3.19%**, worst **+3.09%**; it reduces fallback to 5% but raises mean WAIT and is retained as an ablation rather than the final method.
-
-ROUTE_REORDER is frozen as the final deterministic GRC-ALNS enhancement, with REGION_FAST_HEURISTIC as its independently validated base. This is a narrow coordination-feasibility contribution: 18/20 workbooks tie, and on the four complete HIGH_WORKLOAD pairs ROUTE_REORDER still trails WAG by a median **47.49%**. The paper must not claim uniform superiority over WAG/HGA. GAT V05 remains a learning ablation; CRRR/JRRB remain negative default-off studies. No tested enhancement is combined or retuned on this now-consumed independent set. Full evidence: [final coordination comparison](docs/FINAL_COORDINATION_COMPARISON.md); raw rows: `data/development/graph_ranker_dataset_v05.sqlite`.
+此前 60 秒多方案搜索中，两种联合 GNN 各完成 60 次 TEST，均为 58/60 B32 可行，可行 Cmax 中位分别为 7,172.3 s 和 7,143.1 s。带瓶颈重构版本在共同可行样本上相对负载感知 VNext 的配对 Cmax 中位下降 10.89%，相对 RULE/BEAM 高 3.49%。这些记录保留在 `gnn_results.csv` 中。HGA 论文评分版完成前四个排样的 12 次运行，最终 B32 可行 0/12。WAG+VNS 已暂停，保留两个排样各三个种子的 500 轮结果，B32 可行 5/6。[本轮已完成结果](results/new_dataset_final/final_comparison.csv)

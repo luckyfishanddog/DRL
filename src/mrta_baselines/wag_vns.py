@@ -30,6 +30,7 @@ from mrta_reference.scope import FORMAL_SCOPE_V2
 from .common import (
     BaselineAccounting,
     BaselineResult,
+    CandidateEvaluator,
     CommonBaselineEvaluator,
     EvaluatedCandidate,
     canonical_config_hash,
@@ -765,6 +766,7 @@ def run_adapted_wag_vns(
     method_id: str = METHOD_ID,
     pattern_access_policy: bool | None = None,
     certify: bool = True,
+    candidate_evaluator: CandidateEvaluator | None = None,
 ) -> BaselineResult:
     rng = random.Random(seed)
     v2 = scope.x_split_rule_id is not None
@@ -778,6 +780,7 @@ def run_adapted_wag_vns(
         time_limit=time_limit,
         checkpoints=checkpoints,
         certify=certify,
+        candidate_evaluator=candidate_evaluator,
     )
     if v2:
         evaluator.accounting.legal_x_pattern_count = sum(
@@ -992,6 +995,7 @@ def run_adapted_wag_vns_v2(
     time_limit: float,
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
     certify: bool = True,
+    candidate_evaluator: CandidateEvaluator | None = None,
 ) -> BaselineResult:
     return run_adapted_wag_vns(
         parents,
@@ -1003,4 +1007,5 @@ def run_adapted_wag_vns_v2(
         checkpoints=checkpoints,
         method_id=METHOD_ID_V2,
         certify=certify,
+        candidate_evaluator=candidate_evaluator,
     )

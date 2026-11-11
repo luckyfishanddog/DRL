@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from mrta_reference.certifier import CertificationReport, certify_schedule
 from mrta_reference.model import (
@@ -33,6 +33,7 @@ from mrta_search.direction import (
 DirectionVectors = tuple[
     tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]
 ]
+CandidateEvaluator = Callable[[CanonicalSolution, ScientificConfig], ScheduleResult]
 
 
 class BaselineStatus(str, Enum):
@@ -122,6 +123,7 @@ class EvaluatedCandidate:
     source: str
     completed_at: float
     diagnostics: tuple[str, ...] = ()
+    native_scoring: bool = False
 
 
 @dataclass(frozen=True)
@@ -227,7 +229,7 @@ def solution_telemetry(
 
 
 class CommonBaselineEvaluator:
-    """The sole complete-candidate scientific evaluation path for baselines."""
+    """Track complete candidates under the supplied search objective."""
 
     def __init__(
         self,
@@ -238,6 +240,7 @@ class CommonBaselineEvaluator:
         time_limit: float,
         checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
         certify: bool = True,
+        candidate_evaluator: CandidateEvaluator | None = None,
     ) -> None:
         if time_limit <= 0.0:
             raise ValueError("time_limit must be positive")
@@ -248,6 +251,9 @@ class CommonBaselineEvaluator:
         self.time_limit = float(time_limit)
         self.checkpoint_deadlines = tuple(float(value) for value in checkpoints)
         self.certify = certify
+        if candidate_evaluator is not None and certify:
+            raise ValueError('method-specific candidate evaluation requires certify=False')
+        self.candidate_evaluator = candidate_evaluator
         self.started = time.perf_counter()
         self.deadline = self.started + self.time_limit
         self.accounting = BaselineAccounting()
@@ -257,6 +263,7 @@ class CommonBaselineEvaluator:
         self.first_certified: float | None = None
         self.failure_diagnostics: list[str] = []
         self.reference_evaluator = FormalReferenceEvaluator(scope)
+        self._evaluated_routes: dict[tuple, EvaluatedCandidate] = {}
 
     @property
     def elapsed(self) -> float:
@@ -297,13 +304,19 @@ class CommonBaselineEvaluator:
     def _record_best(self, candidate: EvaluatedCandidate) -> None:
         if candidate.metrics is None:
             return
-        if candidate.completed_at <= self.time_limit and (
-            self.timely_best is None or candidate.metrics.compare(self.timely_best.metrics) < 0
-        ):
+
+        def improves(incumbent):
+            if incumbent is None:
+                return True
+            if candidate.native_scoring:
+                return candidate.metrics.cmax < incumbent.metrics.cmax
+            return candidate.metrics.compare(incumbent.metrics) < 0
+
+        if candidate.completed_at <= self.time_limit and improves(self.timely_best):
             self.timely_best = candidate
         if self.first_certified is None:
             self.first_certified = candidate.completed_at
-        if self.best is None or candidate.metrics.compare(self.best.metrics) < 0:  # type: ignore[arg-type]
+        if improves(self.best):
             self.best = candidate
             has_x = any(
                 pattern.kind is SplitKind.X_SPLIT
@@ -321,61 +334,59 @@ class CommonBaselineEvaluator:
 
     def evaluate(self, solution: CanonicalSolution, *, source: str) -> EvaluatedCandidate:
         self.accounting.candidate_count += 1
+        if self.certify:
+            return self._evaluate(solution, source=source)
+        # With deterministic directions and scoring, an identical complete route
+        # in this run already has its scheduling result and completion time.
+        key = solution.parents, solution.patterns, solution.routes
+        previous = self._evaluated_routes.get(key)
+        if previous is not None:
+            return replace(previous, solution=solution, source=source)
+        result = self._evaluate(solution, source=source)
+        self._evaluated_routes[key] = result
+        return result
+
+    def _evaluate(self, solution: CanonicalSolution, *, source: str) -> EvaluatedCandidate:
         has_x = any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
         has_y = any(pattern.kind is SplitKind.Y_SPLIT for pattern in solution.patterns)
         self.accounting.x_pattern_constructed += int(has_x)
         self.accounting.y_pattern_constructed += int(has_y)
-        direction_started = time.perf_counter()
-        direction: ConstrainedDirectionResult
-        try:
-            direction = optimize_directions_with_initial_feasibility(solution, self.config)
-        except (ArithmeticError, OverflowError, ValueError) as error:
-            self.accounting.numeric_failure += 1
-            completed = self.elapsed
-            result = EvaluatedCandidate(
-                BaselineStatus.NUMERIC_FAILURE,
-                solution,
-                None,
-                None,
-                None,
-                None,
-                source,
-                completed,
-                (str(error),),
-            )
-            self.failure_diagnostics.append(f"{source}: {error}")
-            return result
-        self.accounting.direction_time += time.perf_counter() - direction_started
-        self.accounting.direction_dp_calls += direction.route_dp_calls
-        self.accounting.x_pattern_direction_evaluated += int(has_x)
-        self.accounting.y_pattern_direction_evaluated += int(has_y)
-        if direction.status is not DirectionStatus.FEASIBLE:
-            self.accounting.direction_infeasible += 1
-            return EvaluatedCandidate(
-                BaselineStatus.DIRECTION_INFEASIBLE,
-                solution,
-                direction.directions,
-                None,
-                None,
-                None,
-                source,
-                self.elapsed,
-                direction.diagnostics,
-            )
+        directions = ((),) * 4
+        if self.candidate_evaluator is None:
+            direction_started = time.perf_counter()
+            direction: ConstrainedDirectionResult
+            try:
+                direction = optimize_directions_with_initial_feasibility(solution, self.config)
+            except (ArithmeticError, OverflowError, ValueError) as error:
+                self.accounting.numeric_failure += 1
+                completed = self.elapsed
+                self.failure_diagnostics.append(f"{source}: {error}")
+                return EvaluatedCandidate(BaselineStatus.NUMERIC_FAILURE, solution, None, None, None, None,
+                                          source, completed, (str(error),))
+            self.accounting.direction_time += time.perf_counter() - direction_started
+            self.accounting.direction_dp_calls += direction.route_dp_calls
+            self.accounting.x_pattern_direction_evaluated += int(has_x)
+            self.accounting.y_pattern_direction_evaluated += int(has_y)
+            directions = direction.directions
+            if direction.status is not DirectionStatus.FEASIBLE:
+                self.accounting.direction_infeasible += 1
+                return EvaluatedCandidate(BaselineStatus.DIRECTION_INFEASIBLE, solution, directions, None, None,
+                                          None, source, self.elapsed, direction.diagnostics)
 
-        orientations = {robot: direction.directions[robot] for robot in range(4)}
         scheduler_started = time.perf_counter()
         if has_x and self.accounting.first_x_reference_time is None:
             self.accounting.first_x_reference_time = scheduler_started - self.started
         try:
-            schedule = self.reference_evaluator(
-                solution, self.config, orientations=orientations
-            )
+            if self.candidate_evaluator is None:
+                schedule = self.reference_evaluator(solution, self.config, orientations=dict(enumerate(directions)))
+            else:
+                schedule = self.candidate_evaluator(solution, self.config)
+                directions = schedule.directions
         except (ArithmeticError, OverflowError, ValueError) as error:
             schedule = ScheduleResult(
                 ScheduleStatus.NUMERIC_FAILURE,
                 diagnostics=(str(error),),
-                directions=direction.directions,
+                directions=directions,
                 reference_policy_id=self.scope.reference_scheduler_policy_id,
                 scope_id=self.scope.scope_id,
                 scope_hash=self.scope.scope_hash,
@@ -393,7 +404,7 @@ class CommonBaselineEvaluator:
             return EvaluatedCandidate(
                 BaselineStatus.DEADLOCK,
                 solution,
-                direction.directions,
+                directions,
                 schedule,
                 None,
                 None,
@@ -406,7 +417,7 @@ class CommonBaselineEvaluator:
             return EvaluatedCandidate(
                 BaselineStatus.INFEASIBLE,
                 solution,
-                direction.directions,
+                directions,
                 schedule,
                 None,
                 None,
@@ -419,7 +430,7 @@ class CommonBaselineEvaluator:
             return EvaluatedCandidate(
                 BaselineStatus.NUMERIC_FAILURE,
                 solution,
-                direction.directions,
+                directions,
                 schedule,
                 None,
                 None,
@@ -448,7 +459,7 @@ class CommonBaselineEvaluator:
             result = EvaluatedCandidate(
                 BaselineStatus.NUMERIC_FAILURE,
                 solution,
-                direction.directions,
+                directions,
                 schedule,
                 certification,
                 None,
@@ -467,13 +478,14 @@ class CommonBaselineEvaluator:
         result = EvaluatedCandidate(
             BaselineStatus.COMPLETED,
             solution,
-            direction.directions,
+            directions,
             schedule,
             certification,
             metrics,
             source,
             self.elapsed,
             (),
+            native_scoring=self.candidate_evaluator is not None,
         )
         self._record_best(result)
         return result

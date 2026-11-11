@@ -3053,3 +3053,91 @@ def test_vnext_b_distillation_accepts_near_ties():
     assert target[0] == target[1] and target[1] > target[2]
     assert target.sum().item() == pytest.approx(1.)
 
+
+@pytest.mark.parametrize('reconstruct', (False, True))
+def test_complete_gnn_keeps_late_completion_and_evaluates_each_plan_once(monkeypatch, reconstruct):
+    from types import SimpleNamespace
+    import run_gnn_weld_layout as experiment
+
+    solution = _solution()
+    clock, builds, schedules = [0.], [], []
+    model = SimpleNamespace(encode_static=lambda graph: None)
+    monkeypatch.setattr(experiment, 'time', SimpleNamespace(perf_counter=lambda: clock[0]))
+    monkeypatch.setattr(experiment.gnn, 'parent_assignment_space', lambda *args: SimpleNamespace(graph=None))
+
+    def build(*args, **kwargs):
+        assert kwargs.get('deadline') is None
+        clock[0] += 90.
+        direction = int(bool(builds))
+        builds.append(kwargs)
+        directions = tuple(tuple(direction for _ in route.block_ids) for route in solution.routes)
+        return experiment.gnn.JointCompletionResult(solution, directions, (), 90.)
+
+    def schedule(result):
+        schedules.append(result)
+        return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=110. - 10. * len(schedules))
+
+    monkeypatch.setattr(experiment, 'build_joint', build)
+    monkeypatch.setattr(experiment, 'b32', schedule)
+    monkeypatch.setattr(experiment, 'repair_prefix', lambda *args: (object(), {}))
+    row, stats = experiment.complete_gnn(_parents(), model, 1, (60.,), reconstruct=reconstruct)
+
+    assert len(builds) == (3 if reconstruct else 1)
+    assert len(schedules) == row['b32_calls'] == (2 if reconstruct else 1)
+    assert stats == ((1, 2, 1) if reconstruct else (1, 0, 0))
+    assert row['status'] == 'FEASIBLE' and row['cmax_s'] == (90. if reconstruct else 100.)
+    assert row['construct_s'] == 90. and row['runtime_s'] == (270. if reconstruct else 90.)
+    assert row['cmax_60_s'] is None and row['source'] == experiment.GNN_RESULT_SOURCE
+
+
+@pytest.mark.parametrize('status', (ScheduleStatus.DEADLOCK, ScheduleStatus.INFEASIBLE))
+def test_complete_gnn_reports_actual_schedule_failure(monkeypatch, status):
+    from types import SimpleNamespace
+    import run_gnn_weld_layout as experiment
+
+    result = experiment.gnn.JointCompletionResult(_solution(), ((),) * 4, (), 0.)
+    builds = []
+    model = SimpleNamespace(encode_static=lambda graph: None)
+    monkeypatch.setattr(experiment.gnn, 'parent_assignment_space', lambda *args: SimpleNamespace(graph=None))
+
+    def build(*args, **kwargs):
+        builds.append(kwargs)
+        return result
+
+    monkeypatch.setattr(experiment, 'build_joint', build)
+    monkeypatch.setattr(experiment, 'b32', lambda result: ScheduleResult(status, diagnostics=('blocked',)))
+    row, stats = experiment.complete_gnn(_parents(), model, 1, (), reconstruct=True)
+
+    assert row['status'] == status.value and row['cmax_s'] is None
+    assert row['diagnostic'] == status.value + ' blocked'
+    assert len(builds) == row['b32_calls'] == 1 and stats == (1, 0, 0)
+
+
+def test_weld_layout_writer_preserves_rows_when_extending_existing_columns():
+    import csv
+    import io
+    from unittest.mock import Mock, mock_open
+    import run_gnn_weld_layout as experiment
+
+    fields = [field for field in experiment.RESULT_FIELDS if not field.startswith('native_cmax')]
+    original = dict(layout_id='test_01', method='GNN_JOINT', seed='1', cmax_s='100', source='RUN')
+    previous = io.StringIO(newline='')
+    writer = csv.DictWriter(previous, fieldnames=fields)
+    writer.writeheader()
+    writer.writerow(original)
+    path = Mock()
+    path.exists.return_value = True
+    path.stat.return_value.st_size = len(previous.getvalue())
+    path.open = mock_open(read_data=previous.getvalue())
+    latest = dict(original, seed='2', native_cmax_s='90', source=experiment.GNN_RESULT_SOURCE)
+
+    experiment.write_rows(path, [latest], append=True)
+
+    text = ''.join(call.args[0] for call in path.open.return_value.write.call_args_list)
+    reader = csv.DictReader(io.StringIO(text, newline=''))
+    rows = list(reader)
+    assert reader.fieldnames == list(experiment.RESULT_FIELDS)
+    assert len(rows) == 2 and all(rows[0][field] == value for field, value in original.items())
+    assert rows[0]['native_cmax_s'] == ''
+    assert all(rows[1][field] == value for field, value in latest.items())
+

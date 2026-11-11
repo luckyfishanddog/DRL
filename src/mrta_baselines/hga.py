@@ -29,6 +29,7 @@ from mrta_reference.solution import block_map, canonicalize
 
 from .common import (
     BaselineResult,
+    CandidateEvaluator,
     CommonBaselineEvaluator,
     EvaluatedCandidate,
     canonical_config_hash,
@@ -669,6 +670,8 @@ def normalized_route_edge_distance(
 def _objective_key(individual: _Individual):
     if individual.evaluated is not None and individual.evaluated.metrics is not None:
         metrics = individual.evaluated.metrics
+        if individual.evaluated.native_scoring:
+            return (0, metrics.cmax)
         return (0, metrics.cmax, metrics.optional_split_count, metrics.process_imbalance,
                 metrics.total_empty_travel, metrics.total_waiting,
                 metrics.deterministic_id_order, individual.solution.canonical_hash)
@@ -727,6 +730,7 @@ def run_adapted_hga(
     common_seed: EvaluatedCandidate | None = None,
     method_id: str = METHOD_ID,
     certify: bool = True,
+    candidate_evaluator: CandidateEvaluator | None = None,
 ) -> BaselineResult:
     rng = random.Random(seed)
     v2 = scope.x_split_rule_id is not None
@@ -737,6 +741,7 @@ def run_adapted_hga(
         time_limit=time_limit,
         checkpoints=checkpoints,
         certify=certify,
+        candidate_evaluator=candidate_evaluator,
     )
     if v2:
         evaluator.accounting.legal_x_pattern_count = sum(
@@ -922,6 +927,7 @@ def run_adapted_hga_v2(
     time_limit: float,
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
     certify: bool = True,
+    candidate_evaluator: CandidateEvaluator | None = None,
 ) -> BaselineResult:
     return run_adapted_hga(
         parents,
@@ -933,4 +939,5 @@ def run_adapted_hga_v2(
         checkpoints=checkpoints,
         method_id=METHOD_ID_V2,
         certify=certify,
+        candidate_evaluator=candidate_evaluator,
     )

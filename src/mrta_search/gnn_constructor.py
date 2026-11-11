@@ -1856,13 +1856,18 @@ def construct_coarse_to_fine_gnn(parents, model, config, *, space=None, embeddin
 _VNEXT_LOCAL_COLUMNS = (8, 9, 10, 11, 16, 19, 20, 21, 22, 23, 24, 28)
 _VNEXT_FEATURE_DIM = len(_VNEXT_LOCAL_COLUMNS) + 8
 _VNEXT_TIME_SAMPLES = 12
+_VNEXT_JOINT_PRIOR = (-5., -1.5, -1., -1., -3., -1.5)
 
 
 class VNextGNN(_JointAssignmentGNN):
     """Assignment and distilled directed insertion with a shared geometry encoder."""
 
-    def __init__(self, hidden_dim: int = 64, heads: int = 4, *, workload_lookahead: bool = False):
+    def __init__(self, hidden_dim: int = 64, heads: int = 4, *, workload_lookahead: bool = False,
+                 joint_actions: bool = False):
         super().__init__(hidden_dim, heads, workload_lookahead=workload_lookahead)
+        if joint_actions and not workload_lookahead:
+            raise ValueError('joint VNext actions require workload estimates')
+        self.joint_weights = nn.Parameter(torch.tensor(_VNEXT_JOINT_PRIOR)) if joint_actions else None
         self.insertion_head = nn.Sequential(nn.Linear(4 * hidden_dim + _VNEXT_FEATURE_DIM, hidden_dim),
                                             nn.ReLU(), nn.Linear(hidden_dim, 1))
         for name, size in (('assignment', self.policy[0].in_features), ('insertion', _VNEXT_FEATURE_DIM)):
@@ -1880,6 +1885,10 @@ class VNextGNN(_JointAssignmentGNN):
         neighbors = embeddings[indices.clamp_min(0)] * (indices >= 0).unsqueeze(-1)
         normalized = (features - self.insertion_mean) / self.insertion_scale
         return self.insertion_head(torch.cat((neighbors.flatten(1), normalized), dim=1)).squeeze(1)
+
+    def joint_scores(self, space, embeddings, indices, assignment, outcomes):
+        rows = self.embed_assignment_rows(space, embeddings, indices, assignment)
+        return .35 * self.assignment_scores(rows) + outcomes @ self.joint_weights
 
 
 def _sample_directed_positions(states, robot, endpoints, weld_seconds, config, times):
@@ -1941,11 +1950,136 @@ def vnext_insertion_inputs(graph, state, variants, blocks, config):
     return indices, torch.cat((local[:, _VNEXT_LOCAL_COLUMNS], dynamics), dim=1)
 
 
+class VNextJointAction(NamedTuple):
+    assignment_index: int
+    state: object
+    actions: tuple
+    assignment_features: torch.Tensor
+    outcome: torch.Tensor
+
+
+def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config):
+    """Rank up to eight assignments after their directed child insertions."""
+    from .lns import joint_block_candidates
+
+    indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
+    rows = model.embed_assignment_rows(space, embeddings, indices, features)
+    logits = .35 * model.assignment_scores(rows)
+    # The coarse stage uses the workload forecast. Reranking adds the actual
+    # change in route MOVE and the spatial risk after committing both children.
+    shortlist = shortlist_assignments(space, indices, logits + features[:, -4:-2] @ model.joint_weights[:2],
+                                      owner_alternatives=True)
+    positions = {index: i for i, index in enumerate(indices.tolist())}
+    before_move = features.new_tensor([sum(arcs) for arcs in state.arc_costs])
+    x_low = [min((min(blocks[b].start[0], blocks[b].end[0]) for b in route), default=math.inf)
+             for route in state.routes]
+    x_high = [max((max(blocks[b].start[0], blocks[b].end[0]) for b in route), default=-math.inf)
+              for route in state.routes]
+    plans = []
+    for index in shortlist:
+        assignment = space.actions[index]
+        children = space.children[assignment.pattern]
+        local_blocks = {**blocks, **{b.block_id: b for b in children}}
+        local_nodes = {**nodes, **{b.block_id: space.block_nodes[assignment.pattern, b.block_id] for b in children}}
+        graph = replace(space.graph, block_index=local_nodes)
+        partials = [(state, (), 0.)]
+        lo, hi = x_low.copy(), x_high.copy()
+        for child_index, (child, robot) in enumerate(zip(children, assignment.robots)):
+            lo[robot] = min(lo[robot], child.start[0], child.end[0])
+            hi[robot] = max(hi[robot], child.start[0], child.end[0])
+            expanded = []
+            for partial, actions, risk in partials:
+                variants = joint_block_candidates(partial, child, assignment.pattern, local_blocks, config,
+                                                  robot_id=robot, check_initial_feasibility=False)
+                if not variants:
+                    continue
+                variants = tuple(variants[i] for i in structural_child_indices(variants, limit=12))
+                ix, inputs = vnext_insertion_inputs(graph, partial, variants, local_blocks, config)
+                risk_by_option = inputs[:, -8] + 2. * inputs[:, -7] + .5 * inputs[:, -4]
+                move_delta = inputs.new_tensor([after.travel - partial.travel for after, _ in variants])
+                fine = .65 * model.insertion_logits(embeddings, ix, inputs) - move_delta / 32. - 1.5 * risk_by_option
+                keep = 2 if len(children) == 2 and child_index == 0 else 1
+                for i in torch.argsort(fine, descending=True, stable=True)[:keep].tolist():
+                    after, action = variants[i]
+                    expanded.append((after, (*actions, action), max(risk, float(risk_by_option[i]))))
+            partials = expanded
+        overlap = sum(max(0., hi[r] + config.interference_dx - lo[r + 1]) for r in (0, 2)) / 20.
+        assignment_features = features[positions[index]]
+        for after, actions, risk in partials:
+            moves = before_move.new_tensor([sum(arcs) for arcs in after.arc_costs])
+            expected = assignment_features[-8:-4] + (moves - before_move) / 2500.
+            peak = float(expected.max())
+            nominal = max(p + m for p, m in zip(after.loads, moves.tolist())) / 2500.
+            outcome = moves.new_tensor((peak, peak - float(expected.min()), nominal,
+                                        (after.travel - state.travel) / 45., overlap, risk))
+            plans.append(VNextJointAction(index, after, actions, assignment_features, outcome))
+    legal = legal_assignment_starts(plans, blocks, space, config)
+    plans = tuple(plans[i] for i in legal)
+    if not plans:
+        return plans, logits[:0]
+    selection = torch.tensor([positions[p.assignment_index] for p in plans], dtype=torch.long)
+    scores = logits[selection] + torch.stack([p.outcome for p in plans]) @ model.joint_weights
+    return plans, scores
+
+
+def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, selected, rng,
+                          deadline, step_observer, decision_observer):
+    from .lns import oriented_route_state
+
+    started = time.perf_counter()
+    space = parent_assignment_space(parents, config) if space is None else space
+    embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
+    selected = {} if selected is None else dict(selected)
+    blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
+    nodes = {b.block_id: space.block_nodes[pattern, b.block_id]
+             for pattern in selected.values() for b in space.children[pattern]}
+    pending = set(space.parent_ids) - selected.keys()
+    actions = []
+    empty = ((),) * 4
+    state = oriented_route_state(empty, empty, blocks, config) if state is None else state
+    while pending:
+        if deadline is not None and time.perf_counter() >= deadline:
+            return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
+                                         rejection_reason='TIME_LIMIT')
+        plans, scores = vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config)
+        if not plans:
+            return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
+                                         rejection_reason='NO_COMPLETE_PARENT_ACTION')
+        if step_observer is not None:
+            step_observer(state, selected, plans, scores)
+        best = int(scores.argmax())
+        if rng is not None and len(plans) > 1 and rng.random() < .25:
+            top = torch.argsort(scores, descending=True, stable=True)[:3]
+            best = rng.choices(top.tolist(), weights=(scores[top] / .6).softmax(0).tolist())[0]
+        plan = plans[best]
+        assignment = space.actions[plan.assignment_index]
+        state = plan.state
+        for block in space.children[assignment.pattern]:
+            blocks[block.block_id] = block
+            nodes[block.block_id] = space.block_nodes[assignment.pattern, block.block_id]
+        actions.extend(plan.actions)
+        selected[assignment.parent_id] = assignment.pattern
+        pending.remove(assignment.parent_id)
+        if decision_observer is not None:
+            decision_observer(assignment, plan.actions, state)
+    solution = canonicalize(parents, selected.values(), dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
+    if tuple(route.block_ids for route in solution.routes) != state.routes:
+        return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
+                                     rejection_reason='CANONICALIZATION_CHANGED_DIRECTED_ROUTES')
+    return JointCompletionResult(solution, state.directions, tuple(actions), time.perf_counter() - started,
+                                 oriented_state=state)
+
+
 @torch.no_grad()
-def construct_vnext_gnn(parents, model, config, *, decision_observer=None):
+def construct_vnext_gnn(parents, model, config, *, decision_observer=None, space=None, embeddings=None,
+                        state=None, selected=None, rng=None, deadline=None, step_observer=None):
     """Choose one assignment, then direct its children as a single commit."""
     from .lns import joint_block_candidates, oriented_route_state
 
+    if getattr(model, 'joint_weights', None) is not None:
+        return _construct_vnext_joint(parents, model, config, space=space, embeddings=embeddings, state=state,
+                                      selected=selected, rng=rng, deadline=deadline, step_observer=step_observer,
+                                      decision_observer=decision_observer)
     started = time.perf_counter()
     space = parent_assignment_space(parents, config)
     embeddings = model.encode_static(space.graph)
