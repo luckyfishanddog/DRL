@@ -383,3 +383,271 @@ def test_compiled_priority_follow_matches_existing_ess_including_wait():
     assert wait > 0.
     assert wait == pytest.approx(waited, abs=1e-7)
     assert result[-1, 6] == pytest.approx(ready, abs=1e-7)
+
+
+def test_spatial_native_follow_matches_original_on_motion_wait_and_blocking():
+    import numpy as np
+    from mrta_baselines import wag_vns as w
+    config = ScientificConfig()
+    rng = np.random.default_rng(861)
+    for trial in range(200):
+        points = rng.uniform((0., 0.), (20., 12.), (8, 2, 2))
+        if trial % 3 == 0:
+            points[:, :, 1] = 9.  # collinear motion and same-rail blocking
+        processing = np.array([config.process_time(np.linalg.norm(p[1] - p[0])) for p in points])
+        travel = np.empty((8, 8, 2, 2))
+        for d in range(2):
+            for e in range(2):
+                delta = points[:, 1 - d, None, :] - points[None, :, e, :]
+                travel[:, :, d, e] = np.sqrt(np.sum(delta * delta, axis=-1)) / config.empty_speed
+        a, b = rng.permutation(4), rng.permutation(np.arange(4, 8))
+        _, da = w._direction_array(a, travel, processing, trial % 2)
+        _, db = w._direction_array(b, travel, processing, (trial // 2) % 2)
+        na = w._numeric_templates(a, da, points, processing, config.empty_speed, config.t_pre, config.t_post)
+        nb = w._numeric_templates(b, db, points, processing, config.empty_speed, config.t_pre, config.t_post)
+        for fixed, following, rf, rr in ((na, nb, 0, 1), (nb, na, 1, 0)):
+            ordinary, wait = w._numeric_follow(fixed, following, rf, rr, config.interference_dx,
+                                                config.interference_dy, config.numeric_epsilon)
+            for early in (False, True):
+                skipped, other_wait = w._numeric_follow(fixed, following, rf, rr, config.interference_dx,
+                                                        config.interference_dy, config.numeric_epsilon, True, True,
+                                                        np.inf, True, early_reject=early)
+                assert wait == other_wait
+                np.testing.assert_array_equal(ordinary, skipped)
+
+
+def test_routed_assignment_schedules_native_winner_once(monkeypatch):
+    import math
+    from mrta_baselines import wag_vns as w
+    from mrta_baselines.common import CommonBaselineEvaluator
+    from mrta_reference.model import Route, SplitPattern
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import canonicalize
+    config = ScientificConfig()
+    parents = (ParentWeld('left', (1., 9.), (2., 9.)), ParentWeld('right', (8., 9.), (9., 9.)))
+    patterns = tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents)
+    solution = canonicalize(parents, patterns, (Route(0, ('left::whole',)), Route(1, ('right::whole',)),
+                                               Route(2, ()), Route(3, ())), config, scope=FORMAL_SCOPE_V2)
+    expected = w.priority_schedule(solution, config)
+    routes = tuple(route.block_ids for route in solution.routes)
+    monkeypatch.setattr(w, '_route_combinations', lambda *a, **k: (((0., routes),), 0))
+    original, calls = w._priority_arrays, []
+    def counted(*args):
+        calls.append(None)
+        return original(*args)
+    monkeypatch.setattr(w, '_priority_arrays', counted)
+    evaluator = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V2, time_limit=math.inf,
+                                        certify=False, candidate_evaluator=w.priority_schedule)
+    w._evaluate_routed_assignment(solution, config, w.AdaptedWAGConfig(), evaluator, source='ONCE')
+    assert len(calls) == 1
+    assert evaluator.best.schedule == expected
+    assert evaluator.accounting.reference_calls == 1
+
+
+@pytest.mark.parametrize("with_splits", (False, True))
+def test_lns_fixes_every_retained_task_owner_and_repairs_only_destroyed_tasks(with_splits):
+    import math
+    from mrta_baselines import wag_vns as w
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.model import Route
+    from mrta_reference.solution import canonicalize
+    config = ScientificConfig()
+    parents = _parents()
+    if with_splits:
+        parents += (ParentWeld('x', (2., 9.), (14., 9.)), ParentWeld('y', (2., 5.9), (5., 7.)))
+        catalog = build_legal_pattern_catalog(parents, config, FORMAL_SCOPE_V2)
+        patterns = tuple(next(p for p in catalog[parent.parent_id] if p.kind is
+                         (SplitKind.X_SPLIT if parent.parent_id == 'x' else
+                          SplitKind.Y_SPLIT if parent.parent_id == 'y' else SplitKind.WHOLE))
+                         for parent in parents)
+        routes = [tuple(f'u{i}::whole' for i in (0, 2, 4)) + ('x::0', 'y::1'),
+                  tuple(f'u{i}::whole' for i in (1, 3, 5)) + ('x::1',),
+                  tuple(f'l{i}::whole' for i in (0, 2, 4)) + ('y::0',),
+                  tuple(f'l{i}::whole' for i in (1, 3, 5))]
+        base = canonicalize(parents, patterns, tuple(Route(r, ids) for r, ids in enumerate(routes)),
+                            config, scope=FORMAL_SCOPE_V2)
+    else:
+        base = generate_wag_assignments(parents, _initial_patterns(parents, config, scope=FORMAL_SCOPE_V2),
+                                       config, max_variants=1, scope=FORMAL_SCOPE_V2)[0]
+    old_blocks = block_map(base, config, scope=FORMAL_SCOPE_V2)
+    class RecordingRandom(random.Random):
+        def __init__(self, seed):
+            super().__init__(seed)
+            self.shuffled = []
+        def shuffle(self, values):
+            super().shuffle(values)
+            self.shuffled.append(tuple(values))
+    for seed in range(10):
+        rng = RecordingRandom(seed)
+        candidates = w.wag_lns_candidates(base, config, rng, p=.5, max_variants=None, scope=FORMAL_SCOPE_V2)
+        retained = {name: robot for robot, ids in enumerate(rng.shuffled)
+                    for name in ids[math.ceil(len(ids) * .5):]}
+        assert retained and candidates
+        for candidate in candidates:
+            new_blocks = block_map(candidate, config, scope=FORMAL_SCOPE_V2)
+            owner = {name: route.robot_id for route in candidate.routes for name in route.block_ids}
+            assert set(owner) == set(new_blocks)
+            for name, robot in retained.items():
+                old = old_blocks[name]
+                # Canonical sibling merging may change the task ID, but every
+                # retained physical interval must remain on its original robot.
+                covering = [b for b in new_blocks.values() if b.parent_id == old.parent_id
+                            and b.u_start <= old.u_start and b.u_end >= old.u_end]
+                assert covering and all(owner[b.block_id] == robot for b in covering)
+            for pattern in candidate.patterns:
+                if pattern.kind is SplitKind.X_SPLIT:
+                    first = 0 if pattern.rail.value == 'UPPER' else 2
+                    assert owner[pattern.parent_id + '::0'] == first
+                    assert owner[pattern.parent_id + '::1'] == first + 1
+
+
+def test_native_wag_completes_500_rounds_without_calling_b32_or_certifier(monkeypatch):
+    import math
+    from mrta_baselines import common, wag_vns as w
+    config = ScientificConfig()
+    parents = (ParentWeld('left', (1., 9.), (2., 9.)), ParentWeld('right', (8., 9.), (9., 9.)))
+    def forbidden(*args, **kwargs):
+        raise AssertionError('B32/certifier called inside native WAG search')
+    monkeypatch.setattr(common.FormalReferenceEvaluator, '__call__', forbidden)
+    monkeypatch.setattr(common, 'certify_schedule', forbidden)
+    result = w.run_adapted_wag_vns_v2(parents, config, AdaptedWAGConfig(), seed=20261110,
+                                     time_limit=math.inf, checkpoints=(), certify=False,
+                                     candidate_evaluator=w.priority_schedule)
+    assert result.iterations == 500
+    assert result.termination_reason == 'ITERATION_LIMIT'
+    assert result.certifier_calls == 0
+    assert result.schedule.feasible
+
+
+def test_lazy_time_window_preserves_epsilon_boundaries_zero_moves_and_waits():
+    import numpy as np
+    from mrta_baselines import wag_vns as w
+    config = ScientificConfig()
+    parents = tuple(ParentWeld(name, (x, 9.), (x + 1., 9.))
+                    for name, x in (('a', 0.), ('b', 1.), ('c', .7), ('d', 1.7)))
+    blocks = _blocks_for(parents, _initial_patterns(parents, config), config)
+    _, _, points, travel, processing = w._tables_for(blocks, config)
+    routes = (np.array([0, 1], np.int64), np.array([2, 3], np.int64))
+    operations = []
+    for route in routes:
+        _, bits = w._direction_array(route, travel, processing, 0)
+        operations.append(w._numeric_templates(route, bits, points, processing,
+                                               config.empty_speed, config.t_pre, config.t_post))
+    assert any(op[0] == 0. for op in operations[0])
+    eps = config.numeric_epsilon
+    for boundary in (0., 20., 30., operations[0][2, 6]):
+        for offset in (-1.e-6, -1.e-8, -eps, 0., eps, 1.e-8, 1.e-6):
+            fixed = operations[0].copy()
+            fixed[:, 5:7] += boundary + offset
+            for a, b, rf, rr in ((fixed, operations[1], 0, 1), (operations[1], fixed, 1, 0)):
+                expected, wait = w._numeric_follow(a, b, rf, rr, config.interference_dx,
+                                                   config.interference_dy, eps)
+                for spatial in (False, True):
+                    for early in (False, True):
+                        actual, actual_wait = w._numeric_follow(a, b, rf, rr, config.interference_dx,
+                                                                config.interference_dy, eps, spatial, True,
+                                                                np.inf, True, early_reject=early)
+                        assert actual_wait == wait
+                        np.testing.assert_array_equal(actual, expected)
+
+
+def test_lazy_projection_section_contains_every_original_interval():
+    import numpy as np
+    from mrta_baselines import wag_vns as w
+    config = ScientificConfig()
+    rng = np.random.default_rng(19073)
+    for trial in range(2500):
+        a, b = np.zeros(9), np.zeros(9)
+        for op in (a, b):
+            op[0] = 0. if trial % 11 == 0 else rng.uniform(.001, 300.)
+            op[1:5] = rng.uniform(-2., 12., 4)
+            op[5] = rng.uniform(0., 2000.)
+            op[6] = op[5] + op[0]
+        ready = rng.uniform(0., 2000.)
+        for ra, rb in ((0, 1), (1, 0)):
+            for order in (False, True):
+                lo, hi = w._numeric_forbidden(a, b, ra, rb, ready, config.interference_dx,
+                                               config.interference_dy, config.numeric_epsilon, order)
+                specialized = w._numeric_forbidden_buffer(a, b, ra, rb, ready,
+                    config.interference_dx, config.interference_dy, config.numeric_epsilon,
+                    order, np.empty((10, 3)), True)
+                assert specialized == (lo, hi)
+                if lo > hi:
+                    continue
+                for start in (lo, hi, .5 * (lo + hi)):
+                    assert w._forbidden_may_contain(a, b, ra, ready, start, config.interference_dx,
+                                                     config.interference_dy, config.numeric_epsilon, order)
+
+
+def test_scalar_direction_dp_preserves_exact_cost_and_lexicographic_ties():
+    import itertools
+    import numpy as np
+    from mrta_baselines import wag_vns as w
+    rng = np.random.default_rng(4781)
+    for n in range(1, 9):
+        route = np.arange(n, dtype=np.int64)
+        processing = rng.integers(1, 8, n).astype(float)
+        # Integer-valued arcs deliberately produce exact DP ties.
+        travel = rng.integers(0, 4, (n, n, 2, 2)).astype(float)
+        for first in range(2):
+            choices = []
+            for tail in itertools.product((0, 1), repeat=n - 1):
+                bits = (first,) + tail
+                value = processing[0]
+                for k in range(1, n):
+                    value = value + travel[k - 1, k, bits[k - 1], bits[k]] + processing[k]
+                choices.append((value, bits))
+            expected, bits = min(choices)
+            actual, directions = w._direction_array(route, travel, processing, first)
+            assert actual == expected and tuple(directions) == bits
+
+
+def test_incremental_follow_prefix_matches_full_recomputation_after_suffix_changes():
+    import numpy as np
+    from mrta_baselines import wag_vns as w
+    config, rng, reused = ScientificConfig(), np.random.default_rng(21965), 0
+    for trial in range(200):
+        points = rng.uniform((0., 8.), (12., 10.), (8, 2, 2))
+        if trial % 2 == 0:
+            points[:4, :, 0] *= .2
+            points[4:, :, 0] = 8. + .2 * points[4:, :, 0]
+        processing = np.array([config.process_time(np.linalg.norm(p[1] - p[0])) for p in points])
+        travel = np.empty((8, 8, 2, 2))
+        for d in range(2):
+            for e in range(2):
+                delta = points[:, 1 - d, None, :] - points[None, :, e, :]
+                travel[:, :, d, e] = np.sqrt(np.sum(delta * delta, axis=-1)) / config.empty_speed
+        templates = []
+        for route in (np.arange(4, dtype=np.int64), np.arange(4, 8, dtype=np.int64)):
+            _, bits = w._direction_array(route, travel, processing, trial % 2)
+            templates.append(w._numeric_templates(route, bits, points, processing,
+                                                  config.empty_speed, config.t_pre, config.t_post))
+        for rf, rr in ((0, 1), (1, 0)):
+            fixed, following = templates[rf], templates[rr]
+            old_output, _ = w._numeric_follow(fixed, following, rf, rr, config.interference_dx,
+                                               config.interference_dy, config.numeric_epsilon)
+            if not len(old_output):
+                continue
+            new_fixed, new_following = fixed.copy(), following.copy()
+            for modified in (new_fixed, new_following):
+                index = int(rng.integers(1, len(modified)))
+                delta = rng.choice((-1.e-8, 1.e-8, 1., 10.))
+                if modified[index, 0] + delta < 0.:
+                    delta = abs(delta)
+                modified[index, 0] += delta
+                modified[index, 6] += delta
+                modified[index + 1:, 5:7] += delta
+            reuse = (fixed, following, old_output)
+            count, _, _, _ = w._follow_reusable_prefix(new_fixed, new_following, *reuse,
+                                                       config.numeric_epsilon)
+            reused += int(count > 0)
+            expected, expected_wait = w._numeric_follow(new_fixed, new_following, rf, rr,
+                config.interference_dx, config.interference_dy, config.numeric_epsilon)
+            for early in (False, True):
+                actual, actual_wait = w._numeric_follow(new_fixed, new_following, rf, rr,
+                    config.interference_dx, config.interference_dy, config.numeric_epsilon,
+                    True, True, np.inf, True, reuse, early_reject=early)
+                assert actual_wait == expected_wait
+                np.testing.assert_array_equal(actual, expected)
+    assert reused > 50

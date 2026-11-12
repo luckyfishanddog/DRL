@@ -390,24 +390,25 @@ def _direction_array(route, travel, processing, first):
     if not n:
         return 0., bits
     back = np.zeros((n, 2), np.int64)
-    values = np.full(2, np.inf)
-    values[first] = processing[route[0]]
-    ranks = np.array([0, 1], np.int64)
+    value0 = processing[route[0]] if first == 0 else np.inf
+    value1 = processing[route[0]] if first == 1 else np.inf
+    rank0, rank1 = 0, 1
     for k in range(1, n):
         old, new = route[k - 1], route[k]
-        next_values = np.empty(2)
-        for d in range(2):
-            a, b = values[0] + travel[old, new, 0, d], values[1] + travel[old, new, 1, d]
-            previous = 0 if a < b or (a == b and ranks[0] <= ranks[1]) else 1
-            back[k, d] = previous
-            next_values[d] = min(a, b) + processing[new]
-        if ranks[back[k, 0]] <= ranks[back[k, 1]]:
-            ranks[0], ranks[1] = 0, 1
+        a, b = value0 + travel[old, new, 0, 0], value1 + travel[old, new, 1, 0]
+        previous0 = 0 if a < b or (a == b and rank0 <= rank1) else 1
+        next0 = min(a, b) + processing[new]
+        a, b = value0 + travel[old, new, 0, 1], value1 + travel[old, new, 1, 1]
+        previous1 = 0 if a < b or (a == b and rank0 <= rank1) else 1
+        next1 = min(a, b) + processing[new]
+        back[k, 0], back[k, 1] = previous0, previous1
+        if (rank0 if previous0 == 0 else rank1) <= (rank0 if previous1 == 0 else rank1):
+            rank0, rank1 = 0, 1
         else:
-            ranks[0], ranks[1] = 1, 0
-        values = next_values
-    last = 0 if values[0] < values[1] or (values[0] == values[1] and ranks[0] < ranks[1]) else 1
-    value = values[last]
+            rank0, rank1 = 1, 0
+        value0, value1 = next0, next1
+    last = 0 if value0 < value1 or (value0 == value1 and rank0 < rank1) else 1
+    value = value0 if last == 0 else value1
     bits[n - 1] = last
     for k in range(n - 1, 0, -1):
         bits[k - 1] = back[k, bits[k]]
@@ -425,14 +426,20 @@ def _numeric_templates(route, bits, points, processing, empty_speed, pre, post):
         if k:
             old = points[route[k - 1], 1 - bits[k - 1]]
             duration = math.sqrt((old[0] - start[0]) ** 2 + (old[1] - start[1]) ** 2) / empty_speed
-            ops[count] = np.array([duration, old[0], old[1], start[0], start[1], cursor, cursor + duration, node, 0.])
+            ops[count, 0], ops[count, 1], ops[count, 2] = duration, old[0], old[1]
+            ops[count, 3], ops[count, 4] = start[0], start[1]
+            ops[count, 5], ops[count, 6] = cursor, cursor + duration
+            ops[count, 7], ops[count, 8] = node, 0.
             count += 1
             cursor += duration
         for kind in range(1, 4):
             duration = pre if kind == 1 else post if kind == 3 else processing[node] - pre - post
             a = end if kind == 3 else start
             b = start if kind == 1 else end
-            ops[count] = np.array([duration, a[0], a[1], b[0], b[1], cursor, cursor + duration, node, float(kind)])
+            ops[count, 0], ops[count, 1], ops[count, 2] = duration, a[0], a[1]
+            ops[count, 3], ops[count, 4] = b[0], b[1]
+            ops[count, 5], ops[count, 6] = cursor, cursor + duration
+            ops[count, 7], ops[count, 8] = node, float(kind)
             count += 1
             cursor += duration
     return ops[:count]
@@ -465,8 +472,81 @@ def _numeric_conflict(a, b, ra, rb, dx, dy, eps):
 
 @njit
 def _numeric_forbidden(a, b, ra, rb, ready, dx, dy, eps, order):
-    duration = a[0]
     constraints = np.empty((10, 3))
+    return _numeric_forbidden_buffer(a, b, ra, rb, ready, dx, dy, eps, order, constraints)
+
+
+@njit(inline='always')
+def _temporal_vertex_valid(s, t, duration, begin, end, bound, geometry, eps):
+    if (s - t > eps or t - s > duration + eps or -t > -begin + eps
+            or t > end + eps or -s > -bound + eps or s > end + eps):
+        return False
+    for aa, bb, cc in geometry:
+        if aa * s + bb * t > cc + eps:
+            return False
+    return True
+
+
+@njit
+def _fixed_temporal_projection(duration, begin, end, bound, geometry, eps):
+    # The six unchanged temporal half-planes have twelve nonparallel pairs.
+    # Three yield (end, end); enumerate their ten distinct vertices directly.
+    low, high = np.inf, -np.inf
+    for s, t in ((begin, begin), (end, end), (bound, bound), (begin - duration, begin),
+                 (end - duration, end), (bound, bound + duration), (end, end + duration),
+                 (bound, begin), (end, begin), (bound, end)):
+        if _temporal_vertex_valid(s, t, duration, begin, end, bound, geometry, eps):
+            low, high = min(low, s), max(high, s)
+    temporal = ((1., -1., 0.), (-1., 1., duration), (0., -1., -begin),
+                (0., 1., end), (-1., 0., -bound), (1., 0., end))
+    for x, y, z in temporal:
+        for aa, bb, cc in geometry:
+            determinant = x * bb - aa * y
+            if abs(determinant) <= 1.e-15:
+                continue
+            s = (z * bb - cc * y) / determinant
+            t = (x * cc - aa * z) / determinant
+            if _temporal_vertex_valid(s, t, duration, begin, end, bound, geometry, eps):
+                low, high = min(low, s), max(high, s)
+    for i in range(len(geometry)):
+        x, y, z = geometry[i]
+        for j in range(i + 1, len(geometry)):
+            aa, bb, cc = geometry[j]
+            determinant = x * bb - aa * y
+            if abs(determinant) <= 1.e-15:
+                continue
+            s = (z * bb - cc * y) / determinant
+            t = (x * cc - aa * z) / determinant
+            if _temporal_vertex_valid(s, t, duration, begin, end, bound, geometry, eps):
+                low, high = min(low, s), max(high, s)
+    return low, high
+
+
+@njit
+def _numeric_forbidden_specialized(a, b, ra, ready, dx, dy, eps, order):
+    duration, begin, end = a[0], b[5], b[6]
+    bound = max(ready, begin - duration)
+    vc = (a[3] - a[1]) / duration if duration else 0.
+    vf = (b[3] - b[1]) / b[0] if b[0] else 0.
+    constant = a[1] - b[1] + vf * begin
+    if order:
+        sign = 1. if ra % 2 == 0 else -1.
+        return _fixed_temporal_projection(duration, begin, end, bound,
+            ((sign * vc, sign * (vf - vc), sign * constant + dx - eps),), eps)
+    vy = (a[4] - a[2]) / duration if duration else 0.
+    wy = (b[4] - b[2]) / b[0] if b[0] else 0.
+    cy = a[2] - b[2] + wy * begin
+    lx, ly = dx + eps, dy + eps
+    geometry = ((-vc, vc - vf, lx - constant), (vc, vf - vc, lx + constant),
+                (-vy, vy - wy, ly - cy), (vy, wy - vy, ly + cy))
+    return _fixed_temporal_projection(duration, begin, end, bound, geometry, eps)
+
+
+@njit
+def _numeric_forbidden_buffer(a, b, ra, rb, ready, dx, dy, eps, order, constraints, specialized=False):
+    if specialized:
+        return _numeric_forbidden_specialized(a, b, ra, ready, dx, dy, eps, order)
+    duration = a[0]
     constraints[0] = (1., -1., 0.)
     constraints[1] = (-1., 1., duration)
     constraints[2] = (0., -1., -b[5])
@@ -506,28 +586,229 @@ def _numeric_forbidden(a, b, ra, rb, ready, dx, dy, eps, order):
 
 
 @njit
-def _numeric_follow(fixed, following, rf, rr, dx, dy, eps):
+def _forbidden_may_contain(a, b, ra, ready, start, dx, dy, eps, order):
+    """Conservative section of the original EPS-relaxed projection polygon.
+
+    Every vertex admitted by _numeric_forbidden satisfies those half-planes
+    with EPS slack. Their convex hull contains its entire returned start-time
+    interval. If this looser section is empty, that interval cannot contain
+    start. Near boundaries the original vertex enumeration remains decisive.
+    """
+    duration = a[0]
+    slack = 32. * eps + 1.e-10 * max(1., abs(start), abs(ready), abs(b[5]), abs(b[6]))
+    if start < max(ready, b[5] - duration) - slack or start > b[6] + slack:
+        return False
+    lo, hi = max(start, b[5]) - slack, min(start + duration, b[6]) + slack
+    if lo > hi:
+        return False
+    for axis in range(1 if order else 2):
+        vc = (a[axis + 3] - a[axis + 1]) / duration if duration else 0.
+        vf = (b[axis + 3] - b[axis + 1]) / b[0] if b[0] else 0.
+        constant = a[axis + 1] - b[axis + 1] + vf * b[5]
+        if order:
+            sign = 1. if ra % 2 == 0 else -1.
+            coefficient = sign * (vf - vc)
+            rhs = sign * constant + dx - eps - sign * vc * start
+            margin = slack * (1. + abs(vc) + abs(vf))
+            if coefficient > 0.:
+                hi = min(hi, (rhs + margin) / coefficient)
+            elif coefficient < 0.:
+                lo = max(lo, (rhs + margin) / coefficient)
+            elif rhs + margin < 0.:
+                return False
+        else:
+            limit = (dx if axis == 0 else dy) + eps
+            for side in (-1., 1.):
+                coefficient = side * (vc - vf)
+                rhs = limit - side * constant + side * vc * start
+                margin = slack * (1. + abs(vc) + abs(vf))
+                if coefficient > 0.:
+                    hi = min(hi, (rhs + margin) / coefficient)
+                elif coefficient < 0.:
+                    lo = max(lo, (rhs + margin) / coefficient)
+                elif rhs + margin < 0.:
+                    return False
+        if lo > hi:
+            return False
+    return True
+
+
+@njit
+def _follow_reusable_prefix(fixed, following, old_fixed, old_following, old_output, eps):
+    """A prefix strictly before either fixed timeline changes is identical.
+
+    The saved output must come from this same fixed/following priority. Commit
+    only whole following operations, including their complete preceding WAIT.
+    No inference from the winning priority or from absence of WAIT is used.
+    """
+    k = min(len(fixed), len(old_fixed)) if fixed.ctypes.data == old_fixed.ctypes.data else 0
+    while k < min(len(fixed), len(old_fixed)):
+        equal = True
+        for field in range(9):
+            if fixed[k, field] != old_fixed[k, field]:
+                equal = False
+                break
+        if not equal:
+            break
+        k += 1
+    change = np.inf
+    if k < len(fixed):
+        change = fixed[k, 5]
+    if k < len(old_fixed):
+        change = min(change, old_fixed[k, 5])
+    margin = max(1.e-8, 32. * eps * max(1., abs(change))) if math.isfinite(change) else 0.
+    matched = (min(len(following), len(old_following))
+               if following.ctypes.data == old_following.ctypes.data else 0)
+    while matched < min(len(following), len(old_following)):
+        equal = True
+        for field in range(9):
+            if following[matched, field] != old_following[matched, field]:
+                equal = False
+                break
+        if not equal:
+            break
+        matched += 1
+    count, complete, ready, total_wait, pending_wait = 0, 0, 0., 0., 0.
+    for j in range(len(old_output)):
+        op = old_output[j]
+        if complete >= matched or op[6] >= change - margin:
+            break
+        if op[8] == 4.:
+            pending_wait += op[0]
+        else:
+            complete += 1
+            count, ready = j + 1, op[6]
+            total_wait += pending_wait
+            pending_wait = 0.
+    return count, complete, ready, total_wait
+
+
+@njit
+def _numeric_follow(fixed, following, rf, rr, dx, dy, eps, spatial_skip=False, time_window=False,
+                    cmax_limit=np.inf, lazy_projection=False, reuse=None, failure=None, early_reject=False):
     output = np.empty((2 * len(following), 9))
+    relevant = np.empty(len(fixed) if spatial_skip else 0, np.int64)
+    intervals = np.empty((2 * len(fixed), 2))
+    pending = np.empty((2 * len(fixed) if lazy_projection else 0, 2), np.int64)
+    constraints = np.empty((10, 3))
+    candidate, wait = np.empty(9), np.empty(9)
+    guard = 1.e-8 * max(1., abs(cmax_limit)) if math.isfinite(cmax_limit) else 0.
     count, ready, total_wait = 0, 0., 0.
-    for op in following:
-        intervals = np.empty((2 * len(fixed), 2))
-        n = 0
-        for other in fixed:
-            if other[6] < ready - eps * max(1., abs(ready), abs(other[6])):
-                continue
-            if rr % 2 == 0:
-                separated = max(op[1], op[3]) + dx + eps < min(other[1], other[3])
-            else:
-                separated = max(other[1], other[3]) + dx + eps < min(op[1], op[3])
-            if separated:
-                continue
-            for order in (True, False):
-                lo, hi = _numeric_forbidden(op, other, rr, rf, ready, dx, dy, eps, order)
-                if lo <= hi:
-                    intervals[n] = (lo, hi)
-                    n += 1
+    first, past = 0, 0
+    if failure is not None:
+        failure[0], failure[1] = -2., np.nan  # unknown or a Cmax-only cutoff
+    if reuse is not None:
+        old_fixed, old_following, old_output = reuse
+        count, first, ready, total_wait = _follow_reusable_prefix(
+            fixed, following, old_fixed, old_following, old_output, eps)
+        output[:count] = old_output[:count]
+    for op_index in range(first, len(following)):
+        op = following[op_index]
+        # Positive remaining durations give a lower bound after every committed
+        # prefix. A finite limit is used only to reject non-improving VND moves;
+        # the ordinary native scorer still constructs its complete timeline.
+        remaining = following[-1, 6] - op[5]
+        if ready + remaining >= cmax_limit + guard:
+            return output[:0], np.inf
+        pending_count = 0
+        if time_window:
+            # ready is monotone. Retire each completed fixed operation once,
+            # instead of walking the whole elapsed prefix for every next op.
+            while past < len(fixed):
+                end = fixed[past, 6]
+                if end >= ready - eps * max(1., abs(ready), abs(end)):
+                    break
+                past += 1
+        n, relevant_count, cursor = 0, 0, past
         start = ready
-        for _ in range(n + 2):
+        # Each advance passes an interval endpoint. At most 2*len(fixed)
+        # intervals exist: this bound completes the union search, not a cap.
+        for _ in range(2 * len(fixed) + 2):
+            for other_index in range(cursor, len(fixed)):
+                other = fixed[other_index]
+                if time_window:
+                    # A projected forbidden interval containing start must
+                    # overlap [start, start + duration], up to relaxed time
+                    # inequalities. Later fixed operations are revisited after
+                    # each WAIT advance, in their original chronological order.
+                    edge = start + op[0]
+                    margin = max(1.e-8, 16. * eps * max(1., abs(edge), abs(other[5])))
+                    if other[5] > edge + margin:
+                        break
+                cursor = other_index + 1
+                if other[6] < ready - eps * max(1., abs(ready), abs(other[6])):
+                    continue
+                if rr % 2 == 0:
+                    separated = max(op[1], op[3]) + dx + eps < min(other[1], other[3])
+                else:
+                    separated = max(other[1], other[3]) + dx + eps < min(op[1], op[3])
+                if separated:
+                    continue
+                if spatial_skip:
+                    relevant[relevant_count] = other_index
+                    relevant_count += 1
+                for order in (True, False):
+                    if spatial_skip and not order:
+                        # Conservative spatial exclusion of the proximity polygon.
+                        # Its epsilon-relaxed time bounds can extend each segment
+                        # by at most epsilon * speed. Keep an additional numerical
+                        # margin; near boundaries still use the original polygon.
+                        disjoint = False
+                        for axis in range(2):
+                            va = abs((op[axis + 3] - op[axis + 1]) / op[0]) if op[0] else 0.
+                            vb = abs((other[axis + 3] - other[axis + 1]) / other[0]) if other[0] else 0.
+                            margin = max(1.e-8, 16. * eps * (1. + va + vb))
+                            distance = dx if axis == 0 else dy
+                            if (max(op[axis + 1], op[axis + 3]) + distance + margin < min(other[axis + 1], other[axis + 3])
+                                    or max(other[axis + 1], other[axis + 3]) + distance + margin < min(op[axis + 1], op[axis + 3])):
+                                disjoint = True
+                                break
+                        if disjoint:
+                            continue
+                    if lazy_projection:
+                        pending[pending_count] = (other_index, int(order))
+                        pending_count += 1
+                        continue
+                    lo, hi = _numeric_forbidden_buffer(op, other, rr, rf, ready, dx, dy, eps, order, constraints, early_reject)
+                    if lo <= hi:
+                        intervals[n] = (lo, hi)
+                        n += 1
+                        # Adding forbidden intervals can only delay this start.
+                        # A forced WAIT prefix already in conflict stays invalid.
+                        if early_reject and lo <= start <= hi:
+                            forced = max(np.nextafter(hi, np.inf), hi + eps * max(1., abs(hi)))
+                            if forced + remaining >= cmax_limit + guard:
+                                return output[:0], np.inf
+                            if hi > ready:
+                                wait[:] = op
+                                wait[0], wait[3], wait[4], wait[5], wait[6], wait[8] = hi - ready, op[1], op[2], ready, hi, 4.
+                                if _numeric_conflict(wait, other, rr, rf, dx, dy, eps):
+                                    if failure is not None:
+                                        failure[0], failure[1] = float(op_index), max(hi + op[0], other[6])
+                                    return output[:0], np.inf
+            for j in range(pending_count):
+                index = pending[j, 0]
+                if index < 0:
+                    continue
+                order = pending[j, 1] == 1
+                other = fixed[index]
+                if _forbidden_may_contain(op, other, rr, ready, start, dx, dy, eps, order):
+                    lo, hi = _numeric_forbidden_buffer(op, other, rr, rf, ready, dx, dy, eps, order, constraints, early_reject)
+                    pending[j, 0] = -1
+                    if lo <= hi:
+                        intervals[n] = (lo, hi)
+                        n += 1
+                        if early_reject and lo <= start <= hi:
+                            forced = max(np.nextafter(hi, np.inf), hi + eps * max(1., abs(hi)))
+                            if forced + remaining >= cmax_limit + guard:
+                                return output[:0], np.inf
+                            if hi > ready:
+                                wait[:] = op
+                                wait[0], wait[3], wait[4], wait[5], wait[6], wait[8] = hi - ready, op[1], op[2], ready, hi, 4.
+                                if _numeric_conflict(wait, other, rr, rf, dx, dy, eps):
+                                    if failure is not None:
+                                        failure[0], failure[1] = float(op_index), max(hi + op[0], other[6])
+                                    return output[:0], np.inf
             furthest = -np.inf
             for j in range(n):
                 if intervals[j, 0] <= start <= intervals[j, 1]:
@@ -535,14 +816,23 @@ def _numeric_follow(fixed, following, rf, rr, dx, dy, eps):
             if furthest == -np.inf:
                 break
             start = max(np.nextafter(furthest, np.inf), furthest + eps * max(1., abs(furthest)))
-        candidate = op.copy()
+            if start + remaining >= cmax_limit + guard:
+                return output[:0], np.inf
+        candidate[:] = op
         candidate[5], candidate[6] = start, start + op[0]
-        wait = op.copy()
+        wait[:] = op
         wait[0], wait[3], wait[4], wait[5], wait[6], wait[8] = start - ready, op[1], op[2], ready, start, 4.
-        for other in fixed:
+        # Operations excluded by the original time/strict same-rail spatial
+        # tests cannot conflict with either the candidate or its stationary WAIT.
+        for j in range(relevant_count if spatial_skip else len(fixed)):
+            other = fixed[relevant[j] if spatial_skip else j]
             if _numeric_conflict(candidate, other, rr, rf, dx, dy, eps):
+                if failure is not None:
+                    failure[0], failure[1] = float(op_index), candidate[6]
                 return output[:0], np.inf
             if start > ready and _numeric_conflict(wait, other, rr, rf, dx, dy, eps):
+                if failure is not None:
+                    failure[0], failure[1] = float(op_index), candidate[6]
                 return output[:0], np.inf
         if start > ready + eps:
             output[count] = wait
@@ -551,34 +841,34 @@ def _numeric_follow(fixed, following, rf, rr, dx, dy, eps):
         output[count] = candidate
         count += 1
         ready = candidate[6]
+    if failure is not None:
+        failure[0] = -1.  # complete; no failed operation
     return output[:count], total_wait
 
 
 @njit
-def _priority_arrays(routes, travel, processing, points, parameters):
+def _priority_arrays(routes, travel, processing, points, parameters, fixed_directions=None):
     """Same two-priority rule as WAG, plus four-robot initial/cross checks.
 
     This is a native scorer: no dispatch tree, recovery, certification or B32.
     """
     speed, pre, post, dx, dy, eps = parameters
-    directions = [np.empty(0, np.int64) for _ in range(4)]
+    directions = ([np.empty(0, np.int64) for _ in range(4)] if fixed_directions is None
+                  else [bits.copy() for bits in fixed_directions])
     operations = [np.empty((0, 9)) for _ in range(4)]
     completion = np.zeros(4)
     for left in (0, 2):
         right = left + 1
-        best, bit0, bit1 = np.inf, np.empty(0, np.int64), np.empty(0, np.int64)
-        for first0 in range(2 if len(routes[left]) else 1):
-            c0, d0 = _direction_array(routes[left], travel, processing, first0)
-            for first1 in range(2 if len(routes[right]) else 1):
-                c1, d1 = _direction_array(routes[right], travel, processing, first1)
-                if len(d0) and len(d1):
-                    a, b = points[routes[left][0], d0[0]], points[routes[right][0], d1[0]]
-                    if a[0] + dx > b[0] + eps:
-                        continue
-                    if abs(a[0] - b[0]) <= dx + eps and abs(a[1] - b[1]) <= dy + eps:
-                        continue
-                if c0 + c1 < best:
-                    best, bit0, bit1 = c0 + c1, d0, d1
+        if fixed_directions is not None:
+            bit0, bit1 = fixed_directions[left], fixed_directions[right]
+            best = 0.
+            if len(bit0) and len(bit1):
+                a, b = points[routes[left][0], bit0[0]], points[routes[right][0], bit1[0]]
+                if (a[0] + dx > b[0] + eps or
+                        (abs(a[0] - b[0]) <= dx + eps and abs(a[1] - b[1]) <= dy + eps)):
+                    return np.inf, directions, operations, completion
+        else:
+            best, bit0, bit1 = _priority_pair_directions(routes, left, travel, processing, points, parameters)
         if not math.isfinite(best):
             return np.inf, directions, operations, completion
         directions[left], directions[right] = bit0, bit1
@@ -621,6 +911,26 @@ def _priority_arrays(routes, travel, processing, points, parameters):
     return max(completion), directions, operations, completion
 
 
+@njit
+def _priority_pair_directions(routes, left, travel, processing, points, parameters):
+    right = left + 1
+    dx, dy, eps = parameters[3], parameters[4], parameters[5]
+    best, bit0, bit1 = np.inf, np.empty(0, np.int64), np.empty(0, np.int64)
+    for first0 in range(2 if len(routes[left]) else 1):
+        c0, d0 = _direction_array(routes[left], travel, processing, first0)
+        for first1 in range(2 if len(routes[right]) else 1):
+            c1, d1 = _direction_array(routes[right], travel, processing, first1)
+            if len(d0) and len(d1):
+                a, b = points[routes[left][0], d0[0]], points[routes[right][0], d1[0]]
+                if a[0] + dx > b[0] + eps:
+                    continue
+                if abs(a[0] - b[0]) <= dx + eps and abs(a[1] - b[1]) <= dy + eps:
+                    continue
+            if c0 + c1 < best:
+                best, bit0, bit1 = c0 + c1, d0, d1
+    return best, bit0, bit1
+
+
 def _schedule_from_arrays(value, directions, operations, completion, ids, policy):
     from mrta_reference.model import Operation, OperationKind, ScheduleResult, ScheduleStatus
     vectors = tuple(tuple(int(d) for d in route) for route in directions)
@@ -636,15 +946,21 @@ def _schedule_from_arrays(value, directions, operations, completion, ids, policy
                           directions=vectors, reference_policy_id=policy)
 
 
-def priority_schedule(solution, config):
+def priority_schedule(solution, config, directions=None):
     """Shared lightweight four-robot native objective for the two baselines."""
     blocks = block_map(solution, config)
     ids, index, points, travel, processing = _tables_for(blocks, config)
     routes = [np.array([index[b] for b in route.block_ids], np.int64) for route in solution.routes]
     parameters = np.array([config.empty_speed, config.t_pre, config.t_post,
                            config.interference_dx, config.interference_dy, config.numeric_epsilon])
-    return _schedule_from_arrays(*_priority_arrays(routes, travel, processing, points, parameters),
-                                 ids, "NATIVE_PRIORITY_FOUR_ROBOTS")
+    if directions is not None and any(bit not in (0, 1) for bits in directions for bit in bits):
+        raise ValueError("explicit directions must use 0/1 values")
+    vectors = None if directions is None else [np.array(bits, np.int64) for bits in directions]
+    if vectors is not None and (len(vectors) != 4 or any(len(vectors[r]) != len(routes[r])
+            or np.any((vectors[r] != 0) & (vectors[r] != 1)) for r in range(4))):
+        raise ValueError("explicit directions must contain one 0/1 value per routed block")
+    policy = "NATIVE_PRIORITY_FOUR_ROBOTS" + ("_EXPLICIT_DIRECTIONS" if vectors is not None else "")
+    return _schedule_from_arrays(*_priority_arrays(routes, travel, processing, points, parameters, vectors), ids, policy)
 
 
 def nearest_addition(
@@ -805,9 +1121,15 @@ def generate_wag_assignments(
     max_variants: int | None,
     accounting: BaselineAccounting | None = None,
     scope: FormalScope | None = None,
+    retained_assignments: Mapping[str, int] | None = None,
 ) -> tuple[CanonicalSolution, ...]:
+    """Generate at most 25 local boundary-offset WAGs, not all legal assignments.
+
+    In an LNS repair, retained task owners and prescribed X children are fixed;
+    only the destroyed tasks participate in residual balancing and offsets.
+    """
     blocks = _blocks_for(parents, patterns, config)
-    fixed_x_robot = {
+    fixed_robot = {
         f"{pattern.parent_id}::{child}": robot
         for pattern in patterns
         if pattern.kind is SplitKind.X_SPLIT
@@ -817,15 +1139,21 @@ def generate_wag_assignments(
             else (2, 3)
         )
     }
-    # X children cannot move, but their work still occupies the assigned rail
-    # and robot when balancing the remaining WHOLE/Y blocks.
+    for block_id, robot in (retained_assignments or {}).items():
+        if block_id not in blocks or robot not in range(4) or not robot_is_eligible(blocks[block_id], robot, config):
+            raise ValueError(f"{block_id}: invalid retained assignment")
+        if block_id in fixed_robot and fixed_robot[block_id] != robot:
+            raise ValueError(f"{block_id}: retained owner violates prescribed X assignment")
+        fixed_robot[block_id] = robot
+    # Retained tasks and prescribed X children contribute their existing loads;
+    # none of them participate in assigning the destroyed task set.
     fixed_loads = [0.0] * 4
-    for block_id, robot in fixed_x_robot.items():
+    for block_id, robot in fixed_robot.items():
         fixed_loads[robot] += config.process_time(blocks[block_id].length)
     rail_groups: dict[str, list[str]] = {"UPPER": [], "LOWER": []}
     flexible: list[str] = []
     for block_id, block in blocks.items():
-        if block_id in fixed_x_robot:
+        if block_id in fixed_robot:
             continue
         upper = any(robot_is_eligible(block, robot, config) for robot in (0, 1))
         lower = any(robot_is_eligible(block, robot, config) for robot in (2, 3))
@@ -874,7 +1202,7 @@ def generate_wag_assignments(
             list(lower_order[:lb]),
             list(lower_order[lb:]),
         ]
-        for block_id, robot in sorted(fixed_x_robot.items()):
+        for block_id, robot in sorted(fixed_robot.items()):
             route_lists[robot].append(block_id)
         routes = tuple(
             Route(robot, tuple(route_lists[robot])) for robot in range(4)
@@ -1056,6 +1384,7 @@ def wag_lns_candidates(
         rng.shuffle(routes[robot])
         removed.extend(routes[robot][:count])
         routes[robot] = routes[robot][count:]
+    retained = {block_id: robot for robot, route in enumerate(routes) for block_id in route}
     blocks = block_map(solution, config)
     removed.sort(
         key=lambda item: (
@@ -1090,7 +1419,9 @@ def wag_lns_candidates(
         config,
         scope=scope,
     )
-    return _wag_assignments_cached(solution.parents, solution.patterns, config, max_variants, scope) + (base,)
+    repairs = generate_wag_assignments(solution.parents, solution.patterns, config,
+                                      max_variants=max_variants, scope=scope, retained_assignments=retained)
+    return repairs + (base,)
 
 
 def toggle_optional_y(
@@ -1187,28 +1518,30 @@ def _evaluate_routed_assignment(
     evaluator.accounting.construction_time += elapsed
     evaluator.accounting.factorial_local_search_time += elapsed
     evaluator.accounting.cheap_candidate_operations += factorial_calls
-    native = getattr(evaluator, 'candidate_evaluator', None) is priority_schedule
+    native = (getattr(evaluator, 'candidate_evaluator', None) is priority_schedule
+              and not evaluator.certify)
     if native:
         if not hasattr(evaluator, '_wag_native_contexts'):
             evaluator._wag_native_contexts = {}
         context = evaluator._wag_native_contexts.get(assignment.patterns)
         if context is None:
-            _, index, points, travel, processing = _tables_for(_blocks_for(
+            table_ids, index, points, travel, processing = _tables_for(_blocks_for(
                 assignment.parents, assignment.patterns, scientific_config), scientific_config)
             parameters = np.array([scientific_config.empty_speed, scientific_config.t_pre, scientific_config.t_post,
                                    scientific_config.interference_dx, scientific_config.interference_dy,
                                    scientific_config.numeric_epsilon])
-            context = index, points, travel, processing, parameters, {}, set()
+            context = table_ids, index, points, travel, processing, parameters, {}, set()
             evaluator._wag_native_contexts[assignment.patterns] = context
-        index, points, travel, processing, parameters, encoded, scored = context
+        table_ids, index, points, travel, processing, parameters, encoded, scored = context
     for index, (lower, routes) in enumerate(combinations):
+        native_arrays = None
         if evaluator.expired:
             break
         # Free-end process/travel omits only nonnegative waiting.
         if evaluator.best is not None and lower >= evaluator.best.metrics.cmax + 1.e-8:
             break
         if native and not isinstance(routes, CanonicalSolution):
-            table_index, points, travel, processing, parameters, encoded, scored = context
+            table_ids, table_index, points, travel, processing, parameters, encoded, scored = context
             if routes in scored:
                 continue
             arrays = []
@@ -1216,14 +1549,23 @@ def _evaluate_routed_assignment(
                 if route not in encoded:
                     encoded[route] = np.array([table_index[b] for b in route], np.int64)
                 arrays.append(encoded[route])
-            value = _priority_arrays(arrays, travel, processing, points, parameters)[0]
+            scheduler_started = time.perf_counter()
+            native_arrays = _priority_arrays(arrays, travel, processing, points, parameters)
+            evaluator.accounting.scheduler_time += time.perf_counter() - scheduler_started
+            evaluator.accounting.reference_calls += 1
+            value = native_arrays[0]
             scored.add(routes)
             if not math.isfinite(value) or (evaluator.best is not None and value >= evaluator.best.metrics.cmax - 1.e-8):
                 continue
         candidate = routes if isinstance(routes, CanonicalSolution) else _canonicalize_cached(
             assignment.parents, assignment.patterns, dict(enumerate(routes)), scientific_config,
             scope=evaluator.scope if evaluator.scope.x_split_rule_id else None)
-        evaluator.evaluate(candidate, source=f"{source}_ROUTE_COMBINATION_{index}")
+        native_schedule = None
+        if (native_arrays is not None and candidate.patterns == assignment.patterns
+                and tuple(route.block_ids for route in candidate.routes) == routes):
+            native_schedule = _schedule_from_arrays(*native_arrays, table_ids, "NATIVE_PRIORITY_FOUR_ROBOTS")
+        evaluator.evaluate(candidate, source=f"{source}_ROUTE_COMBINATION_{index}",
+                           **({'native_schedule': native_schedule} if native_schedule is not None else {}))
     if not evaluator.expired:
         evaluator._wag_routed_assignments.add(key)
 

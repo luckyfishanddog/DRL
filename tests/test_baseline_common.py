@@ -49,6 +49,25 @@ def test_common_baseline_path_uses_formal_scope_direction_and_certifier():
     assert evaluator.accounting.certifier_calls == 1
 
 
+def test_precomputed_native_schedule_preserves_metrics_and_avoids_second_call():
+    from mrta_baselines.wag_vns import priority_schedule
+    config, parents, solution = _solution()
+    schedule = priority_schedule(solution, config)
+    ordinary = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V1_1, time_limit=10.,
+                                       certify=False, candidate_evaluator=priority_schedule)
+    expected = ordinary.evaluate(solution, source='ORDINARY')
+    def forbidden(*args):
+        raise AssertionError('duplicate native scheduling')
+    reused = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V1_1, time_limit=10.,
+                                     certify=False, candidate_evaluator=forbidden)
+    actual = reused.evaluate(solution, source='REUSED', native_schedule=schedule)
+    assert actual.schedule == expected.schedule
+    assert actual.directions == expected.directions
+    assert actual.metrics == expected.metrics
+    assert reused.accounting.reference_calls == 0
+    assert reused.best is actual
+
+
 def test_checkpoint_semantics_do_not_backfill_late_feasible_solution():
     config, parents, _ = _solution()
     evaluator = CommonBaselineEvaluator(
@@ -58,6 +77,28 @@ def test_checkpoint_semantics_do_not_backfill_late_feasible_solution():
         (BaselineBestEvent(6.0, 100.0, "LATE"), BaselineBestEvent(20.0, 90.0, "BETTER"))
     )
     assert evaluator.checkpoint_values() == {5.0: None, 30.0: 90.0, 60.0: None}
+
+
+def test_native_cache_distinguishes_explicit_directions_on_the_same_order():
+    from mrta_baselines.wag_vns import priority_schedule
+    config = ScientificConfig()
+    parents = (ParentWeld('a', (1., 9.), (2., 9.)), ParentWeld('b', (5., 9.), (6., 9.)))
+    patterns = tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents)
+    solution = canonicalize(parents, patterns, (Route(0, ('a::whole', 'b::whole')),
+                            Route(1, ()), Route(2, ()), Route(3, ())), config)
+    a = priority_schedule(solution, config, ((0, 0), (), (), ()))
+    b = priority_schedule(solution, config, ((1, 0), (), (), ()))
+    assert a.feasible and b.feasible and a.cmax != b.cmax
+    def forbidden(*args):
+        raise AssertionError('precomputed explicit scores must not be recomputed')
+    evaluator = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V1_1, time_limit=10.,
+                                         certify=False, candidate_evaluator=forbidden)
+    first = evaluator.evaluate(solution, source='A', native_schedule=a)
+    second = evaluator.evaluate(solution, source='B', native_schedule=b)
+    again = evaluator.evaluate(solution, source='A_AGAIN', native_schedule=a)
+    assert first.schedule == again.schedule == a
+    assert second.schedule == b and second.directions != first.directions
+    assert evaluator.accounting.reference_calls == 0
 
 
 def test_experiment_can_use_b32_without_certifier(monkeypatch):

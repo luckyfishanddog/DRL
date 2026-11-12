@@ -78,6 +78,13 @@ class BaselineAccounting:
     population_management_time: float = 0.0
     vnd_pass_cap_hits: int = 0
     vnd_candidate_cap_hits: int = 0
+    vnd_cache_hits: int = 0
+    vnd_unique_calls: int = 0
+    vnd_candidate_operations: int = 0
+    vnd_move_cache_hits: int = 0
+    vnd_priority_bound_rejections: int = 0
+    vnd_schedule_bound_prunes: int = 0
+    vnd_native_candidate_evaluations: int = 0
     initialization_reference_limit_hits: int = 0
     population_survival_events: int = 0
     optional_y_mutations_attempted: int = 0
@@ -332,21 +339,27 @@ class CommonBaselineEvaluator:
                 BaselineBestEvent(candidate.completed_at, candidate.metrics.cmax, candidate.source)
             )
 
-    def evaluate(self, solution: CanonicalSolution, *, source: str) -> EvaluatedCandidate:
+    def evaluate(self, solution: CanonicalSolution, *, source: str,
+                 native_schedule: ScheduleResult | None = None) -> EvaluatedCandidate:
+        if native_schedule is not None and (self.certify or self.candidate_evaluator is None):
+            raise ValueError("precomputed native schedules require an uncertified native evaluator")
         self.accounting.candidate_count += 1
         if self.certify:
             return self._evaluate(solution, source=source)
-        # With deterministic directions and scoring, an identical complete route
-        # in this run already has its scheduling result and completion time.
-        key = solution.parents, solution.patterns, solution.routes
+        # Explicit-direction individuals can share task order but have different
+        # timelines. A precomputed result must therefore retain its directions
+        # in this ordinary run-local memoization key.
+        key = (solution.parents, solution.patterns, solution.routes,
+               None if native_schedule is None else tuple(tuple(bits) for bits in native_schedule.directions))
         previous = self._evaluated_routes.get(key)
         if previous is not None:
             return replace(previous, solution=solution, source=source)
-        result = self._evaluate(solution, source=source)
+        result = self._evaluate(solution, source=source, native_schedule=native_schedule)
         self._evaluated_routes[key] = result
         return result
 
-    def _evaluate(self, solution: CanonicalSolution, *, source: str) -> EvaluatedCandidate:
+    def _evaluate(self, solution: CanonicalSolution, *, source: str,
+                  native_schedule: ScheduleResult | None = None) -> EvaluatedCandidate:
         has_x = any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
         has_y = any(pattern.kind is SplitKind.Y_SPLIT for pattern in solution.patterns)
         self.accounting.x_pattern_constructed += int(has_x)
@@ -380,7 +393,8 @@ class CommonBaselineEvaluator:
             if self.candidate_evaluator is None:
                 schedule = self.reference_evaluator(solution, self.config, orientations=dict(enumerate(directions)))
             else:
-                schedule = self.candidate_evaluator(solution, self.config)
+                schedule = (native_schedule if native_schedule is not None
+                            else self.candidate_evaluator(solution, self.config))
                 directions = schedule.directions
         except (ArithmeticError, OverflowError, ValueError) as error:
             schedule = ScheduleResult(
@@ -392,7 +406,7 @@ class CommonBaselineEvaluator:
                 scope_hash=self.scope.scope_hash,
             )
         self.accounting.scheduler_time += time.perf_counter() - scheduler_started
-        self.accounting.reference_calls += 1
+        self.accounting.reference_calls += int(native_schedule is None)
         self.accounting.x_pattern_reference_evaluated += int(has_x)
         self.accounting.y_pattern_reference_evaluated += int(has_y)
         if schedule.baseline_deadlock:

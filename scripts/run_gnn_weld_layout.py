@@ -52,6 +52,7 @@ BASELINES = {
     'HGA': (run_adapted_hga_v2, AdaptedHGAConfig, 'hga_results_optimized.csv'),
 }
 BASELINE_ITERATIONS = {'WAG+VNS': 500, 'HGA': 200000}
+BASELINE_SOURCES = {'WAG+VNS': 'PARTIAL_LNS_V1', 'HGA': 'ORIENTED_COORDINATED_VND_V1'}
 RESULT_FIELDS = ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'runtime_s', 'construct_s',
                  'cmax_5_s', 'cmax_30_s', 'cmax_60_s', 'native_cmax_s', 'native_cmax_5_s',
                  'native_cmax_30_s', 'native_cmax_60_s', 'max_processing_s', 'move_s', 'wait_s',
@@ -178,6 +179,10 @@ def baseline_job(job):
     started = time.perf_counter()
     result = baseline_run(parents, method, seed, math.inf, CHECKPOINTS,
                           iterations=BASELINE_ITERATIONS[method], candidate_evaluator=NATIVE_EVALUATORS[method])
+    print('BASELINE_STATS', json.dumps(dict(layout_id=name, method=method, seed=seed,
+          source=BASELINE_SOURCES[method], iterations=result.iterations,
+          accounting={key: value for key, value in result.accounting.items()
+                      if value is None or isinstance(value, (int, float))})), flush=True)
     best = result.timely_best
     schedule = schedule_explicit(best.solution, best.directions, CONFIG).schedule if best else None
     if schedule is None:
@@ -188,7 +193,7 @@ def baseline_job(job):
                 status=schedule.status.value if schedule else 'NO_NATIVE_SOLUTION',
                 cmax_s=schedule.cmax if schedule else None, runtime_s=time.perf_counter() - started,
                 b32_calls=int(schedule is not None), diagnostic=diagnostic,
-                source='OPTIMIZED_ITERATIONS', iterations=result.iterations,
+                source=BASELINE_SOURCES[method], iterations=result.iterations,
                 native_cmax_s=best.schedule.cmax if best else None,
                 **baseline_metrics(best, schedule))
 
@@ -256,7 +261,7 @@ def run_baselines(workers, only=None, *, split='validation', representative=Fals
     for path in paths.values():
         rows = read_rows(path)
         done.update((row['layout_id'], row['method'], int(row['seed'])) for row in rows
-                    if row['source'] == 'OPTIMIZED_ITERATIONS')
+                    if row['source'] == BASELINE_SOURCES[row['method']])
     jobs = [(layout, method, seed) for layout in layouts for seed in seeds for method in paths
             if (layout[0], method, seed) not in done]
     with ProcessPoolExecutor(max_workers=workers, initializer=configure_cpu) as executor:
@@ -265,6 +270,196 @@ def run_baselines(workers, only=None, *, split='validation', representative=Fals
             row = future.result()
             print('BASELINE', json.dumps(row), flush=True)
             write_rows(paths[row['method']], [row], append=True)
+
+
+def wag_deadlock_job(job):
+    """Replay one historical incumbent, then observe the existing dispatch kernel.
+
+    Diagnostic rollouts happen only after the complete 500-round search. They
+    never provide feedback to that search and do not change the B32 policy.
+    """
+    from collections import Counter
+    from mrta_reference import scheduler as scheduler
+    from mrta_reference.dispatch_recovery import run_dispatch_rollout
+    from mrta_reference.geometry import finite_x_split_validator, operations_conflict
+    (name, parents), historical, *saved = job
+    seed = int(historical['seed'])
+    if saved and saved[0] is not None:
+        from mrta_reference.geometry import build_legal_pattern_catalog
+        catalog = build_legal_pattern_catalog(parents, CONFIG, FORMAL_SCOPE_V2)
+        lookup = {p.pattern_id: p for options in catalog.values() for p in options}
+        snapshot = saved[0]
+        solution = canonicalize(parents, tuple(lookup[p] for p in snapshot['patterns']),
+                                dict(enumerate(snapshot['routes'])), CONFIG, scope=FORMAL_SCOPE_V2)
+        directions = tuple(tuple(ds) for ds in snapshot['directions'])
+        native, iterations, rerun = priority_schedule(solution, CONFIG), snapshot['iterations'], 0
+    else:
+        result = baseline_run(parents, 'WAG+VNS', seed, math.inf, (),
+                              iterations=500, candidate_evaluator=priority_schedule)
+        best = result.timely_best
+        if best is None:
+            return dict(layout_id=name, seed=seed, reproduced=False, reason='no native incumbent')
+        solution, directions, native = best.solution, best.directions, best.schedule
+        iterations, rerun = result.iterations, result.iterations
+    formal = schedule_explicit(solution, directions, CONFIG).schedule
+    reproduced = (iterations == 500 and formal.status.value == historical['status']
+                  and abs(native.cmax - float(historical['native_cmax_s'])) <= 1.e-6)
+    routes = scheduler.build_robot_routes(solution, CONFIG, dict(enumerate(directions)),
+                    x_split_validator=finite_x_split_validator(solution.parents, CONFIG))
+    templates = {r.robot_id: scheduler.build_operation_templates(r, CONFIG) for r in routes}
+    first_block, first_delay = [], []
+    blocked_edges = dict(same=0, cross=0)
+    delayed_edges = dict(same=0, cross=0)
+    first_cross_delay = []
+    intermediate_cycles = []
+    reported_cycles = []
+
+    class ObservedKernel(scheduler._OptimizedDispatchKernel):
+        def choices(self, state, runtime):
+            choices = super().choices(state, runtime)
+            available = {c.robot_id for c in choices.ordered_choices}
+            blocked = {robot: others for robot, others in choices.blockers_by_robot if robot not in available}
+            for robot, others in blocked.items():
+                for other in others:
+                    blocked_edges['same' if robot // 2 == other // 2 else 'cross'] += 1
+            owners = dict(choices.blockers_by_robot)
+            for choice in choices.ordered_choices:
+                robot = choice.robot_id
+                if choice.start_time <= state.completion[robot] + CONFIG.numeric_epsilon:
+                    continue
+                for other in owners.get(robot, ()):
+                    delayed_edges['same' if robot // 2 == other // 2 else 'cross'] += 1
+                    if robot // 2 != other // 2 and not first_cross_delay:
+                        first_cross_delay.append(dict(depth=state.depth, robot=robot, operation=choice.operation_id,
+                            other_robot=other, ready_s=state.completion[robot], earliest_start_s=choice.start_time,
+                            reported_blocker_ids=dict(choices.blocker_ids_by_robot).get(robot, ())))
+            cycles = scheduler.wait_for_cycles(scheduler.build_wait_for_graph(blocked))
+            if cycles and cycles not in intermediate_cycles:
+                intermediate_cycles.append(cycles)
+            cycles = scheduler.wait_for_cycles(scheduler.build_wait_for_graph(dict(choices.blockers_by_robot)))
+            if cycles and cycles not in reported_cycles:
+                reported_cycles.append(cycles)
+            if not first_delay:
+                for choice in choices.ordered_choices:
+                    if choice.start_time > state.completion[choice.robot_id] + CONFIG.numeric_epsilon:
+                        first_delay.append(dict(depth=state.depth, robot=choice.robot_id,
+                            operation=choice.operation_id, ready_s=state.completion[choice.robot_id],
+                            earliest_start_s=choice.start_time))
+                        break
+            if not first_block:
+                for robot in range(4):
+                    if state.next_index[robot] < len(self.templates[robot]) and robot not in available:
+                        op = self.templates[robot][state.next_index[robot]]
+                        ids = dict(choices.blocker_ids_by_robot).get(robot, ())
+                        first_block.append(dict(depth=state.depth, robot=robot, operation=op.operation_id,
+                            kind=op.kind.value, block_id=op.block_id, ready_s=state.completion[robot],
+                            start=op.start, end=op.end, duration_s=op.duration,
+                            blocker_count=len(ids), blocker_examples=ids[:4],
+                            graph=scheduler.build_wait_for_graph(dict(choices.blockers_by_robot))))
+                        break
+            return choices
+
+    kernel = ObservedKernel(templates, scheduler._remaining_processing_suffix(templates), CONFIG, directions, None)
+    outcome = run_dispatch_rollout(kernel, collect_trace=True)
+    state = outcome.terminal_state
+    choices = scheduler._OptimizedDispatchKernel.choices(kernel, state, kernel.start_runtime(state))
+    fixed = {op.operation_id: op for op in state.fixed_operations}
+    terminal = []
+    for robot, blocker_ids in choices.blocker_ids_by_robot:
+        if state.next_index[robot] >= len(templates[robot]):
+            continue
+        op = templates[robot][state.next_index[robot]]
+        ids = [item for item in blocker_ids if item in fixed]
+        same = [item for item in ids if fixed[item].robot_id // 2 == robot // 2]
+        cross = [item for item in ids if fixed[item].robot_id // 2 != robot // 2]
+        terminal.append(dict(robot=robot, next_operation=op.operation_id, kind=op.kind.value,
+                             block_id=op.block_id, ready_s=state.completion[robot], start=op.start, end=op.end,
+                             same_rail_blockers=len(same), cross_rail_blockers=len(cross),
+                             same_examples=same[:4], cross_examples=cross[:4]))
+    conflicts = 0
+    for i, a in enumerate(native.operations):
+        for b in native.operations[i + 1:]:
+            if a.robot_id != b.robot_id and operations_conflict(a, b, CONFIG):
+                conflicts += 1
+    welds = [op for op in native.operations if op.kind is OperationKind.WELD]
+    coverage = Counter(op.block_id for op in welds) == Counter(block_map(solution, CONFIG, scope=FORMAL_SCOPE_V2).keys())
+    continuous, weld_order = True, True
+    for r in range(4):
+        ops = [op for op in native.operations if op.robot_id == r]
+        continuous &= all(a.end == b.start and a.end_time <= b.start_time + CONFIG.numeric_epsilon
+                          for a, b in zip(ops, ops[1:]))
+        weld_order &= tuple(op.block_id for op in ops if op.kind is OperationKind.WELD) == solution.routes[r].block_ids
+    first_tasks = [dict(robot=r.robot_id, block=r.blocks[0].block_id, direction=r.orientations[0],
+                        start=oriented_endpoints(r.blocks[0], r.orientations[0])[0],
+                        end=oriented_endpoints(r.blocks[0], r.orientations[0])[1]) for r in routes if r.blocks]
+    record = dict(layout_id=name, seed=seed, reproduced=reproduced, iterations=iterations,
+        search_rerun_iterations=rerun, replay_mode='FULL_SEARCH' if rerun else 'SAVED_INCUMBENT',
+        native_cmax_s=native.cmax, historical_native_cmax_s=float(historical['native_cmax_s']),
+        b32_status=formal.status.value, b32_cmax_s=formal.cmax,
+        recovery_rollouts=formal.recovery_rollouts, rollout_budget=formal.rollout_budget,
+        frontier_exhausted=formal.frontier_exhausted, baseline_status=outcome.result.status.value,
+        baseline_matches_b32_failure=(not formal.feasible and outcome.result.operations == formal.operations),
+        terminal_depth=state.depth, next_index=state.next_index,
+        template_lengths=[len(templates[r]) for r in range(4)], completion_s=state.completion,
+        wait_for_graph=outcome.result.wait_for_graph, wait_for_cycles=scheduler.wait_for_cycles(outcome.result.wait_for_graph),
+        first_block=first_block[0] if first_block else None, terminal_blockers=terminal,
+        first_delayed_choice=first_delay[0] if first_delay else None,
+        blocked_edge_occurrences=blocked_edges, intermediate_wait_cycles=intermediate_cycles,
+        delayed_edge_occurrences=delayed_edges, first_cross_delay=first_cross_delay[0] if first_cross_delay else None,
+        all_reported_wait_cycles=reported_cycles,
+        blocker_finished=[dict(waiting=robot, blocker=other,
+                          finished=state.next_index[other] == len(templates[other]))
+                          for robot, others in outcome.result.wait_for_graph for other in others],
+        first_tasks=first_tasks, native_coverage=coverage, native_inter_robot_conflicts=conflicts,
+        native_chain_continuous=continuous, native_weld_order=weld_order,
+        native_wait_s=sum(op.duration for op in native.operations if op.kind is OperationKind.WAIT),
+        # Retain the reconstructed incumbent in the existing report so the
+        # diagnostic can be independently replayed without another WAG search.
+        patterns=[p.pattern_id for p in solution.patterns], routes=[r.block_ids for r in solution.routes],
+        directions=directions)
+    print('WAG_DEADLOCK_DIAGNOSIS', json.dumps({k: v for k, v in record.items()
+          if k not in ('patterns', 'routes', 'directions')}), flush=True)
+    return record
+
+
+def diagnose_wag_deadlocks(workers):
+    historical = [r for r in read_rows(FINAL_RESULTS / BASELINES['WAG+VNS'][2])
+                  if r['source'] == 'OPTIMIZED_ITERATIONS' and r['layout_id'].startswith('validation_')
+                  and r['status'] == 'DEADLOCK']
+    layouts = dict(load_layouts('validation'))
+    report = ROOT / 'docs' / 'WAG_HGA_BASELINE_REPORT_20261111.md'
+    text = report.read_text(encoding='utf-8')
+    start_marker = '<!-- WAG_DEADLOCK_CASES_START -->'
+    snapshots = {}
+    if start_marker in text:
+        raw = text.split(start_marker, 1)[1].split('```json', 1)[1].split('```', 1)[0]
+        snapshots = {(r['layout_id'], r['seed']): r for r in json.loads(raw) if r.get('reproduced')}
+    jobs = [((r['layout_id'], layouts[r['layout_id']]), r,
+             snapshots.get((r['layout_id'], int(r['seed'])))) for r in historical]
+    with ProcessPoolExecutor(max_workers=workers, initializer=configure_cpu) as executor:
+        records = list(executor.map(wag_deadlock_job, jobs))
+    records.sort(key=lambda r: (r['layout_id'], r['seed']))
+    lines = ['\n### 13.3 WAG 历史 11 次死锁的逐例诊断\n',
+             '以下是原 WAG 完成 500 轮后的固定最优路线重放；诊断不反馈搜索。首次从完整 500 轮重建最优路线，随后从本报告保存的模式、路线和方向重放派工，避免 LNS 修正后拿新最优路线冒充旧实例。`search_rerun_iterations=0` 表示只重放已有旧方案。`reproduced` 核对原生 Cmax、最终状态和原搜索预算。B32 未找到时间线不构成数学不可行证明。阻塞边累计值是各派工状态 ESS 返回关联的累计次数，不能解释为独立冲突事件或唯一因果。\n',
+             '| 排样 | 种子 | 重现 | 原生 Cmax/s | B32 | 同轨/跨轨阻塞数 | 等待环 | 原生时间线冲突数 |',
+             '|---|---:|---|---:|---|---|---|---:|']
+    for r in records:
+        blocks = r.get('terminal_blockers', ())
+        same, cross = sum(x['same_rail_blockers'] for x in blocks), sum(x['cross_rail_blockers'] for x in blocks)
+        lines.append(f"| {r['layout_id']} | {r['seed']} | {r['reproduced']} | {r.get('native_cmax_s', 0):.4f} | {r.get('b32_status')} | {same}/{cross} | {r.get('wait_for_cycles')} | {r.get('native_inter_robot_conflicts')} |")
+    lines += ['\n逐例首任务、方向、首次阻塞、终端等待图和重放方案：\n',
+              '<!-- WAG_DEADLOCK_CASES_START -->', '```json', json.dumps(records, ensure_ascii=False, indent=2),
+              '```', '<!-- WAG_DEADLOCK_CASES_END -->', '']
+    marker = '\n### 13.3 WAG 历史 11 次死锁的逐例诊断'
+    # This section is generated evidence in an existing report, not a new file.
+    if marker in text:
+        end_marker = '<!-- WAG_DEADLOCK_CASES_END -->'
+        end = text.index(end_marker, text.index(marker)) + len(end_marker)
+        text = text[:text.index(marker)] + '\n' + '\n'.join(lines) + text[end:]
+    else:
+        text = text.rstrip() + '\n' + '\n'.join(lines)
+    report.write_text(text, encoding='utf-8')
+    print('WAG_DIAGNOSIS_REPORT', report, len(records), flush=True)
 
 
 FINAL_MODEL = ROOT / 'models' / 'gnn_weld_layout_final.pt'
@@ -792,7 +987,7 @@ def write_comparison():
 def summarize_optimized_baselines():
     """Read the two result files and retained references; never rewrite history."""
     rows = [r for _, _, name in BASELINES.values() for r in read_rows(FINAL_RESULTS / name)
-            if r['source'] == 'OPTIMIZED_ITERATIONS']
+            if r['source'] == BASELINE_SOURCES[r['method']]]
     references = read_rows(BEAM_VALIDATION_CSV)
     references += read_rows(FINAL_RESULTS / 'rule_beam_results.csv')
     references += [r for r in read_rows(FINAL_RESULTS / 'gnn_results.csv')
@@ -1101,7 +1296,7 @@ def cmax_value_experiment(workers):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -1118,6 +1313,8 @@ def main():
         beam_validation(args.workers)
     elif args.stage == 'baseline-summary':
         summarize_optimized_baselines()
+    elif args.stage == 'wag-deadlock-diagnosis':
+        diagnose_wag_deadlocks(args.workers)
     elif args.stage == 'cmax-value':
         cmax_value_experiment(args.workers)
     else:
