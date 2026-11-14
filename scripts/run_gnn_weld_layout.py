@@ -211,6 +211,60 @@ def baseline_metrics(best, schedule):
     return dict(**loads, move_s=move, wait_s=wait)
 
 
+def hga_alpha_sensitivity():
+    """Sequential one-seed screening; each alpha starts a fresh native HGA."""
+    from numba import set_num_threads
+    configure_cpu()
+    set_num_threads(1)
+    layouts = dict(load_layouts('validation'))
+    names = ('validation_03', 'validation_04', 'validation_07')
+    alphas = (16, 18, 20, 22, 24, 26)
+    settings = AdaptedHGAConfig()
+    print('HGA_ALPHA_SETTINGS', settings, 'seed', SEED, 'workers/threads', 1, flush=True)
+    # Ten warm-up children also compile the mu+lambda population update.
+    started = time.perf_counter()
+    warm = run_adapted_hga_v2(layouts[names[0]], CONFIG, replace(settings, max_iterations=10),
+        seed=SEED, time_limit=math.inf, checkpoints=(), certify=False, candidate_evaluator=priority_schedule)
+    print('HGA_ALPHA_WARMUP', warm.iterations, 'seconds', time.perf_counter() - started,
+          'excluded from CSV and all measured runs', flush=True)
+    del warm
+    fields = ('layout_id', 'alpha', 'iterations', 'runtime_s', 'initial_native_cmax',
+              'final_native_cmax', 'b32_status', 'b32_cmax', 'vnd_unique_calls',
+              'vnd_cache_hits', 'vnd_native_candidate_evaluations', 'b32_runtime_s', 'run_status')
+    path = FINAL_RESULTS / 'hga_alpha_sensitivity.csv'
+    rows = []
+    with path.open('x', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        stream.flush()
+        for name in names:
+            for alpha in alphas:
+                print('HGA_ALPHA_START', name, 'parents', len(layouts[name]), 'alpha', alpha, flush=True)
+                started = time.perf_counter()
+                result = run_adapted_hga_v2(layouts[name], CONFIG,
+                    replace(settings, alpha=alpha, max_iterations=1000), seed=SEED,
+                    time_limit=math.inf, checkpoints=(), certify=False, candidate_evaluator=priority_schedule)
+                runtime = time.perf_counter() - started
+                best, initial = result.timely_best, result.initial_candidate
+                started = time.perf_counter()
+                schedule = schedule_explicit(best.solution, best.directions, CONFIG).schedule if best else None
+                b32_runtime = time.perf_counter() - started if best else 0.
+                row = dict(layout_id=name, alpha=alpha, iterations=result.iterations, runtime_s=runtime,
+                    initial_native_cmax=initial.schedule.cmax if initial else None,
+                    final_native_cmax=best.schedule.cmax if best else None,
+                    b32_status=schedule.status.value if schedule else 'NO_NATIVE_SOLUTION',
+                    b32_cmax=schedule.cmax if schedule is not None and schedule.feasible else None,
+                    **{key: result.accounting[key] for key in
+                       ('vnd_unique_calls', 'vnd_cache_hits', 'vnd_native_candidate_evaluations')},
+                    b32_runtime_s=b32_runtime,
+                    run_status='COMPLETED' if result.iterations == 1000 else 'INCOMPLETE')
+                writer.writerow(row)
+                stream.flush()
+                rows.append(row)
+                print('HGA_ALPHA_RESULT', json.dumps(row), flush=True)
+    return rows
+
+
 def read_rows(path):
     if not path.exists():
         return []
@@ -1296,7 +1350,7 @@ def cmax_value_experiment(workers):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -1305,6 +1359,8 @@ def main():
     configure_cpu()
     if args.stage == 'baselines':
         run_baselines(args.workers, args.method, split=args.split, representative=args.representative)
+    elif args.stage == 'hga-alpha-sensitivity':
+        hga_alpha_sensitivity()
     elif args.stage == 'train':
         train(args.workers)
     elif args.stage == 'test':
