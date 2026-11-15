@@ -53,6 +53,7 @@ BASELINES = {
 }
 BASELINE_ITERATIONS = {'WAG+VNS': 500, 'HGA': 200000}
 BASELINE_SOURCES = {'WAG+VNS': 'PARTIAL_LNS_V1', 'HGA': 'ORIENTED_COORDINATED_VND_V1'}
+HGA_ROUTE_SOURCE = 'ORIENTED_ROUTE_VND_NATIVE_SELECT_V1'
 RESULT_FIELDS = ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'runtime_s', 'construct_s',
                  'cmax_5_s', 'cmax_30_s', 'cmax_60_s', 'native_cmax_s', 'native_cmax_5_s',
                  'native_cmax_30_s', 'native_cmax_60_s', 'max_processing_s', 'move_s', 'wait_s',
@@ -265,6 +266,74 @@ def hga_alpha_sensitivity(*, full_budget=False):
                 stream.flush()
                 rows.append(row)
                 print('HGA_ALPHA_RESULT', json.dumps(row), flush=True)
+    return rows
+
+
+def hga_route_vnd_job(name, parents, iterations, *, final_b32):
+    """One fixed-seed route-VND run; append to the existing HGA results."""
+    settings = replace(AdaptedHGAConfig(), max_iterations=iterations, vnd_objective='ROUTE_CYCLE')
+    print('HGA_ROUTE_START', name, 'parents', len(parents), settings, 'seed', SEED,
+          'source', HGA_ROUTE_SOURCE, flush=True)
+    started = time.perf_counter()
+    result = run_adapted_hga_v2(parents, CONFIG, settings, seed=SEED, time_limit=math.inf,
+                              checkpoints=(), certify=False, candidate_evaluator=priority_schedule)
+    search_runtime = time.perf_counter() - started
+    best = result.timely_best
+    b32_started = time.perf_counter()
+    schedule = schedule_explicit(best.solution, best.directions, CONFIG).schedule if final_b32 and best else None
+    b32_runtime = time.perf_counter() - b32_started if schedule is not None else 0.
+    stats = dict(phase='FULL' if final_b32 else 'PERFORMANCE_PILOT',
+        run_status='COMPLETED' if result.iterations == iterations else 'INCOMPLETE',
+        search_runtime_s=search_runtime, initialization_s=result.initialization_time,
+        vnd_s=result.accounting['local_search_time'], native_coordination_s=result.accounting['scheduler_time'],
+        crossover_s=result.accounting['crossover_time'], population_management_s=result.accounting['population_management_time'],
+        native_calls=result.reference_calls, vnd_candidates=result.accounting['vnd_candidate_operations'],
+        vnd_unique_calls=result.accounting['vnd_unique_calls'], vnd_cache_hits=result.accounting['vnd_cache_hits'],
+        vnd_native_candidate_evaluations=result.accounting['vnd_native_candidate_evaluations'],
+        vnd_pass_cap_hits=result.accounting['vnd_pass_cap_hits'],
+        vnd_candidate_cap_hits=result.accounting['vnd_candidate_cap_hits'], b32_runtime_s=b32_runtime)
+    if schedule is not None and not schedule.feasible:
+        stats['b32_diagnostic'] = ' | '.join(schedule.diagnostics[:2])
+    row = dict(layout_id=name, seed=SEED, method='HGA', source=HGA_ROUTE_SOURCE,
+        iterations=result.iterations, runtime_s=time.perf_counter() - started,
+        native_cmax_s=best.schedule.cmax if best else None,
+        status=schedule.status.value if schedule is not None else ('NATIVE_ONLY' if best else 'NO_NATIVE_SOLUTION'),
+        cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
+        b32_calls=int(schedule is not None), diagnostic=json.dumps(stats), **baseline_metrics(best, schedule))
+    write_rows(FINAL_RESULTS / BASELINES['HGA'][2], [row], append=True)
+    output = dict(**row, **stats)
+    print('HGA_ROUTE_RESULT', json.dumps(output), flush=True)
+    return output
+
+
+def hga_route_vnd_experiment():
+    """Pilot first; run the full representatives only at the requested thresholds."""
+    from numba import set_num_threads
+    configure_cpu()
+    set_num_threads(1)
+    layouts = dict(load_layouts('validation'))
+    settings = replace(AdaptedHGAConfig(), max_iterations=10, vnd_objective='ROUTE_CYCLE')
+    started = time.perf_counter()
+    warm = run_adapted_hga_v2(layouts['validation_07'], CONFIG, settings, seed=SEED, time_limit=math.inf,
+                            checkpoints=(), certify=False, candidate_evaluator=priority_schedule)
+    print('HGA_ROUTE_WARMUP', warm.iterations, 'seconds', time.perf_counter() - started,
+          'excluded from all measured runs and CSV', flush=True)
+    del warm
+    rows = [hga_route_vnd_job('validation_07', layouts['validation_07'], 20000, final_b32=False)]
+    pilot = rows[-1]
+    if pilot['iterations'] != 20000 or pilot['search_runtime_s'] > 180.:
+        print('HGA_ROUTE_STOP', 'pilot exceeds 180s or is incomplete; locate the measured bottleneck first', flush=True)
+        return rows
+    if pilot['search_runtime_s'] > 150.:
+        print('HGA_ROUTE_CAUTION', '150-180s pilot; assess measured timings before launching full budget', flush=True)
+        return rows
+    rows.append(hga_route_vnd_job('validation_07', layouts['validation_07'], 200000, final_b32=True))
+    full = rows[-1]
+    if full['iterations'] != 200000 or full['runtime_s'] > 1800. or full['status'] != 'FEASIBLE':
+        print('HGA_ROUTE_STOP', 'validation_07 did not meet the full-budget time/feasibility target', flush=True)
+        return rows
+    for name in ('validation_03', 'validation_04'):
+        rows.append(hga_route_vnd_job(name, layouts[name], 200000, final_b32=True))
     return rows
 
 
@@ -1807,7 +1876,7 @@ def expanded_dagger_experiment(workers):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'expanded-teachers', 'expanded-dagger'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -1820,6 +1889,8 @@ def main():
         hga_alpha_sensitivity()
     elif args.stage == 'hga-alpha-full-budget':
         hga_alpha_sensitivity(full_budget=True)
+    elif args.stage == 'hga-route-vnd':
+        hga_route_vnd_experiment()
     elif args.stage == 'train':
         train(args.workers)
     elif args.stage == 'test':

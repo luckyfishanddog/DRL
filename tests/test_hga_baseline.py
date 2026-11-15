@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import random
 
+import pytest
+
 from mrta_baselines.hga import (
     _Individual,
     alpha_nearest,
@@ -705,7 +707,8 @@ def test_fixed_gene_native_updates_match_full_priority_for_all_six_moves():
                         assert not np.isfinite(actual) or actual >= limit - 1.e-8
 
 
-def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods():
+@pytest.mark.parametrize('route_objective', (False, True))
+def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods(route_objective):
     import numpy as np
     from mrta_baselines import hga as h
     from mrta_baselines.wag_vns import _priority_arrays
@@ -714,10 +717,14 @@ def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods():
     routes = w.encode(solution)
     bits = [np.arange(len(r), dtype=np.int64) % 2 for r in routes]
     result = h._vnd_oriented_arrays(routes, bits, w.travel, w.processing, w.points, w.eligible, w.parent_index,
-                                    w.nearest, w.parameters, 20, 0, 0, w.oriented_scratch, np.zeros(1, np.int64))
+                                    w.nearest, w.parameters, 20, 0, 0, w.oriented_scratch, np.zeros(1, np.int64),
+                                    route_objective=route_objective)
     current, directions, score, operations, _, pass_hit, candidate_hit, _ = result
     assert np.isfinite(score) and operations > 0 and not pass_hit and not candidate_hit
-    assert score == _priority_arrays(current, w.travel, w.processing, w.points, w.parameters, directions)[0]
+    expected = (max(h._oriented_route_cost(r, d, w.travel, w.processing) for r, d in zip(current, directions))
+                if route_objective else
+                _priority_arrays(current, w.travel, w.processing, w.points, w.parameters, directions)[0])
+    assert score == pytest.approx(expected, abs=1.e-8)
     longest = int(np.argmax([h._oriented_route_cost(r, d, w.travel, w.processing) for r, d in zip(current, directions)]))
     for move in range(1, 7):
         for ru in range(4):
@@ -738,8 +745,61 @@ def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods():
                             candidate[r], db[r] = h._materialize_segments(segments, current), h._materialize_directions(segments, directions)
                         if any(not w.eligible[n, r] for r, route in enumerate(candidate) for n in route):
                             continue
-                        value = _priority_arrays(candidate, w.travel, w.processing, w.points, w.parameters, db)[0]
+                        value = (max(h._oriented_route_cost(r, d, w.travel, w.processing) for r, d in zip(candidate, db))
+                                 if route_objective else
+                                 _priority_arrays(candidate, w.travel, w.processing, w.points, w.parameters, db)[0])
                         assert not np.isfinite(value) or value >= score - 1.e-8
+
+
+def test_route_cycle_vnd_never_calls_native_coordination(monkeypatch):
+    import numpy as np
+    from mrta_baselines import hga as h
+    config, _, solution = _fixture()
+    w = h._HGAWorkspace(solution.parents, config, None, patterns=solution.patterns)
+    routes = w.encode(solution)
+    bits = [np.arange(len(r), dtype=np.int64) % 2 for r in routes]
+    def forbidden(*args, **kwargs):
+        raise AssertionError('native coordination called inside route-cycle VND')
+    for name in ('_priority_arrays', '_fixed_native_update', '_fixed_native_pair', '_numeric_follow'):
+        monkeypatch.setattr(h, name, forbidden)
+    hits = np.zeros(4, np.int64)
+    result = h._vnd_oriented_arrays.py_func(routes, bits, w.travel, w.processing, w.points, w.eligible,
+        w.parent_index, w.nearest, w.parameters, 20, 0, 0, w.oriented_scratch, hits, route_objective=True)
+    current, directions, score, operations, _, pass_hit, candidate_hit, _ = result
+    assert operations > 0 and hits[3] == 0 and not pass_hit and not candidate_hit
+    assert score == pytest.approx(max(h._oriented_route_cost(r, d, w.travel, w.processing)
+                                     for r, d in zip(current, directions)), abs=1.e-8)
+    _assert_valid(w.solution(current, w.initial_selected), config)
+    assert all(len(r) == len(d) for r, d in zip(current, directions))
+
+
+def test_route_cycle_children_use_one_native_evaluation_and_reuse_best_timeline(monkeypatch):
+    from dataclasses import replace
+    from mrta_baselines import common, hga as h
+    config = ScientificConfig()
+    parents = (ParentWeld('a', (1., 9.), (2., 9.)), ParentWeld('b', (8., 9.), (9., 9.)))
+    original, calls = h._priority_arrays, []
+    def observed(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(result[0])
+        return result
+    def forbidden(*args, **kwargs):
+        raise AssertionError('B32/certifier called inside route-cycle HGA')
+    monkeypatch.setattr(h, '_priority_arrays', observed)
+    monkeypatch.setattr(common.FormalReferenceEvaluator, '__call__', forbidden)
+    monkeypatch.setattr(common, 'certify_schedule', forbidden)
+    settings = replace(AdaptedHGAConfig(), mu=3, lambda_size=2, max_iterations=4, vnd_objective='ROUTE_CYCLE')
+    result = h.run_adapted_hga_v2(parents, config, settings, seed=731, time_limit=float('inf'), checkpoints=())
+    assert result.iterations == 4 and result.termination_reason == 'ITERATION_LIMIT'
+    initial_proposals = min(settings.mu, settings.initialization_reference_limit)
+    assert len(calls) == result.reference_calls == settings.mu + result.iterations + initial_proposals
+    assert result.accounting['vnd_unique_calls'] + result.accounting['vnd_cache_hits'] == settings.mu + result.iterations
+    assert result.accounting['vnd_cache_hits'] > 0
+    assert result.accounting['vnd_native_candidate_evaluations'] == 0 and result.certifier_calls == 0
+    best = result.timely_best
+    expected = h.priority_schedule(best.solution, config, best.directions)
+    assert best.schedule.cmax == min(calls) == expected.cmax
+    assert best.schedule.operations == expected.operations
 
 
 def _oriented_wait_fixture(two_rails=False):
@@ -779,7 +839,8 @@ def test_oriented_vnd_repairs_two_native_rejected_pairs_in_successive_moves():
     assert value == _priority_arrays(current, w.travel, w.processing, w.points, w.parameters, bits)[0]
 
 
-def test_oriented_prefix_bounds_match_complete_native_search_with_waits():
+@pytest.mark.parametrize('route_objective', (False, True))
+def test_oriented_prefix_bounds_match_complete_native_search_with_waits(route_objective):
     import numpy as np
     from mrta_baselines import hga as h
     from mrta_baselines.wag_vns import _priority_arrays
@@ -789,12 +850,14 @@ def test_oriented_prefix_bounds_match_complete_native_search_with_waits():
     assert any(op[8] == 4. for group in original_ops for op in group)
     args = (routes, bits, w.travel, w.processing, w.points, w.eligible, w.parent_index, w.nearest,
             w.parameters, 20, 0, 0, w.oriented_scratch)
-    full = h._vnd_oriented_arrays(*args, np.zeros(3, np.int64), False)
+    full = h._vnd_oriented_arrays(*args, np.zeros(3, np.int64), False, route_objective=route_objective)
     hits = np.zeros(3, np.int64)
-    bounded = h._vnd_oriented_arrays(*args, hits, True)
+    bounded = h._vnd_oriented_arrays(*args, hits, True, route_objective=route_objective)
     for actual, expected in zip(bounded[0] + bounded[1], full[0] + full[1]):
         np.testing.assert_array_equal(actual, expected)
     assert bounded[2:] == full[2:]
+    if route_objective:
+        return
 
     # This small VND need not encounter a reusable failed priority. Exercise a
     # real later gene edit against the independent, complete follower scorer.

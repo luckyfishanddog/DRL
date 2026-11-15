@@ -62,6 +62,7 @@ class AdaptedHGAConfig:
     vnd_candidate_cap: int | None = None
     pattern_mutation_probability: float = 0.15
     direction_encoding: str = "EXPLICIT"
+    vnd_objective: str = "COORDINATED"
 
     def __post_init__(self) -> None:
         if min(self.mu, self.lambda_size, self.alpha, self.max_iterations) <= 0:
@@ -74,6 +75,10 @@ class AdaptedHGAConfig:
             raise ValueError("pattern_mutation_probability must be in [0,1]")
         if self.direction_encoding not in ("EXPLICIT", "LEGACY_ROUTE_DP"):
             raise ValueError("unknown HGA direction encoding")
+        if self.vnd_objective not in ("COORDINATED", "ROUTE_CYCLE"):
+            raise ValueError("unknown HGA VND objective")
+        if self.vnd_objective == "ROUTE_CYCLE" and self.direction_encoding != "EXPLICIT":
+            raise ValueError("route-cycle VND requires explicit direction genes")
 
 
 @dataclass
@@ -406,23 +411,27 @@ def alpha_nearest(
 @njit
 def _move_segments(routes, move, ru, iu, rv, iv):
     nu, nv = len(routes[ru]), len(routes[rv])
+    # Every move has at most three intervals per route. Fixed-size tuples keep
+    # these descriptors in native values instead of allocating two lists for
+    # each candidate; zero-length padding is ignored by the existing consumers.
+    empty = (ru, 0, 0, False)
     if move == 1:
-        a = [(ru, 0, iu, False), (ru, iu + 1, nu, False)]
-        b = [(rv, 0, iv + 1, False), (ru, iu, iu + 1, False), (rv, iv + 1, nv, False)]
+        a = ((ru, 0, iu, False), (ru, iu + 1, nu, False), empty)
+        b = ((rv, 0, iv + 1, False), (ru, iu, iu + 1, False), (rv, iv + 1, nv, False))
     elif move == 2 or move == 3:
         count = 1 if move == 2 else 2
-        a = [(ru, 0, iu, False), (rv, iv, iv + count, False), (ru, iu + count, nu, False)]
-        b = [(rv, 0, iv, False), (ru, iu, iu + count, False), (rv, iv + count, nv, False)]
+        a = ((ru, 0, iu, False), (rv, iv, iv + count, False), (ru, iu + count, nu, False))
+        b = ((rv, 0, iv, False), (ru, iu, iu + count, False), (rv, iv + count, nv, False))
     elif move == 4:
         lo, hi = min(iu, iv) + 1, max(iu, iv)
-        a = [(ru, 0, lo, False), (ru, lo, hi + 1, True), (ru, hi + 1, nu, False)]
-        b = [(rv, 0, 0, False)]
+        a = ((ru, 0, lo, False), (ru, lo, hi + 1, True), (ru, hi + 1, nu, False))
+        b = (empty, empty, empty)
     elif move == 5:
-        a = [(ru, 0, iu + 1, False), (rv, 0, iv + 1, True)]
-        b = [(ru, iu + 1, nu, True), (rv, iv + 1, nv, False)]
+        a = ((ru, 0, iu + 1, False), (rv, 0, iv + 1, True), empty)
+        b = ((ru, iu + 1, nu, True), (rv, iv + 1, nv, False), empty)
     else:
-        a = [(ru, 0, iu + 1, False), (rv, iv + 1, nv, False)]
-        b = [(rv, 0, iv + 1, False), (ru, iu + 1, nu, False)]
+        a = ((ru, 0, iu + 1, False), (rv, iv + 1, nv, False), empty)
+        b = ((rv, 0, iv + 1, False), (ru, iu + 1, nu, False), empty)
     return a, b
 
 
@@ -1059,23 +1068,25 @@ def _materialize_directions(segments, directions):
     return result
 
 
-def _oriented_scratch(capacity, universe):
+def _oriented_scratch(capacity, universe, processing_prefix=None):
     width = capacity + 1
     return (np.empty((4, width), np.int64), np.empty((4, width), np.int64),
             np.zeros(4, np.int64), np.zeros((4, width)),
             np.zeros((4, 4, width), np.int64), np.empty(universe, np.int64),
-            np.empty(universe, np.int64))
+            np.empty(universe, np.int64),
+            np.zeros((4, width)) if processing_prefix is None else processing_prefix)
 
 
 @njit
 def _refresh_oriented_route(r, route, bits, travel, processing, eligible, scratch):
-    nodes, directions, lengths, prefix, invalid, robot, position = scratch
+    nodes, directions, lengths, prefix, invalid, robot, position, processing_prefix = scratch
     n = len(route)
     nodes[r, :n], directions[r, :n], lengths[r] = route, bits, n
-    prefix[r, 0], invalid[r, :, 0] = 0., 0
+    prefix[r, 0], invalid[r, :, 0], processing_prefix[r, 0] = 0., 0, 0.
     for i in range(n):
         node = route[i]
         robot[node], position[node] = r, i
+        processing_prefix[r, i + 1] = processing_prefix[r, i] + processing[node]
         value = processing[node]
         if i:
             value += travel[route[i - 1], node, bits[i - 1], bits[i]]
@@ -1086,7 +1097,7 @@ def _refresh_oriented_route(r, route, bits, travel, processing, eligible, scratc
 
 @njit
 def _oriented_segment_cost(segments, target, scratch, travel, parent_index):
-    nodes, bits, _, prefix, invalid, _, _ = scratch
+    nodes, bits, _, prefix, invalid, _, _, _ = scratch
     value, previous, previous_bit = 0., -1, 0
     for source, lo, hi, reverse in segments:
         if hi <= lo:
@@ -1232,23 +1243,24 @@ def _fixed_native_update(routes, directions, points, processing, parameters,
 @njit
 def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligible, parent_index,
                            nearest, parameters, alpha, max_passes, candidate_cap, scratch,
-                           move_cache_hits=None, use_schedule_bound=True):
-    """Complete oriented M1--M6 VND, scored by the fixed-gene native Cmax.
+                           move_cache_hits=None, use_schedule_bound=True, route_objective=False):
+    """Complete oriented M1--M6, using coordinated or route-cycle Cmax.
 
-    Inf-to-inf moves are accepted only when fewer native robot pairs remain
-    rejected. This lets two separately blocked pairs be repaired in successive
-    moves, without claiming that a native policy rejection proves infeasibility.
+    Route-cycle mode never schedules a candidate. Coordinated mode retains its
+    native rejected-pair progress rule for nonfinite objectives.
     """
     current, bits = [r.copy() for r in routes], [d.copy() for d in directions]
     ops = [np.empty((0, 9)) for _ in range(4)]
     nominal, follows = list(ops), list(ops)
     dirty, pairs = np.ones(4, np.bool_), np.zeros(2)
     failures = np.full((4, 2), np.nan)
-    score, ops, pairs, nominal, follows = _fixed_native_update(
-        current, bits, points, processing, parameters, ops, pairs, nominal, follows, dirty, np.inf,
-        None, failures)
-    rejected = int(not math.isfinite(pairs[0])) + int(not math.isfinite(pairs[1]))
-    nodes, _, lengths, prefix, _, robot, position = scratch
+    score, rejected = np.inf, 0
+    if not route_objective:
+        score, ops, pairs, nominal, follows = _fixed_native_update(
+            current, bits, points, processing, parameters, ops, pairs, nominal, follows, dirty, np.inf,
+            None, failures)
+        rejected = int(not math.isfinite(pairs[0])) + int(not math.isfinite(pairs[1]))
+    nodes, _, lengths, prefix, _, robot, position, processing_prefix = scratch
     costs = np.zeros(4)
     progress = [np.empty((0, 3)) for _ in range(4)]
     active_ids = np.concatenate((current[0], current[1], current[2], current[3]))
@@ -1276,7 +1288,9 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
             if dirty[r]:
                 _refresh_oriented_route(r, current[r], bits[r], travel, processing, eligible, scratch)
                 costs[r] = _oriented_route_cost(current[r], bits[r], travel, processing)
-        if use_schedule_bound and math.isfinite(score):
+        if route_objective:
+            score = max(costs)
+        if not route_objective and use_schedule_bound and math.isfinite(score):
             for left in (0, 2):
                 if dirty[left] or dirty[left + 1] or not len(progress[left]):
                     progress[left] = _fixed_follow_progress(nominal[left], follows[left])
@@ -1315,14 +1329,43 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
                         seen[a, b], seen[b, a] = stamp, stamp
                     if move == 6 and iu + 1 == lengths[ru] and iv + 1 == lengths[rv]:
                         continue
+                    untouched = 0.
                     if math.isfinite(score):
-                        if ru // 2 == rv // 2 and pairs[1 - ru // 2] >= score - 1.e-8:
+                        if not route_objective and ru // 2 == rv // 2 and pairs[1 - ru // 2] >= score - 1.e-8:
                             continue
-                        untouched = 0.
                         for r in range(4):
-                            if r != ru and r != rv and len(nominal[r]):
-                                untouched = max(untouched, nominal[r][-1, 6])
+                            if r != ru and r != rv:
+                                if route_objective:
+                                    untouched = max(untouched, costs[r])
+                                elif len(nominal[r]):
+                                    untouched = max(untouched, nominal[r][-1, 6])
                         if untouched >= score - 1.e-8:
+                            continue
+                    if route_objective and use_schedule_bound and move != 4:
+                        # The existing processing-only route bound, before
+                        # interval/travel work. Empty travel is nonnegative;
+                        # reverse segments retain the same processing sum.
+                        pu = processing_prefix[ru, lengths[ru]]
+                        pv = processing_prefix[rv, lengths[rv]]
+                        if move == 1:
+                            pu -= processing[u]
+                            pv += processing[u]
+                        elif move in (2, 3):
+                            width = 1 if move == 2 else 2
+                            delta = (processing_prefix[rv, iv + width] - processing_prefix[rv, iv]
+                                     - processing_prefix[ru, iu + width] + processing_prefix[ru, iu])
+                            pu += delta
+                            pv -= delta
+                        elif move == 5:
+                            before_u = processing_prefix[ru, iu + 1]
+                            before_v = processing_prefix[rv, iv + 1]
+                            pu, pv = before_u + before_v, pu + pv - before_u - before_v
+                        else:
+                            delta = ((processing_prefix[rv, lengths[rv]] - processing_prefix[rv, iv + 1])
+                                     - (processing_prefix[ru, lengths[ru]] - processing_prefix[ru, iu + 1]))
+                            pu += delta
+                            pv -= delta
+                        if max(pu, pv) >= score + 1.e-8 * max(1., abs(score)):
                             continue
                     seg_a, seg_b = _move_segments(current, move, ru, iu, rv, iv)
                     cu = _oriented_segment_cost(seg_a, ru, scratch, travel, parent_index)
@@ -1332,6 +1375,29 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
                         continue
                     guard = 1.e-8 * max(1., abs(score), abs(lower)) if math.isfinite(score) else 0.
                     if math.isfinite(score) and lower >= score + guard:
+                        continue
+                    if route_objective:
+                        # Only affected intervals and their connecting arcs were
+                        # evaluated above. Materialize a possible improvement;
+                        # full affected-route costs resolve floating-point ties.
+                        value = max(lower, untouched)
+                        if value >= score + guard:
+                            continue
+                        candidate, candidate_bits = list(current), list(bits)
+                        candidate[ru] = _materialize_segments(seg_a, current)
+                        candidate_bits[ru] = _materialize_directions(seg_a, bits)
+                        if move != 4:
+                            candidate[rv] = _materialize_segments(seg_b, current)
+                            candidate_bits[rv] = _materialize_directions(seg_b, bits)
+                        cu = _oriented_route_cost(candidate[ru], candidate_bits[ru], travel, processing)
+                        cv = 0. if move == 4 else _oriented_route_cost(candidate[rv], candidate_bits[rv], travel, processing)
+                        value = max(cu, cv, untouched)
+                        if value < score - 1.e-8:
+                            current, bits, score = candidate, candidate_bits, value
+                            dirty[ru], dirty[rv] = True, True
+                            improved = True
+                            accepted += 1
+                            break
                         continue
                     changed = np.zeros(4, np.bool_)
                     changed[ru], changed[rv] = True, True
@@ -2079,7 +2145,7 @@ class _HGAWorkspace:
         self.parameters = np.array([config.empty_speed, config.t_pre, config.t_post,
                                     config.interference_dx, config.interference_dy, config.numeric_epsilon])
         self.vnd_scratch = _vnd_scratch(2 * len(parents), len(self.processing))
-        self.oriented_scratch = _oriented_scratch(2 * len(parents), len(self.processing))
+        self.oriented_scratch = _oriented_scratch(2 * len(parents), len(self.processing), self.vnd_scratch[4])
 
     def encode(self, solution):
         selected = {p.parent_id: self.patterns.index(p) for p in solution.patterns}
@@ -2337,20 +2403,24 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
     accounting = evaluator.accounting
     last_progress = time.perf_counter()
 
-    def record(routes, directions, selected, score, source):
+    route_objective = settings.vnd_objective == 'ROUTE_CYCLE'
+
+    def record(routes, directions, selected, score, source, native=None):
         if not math.isfinite(score) or (evaluator.best is not None and score >= evaluator.best.metrics.cmax - 1.e-8):
             return
         solution = workspace.solution(routes, selected)
         expected = tuple(tuple(workspace.ids[n] for n in route) for route in routes)
         if tuple(route.block_ids for route in solution.routes) != expected:
             raise RuntimeError('oriented individual changed during canonicalization')
-        started = time.perf_counter()
-        value, vectors, ops, completion = _priority_arrays(
-            routes, workspace.travel, workspace.processing, workspace.points, workspace.parameters, directions)
-        accounting.scheduler_time += time.perf_counter() - started
-        accounting.reference_calls += 1
+        if native is None:
+            started = time.perf_counter()
+            native = _priority_arrays(routes, workspace.travel, workspace.processing,
+                                      workspace.points, workspace.parameters, directions)
+            accounting.scheduler_time += time.perf_counter() - started
+            accounting.reference_calls += 1
+        value, vectors, ops, completion = native
         if not math.isfinite(value) or abs(value - score) > 1.e-8:
-            raise RuntimeError('oriented VND and full native objective disagree')
+            raise RuntimeError('oriented individual and native timeline disagree')
         schedule = _schedule_from_arrays(value, vectors, ops, completion, workspace.ids,
                                          'NATIVE_PRIORITY_FOUR_ROBOTS_EXPLICIT_DIRECTIONS')
         evaluator.evaluate(solution, source=source, native_schedule=schedule)
@@ -2359,12 +2429,14 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
         started = time.perf_counter()
         identity = _oriented_identity(routes, directions)
         previous = cache.get(identity)
-        if previous is None:
+        unique = previous is None
+        if unique:
             hits = np.zeros(4, np.int64)
             result, bits, score, operations, _, pass_hit, candidate_hit, rejected = _vnd_oriented_arrays(
                 routes, directions, workspace.travel, workspace.processing, workspace.points, workspace.eligible,
                 workspace.parent_index, workspace.nearest, workspace.parameters, settings.alpha,
-                settings.vnd_max_passes or 0, settings.vnd_candidate_cap or 0, workspace.oriented_scratch, hits)
+                settings.vnd_max_passes or 0, settings.vnd_candidate_cap or 0, workspace.oriented_scratch, hits,
+                route_objective=route_objective)
             accounting.cheap_candidate_operations += operations
             accounting.vnd_candidate_operations += operations
             accounting.vnd_native_candidate_evaluations += int(hits[3])
@@ -2375,20 +2447,34 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
             accounting.vnd_pass_cap_hits += int(pass_hit)
             accounting.vnd_candidate_cap_hits += int(candidate_hit)
             terminal = _oriented_identity(result, bits)
-            lower = max(_oriented_route_cost(r, d, workspace.travel, workspace.processing) for r, d in zip(result, bits))
+            lower = (float(score) if route_objective else
+                     max(_oriented_route_cost(r, d, workspace.travel, workspace.processing) for r, d in zip(result, bits)))
             encoded = [2 * r + d for r, d in zip(result, bits)]
             previous = _NumericIndividual(result, selected.copy(), float(score), lower, terminal,
                                            _numeric_edges(encoded, 2 * len(workspace.processing)), bits, rejected)
-            _remember_vnd(cache, identity, terminal, previous)
+            if not route_objective:
+                _remember_vnd(cache, identity, terminal, previous)
         else:
             accounting.vnd_cache_hits += 1
             cache.pop(identity)
             cache[identity] = previous
         accounting.local_search_time += time.perf_counter() - started
+        native = None
+        if route_objective:
+            # Exactly one complete fixed-gene native evaluation per improved
+            # individual, including VND cache hits. The best recorder reuses it.
+            started = time.perf_counter()
+            native = _priority_arrays(previous.routes, workspace.travel, workspace.processing,
+                workspace.points, workspace.parameters, previous.directions)
+            accounting.scheduler_time += time.perf_counter() - started
+            accounting.reference_calls += 1
+            previous.cmax = float(native[0])
+            if unique:
+                _remember_vnd(cache, identity, terminal, previous)
         accounting.candidate_count += 1
         accounting.remaining_deadlock += int(not math.isfinite(previous.cmax))
         record(previous.routes, previous.directions, previous.selected, previous.cmax,
-               f'HGA_ORIENTED_NATIVE_{accounting.candidate_count}')
+               f'HGA_ORIENTED_NATIVE_{accounting.candidate_count}', native=native)
         return previous
 
     init_started = time.perf_counter()
@@ -2413,9 +2499,16 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
                 _put_oriented(routes, directions, node, bit, robot, position)
         routes, directions = workspace.repair(routes, selected, directions=directions)
         if index < settings.initialization_reference_limit:
-            value = _priority_arrays(routes, workspace.travel, workspace.processing,
-                                      workspace.points, workspace.parameters, directions)[0]
-            record(routes, directions, selected, value, f'HGA_ORIENTED_INITIAL_{index}')
+            # Keep the existing unmodified initialization proposals as native
+            # incumbents as well. These precede VND and are not offspring.
+            started = time.perf_counter()
+            native = _priority_arrays(routes, workspace.travel, workspace.processing,
+                                      workspace.points, workspace.parameters, directions)
+            if route_objective:
+                accounting.scheduler_time += time.perf_counter() - started
+                accounting.reference_calls += 1
+            record(routes, directions, selected, native[0], f'HGA_ORIENTED_INITIAL_{index}',
+                   native=native if route_objective else None)
         population.append(local(routes, directions, selected))
         now = time.perf_counter()
         if now - last_progress >= 60.:
@@ -2491,8 +2584,11 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
         iterations=iterations, initialization_time=initialization_time,
         termination_reason='TIME_LIMIT' if evaluator.expired else 'ITERATION_LIMIT',
         initial_candidate=initial_candidate, initial_reference_calls=initial_calls,
-        diagnostics=('explicit oriented genes; complete M1-M6 VND; same fixed-gene native Cmax in VND and population',
-                     'only native rejected-pair progress breaks nonfinite-Cmax ties; no internal B32'))
+        diagnostics=((
+            'explicit oriented genes; complete route-cycle M1-M6 VND; native coordinated population selection',
+            'one fixed-gene native evaluation per complete individual; no internal B32') if route_objective else (
+            'explicit oriented genes; complete M1-M6 VND; same fixed-gene native Cmax in VND and population',
+            'only native rejected-pair progress breaks nonfinite-Cmax ties; no internal B32')))
 
 
 def _run_hga_native(parents, config, settings, *, seed, scope, checkpoints, method_id):
