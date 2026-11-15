@@ -3666,3 +3666,113 @@ def test_expanded_final_selection_prioritizes_feasibility_and_does_not_enter_tes
     assert saved['selected_summary'] is best and not saved['acceptance']['feasibility']
     assert saved['state_dict']['value'].item() == 1.
 
+
+def _owner_cf_fixture():
+    import run_gnn_weld_layout as experiment
+    from mrta_search import gnn_constructor as c, lns
+
+    experiment.configure_cpu()
+    torch.manual_seed(53)
+    parents = (ParentWeld('prefix', (1., 9.), (2., 9.)), ParentWeld('target', (5., 9.), (10., 9.)))
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True).eval()
+    space = c.parent_assignment_space(parents, CONFIG)
+    pattern = next(p for p in space.children if p.parent_id == 'prefix' and p.kind is SplitKind.WHOLE)
+    selected = {'prefix': pattern}
+    block = space.children[pattern][0]
+    state = lns.oriented_route_state(((block.block_id,), (), (), ()), ((0,), (), (), ()), {block.block_id: block}, CONFIG)
+    assignment = next(a for a in space.actions if a.parent_id == 'target' and a.pattern.kind is SplitKind.WHOLE
+                      and a.robots == (0,))
+    return experiment, model, space, state, selected, assignment
+
+
+def test_owner_cf_candidates_change_only_whole_owner_and_preserve_prefix():
+    experiment, model, space, state, selected, assignment = _owner_cf_fixture()
+    with torch.no_grad():
+        pair = experiment.owner_cf_candidates(space, model.encode_static(space.graph), model, state, selected, assignment)
+    assert len(pair) == 2
+    actions = [space.actions[p.assignment_index] for p in pair]
+    assert actions[0] == assignment and actions[1].robots != actions[0].robots
+    assert actions[0].parent_id == actions[1].parent_id == 'target'
+    assert actions[0].pattern == actions[1].pattern and actions[0].pattern.kind is SplitKind.WHOLE
+    kept = {b for route in state.routes for b in route}
+    for plan in pair:
+        assert all(not action.neighbour_changes for action in plan.actions)
+        projected = [tuple((b, d) for b, d in zip(route, bits) if b in kept)
+                     for route, bits in zip(plan.state.routes, plan.state.directions)]
+        assert projected == [tuple(zip(route, bits)) for route, bits in zip(state.routes, state.directions)]
+    assert max(pair[1].state.loads) < max(pair[0].state.loads)
+
+
+def test_owner_cf_bounded_residual_matches_shortlist_final_and_training(monkeypatch):
+    from mrta_search import gnn_constructor as c
+
+    experiment, model, space, state, selected, _ = _owner_cf_fixture()
+    original_keys = set(model.state_dict())
+    model.bounded_assignment = True
+    monkeypatch.setattr(model, 'assignment_scores', lambda rows: torch.full((len(rows),), 1000.))
+    original = c.shortlist_assignments
+    recorded = []
+    embeddings = model.encode_static(space.graph)
+    blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
+    nodes = {b.block_id: space.block_nodes[pattern, b.block_id] for pattern in selected.values() for b in space.children[pattern]}
+    pending = {'target'}
+    _, features = model.assignment_features(space, embeddings, state, blocks, pending, CONFIG)
+
+    def shortlist(space_arg, indices, scores, **kwargs):
+        residual = scores - features[:, -4:-2] @ model.joint_weights[:2]
+        assert torch.allclose(residual, torch.full_like(residual, .35), atol=1e-6)
+        recorded.append(True)
+        return original(space_arg, indices, scores, **kwargs)
+
+    monkeypatch.setattr(c, 'shortlist_assignments', shortlist)
+    with torch.no_grad():
+        plans, scores = c.vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, CONFIG)
+        assert recorded and plans
+        outcomes = torch.stack([p.outcome for p in plans])
+        expected = model.joint_scores(space, embeddings, torch.tensor([p.assignment_index for p in plans]),
+                                      torch.stack([p.assignment_features for p in plans]), outcomes)
+        assert torch.allclose(scores, expected)
+        assert torch.allclose(scores - outcomes @ model.joint_weights, torch.full_like(scores, .35), atol=1e-6)
+        rows = torch.zeros(2, model.policy[0].in_features)
+        model.bounded_assignment = False
+        assert torch.equal(model.assignment_contribution(rows), torch.full((2,), 350.))
+    assert set(model.state_dict()) == original_keys and model.cmax_value_head is None
+
+
+def test_owner_cf_training_updates_only_policy_and_keeps_six_epochs(monkeypatch):
+    import math
+
+    experiment, model, space, state, selected, assignment = _owner_cf_fixture()
+    with torch.no_grad():
+        embeddings = model.encode_static(space.graph)
+        plans = experiment.owner_cf_candidates(space, embeddings, model, state, selected, assignment)
+        rows = model.embed_assignment_rows(space, embeddings, torch.tensor([p.assignment_index for p in plans]),
+                                           torch.stack([p.assignment_features for p in plans]))
+    initial = {key: value.clone() for key, value in model.state_dict().items()}
+    group = dict(assignment_rows=rows, outcomes=torch.stack([p.outcome for p in plans]), preferences=[(1, 0, 'cmax')])
+    saved = dict(initial_state_dict=initial, state_dict=initial, completed_epoch=0, history=[],
+                 training=[dict(layout_id='train_fixture', groups=[group])])
+    monkeypatch.setattr(experiment, 'save_owner_cf', lambda saved: None)
+    monkeypatch.setattr(experiment, 'b32', lambda *a: pytest.fail('head training called B32'))
+    monkeypatch.setattr(experiment, 'baseline_run', lambda *a, **k: pytest.fail('repeated WAG/HGA search'))
+    experiment.train_owner_cf(saved)
+    assert saved['completed_epoch'] == len(saved['history']) == 6 and saved['frozen_parameters_unchanged']
+    assert all(record['pairs'] == 1 and math.isfinite(record['ranking_loss']) for record in saved['history'])
+    assert any(not torch.equal(value, saved['state_dict'][key]) for key, value in initial.items() if key.startswith('policy.'))
+    assert all(torch.equal(value, saved['state_dict'][key]) for key, value in initial.items() if not key.startswith('policy.'))
+    assert set(initial) == set(saved['state_dict']) and 'cmax_value_mean' not in saved['state_dict']
+
+
+def test_owner_cf_selects_forty_feasible_train_layouts_across_eight_strata():
+    import run_gnn_weld_layout as experiment
+
+    records = [dict(layout_id=f'train_{i:03d}', parents=[None] * (50 + i),
+                    rectangle_utilization=.79 + (i % 14) / 1000., parts=[None] * (10 + i % 20)) for i in range(112)]
+    source = dict(teachers=[dict(layout_id=row['layout_id'], records=[dict(row=dict(status='FEASIBLE', method='WAG+VNS',
+                   iterations=500, cmax_s=5000., processing_r0_s=100. + i, processing_r1_s=100.,
+                   processing_r2_s=100., processing_r3_s=100.))]) for i, row in enumerate(records)])
+    names, strata, teachers = experiment.owner_cf_layouts(source, records)
+    assert len(names) == len(set(names)) == 40 and len(strata) == 8
+    assert all(len(stratum['layouts']) == 5 for stratum in strata)
+    assert all(name.startswith('train_') and teachers[name]['row']['status'] == 'FEASIBLE' for name in names)
+

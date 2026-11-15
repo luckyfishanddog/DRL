@@ -1241,6 +1241,44 @@ def _fixed_native_update(routes, directions, points, processing, parameters,
 
 
 @njit
+def _collect_oriented_candidates(all_ids, near, robot, position, lengths, longest, candidates, counts):
+    """Fill each move in the original directed (all_ids, near[u]) order.
+
+    Keep symmetric pairs here: the consumer counts and suppresses repeats at
+    their original position, including when only one near direction exists.
+    """
+    counts[:] = 0
+    for u in all_ids:
+        ru, iu = robot[u], position[u]
+        for v in near[u]:
+            if v < 0:
+                break
+            rv, iv = robot[v], position[v]
+            cross = ru != rv
+            if cross and ru == longest:
+                k = counts[0]
+                candidates[0, k, 0], candidates[0, k, 1] = u, v
+                counts[0] = k + 1
+            if cross and (ru == longest or rv == longest):
+                k = counts[1]
+                candidates[1, k, 0], candidates[1, k, 1] = u, v
+                counts[1] = k + 1
+                if iu + 1 < lengths[ru] and iv + 1 < lengths[rv]:
+                    k = counts[2]
+                    candidates[2, k, 0], candidates[2, k, 1] = u, v
+                    counts[2] = k + 1
+            if not cross and iu != iv:
+                k = counts[3]
+                candidates[3, k, 0], candidates[3, k, 1] = u, v
+                counts[3] = k + 1
+            if cross:
+                for m in (4, 5):
+                    k = counts[m]
+                    candidates[m, k, 0], candidates[m, k, 1] = u, v
+                    counts[m] = k + 1
+
+
+@njit
 def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligible, parent_index,
                            nearest, parameters, alpha, max_passes, candidate_cap, scratch,
                            move_cache_hits=None, use_schedule_bound=True, route_objective=False):
@@ -1279,6 +1317,8 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
                     break
     width = len(active_ids) if move_cache_hits is not None else 0
     seen = np.zeros((width, width), np.int64)
+    candidates = np.empty((6, len(active_ids) * alpha, 2), np.int64)
+    candidate_counts = np.zeros(6, np.int64)
     passes, operations, accepted = 0, 0, 0
     while True:
         if max_passes > 0 and passes >= max_passes:
@@ -1298,160 +1338,146 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
         dirty[:] = False
         longest = int(np.argmax(costs))
         all_ids = np.concatenate((current[0], current[1], current[2], current[3]))
+        _collect_oriented_candidates(all_ids, near, robot, position, lengths, longest,
+                                     candidates, candidate_counts)
         improved = False
         for move in range(1, 7):
-            for u in all_ids:
+            for k in range(candidate_counts[move - 1]):
+                u, v = candidates[move - 1, k, 0], candidates[move - 1, k, 1]
                 ru, iu = robot[u], position[u]
-                if move == 1 and ru != longest:
+                rv, iv = robot[v], position[v]
+                if candidate_cap > 0 and operations >= candidate_cap:
+                    return current, bits, score, operations, accepted, False, True, rejected
+                operations += 1
+                if move_cache_hits is not None and move in (2, 3, 4, 6):
+                    a, b, stamp = index[u], index[v], 7 * passes + move
+                    if seen[a, b] == stamp:
+                        move_cache_hits[0] += 1
+                        continue
+                    seen[a, b], seen[b, a] = stamp, stamp
+                if move == 6 and iu + 1 == lengths[ru] and iv + 1 == lengths[rv]:
                     continue
-                for v in near[u]:
-                    if v < 0:
-                        break
-                    rv, iv = robot[v], position[v]
-                    if move == 1 and ru == rv:
+                untouched = 0.
+                if math.isfinite(score):
+                    if not route_objective and ru // 2 == rv // 2 and pairs[1 - ru // 2] >= score - 1.e-8:
                         continue
-                    if move in (2, 3) and (ru == rv or longest not in (ru, rv)):
+                    for r in range(4):
+                        if r != ru and r != rv:
+                            if route_objective:
+                                untouched = max(untouched, costs[r])
+                            elif len(nominal[r]):
+                                untouched = max(untouched, nominal[r][-1, 6])
+                    if untouched >= score - 1.e-8:
                         continue
-                    if move == 3 and (iu + 1 >= lengths[ru] or iv + 1 >= lengths[rv]):
+                if route_objective and use_schedule_bound and move != 4:
+                    # The existing processing-only route bound, before
+                    # interval/travel work. Empty travel is nonnegative;
+                    # reverse segments retain the same processing sum.
+                    pu = processing_prefix[ru, lengths[ru]]
+                    pv = processing_prefix[rv, lengths[rv]]
+                    if move == 1:
+                        pu -= processing[u]
+                        pv += processing[u]
+                    elif move in (2, 3):
+                        width = 1 if move == 2 else 2
+                        delta = (processing_prefix[rv, iv + width] - processing_prefix[rv, iv]
+                                 - processing_prefix[ru, iu + width] + processing_prefix[ru, iu])
+                        pu += delta
+                        pv -= delta
+                    elif move == 5:
+                        before_u = processing_prefix[ru, iu + 1]
+                        before_v = processing_prefix[rv, iv + 1]
+                        pu, pv = before_u + before_v, pu + pv - before_u - before_v
+                    else:
+                        delta = ((processing_prefix[rv, lengths[rv]] - processing_prefix[rv, iv + 1])
+                                 - (processing_prefix[ru, lengths[ru]] - processing_prefix[ru, iu + 1]))
+                        pu += delta
+                        pv -= delta
+                    if max(pu, pv) >= score + 1.e-8 * max(1., abs(score)):
                         continue
-                    if move == 4 and (ru != rv or iu == iv):
+                seg_a, seg_b = _move_segments(current, move, ru, iu, rv, iv)
+                cu = _oriented_segment_cost(seg_a, ru, scratch, travel, parent_index)
+                cv = 0. if move == 4 else _oriented_segment_cost(seg_b, rv, scratch, travel, parent_index)
+                lower = max(cu, cv)
+                if not math.isfinite(lower):
+                    continue
+                guard = 1.e-8 * max(1., abs(score), abs(lower)) if math.isfinite(score) else 0.
+                if math.isfinite(score) and lower >= score + guard:
+                    continue
+                if route_objective:
+                    # Only affected intervals and their connecting arcs were
+                    # evaluated above. Materialize a possible improvement;
+                    # full affected-route costs resolve floating-point ties.
+                    value = max(lower, untouched)
+                    if value >= score + guard:
                         continue
-                    if move in (5, 6) and ru == rv:
-                        continue
-                    if candidate_cap > 0 and operations >= candidate_cap:
-                        return current, bits, score, operations, accepted, False, True, rejected
-                    operations += 1
-                    if move_cache_hits is not None and move in (2, 3, 4, 6):
-                        a, b, stamp = index[u], index[v], 7 * passes + move
-                        if seen[a, b] == stamp:
-                            move_cache_hits[0] += 1
-                            continue
-                        seen[a, b], seen[b, a] = stamp, stamp
-                    if move == 6 and iu + 1 == lengths[ru] and iv + 1 == lengths[rv]:
-                        continue
-                    untouched = 0.
-                    if math.isfinite(score):
-                        if not route_objective and ru // 2 == rv // 2 and pairs[1 - ru // 2] >= score - 1.e-8:
-                            continue
-                        for r in range(4):
-                            if r != ru and r != rv:
-                                if route_objective:
-                                    untouched = max(untouched, costs[r])
-                                elif len(nominal[r]):
-                                    untouched = max(untouched, nominal[r][-1, 6])
-                        if untouched >= score - 1.e-8:
-                            continue
-                    if route_objective and use_schedule_bound and move != 4:
-                        # The existing processing-only route bound, before
-                        # interval/travel work. Empty travel is nonnegative;
-                        # reverse segments retain the same processing sum.
-                        pu = processing_prefix[ru, lengths[ru]]
-                        pv = processing_prefix[rv, lengths[rv]]
-                        if move == 1:
-                            pu -= processing[u]
-                            pv += processing[u]
-                        elif move in (2, 3):
-                            width = 1 if move == 2 else 2
-                            delta = (processing_prefix[rv, iv + width] - processing_prefix[rv, iv]
-                                     - processing_prefix[ru, iu + width] + processing_prefix[ru, iu])
-                            pu += delta
-                            pv -= delta
-                        elif move == 5:
-                            before_u = processing_prefix[ru, iu + 1]
-                            before_v = processing_prefix[rv, iv + 1]
-                            pu, pv = before_u + before_v, pu + pv - before_u - before_v
-                        else:
-                            delta = ((processing_prefix[rv, lengths[rv]] - processing_prefix[rv, iv + 1])
-                                     - (processing_prefix[ru, lengths[ru]] - processing_prefix[ru, iu + 1]))
-                            pu += delta
-                            pv -= delta
-                        if max(pu, pv) >= score + 1.e-8 * max(1., abs(score)):
-                            continue
-                    seg_a, seg_b = _move_segments(current, move, ru, iu, rv, iv)
-                    cu = _oriented_segment_cost(seg_a, ru, scratch, travel, parent_index)
-                    cv = 0. if move == 4 else _oriented_segment_cost(seg_b, rv, scratch, travel, parent_index)
-                    lower = max(cu, cv)
-                    if not math.isfinite(lower):
-                        continue
-                    guard = 1.e-8 * max(1., abs(score), abs(lower)) if math.isfinite(score) else 0.
-                    if math.isfinite(score) and lower >= score + guard:
-                        continue
-                    if route_objective:
-                        # Only affected intervals and their connecting arcs were
-                        # evaluated above. Materialize a possible improvement;
-                        # full affected-route costs resolve floating-point ties.
-                        value = max(lower, untouched)
-                        if value >= score + guard:
-                            continue
-                        candidate, candidate_bits = list(current), list(bits)
-                        candidate[ru] = _materialize_segments(seg_a, current)
-                        candidate_bits[ru] = _materialize_directions(seg_a, bits)
-                        if move != 4:
-                            candidate[rv] = _materialize_segments(seg_b, current)
-                            candidate_bits[rv] = _materialize_directions(seg_b, bits)
-                        cu = _oriented_route_cost(candidate[ru], candidate_bits[ru], travel, processing)
-                        cv = 0. if move == 4 else _oriented_route_cost(candidate[rv], candidate_bits[rv], travel, processing)
-                        value = max(cu, cv, untouched)
-                        if value < score - 1.e-8:
-                            current, bits, score = candidate, candidate_bits, value
-                            dirty[ru], dirty[rv] = True, True
-                            improved = True
-                            accepted += 1
-                            break
-                        continue
-                    changed = np.zeros(4, np.bool_)
-                    changed[ru], changed[rv] = True, True
-                    skip_priorities = np.zeros(4, np.bool_)
-                    if use_schedule_bound and math.isfinite(score):
-                        prefixes, candidate_costs = lengths.copy(), costs.copy()
-                        source, lo, hi, reverse = seg_a[0]
-                        prefixes[ru] = hi if source == ru and lo == 0 and not reverse else 0
-                        candidate_costs[ru] = cu
-                        if move != 4:
-                            source, lo, hi, reverse = seg_b[0]
-                            prefixes[rv] = hi if source == rv and lo == 0 and not reverse else 0
-                            candidate_costs[rv] = cv
-                        blocked = False
-                        for left in (0, 2):
-                            right = left + 1
-                            if not changed[left] and not changed[right]:
-                                continue
-                            skip_priorities[right] = _fixed_prefix_reject(left, right, prefixes, changed,
-                                nominal, progress, candidate_costs, score, parameters[5], failures)
-                            skip_priorities[left] = _fixed_prefix_reject(right, left, prefixes, changed,
-                                nominal, progress, candidate_costs, score, parameters[5], failures)
-                            if move_cache_hits is not None and len(move_cache_hits) > 2:
-                                move_cache_hits[1] += int(skip_priorities[left]) + int(skip_priorities[right])
-                            if skip_priorities[left] and skip_priorities[right]:
-                                blocked = True
-                                break
-                        if blocked:
-                            if move_cache_hits is not None and len(move_cache_hits) > 2:
-                                move_cache_hits[2] += 1
-                            continue
                     candidate, candidate_bits = list(current), list(bits)
                     candidate[ru] = _materialize_segments(seg_a, current)
                     candidate_bits[ru] = _materialize_directions(seg_a, bits)
                     if move != 4:
                         candidate[rv] = _materialize_segments(seg_b, current)
                         candidate_bits[rv] = _materialize_directions(seg_b, bits)
-                    new_failures = failures.copy()
-                    if move_cache_hits is not None and len(move_cache_hits) > 3:
-                        move_cache_hits[3] += 1
-                    value, new_ops, new_pairs, new_nominal, new_follows = _fixed_native_update(
-                        candidate, candidate_bits, points, processing, parameters, ops, pairs,
-                        nominal, follows, changed, score, skip_priorities, new_failures)
-                    new_rejected = int(not math.isfinite(new_pairs[0])) + int(not math.isfinite(new_pairs[1]))
-                    if (value < score - 1.e-8 or (not math.isfinite(score) and not math.isfinite(value)
-                                                 and new_rejected < rejected)):
+                    cu = _oriented_route_cost(candidate[ru], candidate_bits[ru], travel, processing)
+                    cv = 0. if move == 4 else _oriented_route_cost(candidate[rv], candidate_bits[rv], travel, processing)
+                    value = max(cu, cv, untouched)
+                    if value < score - 1.e-8:
                         current, bits, score = candidate, candidate_bits, value
-                        ops, pairs, nominal, follows = new_ops, new_pairs, new_nominal, new_follows
-                        failures = new_failures
-                        rejected, improved = new_rejected, True
                         dirty[ru], dirty[rv] = True, True
+                        improved = True
                         accepted += 1
                         break
-                if improved:
+                    continue
+                changed = np.zeros(4, np.bool_)
+                changed[ru], changed[rv] = True, True
+                skip_priorities = np.zeros(4, np.bool_)
+                if use_schedule_bound and math.isfinite(score):
+                    prefixes, candidate_costs = lengths.copy(), costs.copy()
+                    source, lo, hi, reverse = seg_a[0]
+                    prefixes[ru] = hi if source == ru and lo == 0 and not reverse else 0
+                    candidate_costs[ru] = cu
+                    if move != 4:
+                        source, lo, hi, reverse = seg_b[0]
+                        prefixes[rv] = hi if source == rv and lo == 0 and not reverse else 0
+                        candidate_costs[rv] = cv
+                    blocked = False
+                    for left in (0, 2):
+                        right = left + 1
+                        if not changed[left] and not changed[right]:
+                            continue
+                        skip_priorities[right] = _fixed_prefix_reject(left, right, prefixes, changed,
+                            nominal, progress, candidate_costs, score, parameters[5], failures)
+                        skip_priorities[left] = _fixed_prefix_reject(right, left, prefixes, changed,
+                            nominal, progress, candidate_costs, score, parameters[5], failures)
+                        if move_cache_hits is not None and len(move_cache_hits) > 2:
+                            move_cache_hits[1] += int(skip_priorities[left]) + int(skip_priorities[right])
+                        if skip_priorities[left] and skip_priorities[right]:
+                            blocked = True
+                            break
+                    if blocked:
+                        if move_cache_hits is not None and len(move_cache_hits) > 2:
+                            move_cache_hits[2] += 1
+                        continue
+                candidate, candidate_bits = list(current), list(bits)
+                candidate[ru] = _materialize_segments(seg_a, current)
+                candidate_bits[ru] = _materialize_directions(seg_a, bits)
+                if move != 4:
+                    candidate[rv] = _materialize_segments(seg_b, current)
+                    candidate_bits[rv] = _materialize_directions(seg_b, bits)
+                new_failures = failures.copy()
+                if move_cache_hits is not None and len(move_cache_hits) > 3:
+                    move_cache_hits[3] += 1
+                value, new_ops, new_pairs, new_nominal, new_follows = _fixed_native_update(
+                    candidate, candidate_bits, points, processing, parameters, ops, pairs,
+                    nominal, follows, changed, score, skip_priorities, new_failures)
+                new_rejected = int(not math.isfinite(new_pairs[0])) + int(not math.isfinite(new_pairs[1]))
+                if (value < score - 1.e-8 or (not math.isfinite(score) and not math.isfinite(value)
+                                             and new_rejected < rejected)):
+                    current, bits, score = candidate, candidate_bits, value
+                    ops, pairs, nominal, follows = new_ops, new_pairs, new_nominal, new_follows
+                    failures = new_failures
+                    rejected, improved = new_rejected, True
+                    dirty[ru], dirty[rv] = True, True
+                    accepted += 1
                     break
             if improved:
                 break

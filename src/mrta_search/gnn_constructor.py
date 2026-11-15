@@ -1867,8 +1867,9 @@ class VNextGNN(_JointAssignmentGNN):
     """Assignment and distilled directed insertion with a shared geometry encoder."""
 
     def __init__(self, hidden_dim: int = 64, heads: int = 4, *, workload_lookahead: bool = False,
-                 joint_actions: bool = False, cmax_value: bool = False):
+                 joint_actions: bool = False, cmax_value: bool = False, bounded_assignment: bool = False):
         super().__init__(hidden_dim, heads, workload_lookahead=workload_lookahead)
+        self.bounded_assignment = bounded_assignment
         if joint_actions and not workload_lookahead:
             raise ValueError('joint VNext actions require workload estimates')
         self.joint_weights = nn.Parameter(torch.tensor(_VNEXT_JOINT_PRIOR)) if joint_actions else None
@@ -1884,6 +1885,10 @@ class VNextGNN(_JointAssignmentGNN):
     def assignment_scores(self, rows):
         return self.policy((rows - self.assignment_mean) / self.assignment_scale).squeeze(1)
 
+    def assignment_contribution(self, rows):
+        scores = self.assignment_scores(rows)
+        return .35 * (scores.tanh() if self.bounded_assignment else scores)
+
     def assignment_logits(self, space, embeddings, state, blocks, pending, config):
         indices, rows = self.assignment_rows(space, embeddings, state, blocks, pending, config)
         return indices, self.assignment_scores(rows)
@@ -1895,7 +1900,7 @@ class VNextGNN(_JointAssignmentGNN):
 
     def joint_scores(self, space, embeddings, indices, assignment, outcomes):
         rows = self.embed_assignment_rows(space, embeddings, indices, assignment)
-        return .35 * self.assignment_scores(rows) + outcomes @ self.joint_weights
+        return self.assignment_contribution(rows) + outcomes @ self.joint_weights
 
     def enable_cmax_value(self):
         """Attach the only trainable head; old checkpoints keep their exact keys."""
@@ -2043,18 +2048,20 @@ def vnext_value_candidate_indices(space, plans, scores):
     return tuple((chosen + [i for i in unique if i not in chosen])[:3])
 
 
-def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config):
+def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config, *,
+                        assignment_indices=None, preserve_prefix=False):
     """Rank up to eight assignments after their directed child insertions."""
     from .lns import joint_block_candidates
 
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
     rows = model.embed_assignment_rows(space, embeddings, indices, features)
-    logits = .35 * model.assignment_scores(rows)
+    logits = model.assignment_contribution(rows)
     # The coarse stage uses the workload forecast. Reranking adds the actual
     # change in route MOVE and the spatial risk after committing both children.
-    shortlist = shortlist_assignments(space, indices, logits + features[:, -4:-2] @ model.joint_weights[:2],
-                                      owner_alternatives=True)
     positions = {index: i for i, index in enumerate(indices.tolist())}
+    shortlist = (shortlist_assignments(space, indices, logits + features[:, -4:-2] @ model.joint_weights[:2],
+                                       owner_alternatives=True) if assignment_indices is None
+                 else tuple(index for index in assignment_indices if index in positions))
     before_move = features.new_tensor([sum(arcs) for arcs in state.arc_costs])
     x_low = [min((min(blocks[b].start[0], blocks[b].end[0]) for b in route), default=math.inf)
              for route in state.routes]
@@ -2076,6 +2083,8 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
             for partial, actions, risk, retained_inputs in partials:
                 variants = joint_block_candidates(partial, child, assignment.pattern, local_blocks, config,
                                                   robot_id=robot, check_initial_feasibility=False)
+                if preserve_prefix:
+                    variants = tuple((after, action) for after, action in variants if not action.neighbour_changes)
                 if not variants:
                     continue
                 variants = tuple(variants[i] for i in structural_child_indices(variants, limit=12))

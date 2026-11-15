@@ -583,6 +583,12 @@ CMAX_VALUE_MODEL = ROOT / 'models' / 'gnn_weld_layout_cmax_value.pt'
 CMAX_VALUE_RESULTS = FINAL_RESULTS / 'gnn_cmax_value_results.csv'
 EXPANDED_MODEL = ROOT / 'models' / 'gnn_weld_layout_expanded_dagger.pt'
 EXPANDED_RESULTS = FINAL_RESULTS / 'gnn_expanded_dagger.csv'
+OWNER_CF_MODEL = ROOT / 'models' / 'gnn_weld_layout_owner_cf.pt'
+OWNER_CF_RESULTS = FINAL_RESULTS / 'gnn_owner_cf.csv'
+OWNER_CF_FIELDS = ('split', 'stage', 'layout_id', 'method', 'seed', 'parent_id', 'mode',
+                   'assigned_parents', 'candidate', 'robot', 'winner', 'preference', 'status', 'cmax_s',
+                   'construct_s', 'runtime_s', 'b32_calls', 'processing_r0_s', 'processing_r1_s',
+                   'processing_r2_s', 'processing_r3_s', 'max_processing_s', 'move_s', 'diagnostic')
 EXPANDED_FIELDS = ('split', 'stage', 'round', 'epoch', 'layout_id', 'method', 'seed', 'status', 'cmax_s',
                    'construct_s', 'runtime_s', 'b32_calls', 'iterations', 'native_cmax_s',
                    'fraction', 'assigned_parents', 'candidate', 'parent_id', 'mode', 'robots',
@@ -602,8 +608,9 @@ def configure_cpu():
     torch.set_num_threads(1)
 
 
-def joint_model(weights=None, *, cmax_value=False):
-    model = gnn.VNextGNN(workload_lookahead=True, joint_actions=True, cmax_value=cmax_value)
+def joint_model(weights=None, *, cmax_value=False, bounded_assignment=False):
+    model = gnn.VNextGNN(workload_lookahead=True, joint_actions=True, cmax_value=cmax_value,
+                         bounded_assignment=bounded_assignment)
     if weights is None:
         saved = torch.load(MODEL, map_location='cpu', weights_only=True)
         missing, extra = model.load_state_dict(saved['models']['GNN_VNEXT_WORKLOAD']['state_dict'], strict=False)
@@ -1874,9 +1881,300 @@ def expanded_dagger_experiment(workers):
         print('EXPANDED_TEST', json.dumps(expanded_summary(saved['test'], old_wag + old_rule)), flush=True)
 
 
+def owner_cf_layouts(source, records):
+    teachers = {}
+    for sample in source['teachers']:
+        feasible = [record for record in sample['records'] if record['row']['status'] == 'FEASIBLE'
+                    and record['row']['method'] in ('RULE/BEAM', 'WAG+VNS')
+                    and (record['row']['method'] != 'WAG+VNS' or record['row']['iterations'] == 500)]
+        if feasible:
+            teachers[sample['layout_id']] = min(feasible, key=lambda record: record['row']['cmax_s'])
+    ordered = sorted((row for row in records if row['layout_id'] in teachers),
+                     key=lambda row: (len(row['parents']), row['layout_id']))
+    if len(ordered) < 40:
+        raise ValueError(f'only {len(ordered)} TRAIN layouts have saved B32-feasible teachers; need 40')
+    chosen, strata = [], []
+    for weld_bin in range(4):
+        group = sorted(ordered[len(ordered) * weld_bin // 4:len(ordered) * (weld_bin + 1) // 4],
+                       key=lambda row: (row['rectangle_utilization'], len(row['parts']), row['layout_id']))
+        for size_bin in range(2):
+            members = group[len(group) * size_bin // 2:len(group) * (size_bin + 1) // 2]
+            def load_spread(row):
+                teacher = teachers[row['layout_id']]['row']
+                loads = [teacher[f'processing_r{r}_s'] for r in range(4)]
+                return max(loads) - min(loads), len(row['parts']), row['layout_id']
+            members.sort(key=load_spread)
+            selection = [members[round(i * (len(members) - 1) / 4)] for i in range(5)]
+            names = [row['layout_id'] for row in selection]
+            chosen.extend(names)
+            strata.append(dict(weld_bin=weld_bin, size_bin=size_bin, layouts=names,
+                               parent_range=[min(len(row['parents']) for row in selection),
+                                             max(len(row['parents']) for row in selection)],
+                               parts_range=[min(len(row['parts']) for row in selection),
+                                            max(len(row['parts']) for row in selection)],
+                               utilization_range=[min(row['rectangle_utilization'] for row in selection),
+                                                  max(row['rectangle_utilization'] for row in selection)]))
+    return chosen, strata, teachers
+
+
+def owner_cf_candidates(space, embeddings, model, state, selected, assignment):
+    """Same WHOLE/prefix, with the original owner and the best legal other owner."""
+    if assignment.pattern.kind.value != 'WHOLE':
+        return ()
+    blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
+    nodes = {b.block_id: space.block_nodes[pattern, b.block_id]
+             for pattern in selected.values() for b in space.children[pattern]}
+    indices = tuple(i for i, action in enumerate(space.actions)
+                    if action.parent_id == assignment.parent_id and action.pattern == assignment.pattern)
+    plans, _ = gnn.vnext_joint_actions(space, embeddings, model, state, blocks, nodes,
+                                      set(space.parent_ids) - selected.keys(), CONFIG,
+                                      assignment_indices=indices, preserve_prefix=True)
+    original = next((plan for plan in plans if space.actions[plan.assignment_index] == assignment), None)
+    alternatives = [plan for plan in plans if space.actions[plan.assignment_index].robots != assignment.robots]
+    if original is None or not alternatives:
+        return ()
+    alternative = min(alternatives, key=lambda plan: (max(plan.state.loads), plan.state.travel))
+    return original, alternative
+
+
+@torch.no_grad()
+def collect_owner_cf(job):
+    layout, teacher, records, cached = job
+    name, parents = layout
+    started = time.perf_counter()
+    model = worker_model
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    embeddings = model.encode_static(space.graph)
+    result = unpack_directed_plan(parents, teacher['plan'], space)
+    labels = sorted(gnn.parent_assignment_targets(result.solution, CONFIG),
+                    key=lambda action: (-sum(CONFIG.process_time(b.length) for b in space.children[action.pattern]),
+                                        action.parent_id))
+    full_blocks = {b.block_id: b for action in labels for b in space.children[action.pattern]}
+    routes = tuple(route.block_ids for route in result.solution.routes)
+    seen = pickle.loads(cached) if cached else {}
+    # These are previously measured B32 outcomes, not the WAG native schedule.
+    for record in records:
+        row = record['row']
+        if record['plan'] is not None and row['status'] in ('FEASIBLE', 'DEADLOCK', 'INFEASIBLE'):
+            old = unpack_directed_plan(parents, record['plan'], space)
+            seen.setdefault(plan_key(old.solution, old.directions),
+                            ScheduleResult(ScheduleStatus(row['status']), cmax=row['cmax_s'],
+                                           diagnostics=(row['diagnostic'],) if row['diagnostic'] else ()))
+    targets = []
+    for depth, assignment in enumerate(labels):
+        if assignment.pattern.kind.value != 'WHOLE':
+            continue
+        owners = {action.robots for action in space.actions
+                  if action.parent_id == assignment.parent_id and action.pattern == assignment.pattern}
+        if len(owners) < 2:
+            continue
+        selected = {action.parent_id: action.pattern for action in labels[:depth]}
+        kept = {b.block_id for pattern in selected.values() for b in space.children[pattern]}
+        state = project_routes(routes, result.directions, kept, full_blocks)
+        owner = assignment.robots[0]
+        priority = (state.loads[owner] < max(state.loads) - 1e-9,
+                    -space.children[assignment.pattern][0].length, -state.loads[owner], assignment.parent_id)
+        targets.append((priority, depth, assignment, state, selected))
+    groups, rows, skipped = [], [], {}
+    for _, depth, assignment, state, selected in sorted(targets, key=lambda item: item[0]):
+        plans = owner_cf_candidates(space, embeddings, model, state, selected, assignment)
+        if not plans:
+            reason = 'NO_TWO_PREFIX_PRESERVING_OWNERS'
+            skipped[reason] = skipped.get(reason, 0) + 1
+            continue
+        if (max(plans[1].state.loads), plans[1].state.travel) >= (max(plans[0].state.loads), plans[0].state.travel):
+            reason = 'NO_LOAD_OR_MOVE_ADVANTAGE'
+            skipped[reason] = skipped.get(reason, 0) + 1
+            continue
+        indices = torch.tensor([plan.assignment_index for plan in plans])
+        assignment_rows = model.embed_assignment_rows(space, embeddings, indices,
+                                                      torch.stack([plan.assignment_features for plan in plans])).cpu()
+        completions, group_rows, descriptions = [], [], []
+        for index, plan in enumerate(plans):
+            action = space.actions[plan.assignment_index]
+            branch_started = time.perf_counter()
+            completion = build_joint(parents, model, space=space, embeddings=embeddings, beam_width=1,
+                                     state=plan.state, selected={**selected, action.parent_id: action.pattern})
+            construct_s = time.perf_counter() - branch_started
+            completions.append(completion)
+            group_rows.append(dict(split='train_expanded', stage='owner_branch', layout_id=name,
+                method='FROZEN_BASE_OWNER_CF', seed=SEED, parent_id=action.parent_id, mode='WHOLE',
+                assigned_parents=depth, candidate='AB'[index], robot=action.robots[0],
+                construct_s=construct_s, runtime_s=construct_s, b32_calls=0,
+                **beam_validation_metrics(completion)))
+            descriptions.append(dict(assignment_index=plan.assignment_index, robot=action.robots[0],
+                                     actions=[dict(block_id=a.block_id, robot=a.robot, position=a.position,
+                                                   direction=a.direction, neighbour_changes=a.neighbour_changes)
+                                              for a in plan.actions],
+                                     routes=plan.state.routes, directions=plan.state.directions))
+        schedules = []
+        complete_pair = all(completion.solution is not None for completion in completions)
+        for completion, row in zip(completions, group_rows):
+            evaluated = time.perf_counter()
+            schedule, called = evaluate_once(completion, seen) if complete_pair else (None, False)
+            schedules.append(schedule)
+            row.update(status=schedule.status.value if schedule else
+                       ('NO_COMPLETE_SOLUTION' if completion.solution is None else 'SKIPPED_INCOMPLETE_PAIR'),
+                       cmax_s=schedule.cmax if schedule and schedule.feasible else None,
+                       b32_calls=int(called), runtime_s=row['runtime_s'] + time.perf_counter() - evaluated,
+                       diagnostic=(' | '.join(schedule.diagnostics) if not schedule.feasible else '') if schedule else
+                       (completion.rejection_reason or 'counterpart could not complete construction'))
+        winner, kind = better_branch(*schedules)
+        for row in group_rows:
+            row.update(winner='AB'[winner] if winner is not None else None, preference=kind)
+        groups.append(dict(parent_id=assignment.parent_id, teacher=teacher['row']['method'],
+                           prefix=dict(patterns=tuple(pattern.pattern_id for pattern in selected.values()),
+                                       routes=state.routes, directions=state.directions),
+                           assignment_rows=assignment_rows, outcomes=torch.stack([plan.outcome for plan in plans]).cpu(),
+                           candidates=descriptions, plans=[pack_directed_plan(completion) for completion in completions],
+                           preferences=[(winner, 1 - winner, kind)] if winner is not None else []))
+        rows.extend(group_rows)
+        print('OWNER_CF_PAIR', json.dumps(dict(layout_id=name, parent_id=assignment.parent_id, assigned=depth,
+              robots=[row['robot'] for row in group_rows], status=[row['status'] for row in group_rows],
+              cmax_s=[row['cmax_s'] for row in group_rows], winner=winner, preference=kind,
+              b32_calls=sum(row['b32_calls'] for row in group_rows))), flush=True)
+        if len(groups) == 3:
+            break
+    return dict(layout_id=name, teacher=teacher['row']['method'], groups=groups, rows=rows,
+                skipped=skipped, runtime_s=time.perf_counter() - started)
+
+
+def save_owner_cf(saved):
+    rows = [row for sample in saved['training'] for row in sample['rows']] + saved['validation']
+    for row in rows:
+        if all(row.get(f'processing_r{r}_s') not in (None, '') for r in range(4)):
+            row['max_processing_s'] = max(row[f'processing_r{r}_s'] for r in range(4))
+    torch.save(saved, OWNER_CF_MODEL)
+    with OWNER_CF_RESULTS.open('w', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=OWNER_CF_FIELDS)
+        writer.writeheader()
+        writer.writerows({key: row.get(key) for key in OWNER_CF_FIELDS} for row in rows)
+
+
+def configure_owner_cf_worker(serialized, bounded):
+    configure_expanded_worker(serialized)
+    worker_model.bounded_assignment = bounded
+
+
+def train_owner_cf(saved):
+    if saved['completed_epoch'] == EPOCHS:
+        return
+    torch.manual_seed(SEED)
+    model = joint_model(saved['state_dict'], bounded_assignment=True)
+    model.requires_grad_(False)
+    model.policy.requires_grad_(True)
+    groups = [group for sample in sorted(saved['training'], key=lambda sample: sample['layout_id'])
+              for group in sample['groups'] if group['preferences']]
+    if not groups:
+        raise ValueError('WHOLE owner counterfactuals produced no true B32 preference; do not train')
+    optimizer = torch.optim.AdamW(model.policy.parameters(), lr=3e-4, weight_decay=1e-4)
+    if saved['completed_epoch']:
+        optimizer.load_state_dict(saved['optimizer_state_dict'])
+    for epoch in range(saved['completed_epoch'] + 1, EPOCHS + 1):
+        model.train()
+        order = list(range(len(groups)))
+        Random(SEED + epoch).shuffle(order)
+        losses = []
+        for index in order:
+            group = groups[index]
+            scores = model.assignment_contribution(group['assignment_rows']) + group['outcomes'] @ model.joint_weights
+            good, bad, _ = group['preferences'][0]
+            loss = F.softplus(scores[bad] - scores[good])
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach()))
+        record = dict(epoch=epoch, pairs=len(groups), ranking_loss=sum(losses) / len(losses))
+        saved['history'].append(record)
+        saved['completed_epoch'] = epoch
+        saved['state_dict'] = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        saved['optimizer_state_dict'] = optimizer.state_dict()
+        saved['frozen_parameters_unchanged'] = all(torch.equal(value, saved['state_dict'][key])
+            for key, value in saved['initial_state_dict'].items() if not key.startswith('policy.'))
+        save_owner_cf(saved)
+        print('OWNER_CF_EPOCH', json.dumps(record), 'frozen', saved['frozen_parameters_unchanged'], flush=True)
+
+
+def owner_cf_validation_job(job):
+    layout, cached = job
+    selected = []
+    row, _ = complete_gnn(layout[1], worker_model, SEED, (), reconstruct=False, beam_width=1,
+                          evaluation_cache=pickle.loads(cached) if cached else {},
+                          result_observer=lambda result, schedule: selected.append(result))
+    row = dict(split='validation_fresh', stage='owner_validation', layout_id=layout[0], method='GNN_OWNER_CF', seed=SEED,
+               **{key: row[key] for key in ('status', 'cmax_s', 'construct_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+               **beam_validation_metrics(selected[0]), plan=pack_directed_plan(selected[0]))
+    print('OWNER_CF_VALIDATION', json.dumps({key: value for key, value in row.items() if key != 'plan'}), flush=True)
+    return row
+
+
+def owner_cf_experiment(workers):
+    source = torch.load(EXPANDED_MODEL, map_location='cpu', weights_only=True)
+    if (source['selected_round'], source['selected_epoch']) != (0, 2) or 'cmax_value_mean' in source['state_dict']:
+        raise ValueError('owner-cf requires the saved expanded base GNN epoch 2, without a value head')
+    records = [json.loads(line) for line in (DATA / 'train_expanded.jsonl').read_text(encoding='utf-8').splitlines()]
+    names, strata, teachers = owner_cf_layouts(source, records)
+    if OWNER_CF_MODEL.exists():
+        saved = torch.load(OWNER_CF_MODEL, map_location='cpu', weights_only=True)
+    else:
+        weights = {key: value.clone() for key, value in source['state_dict'].items()}
+        saved = dict(initial_state_dict=weights, state_dict=weights, bounded_assignment=True,
+                     seed=SEED, hidden_dim=64, heads=4, training=[], history=[], validation=[], completed_epoch=0,
+                     layouts=names, strata=strata)
+        save_owner_cf(saved)
+    layouts = dict(load_layouts('train_expanded'))
+    samples = {sample['layout_id']: sample for sample in source['teachers']}
+    old_evaluations = {sample['layout_id']: sample['evaluations'] for index in (1, 2)
+                       for sample in source['rounds'][index]['samples']}
+    done = {sample['layout_id'] for sample in saved['training']}
+    jobs = [((name, layouts[name]), teachers[name], samples[name]['records'], old_evaluations.get(name))
+            for name in saved['layouts'] if name not in done]
+    with ProcessPoolExecutor(max_workers=workers, initializer=configure_owner_cf_worker,
+                             initargs=(pickle.dumps(saved['initial_state_dict']), False)) as executor:
+        futures = [executor.submit(collect_owner_cf, job) for job in jobs]
+        for future in as_completed(futures):
+            sample = future.result()
+            saved['training'].append(sample)
+            save_owner_cf(saved)
+            print('OWNER_CF_SAVED', len(saved['training']), '/ 40', sample['layout_id'],
+                  'pairs', sum(bool(group['preferences']) for group in sample['groups']),
+                  'seconds', sample['runtime_s'], flush=True)
+    train_owner_cf(saved)
+    done = {row['layout_id'] for row in saved['validation']}
+    cached = source.get('validation_seen', {record['layout_id']: record['seen'] for record in source['references']})
+    with ProcessPoolExecutor(max_workers=1, initializer=configure_owner_cf_worker,
+                             initargs=(pickle.dumps(saved['state_dict']), True)) as executor:
+        for layout in load_layouts('validation_fresh'):
+            if layout[0] in done:
+                continue
+            row = executor.submit(owner_cf_validation_job, (layout, cached.get(layout[0]))).result()
+            saved['validation'].append(row)
+            save_owner_cf(saved)
+    references = [record['row'] for reference in source['references'] for record in reference['records']]
+    summary = expanded_summary(saved['validation'], references)
+    before = source['base_validation'][2]
+    pairs = [(row, next(old for old in before if old['layout_id'] == row['layout_id']))
+             for row in saved['validation'] if row['status'] == 'FEASIBLE']
+    pairs = [(a, b) for a, b in pairs if b['status'] == 'FEASIBLE']
+    changes = [a['cmax_s'] - b['cmax_s'] for a, b in pairs]
+    saved['versus_base'] = dict(common=len(pairs), wins=sum(delta < -1e-6 for delta in changes),
+                               ties=sum(abs(delta) <= 1e-6 for delta in changes),
+                               losses=sum(delta > 1e-6 for delta in changes),
+                               median_change_pct=median(100. * (a['cmax_s'] / b['cmax_s'] - 1.) for a, b in pairs) if pairs else None)
+    saved['summary'] = summary
+    saved['acceptance'] = dict(feasibility=summary['feasible'] >= 19,
+                               construction_time=summary['median_construct_s'] <= 20.)
+    for method, pair in summary['paired'].items():
+        saved['acceptance'][method + '_cmax'] = pair['common'] > 0 and pair['median_change_pct'] < 0.
+        saved['acceptance'][method + '_wins'] = pair['wins'] >= pair['losses']
+    save_owner_cf(saved)
+    print('OWNER_CF_FINAL', json.dumps(summary), 'versus_base', json.dumps(saved['versus_base']),
+          'acceptance', json.dumps(saved['acceptance']), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -1907,6 +2205,8 @@ def main():
         expanded_teachers(args.workers)
     elif args.stage == 'expanded-dagger':
         expanded_dagger_experiment(args.workers)
+    elif args.stage == 'owner-cf':
+        owner_cf_experiment(args.workers)
     else:
         write_comparison()
 

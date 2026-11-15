@@ -707,6 +707,62 @@ def test_fixed_gene_native_updates_match_full_priority_for_all_six_moves():
                         assert not np.isfinite(actual) or actual >= limit - 1.e-8
 
 
+def test_oriented_candidate_arrays_preserve_directed_order_and_symmetric_first_encounter():
+    import numpy as np
+    from mrta_baselines import hga as h
+    routes = ([8, 1, 5], [4, 0, 9], [7, 3], [6, 2])
+    all_ids = np.array(sum((list(r) for r in routes), []), np.int64)
+    lengths = np.array([len(r) for r in routes], np.int64)
+    robot, position = np.empty(10, np.int64), np.empty(10, np.int64)
+    for r, route in enumerate(routes):
+        for i, u in enumerate(route):
+            robot[u], position[u] = r, i
+    near = np.array([[8, 4, 3], [4, 5, 7], [9, 6, 3], [7, 8, 5], [1, 0, 7],
+                     [8, 3, 2], [2, 7, 4], [3, 2, 4], [1, 5, -1], [8, 4, 2]], np.int64)
+    candidates = np.empty((6, len(all_ids) * near.shape[1], 2), np.int64)
+    counts = np.full(6, -1, np.int64)
+    index = {u: i for i, u in enumerate(all_ids)}
+    # 9 -> 8 exists, 8 -> 9 does not, and 9 occurs later in all_ids.
+    assert index[9] > index[8] and 8 in near[9] and 9 not in near[8]
+    for longest in range(4):
+        h._collect_oriented_candidates(all_ids, near, robot, position, lengths, longest, candidates, counts)
+        for move in range(1, 7):
+            expected = []
+            for u in all_ids:
+                ru, iu = robot[u], position[u]
+                if move == 1 and ru != longest:
+                    continue
+                for v in near[u]:
+                    if v < 0:
+                        break
+                    rv, iv = robot[v], position[v]
+                    if move == 1 and ru == rv:
+                        continue
+                    if move in (2, 3) and (ru == rv or longest not in (ru, rv)):
+                        continue
+                    if move == 3 and (iu + 1 >= lengths[ru] or iv + 1 >= lengths[rv]):
+                        continue
+                    if move == 4 and (ru != rv or iu == iv):
+                        continue
+                    if move in (5, 6) and ru == rv:
+                        continue
+                    expected.append((int(u), int(v)))
+            actual = [tuple(pair) for pair in candidates[move - 1, :counts[move - 1]]]
+            assert actual == expected
+            if move in (2, 3, 4, 6):
+                def first_encounters(pairs):
+                    seen, first = set(), []
+                    for u, v in pairs:
+                        key = frozenset((u, v))
+                        if key not in seen:
+                            first.append((u, v))
+                            seen.add(key)
+                    return first
+                assert first_encounters(actual) == first_encounters(expected)
+            if longest == 0 and move == 2:
+                assert (9, 8) in actual
+
+
 @pytest.mark.parametrize('route_objective', (False, True))
 def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods(route_objective):
     import numpy as np
