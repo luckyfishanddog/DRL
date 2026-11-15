@@ -3464,3 +3464,205 @@ def test_cmax_value_collector_uses_three_real_prefixes_and_only_original_continu
         assert len(group['candidates']) == group['features'].shape[0] == 3
         assert group['features'].shape[1] == model.policy[0].in_features + c._VNEXT_VALUE_EXTRA_DIM
 
+
+@pytest.mark.parametrize('rule_feasible', (True, False))
+def test_formal_teacher_uses_full_wag_b32_and_only_positive_demonstrations(monkeypatch, rule_feasible):
+    import io
+    import math
+    import pickle
+    from types import SimpleNamespace
+    import run_gnn_weld_layout as experiment
+    from mrta_search import gnn_constructor as c
+
+    experiment.configure_cpu()
+    solution = _solution()
+    directions = tuple(tuple(0 for _ in route.block_ids) for route in solution.routes)
+    reversed_bits = tuple(tuple(1 for _ in route.block_ids) for route in solution.routes)
+    monkeypatch.setattr(experiment, 'rule_beam', lambda *a: c.JointCompletionResult(solution, directions, (), 0.))
+
+    def search(parents, method, seed, budget, checkpoints, **kwargs):
+        assert method == 'WAG+VNS' and budget == math.inf and checkpoints == ()
+        assert kwargs['iterations'] == 500 and kwargs['candidate_evaluator'] is experiment.priority_schedule
+        best = SimpleNamespace(solution=solution, directions=reversed_bits,
+                               schedule=ScheduleResult(ScheduleStatus.FEASIBLE, cmax=1.))
+        return SimpleNamespace(timely_best=best, iterations=500, termination_reason='COMPLETED')
+
+    def b32(result):
+        if result.directions == directions and rule_feasible:
+            return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100.)
+        return ScheduleResult(ScheduleStatus.DEADLOCK, cmax=None, diagnostics=('actual B32 failure',))
+
+    monkeypatch.setattr(experiment, 'baseline_run', search)
+    monkeypatch.setattr(experiment, 'b32', b32)
+    records, seen = experiment.formal_teacher_records(('train_fixture', _parents()))
+    assert records[1]['row']['native_cmax_s'] == 1. and records[1]['row']['cmax_s'] is None
+    assert records[1]['row']['status'] == 'DEADLOCK' and len(seen) == 2
+    buffer = io.BytesIO()
+    torch.save(dict(seen=pickle.dumps(seen)), buffer)
+    buffer.seek(0)
+    assert len(pickle.loads(torch.load(buffer, weights_only=True)['seen'])) == 2
+    monkeypatch.setattr(experiment, 'formal_teacher_records', lambda *a: (records, seen))
+    monkeypatch.setattr(experiment, 'worker_model', c.VNextGNN(workload_lookahead=True, joint_actions=True).eval(), raising=False)
+    monkeypatch.setattr(experiment, 'build_joint', lambda *a, **k: c.JointCompletionResult(None, None, (), 0.))
+    examples = []
+    monkeypatch.setattr(experiment, 'teacher_examples', lambda *a, **k: examples.append(a[2]))
+    sample = pickle.loads(experiment.collect_teachers(('train_fixture', _parents())))
+    assert len(examples) == int(rule_feasible)
+    assert sample.evidence['teachers']['WAG+VNS'] == ('DEADLOCK', None)
+
+
+def test_formal_teacher_training_accepts_preferences_without_positive_demonstrations(monkeypatch):
+    import pickle
+    import run_gnn_weld_layout as experiment
+    from mrta_search import gnn_constructor as c, lns
+
+    experiment.configure_cpu()
+    torch.manual_seed(47)
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True)
+    space = c.parent_assignment_space(_parents(), CONFIG)
+    state = lns.oriented_route_state(((),) * 4, ((),) * 4, {}, CONFIG)
+    with torch.no_grad():
+        indices, features = model.assignment_features(space, model.encode_static(space.graph), state, {},
+                                                       set(space.parent_ids), CONFIG)
+    preference = (indices[:2], features[:2], torch.tensor([[1., 0., 0., 0., 0., 0.], [2., 0., 0., 0., 0., 0.]]))
+    samples = [experiment.TrainingLayout(space, None, None, (preference,), {'name': 'preference_only'}),
+               experiment.TrainingLayout(space, None, None, (), {'name': 'no_signal'})]
+    serialized = [pickle.dumps(sample) for sample in samples]
+
+    class InlinePool:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def map(self, function, layouts):
+            return serialized
+
+    saved, before = {}, model.joint_weights.detach().clone()
+    monkeypatch.setattr(experiment, 'ProcessPoolExecutor', InlinePool)
+    monkeypatch.setattr(experiment, 'load_layouts', lambda split: [('fixture', _parents())])
+    monkeypatch.setattr(experiment, 'joint_model', lambda: model)
+    monkeypatch.setattr(experiment, 'EPOCHS', 1)
+    monkeypatch.setattr(experiment, 'VALIDATE_EPOCHS', (1,))
+    monkeypatch.setattr(experiment, 'validate', lambda *args: dict(feasible=1, median_cmax_s=100., median_runtime_s=1.))
+    monkeypatch.setattr(experiment.torch, 'save', lambda value, path: saved.update(value))
+    experiment.train(1)
+    assert saved['selected_epoch'] == 1 and len(saved['training']) == 2
+    assert saved['history'][0]['assignment_loss'] == saved['history'][0]['insertion_loss'] == 0.
+    assert saved['history'][0]['cmax_rank_loss'] > 0.
+    assert not torch.equal(saved['state_dict']['joint_weights'], before)
+
+
+def test_dagger_stratification_covers_weld_count_and_packing_size():
+    from run_gnn_weld_layout import stratified_dagger_layouts
+
+    records = [dict(layout_id=f'train_{i:03d}', parents=[None] * i,
+                    rectangle_utilization=.5 + (i % 40) / 100., parts=[None] * (1 + i % 7)) for i in range(1, 121)]
+    names, strata = stratified_dagger_layouts(records)
+    assert len(names) == len(set(names)) == 60 and len(strata) == 6
+    assert all(len(stratum['layouts']) == 10 for stratum in strata)
+    assert [sum(40 * b < int(name[-3:]) <= 40 * (b + 1) for name in names) for b in range(3)] == [20, 20, 20]
+
+
+def test_dagger_uses_current_value_policy_for_both_states_and_continuations(monkeypatch):
+    import pickle
+    import run_gnn_weld_layout as experiment
+    from mrta_search import gnn_constructor as c
+
+    experiment.configure_cpu()
+    torch.manual_seed(29)
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True, cmax_value=True).eval()
+    monkeypatch.setattr(model, 'cmax_values', lambda features: -features[:, -1])
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    monkeypatch.setattr(experiment, 'worker_model', model, raising=False)
+    parents = tuple(ParentWeld(f'p{i:02d}', (.7 + i % 10 * 1.8, 9. if i < 10 else 3.),
+                              (1.3 + i % 10 * 1.8, 9. if i < 10 else 3.)) for i in range(20))
+    original = experiment.build_joint
+    builds, evaluated = [], []
+
+    def build(*args, **kwargs):
+        assert args[1] is model and kwargs['beam_width'] == 1 and kwargs.get('deadline') is None
+        builds.append(kwargs)
+        return original(*args, **kwargs)
+
+    def schedule(result):
+        key = experiment.plan_key(result.solution, result.directions)
+        assert key not in evaluated
+        evaluated.append(key)
+        return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=max(result.oriented_state.loads) + result.oriented_state.travel)
+
+    monkeypatch.setattr(experiment, 'build_joint', build)
+    monkeypatch.setattr(experiment, 'b32', schedule)
+    monkeypatch.setattr(experiment, 'baseline_run', lambda *a, **k: pytest.fail('DAgger inference called WAG'))
+    sample = experiment.collect_value_branches(('train_fixture', parents), fractions=(.05, .15, .5, .85),
+                                               candidate_limit=2, current_policy=True, retain_evaluations=True)
+    assert sample['policy_has_value'] and sample['original_complete']
+    assert [group['assigned_parents'] for group in sample['groups']] == [1, 3, 10, 17]
+    assert len(sample['rows']) == 8 and len(builds) == 9
+    assert all(model.cmax_values(group['features'])[0] >= model.cmax_values(group['features'])[1] for group in sample['groups'])
+    assert all(torch.equal(value, model.state_dict()[key]) for key, value in before.items())
+    replay = experiment.collect_value_branches(('train_fixture', parents), fractions=(.05, .15, .5, .85),
+                                               candidate_limit=2, current_policy=True,
+                                               evaluation_cache=pickle.loads(sample['evaluations']))
+    assert sum(row['b32_calls'] for row in replay['rows']) == 0
+
+
+def test_dagger_second_round_merges_preferences_and_preserves_input_normalization(monkeypatch):
+    import run_gnn_weld_layout as experiment
+    from mrta_search import gnn_constructor as c
+
+    torch.manual_seed(41)
+    model = c.VNextGNN(workload_lookahead=True, joint_actions=True)
+    base = {key: value.clone() for key, value in model.state_dict().items()}
+    model.enable_cmax_value()
+    model.cmax_value_mean.copy_(torch.randn_like(model.cmax_value_mean))
+    model.cmax_value_scale.fill_(2.)
+    policy = {key: value.clone() for key, value in model.state_dict().items()}
+    width = model.cmax_value_head[0].in_features
+    groups = [dict(features=torch.randn(2, width), preferences=[(i % 2, 1 - i % 2, 'cmax')]) for i in range(2)]
+    row = dict(layout_id='validation_fixture', status='FEASIBLE', cmax_s=100., construct_s=1., runtime_s=1.,
+               b32_calls=0, processing_r0_s=90., processing_r1_s=80., processing_r2_s=85., processing_r3_s=75., move_s=10.)
+    references = [dict(row, method=method, cmax_s=110.) for method in ('RULE/BEAM', 'WAG+VNS')]
+    saved = dict(base_state_dict=base, references=[dict(records=[dict(row=r) for r in references])],
+                 rounds={1: dict(samples=[dict(layout_id='a', groups=[groups[0]])]),
+                         2: dict(policy_state_dict=policy, samples=[dict(layout_id='b', groups=[groups[1]])],
+                                 completed_epoch=0, history=[], validation={})})
+    monkeypatch.setattr(experiment, 'EPOCHS', 1)
+    monkeypatch.setattr(experiment, 'VALIDATE_EPOCHS', (1,))
+    monkeypatch.setattr(experiment, 'expanded_validate', lambda *a, **k: [row])
+    monkeypatch.setattr(experiment, 'save_expanded_experiment', lambda *a: None)
+    experiment.train_dagger_round(saved, 2)
+    trained = saved['rounds'][2]
+    assert trained['history'][0]['labelled_prefixes'] == 2 and trained['base_parameters_unchanged']
+    assert torch.equal(trained['state_dict']['cmax_value_mean'], policy['cmax_value_mean'])
+    assert torch.equal(trained['state_dict']['cmax_value_scale'], policy['cmax_value_scale'])
+
+
+def test_expanded_final_selection_prioritizes_feasibility_and_does_not_enter_test_when_failed(monkeypatch):
+    import run_gnn_weld_layout as experiment
+
+    def summary(feasible, change):
+        return dict(feasible=feasible, median_construct_s=1., paired={method: dict(common=10, wins=5, losses=5,
+                    median_change_pct=change) for method in ('WAG+VNS', 'RULE/BEAM')})
+
+    best = summary(18, 1.)
+    saved = dict(base_selected_epoch=4, base_state_dict={'value': torch.tensor(1.)}, base_selected_summary=best,
+                 rounds={i: dict(selected_epoch=2, state_dict={'value': torch.tensor(float(i + 1))},
+                                 selected_summary=summary(18 - i, -float(i))) for i in (1, 2)},
+                 references=[dict(records=[dict(row=dict(method=method, status='FEASIBLE'))
+                                            for method in ('RULE/BEAM', 'WAG+VNS')]) for _ in range(20)])
+    monkeypatch.setattr(experiment, 'expanded_teachers', lambda *a: saved)
+    monkeypatch.setattr(experiment, 'train_expanded_base', lambda *a: None)
+    monkeypatch.setattr(experiment, 'collect_dagger_round', lambda *a: None)
+    monkeypatch.setattr(experiment, 'train_dagger_round', lambda *a: None)
+    monkeypatch.setattr(experiment, 'save_expanded_experiment', lambda *a: None)
+    monkeypatch.setattr(experiment, 'expanded_validate', lambda *a, **k: pytest.fail('unaccepted model entered TEST'))
+    experiment.expanded_dagger_experiment(1)
+    assert saved['selected_round'] == 0 and saved['selected_epoch'] == 4
+    assert saved['selected_summary'] is best and not saved['acceptance']['feasibility']
+    assert saved['state_dict']['value'].item() == 1.
+

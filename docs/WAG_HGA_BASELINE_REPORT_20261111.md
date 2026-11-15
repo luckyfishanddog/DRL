@@ -6386,3 +6386,136 @@ $env:NUMEXPR_NUM_THREADS='1'
 
 本轮修改范围：`scripts/run_gnn_weld_layout.py` 增加实验函数和CLI分支；本报告仅追加13.10节；新增上述一个获批CSV。没有新增辅助文件、实验管理模块、评价器、缓存机制、指纹或协议，没有修改正式HGA默认参数、WAG、GNN、原始数据、几何、ScientificConfig、FORMAL_SCOPE_V2或最终B32。
 
+
+### 13.11 新版PARTIAL_LNS_V1的8次VALIDATION死锁诊断
+
+使用当前代码、原始种子对CSV中PARTIAL_LNS_V1的8条失败记录逐条重新执行完整500轮搜索；不读取13.3节的旧路线快照，不修改搜索或B32。只有预算、原生Cmax（容差1e-6）和最终B32状态全部复现后才诊断；未复现者跳过归因。诊断只观察既有派工内核，不反馈搜索。
+
+| 排样 | 种子 | 完成轮数 | 重现 | 原生 Cmax/s | 与CSV差值/s | B32 |
+|---|---:|---:|---|---:|---:|---|
+| validation_02 | 20261110 | 500 | True | 6480.711522171011 | 0.0 | DEADLOCK |
+| validation_02 | 20261112 | 500 | True | 6423.460396311804 | 0.0 | DEADLOCK |
+| validation_03 | 20261112 | 500 | True | 5012.5553338942445 | 0.0 | DEADLOCK |
+| validation_07 | 20261110 | 500 | True | 6161.084756775765 | 0.0 | DEADLOCK |
+| validation_07 | 20261111 | 500 | True | 6166.432940777202 | 0.0 | DEADLOCK |
+| validation_07 | 20261112 | 500 | True | 6167.828488850058 | 0.0 | DEADLOCK |
+| validation_10 | 20261110 | 500 | True | 6138.083333819142 | 0.0 | DEADLOCK |
+| validation_10 | 20261112 | 500 | True | 6045.490741217289 | 0.0 | DEADLOCK |
+
+逐例诊断（机器人与操作编号沿用代码的0起始编号）：
+
+**validation_02 / 20261110**：搜索208.183s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 310, "robot": 3, "operation": "R3:B3:WELD", "kind": "WELD", "block_id": "P13-W01-S01::whole", "ready_s": 3657.4414858688106, "start": [7.02773046875, 4.259368164062502], "end": [7.02773046875, 1.3002275390625015], "duration_s": 273.9945023148148, "blocker_count": 1, "blocker_examples": ["R2:B21:WELD"], "graph": [[3, [2]]]}`。
+终端阻塞：`[{"robot": 1, "operation": "R1:B37:WELD", "ready_s": 4459.931544823048, "same": 5, "cross": 0, "same_examples": ["R0:B22:POST", "R0:B22:WELD", "R0:B23:MOVE", "R0:B23:SETUP"], "cross_examples": []}, {"robot": 3, "operation": "R3:B3:WELD", "ready_s": 3657.4414858688106, "same": 10, "cross": 0, "same_examples": ["R2:B21:POST", "R2:B21:WELD", "R2:B22:MOVE", "R2:B22:POST"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=78/0；延迟边累计同轨/跨轨=1/0；终端等待图=((1, (0,)), (3, (2,)))，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 1, 'blocker': 0, 'finished': True}, {'waiting': 3, 'blocker': 2, 'finished': True}]；B32恢复32/32，前沿耗尽=False；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+**validation_02 / 20261112**：搜索236.571s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 279, "robot": 3, "operation": "R3:B3:WELD", "kind": "WELD", "block_id": "P07-W01-S01::whole", "ready_s": 3670.862222222221, "start": [7.500000000000002, 6.436999999999999], "end": [20.0, 6.43700000000001], "duration_s": 1157.407407407407, "blocker_count": 1, "blocker_examples": ["R2:B21:MOVE"], "graph": [[3, [2]]]}`。
+终端阻塞：`[{"robot": 1, "operation": "R1:B25:POST", "ready_s": 4086.638444067021, "same": 2, "cross": 0, "same_examples": ["R0:B23:POST", "R0:B23:WELD"], "cross_examples": []}, {"robot": 3, "operation": "R3:B3:WELD", "ready_s": 3670.862222222221, "same": 12, "cross": 0, "same_examples": ["R2:B21:MOVE", "R2:B21:POST", "R2:B21:SETUP", "R2:B21:WELD"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=34/0；延迟边累计同轨/跨轨=2/0；终端等待图=((1, (0,)), (3, (2,)))，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 1, 'blocker': 0, 'finished': True}, {'waiting': 3, 'blocker': 2, 'finished': True}]；B32恢复32/32，前沿耗尽=False；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+**validation_03 / 20261112**：搜索165.154s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 93, "robot": 2, "operation": "R2:B3:SETUP", "kind": "SETUP", "block_id": "P02-W02-S01::whole", "ready_s": 1517.42828100035, "start": [16.95569970703125, 1.459], "end": [16.95569970703125, 1.459], "duration_s": 20.0, "blocker_count": 1, "blocker_examples": ["R3:B9:WELD"], "graph": [[2, [3]]]}`。
+终端阻塞：`[{"robot": 2, "operation": "R2:B3:SETUP", "ready_s": 1517.42828100035, "same": 86, "cross": 0, "same_examples": ["R3:B10:MOVE", "R3:B10:POST", "R3:B10:SETUP", "R3:B10:WELD"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=189/0；延迟边累计同轨/跨轨=0/0；终端等待图=((2, (3,)),)，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 2, 'blocker': 3, 'finished': True}]；B32恢复32/32，前沿耗尽=False；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+**validation_07 / 20261110**：搜索174.590s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 201, "robot": 2, "operation": "R2:B4:POST", "kind": "POST", "block_id": "P09-W02-S01::whole", "ready_s": 3021.709777675817, "start": [13.683336425781249, 0.7230000000000107], "end": [13.683336425781249, 0.7230000000000107], "duration_s": 30.0, "blocker_count": 1, "blocker_examples": ["R3:B12:MOVE"], "graph": [[2, [3]]]}`。
+终端阻塞：`[{"robot": 2, "operation": "R2:B4:POST", "ready_s": 3021.709777675817, "same": 72, "cross": 0, "same_examples": ["R3:B12:MOVE", "R3:B12:POST", "R3:B12:SETUP", "R3:B12:WELD"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=239/0；延迟边累计同轨/跨轨=11/0；终端等待图=((2, (3,)),)，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 2, 'blocker': 3, 'finished': True}]；B32恢复32/32，前沿耗尽=False；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+**validation_07 / 20261111**：搜索184.722s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 190, "robot": 2, "operation": "R2:B4:POST", "kind": "POST", "block_id": "P09-W02-S01::whole", "ready_s": 3021.709777675817, "start": [13.683336425781249, 0.7230000000000107], "end": [13.683336425781249, 0.7230000000000107], "duration_s": 30.0, "blocker_count": 1, "blocker_examples": ["R3:B12:MOVE"], "graph": [[2, [3]]]}`。
+终端阻塞：`[{"robot": 2, "operation": "R2:B4:POST", "ready_s": 3021.709777675817, "same": 72, "cross": 0, "same_examples": ["R3:B12:MOVE", "R3:B12:POST", "R3:B12:SETUP", "R3:B12:WELD"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=250/0；延迟边累计同轨/跨轨=8/0；终端等待图=((2, (3,)),)，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 2, 'blocker': 3, 'finished': True}]；B32恢复32/32，前沿耗尽=False；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+**validation_07 / 20261112**：搜索148.939s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 222, "robot": 2, "operation": "R2:B4:POST", "kind": "POST", "block_id": "P09-W02-S01::whole", "ready_s": 3021.709777675817, "start": [13.683336425781249, 0.7230000000000107], "end": [13.683336425781249, 0.7230000000000107], "duration_s": 30.0, "blocker_count": 1, "blocker_examples": ["R3:B12:MOVE"], "graph": [[2, [3]]]}`。
+终端阻塞：`[{"robot": 2, "operation": "R2:B4:POST", "ready_s": 3021.709777675817, "same": 72, "cross": 0, "same_examples": ["R3:B12:MOVE", "R3:B12:POST", "R3:B12:SETUP", "R3:B12:WELD"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=218/0；延迟边累计同轨/跨轨=6/0；终端等待图=((2, (3,)),)，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 2, 'blocker': 3, 'finished': True}]；B32恢复32/32，前沿耗尽=False；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+**validation_10 / 20261110**：搜索126.063s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 347, "robot": 3, "operation": "R3:B30:WELD", "kind": "WELD", "block_id": "P16-W05-S01::whole", "ready_s": 4753.591523513655, "start": [11.413784170910837, 3.469801635742187], "end": [11.413784170910837, 4.1698016357421865], "duration_s": 64.81481481481478, "blocker_count": 1, "blocker_examples": ["R2:B31:WELD"], "graph": [[3, [2]]]}`。
+终端阻塞：`[{"robot": 1, "operation": "R1:B4:WELD", "ready_s": 4874.37962962963, "same": 2, "cross": 0, "same_examples": ["R0:B21:POST", "R0:B21:WELD"], "cross_examples": []}, {"robot": 3, "operation": "R3:B30:WELD", "ready_s": 4753.591523513655, "same": 2, "cross": 0, "same_examples": ["R2:B31:POST", "R2:B31:WELD"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=9/0；延迟边累计同轨/跨轨=0/0；终端等待图=((1, (0,)), (3, (2,)))，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 1, 'blocker': 0, 'finished': True}, {'waiting': 3, 'blocker': 2, 'finished': True}]；B32恢复14/32，前沿耗尽=True；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+**validation_10 / 20261112**：搜索101.516s。
+覆盖完整=True，操作链连续=True，焊接顺序一致=True，原生机器人间实际冲突=0。
+首次阻塞：`{"depth": 347, "robot": 3, "operation": "R3:B30:WELD", "kind": "WELD", "block_id": "P16-W05-S01::whole", "ready_s": 4753.591523513655, "start": [11.413784170910837, 3.469801635742187], "end": [11.413784170910837, 4.1698016357421865], "duration_s": 64.81481481481478, "blocker_count": 1, "blocker_examples": ["R2:B31:WELD"], "graph": [[3, [2]]]}`。
+终端阻塞：`[{"robot": 1, "operation": "R1:B4:WELD", "ready_s": 4874.37962962963, "same": 2, "cross": 0, "same_examples": ["R0:B21:POST", "R0:B21:WELD"], "cross_examples": []}, {"robot": 3, "operation": "R3:B30:WELD", "ready_s": 4753.591523513655, "same": 2, "cross": 0, "same_examples": ["R2:B31:POST", "R2:B31:WELD"], "cross_examples": []}]`。
+阻塞边累计同轨/跨轨=9/0；延迟边累计同轨/跨轨=0/0；终端等待图=((1, (0,)), (3, (2,)))，等待环=()，中间完全阻塞等待环=[]，含可延迟执行操作的关联环=[]。
+阻塞机器人是否完成=[{'waiting': 1, 'blocker': 0, 'finished': True}, {'waiting': 3, 'blocker': 2, 'finished': True}]；B32恢复14/32，前沿耗尽=True；诊断原始派工状态=DEADLOCK，失败操作时间线与最终B32一致=True。
+
+阻塞边累计是各派工状态返回的关联次数，不是独立冲突数或唯一因果。含可延迟执行操作的关联环不等同于真正等待环。B32失败仅表示该有限恢复策略未找到时间线，不构成数学不可行证明。完整路线快照未保存；13.3节历史11例及其旧快照保持原样。
+
+**本次诊断结论（2026-11-14实测）。** 8/8均完成当前版本500轮，native Cmax与原CSV差值全部为0，最终B32状态全部重现。8条原生时间线均完整覆盖焊缝、操作链连续、焊接顺序一致，机器人间实际冲突均为0。诊断派工重放的失败操作时间线也全部与最终B32一致。
+
+逐例首次阻塞分别为：validation_02/20261110的R3:B3:WELD被R2:B21:WELD阻塞；validation_02/20261112的R3:B3:WELD被R2:B21:MOVE阻塞；validation_03/20261112的R2:B3:SETUP被R3:B9:WELD阻塞；validation_07三个种子均为R2:B4:POST被R3:B12:MOVE阻塞；validation_10两个种子均为R3:B30:WELD被R2:B31:WELD阻塞。终端另有validation_02的R1→R0，以及validation_10的R1→R0和R3→R2阻塞，详见上列操作编号。
+
+这些失败均表现为B32既有派工承诺下的同轨固定操作阻塞；终端阻塞者都已完成自身路线，其已固定操作时窗仍约束被阻塞机器人的较早ready时刻。全部8例的跨轨阻塞/延迟关联、终端等待环、中间完全阻塞环及含延迟选择的关联环均为0。validation_02/03/07共6例用尽32次恢复且前沿未耗尽；validation_10两例各执行14次恢复后前沿耗尽。原生优先排程与B32派工及有限恢复策略的差异足以解释本次可复现的失败现象；本轮仅诊断并保留失败，没有修改搜索、物理约束或恢复策略。
+
+复现命令为指定解释器在DRL目录执行`-B -X utf8 -W ignore scripts/run_gnn_weld_layout.py wag-deadlock-diagnosis --workers 4`，同时设置`PYTHONDONTWRITEBYTECODE=1`以及Numba/OMP/MKL/OpenBLAS/NumExpr线程数为1。只重跑上述8例，未重跑90次正式WAG实验。
+
+完成8例诊断后，使用同一解释器和单线程环境执行既有`tests/test_wag_baseline.py`、`tests/test_hga_baseline.py`、`tests/test_baseline_common.py`，结果为**63 passed，65 warnings，166.54s**；警告为既有Numba类型反射弃用提示。命令附加`-B -X utf8 -m pytest -q -p no:cacheprovider --disable-warnings`，未运行无关GNN测试。另在内存中核对诊断入口对native Cmax超容差和不足500轮的返回值均跳过归因；HGA入口按预热→α20/200000→α18/200000顺序调用，追加保留旧行、DEADLOCK的B32 Cmax留空、199999有效子代标为INCOMPLETE。这些模拟结果未写入实验CSV。
+
+### 13.12 HGA α=20与α=18的200000有效子代完整预算配对实验（2/2完成）
+
+本轮于2026-11-14至2026-11-15实际完成两组长预算运行。固定`validation_07`（115条父焊缝）、seed=20261110，使用当前`ORIENTED_COORDINATED_VND_V1`和EXPLICIT方向编码。两组均为μ=20、λ=10、200000有效子代、完整M1～M6、`vnd_max_passes=None`、`vnd_candidate_cap=None`、模式变异概率0.15、`time_limit=math.inf`、`ScientificConfig()`及`FORMAL_SCOPE_V2`；只改变α。没有修改WAG/HGA算法主体、数据、物理约束、拆分规则或最终B32，`AdaptedHGAConfig`默认α仍为20。
+
+使用指定解释器，在DRL目录执行既有脚本新增的简单入口`hga-alpha-full-budget --workers 1`。Numba、OMP、MKL、OpenBLAS、NumExpr计算线程均设为1，先用10个有效子代预热，再依次运行α=20和α=18。每次正式调用均重新设置同一种子，新建种群、工作区和VND缓存，没有注入预热或另一组的搜索结果。首次准备阶段在预热66.830159s后因现有CSV写句柄权限停止，尚未开始正式搜索；解决写入权限后，同一正式进程重新预热60.520375s，随后两组各完整执行一次。上述预热均不计入正式结果，未因B32结果挑选种子或重跑。
+
+`runtime_s`为调用HGA至返回的实测墙钟总耗时，包含预计算、初始化、交叉、完整VND及种群管理，排除预热和最终B32；B32另行计时。初始native Cmax沿用13.10节既有字段定义，为20个初始个体完成VND后的当前最优值，α已影响这一阶段。搜索内不调用B32或独立认证；每组结束后仅对最终最优固定方向方案调用一次既有`schedule_explicit()`。
+
+两组主要结果如下，时间及Cmax单位均为秒：
+
+| α | 实际有效子代 | HGA总耗时 | 初始native Cmax | 最终native Cmax | 最终B32状态 | 最终B32 Cmax | B32耗时 | 完成状态 |
+|---|---:|---:|---:|---:|---|---:|---:|---|
+| 20 | 200000 | 24677.210502 | 5702.410599243 | 5628.571419059 | FEASIBLE | 5628.571419059 | 0.315199500 | COMPLETED |
+| 18 | 200000 | 21671.872442 | 5751.467420702 | 5630.628466249 | FEASIBLE | 5630.628466249 | 0.112084700 | COMPLETED |
+
+| α | VND唯一调用 | VND缓存命中 | 原生候选评价次数 |
+|---|---:|---:|---:|
+| 20 | 197066 | 2954 | 1222088730 |
+| 18 | 197187 | 2833 | 1178765872 |
+
+结果直接追加到既有`results/new_dataset_final/hga_alpha_sensitivity.csv`，当前共20条数据：原18条1000子代记录逐字段、按原顺序完整保留，最后两条依次为α=20和α=18的200000子代记录。两组均为`run_status=COMPLETED`，各自`vnd_unique_calls+vnd_cache_hits=200020`，对应20次初始化和200000次完整VND子代请求。未将1000子代记录混入完整预算结果，也没有将未完成运行标为正式完成。程序正常结束，退出码为0。
+
+**完整预算分析。**
+
+1. **本次α=18确实减少完整预算墙钟时间。** α=20实测24677.210502s（约6小时51分17秒），α=18为21671.872442s（约6小时1分12秒），减少3005.338059s，约50分5秒，降幅**12.18%**。这是两次真实200000有效子代的结果，没有使用短预算线性外推。
+2. **短预算的速度方向在本配对样本中保留。** 13.10节同排样/种子的1000子代耗时为α=20的121.194535s、α=18的109.421881s，α=18减少9.71%；完整预算下减少12.18%。固定运行顺序、机器状态等影响未通过重复试验分离，不能据此宣称跨排样或跨种子的普遍提速幅度。
+3. **α=18没有改善最终native Cmax。** 完整预算下α=18比α=20高2.057047s，即**+0.03655%**。1000子代时α=18为5647.756543s、α=20为5657.522305s，α=18低0.17262%；该质量排序在完整预算下反转。两组均改善各自初始化结果，但不能把这点解释为α=18相对α=20的最终质量改善。
+4. **最终B32均可行。** 两次均返回FEASIBLE，且本次各自B32 Cmax与native Cmax相同。只进行了每组一次最终B32，未用B32筛选搜索候选，也未追加独立认证。
+5. **评价次数只能部分解释时间差。** α=18原生候选评价减少43322858次，降幅3.545%，与耗时下降方向一致，但明显小于12.18%的耗时降幅。其VND唯一调用反而增加121次、缓存命中减少121次，提速不能归因于更多完整VND缓存命中。α改变搜索轨迹及每次协调调度的计算代价，其他VND工作和机器状态也影响墙钟时间；仅凭这些计数不足以唯一分解提速原因，本轮未追加性能插桩或优化模块。
+6. **下一步正式主参数建议继续固定α=20。** α=18在这个完整预算样本中确认了速度收益，但最终native和B32 Cmax均略高，尚无充分依据用单排样、单种子结果替换正式主参数。α=18保留为有完整预算数据支持的提速备选；默认α=20未改。本轮不声称统计显著，也不宣称任一α普遍优于另一α。
+
+本轮任务A和任务B均已完成。其他代表排样（validation_03/04）的新版EXPLICIT完整预算验证，以及α结论的跨排样/多种子验证仍未完成；本轮没有启动这些运行，也没有启动全量30次VALIDATION和60次TEST的HGA实验。
+
+正式长预算入口复现命令如下；其行为是向已有CSV追加结果：
+
+```powershell
+Set-Location -LiteralPath 'D:\pybullet_test\MRTA_GA\DRL'
+$env:PYTHONDONTWRITEBYTECODE='1'
+$env:NUMBA_NUM_THREADS='1'
+$env:OMP_NUM_THREADS='1'
+$env:MKL_NUM_THREADS='1'
+$env:OPENBLAS_NUM_THREADS='1'
+$env:NUMEXPR_NUM_THREADS='1'
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 -W ignore 'scripts/run_gnn_weld_layout.py' hga-alpha-full-budget --workers 1
+```
+
+本轮只修改现有实验入口、本报告和上述既有CSV，没有新增文件。算法模块`wag_vns.py`、`hga.py`、`common.py`及HGA默认α保持原样；保留工作区其他既有修改。已核对脚本语法、旧18行保留、两组实际200000子代、VND请求计数和最终结果字段；相关三份单元测试的本轮实测结果见13.11节，未重复运行无关GNN测试。

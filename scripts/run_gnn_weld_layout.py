@@ -211,16 +211,18 @@ def baseline_metrics(best, schedule):
     return dict(**loads, move_s=move, wait_s=wait)
 
 
-def hga_alpha_sensitivity():
-    """Sequential one-seed screening; each alpha starts a fresh native HGA."""
+def hga_alpha_sensitivity(*, full_budget=False):
+    """Run the screening or full-budget pair, with a fresh HGA per alpha."""
     from numba import set_num_threads
     configure_cpu()
     set_num_threads(1)
     layouts = dict(load_layouts('validation'))
-    names = ('validation_03', 'validation_04', 'validation_07')
-    alphas = (16, 18, 20, 22, 24, 26)
+    names = ('validation_07',) if full_budget else ('validation_03', 'validation_04', 'validation_07')
+    alphas = (20, 18) if full_budget else (16, 18, 20, 22, 24, 26)
+    iterations = 200000 if full_budget else 1000
     settings = AdaptedHGAConfig()
-    print('HGA_ALPHA_SETTINGS', settings, 'seed', SEED, 'workers/threads', 1, flush=True)
+    print('HGA_ALPHA_SETTINGS', settings, 'seed', SEED, 'workers/threads', 1,
+          'source', BASELINE_SOURCES['HGA'], 'iterations', iterations, flush=True)
     # Ten warm-up children also compile the mu+lambda population update.
     started = time.perf_counter()
     warm = run_adapted_hga_v2(layouts[names[0]], CONFIG, replace(settings, max_iterations=10),
@@ -233,16 +235,17 @@ def hga_alpha_sensitivity():
               'vnd_cache_hits', 'vnd_native_candidate_evaluations', 'b32_runtime_s', 'run_status')
     path = FINAL_RESULTS / 'hga_alpha_sensitivity.csv'
     rows = []
-    with path.open('x', encoding='utf-8', newline='') as stream:
+    with path.open('a' if full_budget else 'x', encoding='utf-8', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
+        if stream.tell() == 0:
+            writer.writeheader()
         stream.flush()
         for name in names:
             for alpha in alphas:
                 print('HGA_ALPHA_START', name, 'parents', len(layouts[name]), 'alpha', alpha, flush=True)
                 started = time.perf_counter()
                 result = run_adapted_hga_v2(layouts[name], CONFIG,
-                    replace(settings, alpha=alpha, max_iterations=1000), seed=SEED,
+                    replace(settings, alpha=alpha, max_iterations=iterations), seed=SEED,
                     time_limit=math.inf, checkpoints=(), certify=False, candidate_evaluator=priority_schedule)
                 runtime = time.perf_counter() - started
                 best, initial = result.timely_best, result.initial_candidate
@@ -257,7 +260,7 @@ def hga_alpha_sensitivity():
                     **{key: result.accounting[key] for key in
                        ('vnd_unique_calls', 'vnd_cache_hits', 'vnd_native_candidate_evaluations')},
                     b32_runtime_s=b32_runtime,
-                    run_status='COMPLETED' if result.iterations == 1000 else 'INCOMPLETE')
+                    run_status='COMPLETED' if result.iterations == iterations else 'INCOMPLETE')
                 writer.writerow(row)
                 stream.flush()
                 rows.append(row)
@@ -327,7 +330,7 @@ def run_baselines(workers, only=None, *, split='validation', representative=Fals
 
 
 def wag_deadlock_job(job):
-    """Replay one historical incumbent, then observe the existing dispatch kernel.
+    """Rebuild one current incumbent, then observe the existing dispatch kernel.
 
     Diagnostic rollouts happen only after the complete 500-round search. They
     never provide feedback to that search and do not change the B32 policy.
@@ -336,28 +339,32 @@ def wag_deadlock_job(job):
     from mrta_reference import scheduler as scheduler
     from mrta_reference.dispatch_recovery import run_dispatch_rollout
     from mrta_reference.geometry import finite_x_split_validator, operations_conflict
-    (name, parents), historical, *saved = job
+    (name, parents), historical = job
     seed = int(historical['seed'])
-    if saved and saved[0] is not None:
-        from mrta_reference.geometry import build_legal_pattern_catalog
-        catalog = build_legal_pattern_catalog(parents, CONFIG, FORMAL_SCOPE_V2)
-        lookup = {p.pattern_id: p for options in catalog.values() for p in options}
-        snapshot = saved[0]
-        solution = canonicalize(parents, tuple(lookup[p] for p in snapshot['patterns']),
-                                dict(enumerate(snapshot['routes'])), CONFIG, scope=FORMAL_SCOPE_V2)
-        directions = tuple(tuple(ds) for ds in snapshot['directions'])
-        native, iterations, rerun = priority_schedule(solution, CONFIG), snapshot['iterations'], 0
-    else:
-        result = baseline_run(parents, 'WAG+VNS', seed, math.inf, (),
-                              iterations=500, candidate_evaluator=priority_schedule)
-        best = result.timely_best
-        if best is None:
-            return dict(layout_id=name, seed=seed, reproduced=False, reason='no native incumbent')
-        solution, directions, native = best.solution, best.directions, best.schedule
-        iterations, rerun = result.iterations, result.iterations
+    started = time.perf_counter()
+    result = baseline_run(parents, 'WAG+VNS', seed, math.inf, (),
+                          iterations=500, candidate_evaluator=priority_schedule)
+    best = result.timely_best
+    record = dict(layout_id=name, seed=seed, source=historical['source'], reproduced=False,
+                  iterations=result.iterations, search_rerun_iterations=result.iterations,
+                  replay_mode='FULL_SEARCH', search_runtime_s=time.perf_counter() - started,
+                  historical_native_cmax_s=float(historical['native_cmax_s']),
+                  historical_b32_status=historical['status'])
+    if best is None:
+        record['reason'] = 'no native incumbent; diagnosis skipped'
+        print('WAG_DEADLOCK_DIAGNOSIS', json.dumps(record), flush=True)
+        return record
+    solution, directions, native = best.solution, best.directions, best.schedule
     formal = schedule_explicit(solution, directions, CONFIG).schedule
-    reproduced = (iterations == 500 and formal.status.value == historical['status']
-                  and abs(native.cmax - float(historical['native_cmax_s'])) <= 1.e-6)
+    delta = native.cmax - record['historical_native_cmax_s']
+    record.update(native_cmax_s=native.cmax, native_cmax_delta_s=delta,
+                  b32_status=formal.status.value, b32_cmax_s=formal.cmax,
+                  reproduced=(result.iterations == 500 and abs(delta) <= 1.e-6
+                              and formal.status.value == historical['status']))
+    if not record['reproduced']:
+        record['reason'] = 'budget, native Cmax or B32 status not reproduced; diagnosis skipped'
+        print('WAG_DEADLOCK_DIAGNOSIS', json.dumps(record), flush=True)
+        return record
     routes = scheduler.build_robot_routes(solution, CONFIG, dict(enumerate(directions)),
                     x_split_validator=finite_x_split_validator(solution.parents, CONFIG))
     templates = {r.robot_id: scheduler.build_operation_templates(r, CONFIG) for r in routes}
@@ -443,13 +450,7 @@ def wag_deadlock_job(job):
         continuous &= all(a.end == b.start and a.end_time <= b.start_time + CONFIG.numeric_epsilon
                           for a, b in zip(ops, ops[1:]))
         weld_order &= tuple(op.block_id for op in ops if op.kind is OperationKind.WELD) == solution.routes[r].block_ids
-    first_tasks = [dict(robot=r.robot_id, block=r.blocks[0].block_id, direction=r.orientations[0],
-                        start=oriented_endpoints(r.blocks[0], r.orientations[0])[0],
-                        end=oriented_endpoints(r.blocks[0], r.orientations[0])[1]) for r in routes if r.blocks]
-    record = dict(layout_id=name, seed=seed, reproduced=reproduced, iterations=iterations,
-        search_rerun_iterations=rerun, replay_mode='FULL_SEARCH' if rerun else 'SAVED_INCUMBENT',
-        native_cmax_s=native.cmax, historical_native_cmax_s=float(historical['native_cmax_s']),
-        b32_status=formal.status.value, b32_cmax_s=formal.cmax,
+    record.update(
         recovery_rollouts=formal.recovery_rollouts, rollout_budget=formal.rollout_budget,
         frontier_exhausted=formal.frontier_exhausted, baseline_status=outcome.result.status.value,
         baseline_matches_b32_failure=(not formal.feasible and outcome.result.operations == formal.operations),
@@ -464,66 +465,64 @@ def wag_deadlock_job(job):
         blocker_finished=[dict(waiting=robot, blocker=other,
                           finished=state.next_index[other] == len(templates[other]))
                           for robot, others in outcome.result.wait_for_graph for other in others],
-        first_tasks=first_tasks, native_coverage=coverage, native_inter_robot_conflicts=conflicts,
+        native_coverage=coverage, native_inter_robot_conflicts=conflicts,
         native_chain_continuous=continuous, native_weld_order=weld_order,
-        native_wait_s=sum(op.duration for op in native.operations if op.kind is OperationKind.WAIT),
-        # Retain the reconstructed incumbent in the existing report so the
-        # diagnostic can be independently replayed without another WAG search.
-        patterns=[p.pattern_id for p in solution.patterns], routes=[r.block_ids for r in solution.routes],
-        directions=directions)
-    print('WAG_DEADLOCK_DIAGNOSIS', json.dumps({k: v for k, v in record.items()
-          if k not in ('patterns', 'routes', 'directions')}), flush=True)
+        native_wait_s=sum(op.duration for op in native.operations if op.kind is OperationKind.WAIT))
+    print('WAG_DEADLOCK_DIAGNOSIS', json.dumps(record), flush=True)
     return record
 
 
 def diagnose_wag_deadlocks(workers):
     historical = [r for r in read_rows(FINAL_RESULTS / BASELINES['WAG+VNS'][2])
-                  if r['source'] == 'OPTIMIZED_ITERATIONS' and r['layout_id'].startswith('validation_')
+                  if r['source'] == BASELINE_SOURCES['WAG+VNS'] and r['layout_id'].startswith('validation_')
                   and r['status'] == 'DEADLOCK']
     layouts = dict(load_layouts('validation'))
     report = ROOT / 'docs' / 'WAG_HGA_BASELINE_REPORT_20261111.md'
-    text = report.read_text(encoding='utf-8')
-    start_marker = '<!-- WAG_DEADLOCK_CASES_START -->'
-    snapshots = {}
-    if start_marker in text:
-        raw = text.split(start_marker, 1)[1].split('```json', 1)[1].split('```', 1)[0]
-        snapshots = {(r['layout_id'], r['seed']): r for r in json.loads(raw) if r.get('reproduced')}
-    jobs = [((r['layout_id'], layouts[r['layout_id']]), r,
-             snapshots.get((r['layout_id'], int(r['seed'])))) for r in historical]
+    jobs = [((r['layout_id'], layouts[r['layout_id']]), r) for r in historical]
     with ProcessPoolExecutor(max_workers=workers, initializer=configure_cpu) as executor:
         records = list(executor.map(wag_deadlock_job, jobs))
     records.sort(key=lambda r: (r['layout_id'], r['seed']))
-    lines = ['\n### 13.3 WAG 历史 11 次死锁的逐例诊断\n',
-             '以下是原 WAG 完成 500 轮后的固定最优路线重放；诊断不反馈搜索。首次从完整 500 轮重建最优路线，随后从本报告保存的模式、路线和方向重放派工，避免 LNS 修正后拿新最优路线冒充旧实例。`search_rerun_iterations=0` 表示只重放已有旧方案。`reproduced` 核对原生 Cmax、最终状态和原搜索预算。B32 未找到时间线不构成数学不可行证明。阻塞边累计值是各派工状态 ESS 返回关联的累计次数，不能解释为独立冲突事件或唯一因果。\n',
-             '| 排样 | 种子 | 重现 | 原生 Cmax/s | B32 | 同轨/跨轨阻塞数 | 等待环 | 原生时间线冲突数 |',
-             '|---|---:|---|---:|---|---|---|---:|']
+    lines = ['\n### 13.11 新版PARTIAL_LNS_V1的8次VALIDATION死锁诊断\n',
+             '使用当前代码、原始种子对CSV中PARTIAL_LNS_V1的8条失败记录逐条重新执行完整500轮搜索；不读取13.3节的旧路线快照，不修改搜索或B32。只有预算、原生Cmax（容差1e-6）和最终B32状态全部复现后才诊断；未复现者跳过归因。诊断只观察既有派工内核，不反馈搜索。\n',
+             '| 排样 | 种子 | 完成轮数 | 重现 | 原生 Cmax/s | 与CSV差值/s | B32 |',
+             '|---|---:|---:|---|---:|---:|---|']
     for r in records:
-        blocks = r.get('terminal_blockers', ())
-        same, cross = sum(x['same_rail_blockers'] for x in blocks), sum(x['cross_rail_blockers'] for x in blocks)
-        lines.append(f"| {r['layout_id']} | {r['seed']} | {r['reproduced']} | {r.get('native_cmax_s', 0):.4f} | {r.get('b32_status')} | {same}/{cross} | {r.get('wait_for_cycles')} | {r.get('native_inter_robot_conflicts')} |")
-    lines += ['\n逐例首任务、方向、首次阻塞、终端等待图和重放方案：\n',
-              '<!-- WAG_DEADLOCK_CASES_START -->', '```json', json.dumps(records, ensure_ascii=False, indent=2),
-              '```', '<!-- WAG_DEADLOCK_CASES_END -->', '']
-    marker = '\n### 13.3 WAG 历史 11 次死锁的逐例诊断'
-    # This section is generated evidence in an existing report, not a new file.
-    if marker in text:
-        end_marker = '<!-- WAG_DEADLOCK_CASES_END -->'
-        end = text.index(end_marker, text.index(marker)) + len(end_marker)
-        text = text[:text.index(marker)] + '\n' + '\n'.join(lines) + text[end:]
-    else:
-        text = text.rstrip() + '\n' + '\n'.join(lines)
-    report.write_text(text, encoding='utf-8')
+        lines.append(f"| {r['layout_id']} | {r['seed']} | {r['iterations']} | {r['reproduced']} | {r.get('native_cmax_s')} | {r.get('native_cmax_delta_s')} | {r.get('b32_status')} |")
+    lines += ['\n逐例诊断（机器人与操作编号沿用代码的0起始编号）：\n']
+    for r in records:
+        lines.append(f"**{r['layout_id']} / {r['seed']}**：搜索{r['search_runtime_s']:.3f}s。")
+        if not r['reproduced']:
+            lines += [r['reason'], '']
+            continue
+        lines.append(f"覆盖完整={r['native_coverage']}，操作链连续={r['native_chain_continuous']}，焊接顺序一致={r['native_weld_order']}，原生机器人间实际冲突={r['native_inter_robot_conflicts']}。")
+        lines.append('首次阻塞：`' + json.dumps(r['first_block'], ensure_ascii=False) + '`。')
+        terminal = [dict(robot=b['robot'], operation=b['next_operation'], ready_s=b['ready_s'],
+                         same=b['same_rail_blockers'], cross=b['cross_rail_blockers'],
+                         same_examples=b['same_examples'], cross_examples=b['cross_examples'])
+                    for b in r['terminal_blockers']]
+        lines.append('终端阻塞：`' + json.dumps(terminal, ensure_ascii=False) + '`。')
+        lines.append(f"阻塞边累计同轨/跨轨={r['blocked_edge_occurrences']['same']}/{r['blocked_edge_occurrences']['cross']}；延迟边累计同轨/跨轨={r['delayed_edge_occurrences']['same']}/{r['delayed_edge_occurrences']['cross']}；终端等待图={r['wait_for_graph']}，等待环={r['wait_for_cycles']}，中间完全阻塞等待环={r['intermediate_wait_cycles']}，含可延迟执行操作的关联环={r['all_reported_wait_cycles']}。")
+        lines.append(f"阻塞机器人是否完成={r['blocker_finished']}；B32恢复{r['recovery_rollouts']}/{r['rollout_budget']}，前沿耗尽={r['frontier_exhausted']}；诊断原始派工状态={r['baseline_status']}，失败操作时间线与最终B32一致={r['baseline_matches_b32_failure']}。\n")
+    lines += ['阻塞边累计是各派工状态返回的关联次数，不是独立冲突数或唯一因果。含可延迟执行操作的关联环不等同于真正等待环。B32失败仅表示该有限恢复策略未找到时间线，不构成数学不可行证明。完整路线快照未保存；13.3节历史11例及其旧快照保持原样。\n']
+    with report.open('a', encoding='utf-8') as stream:
+        stream.write('\n'.join(lines))
     print('WAG_DIAGNOSIS_REPORT', report, len(records), flush=True)
 
 
 FINAL_MODEL = ROOT / 'models' / 'gnn_weld_layout_final.pt'
 CMAX_VALUE_MODEL = ROOT / 'models' / 'gnn_weld_layout_cmax_value.pt'
 CMAX_VALUE_RESULTS = FINAL_RESULTS / 'gnn_cmax_value_results.csv'
+EXPANDED_MODEL = ROOT / 'models' / 'gnn_weld_layout_expanded_dagger.pt'
+EXPANDED_RESULTS = FINAL_RESULTS / 'gnn_expanded_dagger.csv'
+EXPANDED_FIELDS = ('split', 'stage', 'round', 'epoch', 'layout_id', 'method', 'seed', 'status', 'cmax_s',
+                   'construct_s', 'runtime_s', 'b32_calls', 'iterations', 'native_cmax_s',
+                   'fraction', 'assigned_parents', 'candidate', 'parent_id', 'mode', 'robots',
+                   'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
+                   'max_processing_s', 'move_s', 'diagnostic')
 CMAX_VALUE_FIELDS = ('split', 'layout_id', 'method', 'epoch', 'fraction', 'assigned_parents', 'candidate',
                      'parent_id', 'mode', 'robots', 'status', 'cmax_s',
                      'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
                      'max_processing_s', 'move_s', 'runtime_s', 'b32_calls', 'diagnostic')
-TRAIN_BUDGET = 12.
 EPOCHS = 6
 VALIDATE_EPOCHS = (2, 4, 6)
 JOINT_METHODS = ('GNN_JOINT', 'GNN_JOINT_RECONSTRUCT')
@@ -662,33 +661,73 @@ def better_branch(first, second):
     return None, None
 
 
+def pack_directed_plan(result):
+    if result.solution is None:
+        return None
+    return dict(patterns=tuple(p.pattern_id for p in result.solution.patterns),
+                routes=tuple(r.block_ids for r in result.solution.routes), directions=result.directions)
+
+
+def unpack_directed_plan(parents, snapshot, space):
+    lookup = {p.pattern_id: p for p in space.children}
+    solution = canonicalize(parents, tuple(lookup[p] for p in snapshot['patterns']),
+                            dict(enumerate(snapshot['routes'])), CONFIG, scope=FORMAL_SCOPE_V2)
+    return gnn.JointCompletionResult(solution, snapshot['directions'], (), 0.)
+
+
+def formal_teacher_records(layout):
+    """RULE and the current full-500 WAG; only their final B32 is a teacher label."""
+    name, parents = layout
+    records, seen = [], {}
+    for method in ('RULE/BEAM', 'WAG+VNS'):
+        print('FORMAL_TEACHER_START', name, method, flush=True)
+        started = time.perf_counter()
+        native_cmax, iterations = None, None
+        if method == 'RULE/BEAM':
+            result = rule_beam(parents)
+        else:
+            search = baseline_run(parents, method, SEED, math.inf, (), iterations=500,
+                                  candidate_evaluator=priority_schedule)
+            iterations = search.iterations
+            best = search.timely_best
+            native_cmax = best.schedule.cmax if best is not None else None
+            result = gnn.JointCompletionResult(best.solution if best else None, best.directions if best else None,
+                                               (), time.perf_counter() - started,
+                                               rejection_reason=search.termination_reason if best is None else None)
+        construct_s = time.perf_counter() - started
+        schedule, called = evaluate_once(result, seen)
+        row = dict(layout_id=name, method=method, seed=SEED, status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
+                   cmax_s=schedule.cmax if schedule and schedule.feasible else None,
+                   construct_s=construct_s, runtime_s=time.perf_counter() - started, b32_calls=int(called),
+                   iterations=iterations, native_cmax_s=native_cmax,
+                   diagnostic=(' | '.join(schedule.diagnostics) if not schedule.feasible else '') if schedule else result.rejection_reason,
+                   **beam_validation_metrics(result))
+        records.append(dict(row=row, plan=pack_directed_plan(result)))
+        print('FORMAL_TEACHER_RESULT', json.dumps(row), flush=True)
+    return records, seen
+
+
 @torch.no_grad()
-def collect_teachers(layout):
+def collect_teachers(layout, *, records_only=False):
     name, parents = layout
     model = worker_model
-    teachers, seen = [], {}
-    beam = rule_beam(parents)
-    schedule, _ = evaluate_once(beam, seen)
-    if beam.solution is not None:
-        teachers.append(('RULE/BEAM', beam.solution, beam.directions, schedule))
-    for method in BASELINES:
-        search = baseline_run(parents, method, SEED, TRAIN_BUDGET, (TRAIN_BUDGET,))
-        best = search.timely_best
-        if best is not None:
-            teachers.append((method, best.solution, best.directions, best.schedule))
-            seen[plan_key(best.solution, best.directions)] = best.schedule
-
+    records, seen = formal_teacher_records(layout)
     space = gnn.parent_assignment_space(parents, CONFIG)
     embeddings = model.encode_static(space.graph)
-    best_cmax = min((s.cmax for _, _, _, s in teachers if s.feasible), default=None)
+    teachers = [(record, unpack_directed_plan(parents, record['plan'], space)) for record in records
+                if record['row']['status'] == 'FEASIBLE' and record['plan'] is not None
+                and (record['row']['method'] != 'WAG+VNS' or record['row']['iterations'] == 500)]
+    best_cmax = min((record['row']['cmax_s'] for record, _ in teachers), default=None)
     votes = torch.zeros(len(space.actions))
     assignment_steps, insertion_steps, preferences = [], [], []
-    for _, solution, directions, schedule in teachers:
+    for record, result in teachers:
+        solution, directions = result.solution, result.directions
         labels = gnn.parent_assignment_targets(solution, CONFIG)
         teacher_votes = torch.zeros_like(votes)
-        teacher_votes[[space.action_index[a] for a in labels]] = best_cmax / schedule.cmax if schedule.feasible else .35
+        teacher_votes[[space.action_index[a] for a in labels]] = best_cmax / record['row']['cmax_s']
         votes += teacher_votes
-        teacher_examples(space, model, solution, directions, teacher_votes, assignment_steps, insertion_steps)
+        if not records_only:
+            teacher_examples(space, model, solution, directions, teacher_votes, assignment_steps, insertion_steps)
 
     depths = {round(len(parents) * .30), round(len(parents) * .65)}
     prefixes = []
@@ -707,21 +746,33 @@ def collect_teachers(layout):
 
     build_joint(parents, model, space=space, embeddings=embeddings, step_observer=observe)
     branch_calls = branches = 0
+    branch_rows, prefix_records = [], []
     preference_types = {}
     for state, selected, plans in prefixes:
         blocks = {b.block_id: b for p in selected.values() for b in space.children[p]}
         example = assignment_example(space, model, state, blocks, set(space.parent_ids) - selected.keys(), votes)
-        if example is not None:
+        if example is not None and not records_only:
             assignment_steps.append(example)
+        prefix_records.append(dict(patterns=tuple(p.pattern_id for p in selected.values()),
+                                   routes=state.routes, directions=state.directions))
         results = []
         for plan in plans:
+            started = time.perf_counter()
             action = space.actions[plan.assignment_index]
             result = build_joint(parents, model, space=space, embeddings=embeddings, state=plan.state,
                                  selected={**selected, action.parent_id: action.pattern})
+            construct_s = time.perf_counter() - started
             outcome, called = evaluate_once(result, seen)
             branch_calls += int(called)
             branches += 1
             results.append(outcome)
+            branch_rows.append(dict(layout_id=name, method='BASE_PREFERENCE_BRANCH', fraction=len(selected) / len(parents),
+                                    candidate=len(results), parent_id=action.parent_id, mode=action.pattern.kind.value,
+                                    robots=str(action.robots), status=outcome.status.value if outcome else 'NO_COMPLETE_SOLUTION',
+                                    cmax_s=outcome.cmax if outcome and outcome.feasible else None,
+                                    construct_s=construct_s, runtime_s=time.perf_counter() - started, b32_calls=int(called),
+                                    diagnostic=(' | '.join(outcome.diagnostics) if not outcome.feasible else '') if outcome else result.rejection_reason,
+                                    **beam_validation_metrics(result)))
         winner, kind = better_branch(*results)
         if winner is None:
             continue
@@ -731,9 +782,12 @@ def collect_teachers(layout):
                             torch.stack((good.outcome, bad.outcome))))
         preference_types[kind] = preference_types.get(kind, 0) + 1
 
-    evidence = dict(name=name, teachers={m: (s.status.value, s.cmax) for m, _, _, s in teachers},
+    evidence = dict(name=name, teachers={record['row']['method']: (record['row']['status'], record['row']['cmax_s']) for record in records},
                     prefixes=len(prefixes), branches=branches, branch_b32=branch_calls, preferences=preference_types,
                     assignment_prefixes=len(assignment_steps), insertion_prefixes=len(insertion_steps))
+    if records_only:
+        return dict(layout_id=name, records=records, preferences=tuple(preferences), prefixes=prefix_records,
+                    evidence=evidence, rows=[record['row'] for record in records] + branch_rows)
     return pickle.dumps(TrainingLayout(space, Choices.from_steps(assignment_steps),
                                        Choices.from_steps(insertion_steps), tuple(preferences), evidence))
 
@@ -960,15 +1014,17 @@ def train(workers):
     for epoch in range(1, EPOCHS + 1):
         model.train()
         rng.shuffle(order)
-        totals = torch.zeros(3)
+        totals, updates = torch.zeros(3), 0
         for index in order:
             sample = samples[index]
-            embeddings = model.encode_static(sample.space.graph)
             a, ins = sample.assignment, sample.insertion
-            rows = model.embed_assignment_rows(sample.space, embeddings, a.indices, a.features)
-            assignment = ranking_loss(model.assignment_scores(rows), a)
-            insertion = (ranking_loss(model.insertion_logits(embeddings, ins.indices, ins.features), ins)
-                         if ins is not None else assignment.new_zeros(()))
+            if a is None and ins is None and not sample.preferences:
+                continue
+            embeddings = model.encode_static(sample.space.graph)
+            zero = embeddings.sum() * 0.
+            assignment = ranking_loss(model.assignment_scores(model.embed_assignment_rows(
+                sample.space, embeddings, a.indices, a.features)), a) if a is not None else zero
+            insertion = ranking_loss(model.insertion_logits(embeddings, ins.indices, ins.features), ins) if ins is not None else zero
             ranks = []
             for ids, features, outcome in sample.preferences:
                 scores = model.joint_scores(sample.space, embeddings, ids, features, outcome)
@@ -979,8 +1035,9 @@ def train(workers):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
             optimizer.step()
             totals += torch.stack((assignment.detach(), insertion.detach(), preference.detach()))
+            updates += 1
         record = dict(epoch=epoch, **dict(zip(('assignment_loss', 'insertion_loss', 'cmax_rank_loss'),
-                                             (totals / len(samples)).tolist())))
+                                             (totals / max(1, updates)).tolist())))
         if epoch in VALIDATE_EPOCHS:
             result = validate(model.eval(), validation, workers)
             record['validation'] = result
@@ -992,7 +1049,8 @@ def train(workers):
         print('EPOCH', json.dumps(record), flush=True)
     torch.save(dict(state_dict=selected_state, selected_epoch=selected_epoch, epochs=EPOCHS, seed=SEED,
                     hidden_dim=64, heads=4, workload_lookahead=True, joint_actions=True, history=history,
-                    teacher_budget_s=TRAIN_BUDGET, validation_stopping='one construction and up to two reconstructions',
+                    teacher_iterations=500, teacher_methods=('RULE/BEAM', 'WAG+VNS'),
+                    validation_stopping='one construction and up to two reconstructions',
                     training=[s.evidence for s in samples], elapsed_s=time.perf_counter() - started), FINAL_MODEL)
     print('MODEL', FINAL_MODEL, 'epoch', selected_epoch, flush=True)
 
@@ -1099,30 +1157,47 @@ def value_preferences(schedules):
 
 
 @torch.no_grad()
-def collect_value_branches(layout):
+def collect_value_branches(layout, *, fractions=(.25, .50, .75), candidate_limit=3, current_policy=False,
+                           evaluation_cache=None, retain_evaluations=False):
     name, parents = layout
     started = time.perf_counter()
     model = worker_model
-    if model.cmax_value_head is not None:
+    if model.cmax_value_head is not None and not current_policy:
         raise ValueError('TRAIN continuation labels must use the original frozen GNN')
     model.requires_grad_(False)
     space = gnn.parent_assignment_space(parents, CONFIG)
     embeddings = model.encode_static(space.graph)
-    depths = {math.ceil(len(parents) * fraction): fraction for fraction in (.25, .50, .75)}
+    depths = {math.ceil(len(parents) * fraction): fraction for fraction in fractions}
     prefixes = []
 
     def observe(state, selected, plans, scores):
         if len(selected) in depths:
             indices = gnn.vnext_value_candidate_indices(space, plans, scores)
-            chosen = tuple(plans[i] for i in indices)
             pending = set(space.parent_ids) - selected.keys()
+            if candidate_limit == 2 and len(indices) > 1:
+                if model.cmax_value_head is None:
+                    policy_scores = scores[list(indices)]
+                else:
+                    inputs = model.cmax_value_inputs(space, embeddings, state, pending,
+                                                     tuple(plans[i] for i in indices), scores[list(indices)])
+                    policy_scores = model.cmax_values(inputs)
+                order = [indices[i] for i in torch.argsort(policy_scores, descending=True, stable=True).tolist()]
+                first = space.actions[plans[order[0]].assignment_index]
+                alternatives = [i for i in order[1:] if space.actions[plans[i].assignment_index] != first]
+                same_parent = [i for i in alternatives if space.actions[plans[i].assignment_index].parent_id == first.parent_id]
+                second = next(iter(same_parent or alternatives or order[1:]))
+                indices = (order[0], second)
+            else:
+                indices = indices[:candidate_limit]
+            chosen = tuple(plans[i] for i in indices)
             features = model.cmax_value_inputs(space, embeddings, state, pending, chosen, scores[list(indices)])
             prefixes.append((state, dict(selected), chosen, features.cpu()))
 
     original = build_joint(parents, model, space=space, embeddings=embeddings,
                            beam_width=1, step_observer=observe)
     original_seconds = time.perf_counter() - started
-    groups, rows, seen = [], [], {}
+    groups, rows = [], []
+    seen = {} if evaluation_cache is None else evaluation_cache
     for state, selected, plans, features in prefixes:
         fraction = depths[len(selected)]
         schedules, descriptions = [], []
@@ -1131,6 +1206,7 @@ def collect_value_branches(layout):
             assignment = space.actions[plan.assignment_index]
             result = build_joint(parents, model, space=space, embeddings=embeddings, beam_width=1,
                                  state=plan.state, selected={**selected, assignment.parent_id: assignment.pattern})
+            construct_s = time.perf_counter() - branch_started
             schedule, called = evaluate_once(result, seen)
             elapsed = time.perf_counter() - branch_started
             diagnostic = (' | '.join(schedule.diagnostics) if not schedule.feasible else '') if schedule else result.rejection_reason
@@ -1141,6 +1217,8 @@ def collect_value_branches(layout):
                        cmax_s=schedule.cmax if schedule and schedule.feasible else None,
                        runtime_s=elapsed, b32_calls=int(called), diagnostic=diagnostic,
                        **beam_validation_metrics(result))
+            if current_policy:
+                row['construct_s'] = construct_s
             rows.append(row)
             schedules.append(schedule)
             descriptions.append(dict(parent_id=assignment.parent_id, kind=assignment.pattern.kind.value,
@@ -1156,9 +1234,13 @@ def collect_value_branches(layout):
                                      for p in selected.values()],
                            pending=tuple(sorted(set(space.parent_ids) - selected.keys())),
                            features=features, candidates=descriptions, preferences=value_preferences(schedules)))
-    return dict(layout_id=name, parents=len(parents), groups=groups, rows=rows,
-                original_construct_s=original_seconds, original_complete=original.solution is not None,
-                original_diagnostic=original.rejection_reason, runtime_s=time.perf_counter() - started)
+    sample = dict(layout_id=name, parents=len(parents), groups=groups, rows=rows,
+                  original_construct_s=original_seconds, original_complete=original.solution is not None,
+                  original_diagnostic=original.rejection_reason, runtime_s=time.perf_counter() - started,
+                  policy_has_value=model.cmax_value_head is not None)
+    if retain_evaluations:
+        sample['evaluations'] = pickle.dumps(seen)
+    return sample
 
 
 def value_reference_rows(split='validation'):
@@ -1348,9 +1430,384 @@ def cmax_value_experiment(workers):
         print('CMAX_VALUE_TEST', json.dumps(cmax_value_summary(saved['test'], value_reference_rows('test'))), flush=True)
 
 
+def load_expanded_experiment():
+    if EXPANDED_MODEL.exists():
+        return torch.load(EXPANDED_MODEL, map_location='cpu', weights_only=True)
+    source = torch.load(FINAL_MODEL, map_location='cpu', weights_only=True)
+    return dict(initial_state_dict=source['state_dict'], teachers=[], references=[], base_history=[],
+                base_validation={}, base_completed_epoch=0, rounds={}, seed=SEED)
+
+
+def save_expanded_experiment(saved):
+    rows = []
+    for sample in saved['teachers']:
+        rows.extend(dict(row, split='train_expanded', stage='teacher' if row['method'] in ('RULE/BEAM', 'WAG+VNS') else 'base_branch')
+                    for row in sample['rows'])
+    for reference in saved['references']:
+        rows.extend(dict(record['row'], split='validation_fresh', stage='reference') for record in reference['records'])
+    for values in saved['base_validation'].values():
+        rows.extend(values)
+    for data in saved['rounds'].values():
+        for sample in data.get('samples', []):
+            rows.extend(sample['rows'])
+        for values in data.get('validation', {}).values():
+            rows.extend(values)
+    rows.extend(saved.get('test', []))
+    for row in rows:
+        if all(row.get(f'processing_r{r}_s') not in (None, '') for r in range(4)):
+            row['max_processing_s'] = max(float(row[f'processing_r{r}_s']) for r in range(4))
+    torch.save(saved, EXPANDED_MODEL)
+    with EXPANDED_RESULTS.open('w', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=EXPANDED_FIELDS)
+        writer.writeheader()
+        writer.writerows({key: row.get(key) for key in EXPANDED_FIELDS} for row in rows)
+
+
+def expanded_teacher_job(layout):
+    started = time.perf_counter()
+    sample = collect_teachers(layout, records_only=True)
+    sample['runtime_s'] = time.perf_counter() - started
+    return sample
+
+
+def expanded_reference_job(layout):
+    records, seen = formal_teacher_records(layout)
+    return dict(layout_id=layout[0], records=records, seen=pickle.dumps(seen))
+
+
+def expanded_teachers(workers):
+    saved = load_expanded_experiment()
+    done = {sample['layout_id'] for sample in saved['teachers']}
+    layouts = load_layouts('train_expanded')
+    references = load_layouts('validation_fresh')
+    if len(layouts) != 120 or len(references) != 20:
+        raise ValueError('complete the requested 120/20 expanded packing generation first')
+    weights = pickle.dumps(saved['initial_state_dict'])
+    with ProcessPoolExecutor(max_workers=workers, initializer=configure_joint_worker, initargs=(weights,)) as executor:
+        jobs = [layout for layout in layouts if layout[0] not in done]
+        futures = [executor.submit(expanded_teacher_job, layout) for layout in jobs]
+        for future in as_completed(futures):
+            sample = future.result()
+            saved['teachers'].append(sample)
+            save_expanded_experiment(saved)
+            print('EXPANDED_TEACHERS_SAVED', len(saved['teachers']), '/ 120', sample['layout_id'],
+                  json.dumps(sample['evidence']), 'seconds', sample['runtime_s'], flush=True)
+        done = {reference['layout_id'] for reference in saved['references']}
+        futures = [executor.submit(expanded_reference_job, layout) for layout in references if layout[0] not in done]
+        for future in as_completed(futures):
+            sample = future.result()
+            saved['references'].append(sample)
+            save_expanded_experiment(saved)
+            print('FRESH_REFERENCES_SAVED', len(saved['references']), '/ 20', sample['layout_id'], flush=True)
+    return saved
+
+
+def expanded_training_layout(layout, record, model):
+    """Rebuild the existing demonstrations from saved, B32-feasible teachers."""
+    _, parents = layout
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    feasible = [item for item in record['records'] if item['row']['status'] == 'FEASIBLE'
+                and (item['row']['method'] != 'WAG+VNS' or item['row']['iterations'] == 500)]
+    best = min((item['row']['cmax_s'] for item in feasible), default=None)
+    votes = torch.zeros(len(space.actions))
+    assignment_steps, insertion_steps = [], []
+    for item in feasible:
+        result = unpack_directed_plan(parents, item['plan'], space)
+        labels = gnn.parent_assignment_targets(result.solution, CONFIG)
+        teacher_votes = torch.zeros_like(votes)
+        teacher_votes[[space.action_index[a] for a in labels]] = best / item['row']['cmax_s']
+        votes += teacher_votes
+        teacher_examples(space, model, result.solution, result.directions, teacher_votes, assignment_steps, insertion_steps)
+    lookup = {pattern.pattern_id: pattern for pattern in space.children}
+    for prefix in record['prefixes']:
+        selected = {lookup[key].parent_id: lookup[key] for key in prefix['patterns']}
+        blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
+        state = lns.oriented_route_state(prefix['routes'], prefix['directions'], blocks, CONFIG)
+        example = assignment_example(space, model, state, blocks, set(space.parent_ids) - selected.keys(), votes)
+        if example is not None:
+            assignment_steps.append(example)
+    evidence = dict(record['evidence'], assignment_prefixes=len(assignment_steps), insertion_prefixes=len(insertion_steps))
+    return TrainingLayout(space, Choices.from_steps(assignment_steps), Choices.from_steps(insertion_steps),
+                          record['preferences'], evidence)
+
+
+def configure_expanded_worker(serialized):
+    configure_cpu()
+    from numba import set_num_threads
+    set_num_threads(1)
+    weights = pickle.loads(serialized)
+    global worker_model
+    worker_model = joint_model(weights, cmax_value='cmax_value_mean' in weights).eval()
+    worker_model.requires_grad_(False)
+
+
+def expanded_validation_job(job):
+    layout, stage, round_index, epoch, cached = job
+    selected = []
+    seen = pickle.loads(cached) if cached else {}
+    row, _ = complete_gnn(layout[1], worker_model, SEED, (), reconstruct=False, beam_width=1,
+                          evaluation_cache=seen, result_observer=lambda result, schedule: selected.append(result))
+    row = dict(split='test' if stage == 'final_test' else 'validation_fresh', stage=stage, round=round_index, epoch=epoch, layout_id=layout[0],
+               method='GNN_BASE' if worker_model.cmax_value_head is None else 'GNN_DAGGER', seed=SEED,
+               **{key: row[key] for key in ('status', 'cmax_s', 'construct_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+               **beam_validation_metrics(selected[0]), plan=pack_directed_plan(selected[0]))
+    print('FRESH_GNN_RESULT', json.dumps({k: v for k, v in row.items() if k != 'plan'}), flush=True)
+    return row, pickle.dumps(seen)
+
+
+def expanded_validate(model, saved, stage, round_index, epoch, split='validation_fresh'):
+    layouts = load_layouts(split)
+    caches = saved.setdefault('validation_seen', {r['layout_id']: r['seen'] for r in saved['references']})
+    jobs = [(layout, stage, round_index, epoch, caches.get(layout[0])) for layout in layouts]
+    with ProcessPoolExecutor(max_workers=1, initializer=configure_expanded_worker,
+                             initargs=(pickle.dumps(model.state_dict()),)) as executor:
+        results = list(executor.map(expanded_validation_job, jobs))
+    rows = []
+    for layout, (row, cache) in zip(layouts, results):
+        caches[layout[0]] = cache
+        if split == 'test':
+            row['split'], row['stage'] = 'test', 'final_test'
+        rows.append(row)
+    return rows
+
+
+def expanded_summary(rows, references):
+    feasible = [row for row in rows if row['status'] == 'FEASIBLE']
+    def peak(row):
+        return max(float(row[f'processing_r{i}_s']) for i in range(4)) if row.get('processing_r0_s') not in (None, '') else float(row['max_processing_s'])
+    summary = dict(runs=len(rows), feasible=len(feasible),
+                   median_cmax_s=median(float(row['cmax_s']) for row in feasible) if feasible else None,
+                   median_construct_s=median(float(row['construct_s']) for row in rows),
+                   median_runtime_s=median(float(row['runtime_s']) for row in rows),
+                   b32_calls=sum(int(row['b32_calls']) for row in rows), paired={})
+    for method in ('WAG+VNS', 'RULE/BEAM'):
+        lookup = {row['layout_id']: row for row in references if row['method'] == method}
+        pairs = [(row, lookup[row['layout_id']]) for row in feasible
+                 if row['layout_id'] in lookup and lookup[row['layout_id']]['status'] == 'FEASIBLE']
+        changes = [float(a['cmax_s']) - float(b['cmax_s']) for a, b in pairs]
+        summary['paired'][method] = dict(common=len(pairs), wins=sum(d < -1e-6 for d in changes),
+            ties=sum(abs(d) <= 1e-6 for d in changes), losses=sum(d > 1e-6 for d in changes),
+            median_change_pct=median(100. * (float(a['cmax_s']) / float(b['cmax_s']) - 1.) for a, b in pairs) if pairs else None,
+            median_processing_delta_s=median(peak(a) - peak(b) for a, b in pairs) if pairs else None,
+            median_move_delta_s=median(float(a['move_s']) - float(b['move_s']) for a, b in pairs) if pairs else None)
+    return summary
+
+
+def expanded_model_key(summary):
+    changes = [summary['paired'][method]['median_change_pct'] for method in ('WAG+VNS', 'RULE/BEAM')]
+    return (summary['feasible'], *(-(value if value is not None else math.inf) for value in changes),
+            -summary['median_construct_s'])
+
+
+def train_expanded_base(saved):
+    if saved['base_completed_epoch'] == EPOCHS:
+        return
+    torch.manual_seed(SEED)
+    model = joint_model(saved['initial_state_dict'])
+    layouts = dict(load_layouts('train_expanded'))
+    samples = []
+    for record in sorted(saved['teachers'], key=lambda r: r['layout_id']):
+        sample = expanded_training_layout((record['layout_id'], layouts[record['layout_id']]), record, model)
+        record['evidence'] = sample.evidence
+        samples.append(sample)
+        print('EXPANDED_DEMONSTRATIONS', record['layout_id'], json.dumps(sample.evidence), flush=True)
+    optimizer = torch.optim.AdamW([{'params': [p for name, p in model.named_parameters() if name != 'joint_weights']},
+                                  {'params': [model.joint_weights], 'lr': .02}], lr=3e-4)
+    if saved['base_completed_epoch']:
+        model.load_state_dict(saved['base_last_state_dict'])
+        optimizer.load_state_dict(saved['base_optimizer_state_dict'])
+    references = [record['row'] for reference in saved['references'] for record in reference['records']]
+    for epoch in range(saved['base_completed_epoch'] + 1, EPOCHS + 1):
+        model.train()
+        order = list(range(len(samples)))
+        Random(SEED + epoch).shuffle(order)
+        totals, updates = torch.zeros(3), 0
+        for index in order:
+            sample = samples[index]
+            a, ins = sample.assignment, sample.insertion
+            if a is None and ins is None and not sample.preferences:
+                continue
+            embeddings = model.encode_static(sample.space.graph)
+            zero = embeddings.sum() * 0.
+            assignment = ranking_loss(model.assignment_scores(model.embed_assignment_rows(
+                sample.space, embeddings, a.indices, a.features)), a) if a is not None else zero
+            insertion = ranking_loss(model.insertion_logits(embeddings, ins.indices, ins.features), ins) if ins is not None else zero
+            ranks = []
+            for ids, features, outcome in sample.preferences:
+                scores = model.joint_scores(sample.space, embeddings, ids, features, outcome)
+                ranks.append(F.softplus(scores[1] - scores[0]))
+            preference = torch.stack(ranks).mean() if ranks else zero
+            optimizer.zero_grad(set_to_none=True)
+            (assignment + .5 * insertion + .7 * preference).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True)
+            optimizer.step()
+            totals += torch.stack((assignment.detach(), insertion.detach(), preference.detach()))
+            updates += 1
+            if updates % 20 == 0:
+                print('EXPANDED_BASE_PROGRESS', epoch, updates, '/ 120', flush=True)
+        record = dict(epoch=epoch, labelled_layouts=updates,
+                      **dict(zip(('assignment_loss', 'insertion_loss', 'cmax_rank_loss'), (totals / max(1, updates)).tolist())))
+        if epoch in VALIDATE_EPOCHS:
+            rows = expanded_validate(model.eval(), saved, 'base_validation', 0, epoch)
+            saved['base_validation'][epoch] = rows
+            summary = expanded_summary(rows, references)
+            record['validation'] = summary
+            if 'base_selected_epoch' not in saved or expanded_model_key(summary) > expanded_model_key(saved['base_selected_summary']):
+                saved['base_selected_epoch'], saved['base_selected_summary'] = epoch, summary
+                saved['base_state_dict'] = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        saved['base_history'].append(record)
+        saved['base_completed_epoch'] = epoch
+        saved['base_last_state_dict'] = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        saved['base_optimizer_state_dict'] = optimizer.state_dict()
+        save_expanded_experiment(saved)
+        print('EXPANDED_BASE_EPOCH', json.dumps(record), flush=True)
+
+
+def stratified_dagger_layouts(records):
+    ordered = sorted(records, key=lambda row: (len(row['parents']), row['layout_id']))
+    chosen, strata = [], []
+    for weld_bin in range(3):
+        group = sorted(ordered[weld_bin * 40:(weld_bin + 1) * 40],
+                       key=lambda row: (row['rectangle_utilization'], len(row['parts']), row['layout_id']))
+        for size_bin in range(2):
+            members = group[size_bin * 20:(size_bin + 1) * 20]
+            selection = [members[round(i * (len(members) - 1) / 9)] for i in range(10)]
+            chosen.extend(row['layout_id'] for row in selection)
+            strata.append(dict(weld_bin=weld_bin, size_bin=size_bin, layouts=[row['layout_id'] for row in selection],
+                               parent_range=[min(len(row['parents']) for row in selection), max(len(row['parents']) for row in selection)],
+                               utilization_range=[min(row['rectangle_utilization'] for row in selection), max(row['rectangle_utilization'] for row in selection)]))
+    return chosen, strata
+
+
+def dagger_branch_job(job):
+    layout, round_index, cached = job
+    seen = pickle.loads(cached) if cached else {}
+    sample = collect_value_branches(layout, fractions=(.05, .15, .50, .85), candidate_limit=2, current_policy=True,
+                                    evaluation_cache=seen, retain_evaluations=True)
+    for row in sample['rows']:
+        row.update(split='train_expanded', stage='dagger_branch', round=round_index, method='GNN_DAGGER_BRANCH')
+    print('DAGGER_BRANCH_RESULT', round_index, layout[0], 'prefixes', len(sample['groups']),
+          'branches', len(sample['rows']), 'B32', sum(r['b32_calls'] for r in sample['rows']),
+          'value_policy', sample['policy_has_value'], 'seconds', sample['runtime_s'], flush=True)
+    return sample
+
+
+def collect_dagger_round(saved, round_index, workers):
+    data = saved['rounds'].get(round_index)
+    if data is None:
+        policy = saved['base_state_dict'] if round_index == 1 else saved['rounds'][1]['state_dict']
+        data = dict(policy_state_dict={key: value.clone() for key, value in policy.items()}, samples=[],
+                    history=[], validation={}, completed_epoch=0)
+        saved['rounds'][round_index] = data
+        save_expanded_experiment(saved)
+    if 'dagger_layouts' not in saved:
+        records = [json.loads(line) for line in (DATA / 'train_expanded.jsonl').read_text(encoding='utf-8').splitlines()]
+        saved['dagger_layouts'], saved['dagger_strata'] = stratified_dagger_layouts(records)
+    layouts = dict(load_layouts('train_expanded'))
+    done = {sample['layout_id'] for sample in data['samples']}
+    previous = {sample['layout_id']: sample.get('evaluations') for sample in saved['rounds'].get(round_index - 1, {}).get('samples', [])}
+    jobs = [((name, layouts[name]), round_index, previous.get(name)) for name in saved['dagger_layouts'] if name not in done]
+    with ProcessPoolExecutor(max_workers=workers, initializer=configure_expanded_worker,
+                             initargs=(pickle.dumps(data['policy_state_dict']),)) as executor:
+        futures = [executor.submit(dagger_branch_job, job) for job in jobs]
+        for future in as_completed(futures):
+            data['samples'].append(future.result())
+            save_expanded_experiment(saved)
+            print('DAGGER_SAVED', round_index, len(data['samples']), '/ 60', flush=True)
+
+
+def train_dagger_round(saved, round_index):
+    data = saved['rounds'][round_index]
+    if data['completed_epoch'] == EPOCHS:
+        return
+    source = data['policy_state_dict']
+    torch.manual_seed(SEED + round_index)
+    model = joint_model(source, cmax_value='cmax_value_mean' in source)
+    model.enable_cmax_value()
+    groups = [group for index in range(1, round_index + 1)
+              for sample in sorted(saved['rounds'][index]['samples'], key=lambda sample: sample['layout_id'])
+              for group in sample['groups']]
+    trainable = [group for group in groups if group['preferences']]
+    if not trainable:
+        raise ValueError(f'DAgger round {round_index} obtained no true B32 preferences')
+    optimizer = torch.optim.AdamW(model.cmax_value_head.parameters(), lr=1e-3, weight_decay=1e-4)
+    if data['completed_epoch']:
+        model.load_state_dict(data['last_state_dict'])
+        optimizer.load_state_dict(data['optimizer_state_dict'])
+    elif round_index == 1:
+        features = torch.cat([group['features'] for group in groups])
+        model.cmax_value_mean.copy_(features.mean(0))
+        model.cmax_value_scale.copy_(features.std(0, unbiased=False).clamp_min(.05))
+    references = [record['row'] for reference in saved['references'] for record in reference['records']]
+    for epoch in range(data['completed_epoch'] + 1, EPOCHS + 1):
+        model.train()
+        order = list(range(len(trainable)))
+        Random(SEED + round_index * 100 + epoch).shuffle(order)
+        losses = []
+        for index in order:
+            group = trainable[index]
+            scores = model.cmax_values(group['features'])
+            good, bad = zip(*[(a, b) for a, b, _ in group['preferences']])
+            loss = F.softplus(scores[list(bad)] - scores[list(good)]).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach()))
+        record = dict(epoch=epoch, ranking_loss=sum(losses) / len(losses), labelled_prefixes=len(trainable))
+        if epoch in VALIDATE_EPOCHS:
+            rows = expanded_validate(model.eval(), saved, 'dagger_validation', round_index, epoch)
+            data['validation'][epoch] = rows
+            summary = expanded_summary(rows, references)
+            record['validation'] = summary
+            if 'selected_epoch' not in data or expanded_model_key(summary) > expanded_model_key(data['selected_summary']):
+                data['selected_epoch'], data['selected_summary'] = epoch, summary
+                data['state_dict'] = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        data['history'].append(record)
+        data['completed_epoch'] = epoch
+        data['last_state_dict'] = {key: value.detach().clone() for key, value in model.state_dict().items()}
+        data['optimizer_state_dict'] = optimizer.state_dict()
+        data['base_parameters_unchanged'] = all(torch.equal(value, model.state_dict()[key])
+                                                 for key, value in saved['base_state_dict'].items())
+        save_expanded_experiment(saved)
+        print('DAGGER_EPOCH', round_index, json.dumps(record), 'frozen_body', data['base_parameters_unchanged'], flush=True)
+
+
+def expanded_dagger_experiment(workers):
+    saved = expanded_teachers(workers)
+    train_expanded_base(saved)
+    for round_index in (1, 2):
+        collect_dagger_round(saved, round_index, workers)
+        train_dagger_round(saved, round_index)
+    candidates = [(0, saved['base_selected_epoch'], saved['base_state_dict'], saved['base_selected_summary'])]
+    candidates.extend((index, saved['rounds'][index]['selected_epoch'], saved['rounds'][index]['state_dict'],
+                       saved['rounds'][index]['selected_summary']) for index in (1, 2))
+    round_index, epoch, weights, summary = max(candidates, key=lambda item: expanded_model_key(item[3]))
+    saved['state_dict'] = weights
+    saved['selected_round'], saved['selected_epoch'], saved['selected_summary'] = round_index, epoch, summary
+    references = [record['row'] for reference in saved['references'] for record in reference['records']]
+    counts = {method: sum(row['status'] == 'FEASIBLE' for row in references if row['method'] == method)
+              for method in ('RULE/BEAM', 'WAG+VNS')}
+    saved['acceptance'] = dict(feasibility=summary['feasible'] >= max(counts.values()),
+                               construction_time=summary['median_construct_s'] <= 20.)
+    for method, pair in summary['paired'].items():
+        saved['acceptance'][method + '_cmax'] = pair['common'] > 0 and pair['median_change_pct'] < 0.
+        saved['acceptance'][method + '_wins'] = pair['wins'] >= pair['losses']
+    save_expanded_experiment(saved)
+    print('EXPANDED_FINAL', json.dumps(summary), 'acceptance', json.dumps(saved['acceptance']), flush=True)
+    if all(saved['acceptance'].values()) and not saved.get('test'):
+        model = joint_model(saved['state_dict'], cmax_value='cmax_value_mean' in saved['state_dict']).eval()
+        model.requires_grad_(False)
+        saved['test'] = expanded_validate(model, saved, 'final_test', round_index, epoch, split='test')
+        save_expanded_experiment(saved)
+        old_wag = [row for row in read_rows(FINAL_RESULTS / 'wag_vns_results_optimized.csv')
+                   if row['source'] == BASELINE_SOURCES['WAG+VNS'] and int(row['seed']) == SEED and row['layout_id'].startswith('test_')]
+        old_rule = [row for row in read_rows(FINAL_RESULTS / 'rule_beam_results.csv') if int(row['seed']) == SEED]
+        print('EXPANDED_TEST', json.dumps(expanded_summary(saved['test'], old_wag + old_rule)), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'expanded-teachers', 'expanded-dagger'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -1361,6 +1818,8 @@ def main():
         run_baselines(args.workers, args.method, split=args.split, representative=args.representative)
     elif args.stage == 'hga-alpha-sensitivity':
         hga_alpha_sensitivity()
+    elif args.stage == 'hga-alpha-full-budget':
+        hga_alpha_sensitivity(full_budget=True)
     elif args.stage == 'train':
         train(args.workers)
     elif args.stage == 'test':
@@ -1373,6 +1832,10 @@ def main():
         diagnose_wag_deadlocks(args.workers)
     elif args.stage == 'cmax-value':
         cmax_value_experiment(args.workers)
+    elif args.stage == 'expanded-teachers':
+        expanded_teachers(args.workers)
+    elif args.stage == 'expanded-dagger':
+        expanded_dagger_experiment(args.workers)
     else:
         write_comparison()
 

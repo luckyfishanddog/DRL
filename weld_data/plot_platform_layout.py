@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 from dataclasses import dataclass
 from itertools import combinations, product
@@ -439,6 +440,76 @@ def export_dataset(parts: list[LayoutPart], split: str, seeds: list[int] | None,
         print(f"已导出 {len(rows)} 组排样到 {output.resolve()}")
 
 
+def export_expanded_dataset(parts: list[LayoutPart], workbook: Path, output_dir: Path) -> None:
+    """Append new training-side layouts, preserving all three original datasets."""
+    original = {}
+    for name in DATASET_SEEDS:
+        original[name] = [json.loads(line) for line in (output_dir / f'{name}.jsonl').read_text(encoding='utf-8').splitlines()]
+    geometries = [layout_geometry(row) for rows in original.values() for row in rows]
+    used_seeds = {row['geometry_seed'] for rows in original.values() for row in rows}
+    library = [part for part in parts if not held_out(part.ident)]
+    welds = {part.ident: dataset_weld_paths(part) for part in library}
+    settings = (('train_expanded', 120, 2026111401, original['train']),
+                ('validation_fresh', 20, 2026111501, []))
+    datasets = {}
+    # Resume only the two new outputs. Original files are always read-only.
+    for name, target, first_seed, initial in settings:
+        path = output_dir / f'{name}.jsonl'
+        if path.exists():
+            rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+            if rows[:len(initial)] != initial or len(rows) > target:
+                raise ValueError(f'{name} does not preserve the original TRAIN prefix or exceeds {target}')
+        else:
+            rows = list(initial)
+            path.write_text(''.join(json.dumps(row, ensure_ascii=False, allow_nan=False) + '\n' for row in rows),
+                            encoding='utf-8', newline='\n')
+        for row in rows[len(initial):]:
+            geometry = layout_geometry(row)
+            if row['geometry_seed'] in used_seeds or any(same_layout(geometry, other) for other in geometries):
+                raise ValueError(f'duplicate existing expanded layout: {row["layout_id"]}')
+            used_seeds.add(row['geometry_seed'])
+            geometries.append(geometry)
+        datasets[name] = rows
+    next_seed = max(*used_seeds, 2026111520) + 1
+    for name, target, first_seed, initial in settings:
+        rows = datasets[name]
+        path = output_dir / f'{name}.jsonl'
+        duplicates = 0
+        while len(rows) < target:
+            index = len(rows) - len(initial)
+            seed = first_seed + index
+            for _ in range(128):
+                if seed in used_seeds:
+                    seed, next_seed = next_seed, next_seed + 1
+                used_seeds.add(seed)
+                placements = pack_platform(library, seed, SPACING)
+                if not placements:
+                    raise ValueError('training-side library produced an empty packing')
+                layout_id = f'train_{len(rows) + 1:02d}' if name == 'train_expanded' else f'validation_fresh_{len(rows) + 1:02d}'
+                row = dataset_record(placements, welds, layout_id, seed, SPACING, workbook)
+                geometry = layout_geometry(row)
+                if any(same_layout(geometry, other) for other in geometries):
+                    duplicates += 1
+                    seed, next_seed = next_seed, next_seed + 1
+                    continue
+                geometries.append(geometry)
+                rows.append(row)
+                with path.open('a', encoding='utf-8', newline='\n') as stream:
+                    stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + '\n')
+                print('EXPANDED_LAYOUT', name, len(rows), '/', target, 'seed', seed,
+                      'parents', len(row['parents']), 'parts', len(row['parts']), flush=True)
+                break
+            else:
+                raise ValueError(f'{name}: 128 duplicate packing attempts')
+        summary = dict(dataset=name, layouts=len(rows), parents=sum(len(row['parents']) for row in rows),
+                       models=dict(sorted(Counter(part['model_id'] for row in rows for part in row['parts']).items())),
+                       minimum_clearance_m=min(row['minimum_clearance_m'] for row in rows),
+                       minimum_parent_m=min(hypot(p['end'][0] - p['start'][0], p['end'][1] - p['start'][1])
+                                            for row in rows for p in row['parents']),
+                       skipped_duplicates=duplicates)
+        print('EXPANDED_DATASET', json.dumps(summary, ensure_ascii=False), flush=True)
+
+
 def label_position(box: Box, paths: list[np.ndarray], ident: str, points_per_meter: float):
     x0, y0, x1, y1 = box
     width, height = x1 - x0, y1 - y0
@@ -528,7 +599,7 @@ def main() -> None:
     parser.add_argument("workbook", type=Path, nargs="?", default=PROJECT_DIR / "C_layout_geometry.xlsx")
     parser.add_argument("--seed", type=int, action="append", help="随机种子，可重复指定")
     parser.add_argument("--spacing", type=float, action="append", help=f"件间净距（m），可重复指定，默认 {SPACING:g}")
-    parser.add_argument("--split", choices=("all", *DATASET_SEEDS), help="导出训练、验证及测试 JSONL")
+    parser.add_argument("--split", choices=("all", "expanded", *DATASET_SEEDS), help="导出 JSONL；expanded 仅新增扩充训练和独立验证")
     parser.add_argument("--output-dir", type=Path, help="指定 PNG 或 JSONL 的输出目录")
     args = parser.parse_args()
     if args.split == "all" and args.seed:
@@ -542,6 +613,11 @@ def main() -> None:
             raise ValueError("工作簿中没有小组立")
         if args.split:
             output_dir = args.output_dir or PROJECT_DIR.parent / "data" / "weld_layout"
+            if args.split == 'expanded':
+                if args.seed or args.spacing:
+                    parser.error('expanded 使用固定的新种子及原 0.3m 间距')
+                export_expanded_dataset(parts, args.workbook, output_dir)
+                return
             seeds = list(dict.fromkeys(args.seed)) if args.seed else None
             export_dataset(parts, args.split, seeds, gaps, args.workbook, output_dir)
             return
