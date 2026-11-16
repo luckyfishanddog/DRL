@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import math
 import random
 import sys
 import time
@@ -13,6 +14,265 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import run_gnn_construct_vns_pilot as pilot_script
+
+
+def _feedback_fixture():
+    import run_gnn_weld_layout as experiment
+    from mrta_search import gnn_constructor as c
+    experiment.configure_cpu()
+    torch.manual_seed(81)
+    parents = (ParentWeld('a', (1., 9.), (6., 9.)), ParentWeld('b', (14., 9.), (18., 9.)),
+               ParentWeld('c', (2., 5.), (2., 7.)), ParentWeld('d', (14., 2.), (18., 2.)))
+    model = c.VNextGNN(16, 4, workload_lookahead=True, joint_actions=True, schedule_feedback=True)
+    return experiment, c, parents, model
+
+
+def test_feedback_joint_trajectory_preserves_coverage_legality_and_replays_exact_logits():
+    from collections import Counter
+    from mrta_reference.geometry import robot_is_eligible
+    experiment, c, parents, model = _feedback_fixture()
+    space = c.parent_assignment_space(parents, CONFIG)
+    trace, observed = [], []
+    result = c.construct_vnext_gnn(parents, model, CONFIG, space=space,
+        step_observer=lambda state, selected, plans, scores: observed.append(scores.detach().clone()),
+        policy_observer=lambda inputs, choice: trace.append((inputs, choice)))
+    assert result.solution is not None and len(trace) == len(parents)
+    blocks = block_map(result.solution, CONFIG)
+    assert Counter(b for route in result.solution.routes for b in route.block_ids) == Counter(blocks.keys())
+    for robot, (route, directions) in enumerate(zip(result.solution.routes, result.directions)):
+        assert len(route.block_ids) == len(directions)
+        assert all(d in (0, 1) and robot_is_eligible(blocks[b], robot, CONFIG) for b, d in zip(route.block_ids, directions))
+    embeddings = model.encode_static(space.graph)
+    for logits, (inputs, choice) in zip(observed, trace):
+        assert torch.allclose(model.feedback_scores(space, embeddings, inputs), logits, atol=1e-6)
+        assert choice == int(logits.argmax())
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    loss, norm = experiment.feedback_update(model, space, trace, .2,
+                                           torch.optim.AdamW(model.parameters(), lr=1e-3))
+    assert math.isfinite(loss) and math.isfinite(norm)
+    for prefix in ('layer1.', 'policy.', 'insertion_head.'):
+        assert any(not torch.equal(value, model.state_dict()[key]) for key, value in before.items() if key.startswith(prefix))
+    assert model.cmax_value_head is None
+
+
+def test_feedback_sampling_uses_all_legal_joint_candidates():
+    experiment, c, parents, model = _feedback_fixture()
+    class LastChoice:
+        def choices(self, population, *, weights):
+            assert len(population) == len(weights) and all(w >= 0. for w in weights)
+            return [population[-1]]
+    trace = []
+    result = c.construct_vnext_gnn(parents, model, CONFIG, rng=LastChoice(),
+        policy_observer=lambda inputs, choice: trace.append((len(inputs['indices']), choice)))
+    assert result.solution is not None
+    assert all(choice == count - 1 for count, choice in trace)
+    assert any(count > 3 for count, _ in trace)
+
+
+def test_feedback_shortlist_keeps_robot_and_mode_representatives_without_outcome_penalties():
+    from mrta_search.lns import oriented_route_state
+    experiment, c, parents, model = _feedback_fixture()
+    space = c.parent_assignment_space(parents, CONFIG)
+    embeddings = model.encode_static(space.graph)
+    state = oriented_route_state(((),) * 4, ((),) * 4, {}, CONFIG)
+    indices, features = model.assignment_features(space, embeddings, state, {}, set(space.parent_ids), CONFIG)
+    chosen = c.feedback_shortlist(space, indices, torch.arange(len(indices), dtype=torch.float32))
+    available = [space.actions[i] for i in indices.tolist()]
+    kept = [space.actions[i] for i in chosen]
+    assert {r for a in kept for r in a.robots} == {r for a in available for r in a.robots}
+    assert {a.pattern.kind for a in kept} == {a.pattern.kind for a in available}
+    assert len(chosen) <= c.COARSE_ASSIGNMENT_LIMIT and len({a.parent_id for a in kept}) > 1
+
+
+def test_feedback_parent_removal_closes_siblings_and_freezes_unremoved_directions():
+    from test_gnn_schedule_blocker_pilot import _selection_fixture
+    solution, schedule, event, config = _selection_fixture()
+    experiment, c, _, model = _feedback_fixture()
+    space = c.parent_assignment_space(solution.parents, config)
+    blocks = block_map(solution, config)
+    bits = ((1,), (0, 1), (0,), (1,))
+    state = experiment.lns.oriented_route_state(tuple(r.block_ids for r in solution.routes), bits, blocks, config)
+    result = c.JointCompletionResult(solution, bits, (), 0., oriented_state=state)
+    feedback = experiment.lns.schedule_feedback_summary(solution, schedule, (event,), config)
+    feedback['scores'] = dict.fromkeys(feedback['scores'], 0.)
+    feedback['scores']['a'] = 100.
+    partial, selected = experiment.feedback_prefix(result, space, feedback, 1, 1)
+    assert 'a' not in selected and all(not b.startswith('a::') for route in partial.routes for b in route)
+    repaired = c.construct_vnext_gnn(solution.parents, model, config, space=space, state=partial,
+                                      selected=selected, feedback=feedback)
+    assert repaired.solution is not None
+    retained = {b for route in partial.routes for b in route}
+    for old_route, old_bits, route, new_bits in zip(partial.routes, partial.directions,
+                                                   repaired.oriented_state.routes, repaired.directions):
+        assert tuple((b, d) for b, d in zip(route, new_bits) if b in retained) == tuple(zip(old_route, old_bits))
+    assert feedback['parent_wait']['a'] == 5. and feedback['parent_blocked']['b'] == 5.
+    unrelated = experiment.lns.schedule_feedback_summary(solution, schedule, (), config)
+    assert unrelated['parent_blocked'] == {}
+
+
+@pytest.mark.parametrize('status,cmax,accepted', [('FEASIBLE', 9., True), ('FEASIBLE', 10., False),
+    ('FEASIBLE', 11., False), ('DEADLOCK', None, False), ('NUMERIC_FAILURE', None, False)])
+def test_feedback_accepts_only_strict_feasible_cmax_improvements(status, cmax, accepted):
+    import run_gnn_weld_layout as experiment
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    incumbent = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10.)
+    candidate = ScheduleResult(ScheduleStatus(status), cmax=cmax)
+    assert experiment.feedback_improves(candidate, incumbent) is accepted
+    if status == 'NUMERIC_FAILURE':
+        assert experiment.feedback_reward(candidate, 10.) is None
+    elif status == 'DEADLOCK':
+        assert experiment.feedback_reward(candidate, 10.) == -5.
+
+
+def test_feedback_complete_schedule_and_blocker_evidence_are_evaluated_once(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, parents, model = _feedback_fixture()
+    result = c.construct_vnext_gnn(parents, model, CONFIG)
+    calls = []
+    schedule = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10.)
+    monkeypatch.setattr(experiment, 'b32', lambda result, **kwargs: calls.append(result) or schedule)
+    seen, blockers = {}, {}
+    assert experiment.evaluate_once(result, seen, blocker_cache=blockers) == (schedule, True)
+    assert experiment.evaluate_once(result, seen, blocker_cache=blockers) == (schedule, False)
+    assert len(calls) == len(blockers) == 1
+
+
+@pytest.mark.parametrize('status,cmax', [('DEADLOCK', None), ('NUMERIC_FAILURE', None),
+                                      ('FEASIBLE', 10.), ('FEASIBLE', 11.)])
+def test_feedback_search_retains_incumbent_after_failed_or_nonimproving_repair(monkeypatch, status, cmax):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, parents, model = _feedback_fixture()
+    result = c.construct_vnext_gnn(parents, model, CONFIG)
+    clock = [0.]
+    constructions = []
+    def construct(*args, **kwargs):
+        clock[0] += 1. if not constructions else 2.
+        constructions.append(1)
+        return result
+    outcomes = [ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10.)]
+    def evaluate(*args, **kwargs):
+        schedule = outcomes[0] if len(constructions) == 1 else ScheduleResult(ScheduleStatus(status), cmax=cmax)
+        return schedule, True
+    monkeypatch.setattr(experiment.time, 'perf_counter', lambda: clock[0])
+    monkeypatch.setattr(c, 'construct_vnext_gnn', construct)
+    monkeypatch.setattr(experiment, 'evaluate_once', evaluate)
+    row = experiment.run_feedback_gnn(parents, model, 1, budget=10.)
+    assert row['status'] == 'FEASIBLE' and row['cmax_s'] == row['initial_cmax_s'] == 10.
+    assert row['reconstructions'] > 0 and row['accepted'] == 0
+    assert row['b32_calls'] == len(constructions) and row['runtime_s'] <= 10.
+
+
+def test_feedback_continuation_uses_packed_120_train_and_retains_original_validation(monkeypatch):
+    import copy
+    from types import SimpleNamespace
+    experiment, c, _, model = _feedback_fixture()
+    parent = ParentWeld('p', (1., 9.), (2., 9.))
+    base = [(f'train_{i + 1:02d}', (parent,) * (94 if i < 29 else 93)) for i in range(40)]
+    expanded = base + [(f'train_{i + 41:02d}', (parent,) * (94 if i < 78 else 93)) for i in range(80)]
+    validation = [(f'validation_{i + 1:02d}', (parent,) * (94 if i < 6 else 93)) for i in range(10)]
+    calls, trained, stored = [], [], []
+    def load(split):
+        calls.append(split)
+        return dict(train=base, train_expanded=expanded, validation=validation)[split]
+    weights = copy.deepcopy(model.state_dict())
+    saved = dict(state_dict=weights, last_state_dict=weights, selected_epoch=0, completed_epoch=1,
+        training_complete=True, training_layouts=[name for name, _ in base],
+        history=[dict(epoch=0), dict(epoch=1)], test_eligible=False)
+    reference = [dict(stage='validation', epoch=0, layout_id=name, seed=experiment.SEED,
+                      status='FEASIBLE', cmax_s=100., runtime_s=119.) for name, _ in validation]
+    monkeypatch.setattr(experiment, 'load_layouts', load)
+    monkeypatch.setattr(experiment, 'FEEDBACK_MODEL', SimpleNamespace(exists=lambda: True))
+    monkeypatch.setattr(experiment, 'FEEDBACK_TEST_CSV', SimpleNamespace(exists=lambda: False))
+    monkeypatch.setattr(experiment.torch, 'load', lambda *a, **kw: saved)
+    monkeypatch.setattr(experiment.torch, 'save', lambda state, path: stored.append(copy.deepcopy(state)))
+    monkeypatch.setattr(experiment, 'feedback_model', lambda *a: c.VNextGNN(16, 4,
+        workload_lookahead=True, joint_actions=True, schedule_feedback=True))
+    monkeypatch.setattr(experiment, 'read_rows', lambda path: reference)
+    monkeypatch.setattr(experiment, 'feedback_write', lambda *a: None)
+    def train(model, baseline, layout, epoch, optimizer, **kwargs):
+        trained.append((layout[0], epoch, kwargs['training_stage']))
+        return []
+    monkeypatch.setattr(experiment, 'feedback_train_layout', train)
+    monkeypatch.setattr(experiment, 'feedback_evaluate', lambda *a, **kw:
+                        [dict(row, epoch=2, cmax_s=110.) for row in reference])
+    result = experiment.train_feedback(1, 2, expanded=True)
+    assert calls == ['train', 'train_expanded', 'validation']
+    assert len(trained) == 120 and len({name for name, _, _ in trained}) == 120
+    assert all(epoch == 2 and stage == 'train_expanded' for _, epoch, stage in trained)
+    assert result['history'][:2] == [dict(epoch=0), dict(epoch=1)]
+    assert result['history'][-1]['training_parents'] == result['training_parents'] == 11267
+    assert result['selected_epoch'] == 0 and result['training_complete']
+    assert 'forty_layout_state_dict' in stored[-1]
+
+
+def test_feedback_late_initial_schedule_is_not_reported_as_timely_feasible(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, parents, model = _feedback_fixture()
+    result = c.construct_vnext_gnn(parents, model, CONFIG)
+    clock = [0.]
+    def construct(*args, **kwargs):
+        clock[0] += 1.
+        return result
+    def evaluate(*args, **kwargs):
+        clock[0] += 5.
+        return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10.), True
+    monkeypatch.setattr(experiment.time, 'perf_counter', lambda: clock[0])
+    monkeypatch.setattr(c, 'construct_vnext_gnn', construct)
+    monkeypatch.setattr(experiment, 'evaluate_once', evaluate)
+    row = experiment.run_feedback_gnn(parents, model, 1, budget=5.)
+    assert row['status'] == 'TIME_LIMIT' and row['cmax_s'] is None
+    assert row['b32_calls'] == row['late_candidates'] == 1
+
+
+def test_feedback_fixed_reconstruction_count_finishes_after_120_seconds(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, parents, model = _feedback_fixture()
+    result = c.construct_vnext_gnn(parents, model, CONFIG)
+    clock = [0.]
+    def construct(*args, **kwargs):
+        clock[0] += 60.
+        return result
+    monkeypatch.setattr(experiment.time, 'perf_counter', lambda: clock[0])
+    monkeypatch.setattr(c, 'construct_vnext_gnn', construct)
+    monkeypatch.setattr(experiment, 'evaluate_once', lambda *a, **kw:
+                        (ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10.), True))
+    row = experiment.run_feedback_gnn(parents, model, 1, budget=None, reconstruction_limit=3)
+    assert row['reconstruction_attempts'] == row['reconstructions'] == 3
+    assert row['runtime_s'] == 240. and row['status'] == 'FEASIBLE'
+    assert row['b32_calls'] == 4
+
+
+def test_feedback_full_selection_uses_same_stop_and_prefers_actual_cmax_median(monkeypatch):
+    from types import SimpleNamespace
+    import run_gnn_weld_layout as experiment
+    weights = {i: {'weight': torch.tensor(float(i))} for i in (0, 2, 3)}
+    saved = dict(training_complete=True, initial_state_dict=weights[0], state_dict=weights[2],
+        last_state_dict=weights[3], completed_epoch=3, selected_epoch=2, round_state_dicts={2: weights[2]})
+    reference = [dict(layout_id=f'validation_{i:02d}', method='GNN_WIDTH1', seed=experiment.SEED,
+        status='FEASIBLE' if i <= 6 else 'DEADLOCK', cmax_s=110. if i <= 6 else '', runtime_s=10.)
+        for i in range(1, 11)]
+    evaluated, stored, loaded = [], [], []
+    def load(split):
+        loaded.append(split)
+        return [(r['layout_id'], ()) for r in reference]
+    def evaluate(model, layouts, epoch, workers, **kwargs):
+        evaluated.append((epoch, kwargs['reconstruction_limit']))
+        return [dict(r, status='DEADLOCK' if epoch == 3 and i == 9 else 'FEASIBLE',
+                     cmax_s=100. if epoch == 0 else (105. if epoch == 2 else ('' if i == 9 else 90.)))
+                for i, r in enumerate(reference)]
+    monkeypatch.setattr(experiment, 'FEEDBACK_TEST_CSV', SimpleNamespace(exists=lambda: False))
+    monkeypatch.setattr(experiment.torch, 'load', lambda *a, **kw: saved)
+    monkeypatch.setattr(experiment.torch, 'save', lambda state, path: stored.append(state))
+    monkeypatch.setattr(experiment, 'feedback_model', lambda state: SimpleNamespace(eval=lambda: state))
+    monkeypatch.setattr(experiment, 'feedback_evaluate', evaluate)
+    monkeypatch.setattr(experiment, 'load_layouts', load)
+    monkeypatch.setattr(experiment, 'read_rows', lambda path: reference)
+    experiment.validate_feedback_complete(1)
+    assert evaluated == [(0, 100), (2, 100), (3, 100)] and loaded == ['validation']
+    assert stored[-1]['selected_epoch'] == 0 and stored[-1]['pilot_selected_epoch'] == 2
+    assert stored[-1]['full_validation_complete'] and stored[-1]['test_eligible']
+    assert stored[-1]['stopping_condition'] == 'FIXED_RECONSTRUCTIONS'
+    assert stored[-1]['budget_s'] is None and stored[-1]['pilot_budget_s'] == 120.
 
 
 def test_ranked_parent_budgets_keep_gnn_priority_and_two_distinct_supplements():

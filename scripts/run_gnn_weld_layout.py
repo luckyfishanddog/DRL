@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
+import copy
 from dataclasses import dataclass, replace
 import json
 import math
@@ -23,7 +24,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 
 from mrta_reference.geometry import optimize_directions, oriented_endpoints
 from mrta_reference.model import Operation, OperationKind, ParentWeld, RobotRoute, ScheduleResult, ScheduleStatus, ScientificConfig
-from mrta_reference.scheduler import build_operation_templates, earliest_safe_start
+from mrta_reference.scheduler import build_operation_templates, earliest_safe_start, selected_schedule_wait_blockers
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
 from mrta_baselines import AdaptedHGAConfig, AdaptedWAGConfig, run_adapted_hga_v2, run_adapted_wag_vns_v2
@@ -102,8 +103,9 @@ def rule_beam(parents):
                                      rejection_reason='; '.join(failures) or 'EMPTY_BEAM')
 
 
-def b32(result):
-    return schedule_explicit(result.solution, result.directions, CONFIG).schedule
+def b32(result, *, feasible_dispatch_observer=None):
+    return schedule_explicit(result.solution, result.directions, CONFIG,
+                             feasible_dispatch_observer=feasible_dispatch_observer).schedule
 
 
 def final_metrics(schedule):
@@ -863,13 +865,23 @@ def plan_key(solution, directions):
     return solution.patterns, solution.routes, directions
 
 
-def evaluate_once(result, seen):
+def evaluate_once(result, seen, *, blocker_cache=None):
     if result.solution is None:
         return None, False
     key = plan_key(result.solution, result.directions)
     if key in seen:
         return seen[key], False
-    schedule = b32(result)
+    if blocker_cache is None:
+        schedule = b32(result)
+    else:
+        orders = {}
+        schedule = b32(result, feasible_dispatch_observer=lambda candidate, order:
+                       orders.setdefault(candidate.operations, order))
+        events = ()
+        if schedule.feasible and any(op.kind is OperationKind.WAIT for op in schedule.operations):
+            events = selected_schedule_wait_blockers(result.solution, result.directions, schedule,
+                                                       orders[schedule.operations], CONFIG)
+        blocker_cache[key] = events
     seen[key] = schedule
     return schedule, True
 
@@ -2430,20 +2442,495 @@ def owner_cf_experiment(workers):
           'acceptance', json.dumps(saved['acceptance']), flush=True)
 
 
+FEEDBACK_MODEL = ROOT / 'models' / 'gnn_schedule_feedback.pt'
+FEEDBACK_TRAIN_CSV = FINAL_RESULTS / 'gnn_schedule_feedback_training_validation.csv'
+FEEDBACK_TEST_CSV = FINAL_RESULTS / 'gnn_schedule_feedback_test.csv'
+FEEDBACK_SOURCE = 'SCHEDULE_FEEDBACK_REINFORCE'
+FEEDBACK_METHOD = 'GNN_SCHEDULE_FEEDBACK'
+FEEDBACK_RECONSTRUCTIONS = 100
+FEEDBACK_FULL_SOURCE = 'COMPLETE_100_RECONSTRUCTIONS'
+FEEDBACK_FIELDS = ('stage', 'epoch', 'layout_id', 'seed', 'method', 'status', 'cmax_s',
+    'initial_status', 'initial_cmax_s', 'runtime_s', 'construct_s', 'reconstruction_attempts',
+    'reconstructions', 'accepted', 'b32_calls', 'cache_hits', 'deadlocks', 'numeric_failures',
+    'incomplete', 'late_candidates', 'baseline_status', 'baseline_cmax_s', 'reward', 'advantage',
+    'loss', 'steps', 'gradient_norm', 'max_processing_s', 'move_s', 'wait_s', 'diagnostic', 'source')
+
+
+def feedback_model(weights=None):
+    """Transfer the clean current-TRAIN model, excluding the HGA-taught final model."""
+    model = gnn.VNextGNN(workload_lookahead=True, joint_actions=True, schedule_feedback=True)
+    if weights is not None:
+        model.load_state_dict(weights)
+        return model
+    saved = torch.load(MODEL, map_location='cpu', weights_only=True)
+    training = saved['training']
+    if (saved['hidden_dim'], saved['heads'], training['layouts'], training['validation_layouts']) != (64, 4, 40, 10):
+        raise ValueError('initial weights do not describe the current weld-layout experiment')
+    source = saved['models']['GNN_VNEXT_WORKLOAD']['state_dict']
+    target = model.state_dict()
+    for key, value in source.items():
+        if target[key].shape == value.shape:
+            target[key].copy_(value)
+        elif key == 'policy.0.weight':
+            target[key].zero_()
+            target[key][:, :value.shape[1]].copy_(value)
+        elif key in ('assignment_mean', 'assignment_scale'):
+            target[key][:len(value)].copy_(value)
+        else:
+            raise ValueError(f'incompatible initial tensor: {key}')
+    model.load_state_dict(target)
+    return model
+
+
+def feedback_write(path, rows):
+    with path.open('a', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=FEEDBACK_FIELDS)
+        if stream.tell() == 0:
+            writer.writeheader()
+        for row in rows:
+            record = dict(method=FEEDBACK_METHOD, source=FEEDBACK_SOURCE)
+            record.update(row)
+            writer.writerow(record)
+        stream.flush()
+
+
+def feedback_reward(schedule, scale, *, incumbent=None):
+    if schedule is None or schedule.status is ScheduleStatus.NUMERIC_FAILURE:
+        return None
+    if schedule.status is ScheduleStatus.DEADLOCK:
+        return -5.
+    if not schedule.feasible:
+        return None
+    return -schedule.cmax / scale if incumbent is None else (incumbent.cmax - schedule.cmax) / scale
+
+
+def feedback_improves(candidate, incumbent):
+    return candidate is not None and candidate.feasible and (
+        incumbent is None or not incumbent.feasible or candidate.cmax < incumbent.cmax)
+
+
+def feedback_prefix(result, space, feedback, q, seed):
+    partial = lns.select_feedback_bottleneck(result.solution, feedback,
+                                            q=min(q, len(result.solution.parents)), seed=seed)
+    removed = set(partial.removed_parent_ids)
+    selected = {p.parent_id: p for p in result.solution.patterns if p.parent_id not in removed}
+    blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
+    return project_routes(result.oriented_state.routes, result.directions, set(blocks), blocks), selected
+
+
+@torch.no_grad()
+def run_feedback_gnn(parents, model, seed, *, budget=EQUAL_TIME_LIMIT, reconstruction_limit=None):
+    """Greedy joint construction and alternating 4/8-parent greedy reconstruction."""
+    started = time.perf_counter()
+    if budget is None and reconstruction_limit is None:
+        raise ValueError('construction needs a time budget or a finite reconstruction count')
+    deadline = math.inf if budget is None else started + budget
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    embeddings = model.encode_static(space.graph)
+    seen, blockers = {}, {}
+    counts = dict(reconstruction_attempts=0, reconstructions=0, accepted=0, b32_calls=0,
+                  cache_hits=0, deadlocks=0, numeric_failures=0, incomplete=0, late_candidates=0)
+    best_result = best_schedule = None
+    initial_status, initial_cmax, diagnostic = 'NO_COMPLETE_SOLUTION', None, ''
+    last_status = initial_status
+    reserve = 1.
+    rng = Random(seed)
+
+    def consider(result):
+        nonlocal best_result, best_schedule, diagnostic, last_status, reserve
+        if result.solution is None:
+            counts['incomplete'] += 1
+            diagnostic = result.rejection_reason or 'NO_COMPLETE_SOLUTION'
+            last_status = 'TIME_LIMIT' if diagnostic == 'TIME_LIMIT' else 'CONSTRUCTION_FAILED'
+            return None
+        if time.perf_counter() + reserve >= deadline:
+            counts['late_candidates'] += 1
+            last_status = 'TIME_LIMIT'
+            return None
+        evaluation_started = time.perf_counter()
+        schedule, called = evaluate_once(result, seen, blocker_cache=blockers)
+        reserve = max(reserve, 1.5 * (time.perf_counter() - evaluation_started))
+        counts['b32_calls'] += int(called)
+        counts['cache_hits'] += int(not called)
+        last_status = schedule.status.value
+        counts['deadlocks'] += int(schedule.status is ScheduleStatus.DEADLOCK)
+        counts['numeric_failures'] += int(schedule.status is ScheduleStatus.NUMERIC_FAILURE)
+        if time.perf_counter() > deadline:
+            counts['late_candidates'] += 1
+            last_status = 'TIME_LIMIT'
+            return schedule
+        if feedback_improves(schedule, best_schedule):
+            best_result, best_schedule = result, schedule
+        elif not schedule.feasible:
+            diagnostic = ' | '.join(schedule.diagnostics)
+        return schedule
+
+    # Only GNN sampling may recover a deadlocked greedy initial construction.
+    for attempt in range(3):
+        if time.perf_counter() + reserve >= deadline:
+            break
+        result = gnn.construct_vnext_gnn(parents, model, CONFIG, space=space, embeddings=embeddings,
+            rng=None if attempt == 0 else rng, deadline=deadline - reserve)
+        schedule = consider(result)
+        if attempt == 0:
+            initial_status = schedule.status.value if schedule is not None else last_status
+            initial_cmax = schedule.cmax if schedule is not None and schedule.feasible else None
+            initial_seconds = time.perf_counter() - started
+        if best_schedule is not None:
+            break
+    initial_seconds = locals().get('initial_seconds', time.perf_counter() - started)
+    initial_incumbent_cmax = best_schedule.cmax if best_schedule is not None else None
+    # No per-action B32, direction pass, literature initializer or fallback.
+    previous_repair_seconds = 0.
+    while (best_schedule is not None
+           and (reconstruction_limit is None or counts['reconstruction_attempts'] < reconstruction_limit)
+           and time.perf_counter() + reserve + previous_repair_seconds < deadline):
+        repair_started = time.perf_counter()
+        feedback = lns.schedule_feedback_summary(best_result.solution, best_schedule,
+            blockers.get(plan_key(best_result.solution, best_result.directions), ()), CONFIG)
+        q = 4 if counts['reconstruction_attempts'] % 2 == 0 else 8
+        state, selected = feedback_prefix(best_result, space, feedback, q, rng.randrange(2**32))
+        counts['reconstruction_attempts'] += 1
+        candidate = gnn.construct_vnext_gnn(parents, model, CONFIG, space=space, embeddings=embeddings,
+            state=state, selected=selected, feedback=feedback, deadline=deadline - reserve)
+        counts['reconstructions'] += int(candidate.solution is not None)
+        prior = best_schedule
+        consider(candidate)
+        counts['accepted'] += int(best_schedule is not prior)
+        previous_repair_seconds = time.perf_counter() - repair_started
+        if candidate.rejection_reason == 'TIME_LIMIT':
+            break
+    return dict(status='FEASIBLE' if best_schedule is not None else last_status,
+        cmax_s=best_schedule.cmax if best_schedule is not None else None,
+        initial_status=initial_status, initial_cmax_s=initial_cmax,
+        runtime_s=time.perf_counter() - started, construct_s=initial_seconds, **counts,
+        diagnostic=diagnostic if best_schedule is None else json.dumps(
+            dict(initial_incumbent_cmax_s=initial_incumbent_cmax)), **final_metrics(best_schedule))
+
+
+def feedback_update(model, space, trace, advantage, optimizer):
+    if advantage is None or not trace:
+        return None, None
+    optimizer.zero_grad(set_to_none=True)
+    embeddings = model.encode_static(space.graph)
+    log_prob = torch.stack([model.feedback_scores(space, embeddings, inputs).log_softmax(0)[choice]
+                            for inputs, choice in trace]).sum()
+    loss = -float(advantage) * log_prob
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+    optimizer.step()
+    return float(loss.detach()), float(norm)
+
+
+def feedback_train_layout(model, baseline, layout, epoch, optimizer, *, training_stage='train'):
+    name, parents = layout
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    scale = max(1., sum(CONFIG.process_time(p.length) for p in parents) / 4.)
+    seen, blockers, rows = {}, {}, []
+    rng = Random(SEED + epoch * 1000 + int(name.rsplit('_', 1)[1]))
+
+    def construct(policy, state=None, selected=None, feedback=None, sample=False):
+        trace = []
+        with torch.no_grad():
+            result = gnn.construct_vnext_gnn(parents, policy, CONFIG, space=space, state=state,
+                selected=selected, feedback=feedback, rng=rng if sample else None,
+                policy_observer=(lambda inputs, choice: trace.append((inputs, choice))) if sample else None)
+        schedule, called = evaluate_once(result, seen, blocker_cache=blockers)
+        return result, schedule, trace, int(called)
+
+    def update(phase, sampled, greedy, started, incumbent=None):
+        result, schedule, trace, calls = sampled
+        _, base_schedule, _, base_calls = greedy
+        reward = feedback_reward(schedule, scale, incumbent=incumbent)
+        base_reward = feedback_reward(base_schedule, scale, incumbent=incumbent)
+        advantage = None if reward is None or base_reward is None else reward - base_reward
+        loss, norm = feedback_update(model, space, trace, advantage, optimizer)
+        rows.append(dict(stage=training_stage + '_' + phase, epoch=epoch, layout_id=name, seed=SEED,
+            status=schedule.status.value if schedule else 'CONSTRUCTION_FAILED',
+            cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
+            baseline_status=base_schedule.status.value if base_schedule else 'CONSTRUCTION_FAILED',
+            baseline_cmax_s=base_schedule.cmax if base_schedule is not None and base_schedule.feasible else None,
+            initial_cmax_s=incumbent.cmax if incumbent else None, runtime_s=time.perf_counter() - started,
+            b32_calls=calls + base_calls, cache_hits=int(not calls and result.solution is not None),
+            deadlocks=sum(s is not None and s.status is ScheduleStatus.DEADLOCK for s in (schedule, base_schedule)),
+            numeric_failures=sum(s is not None and s.status is ScheduleStatus.NUMERIC_FAILURE for s in (schedule, base_schedule)),
+            reward=reward, advantage=advantage, loss=loss, steps=len(trace), gradient_norm=norm,
+            diagnostic=result.rejection_reason or (' | '.join(schedule.diagnostics) if schedule is not None and not schedule.feasible else '')))
+
+    started = time.perf_counter()
+    greedy = construct(baseline)
+    sampled = construct(model, sample=True)
+    update('construct', sampled, greedy, started)
+    incumbent_result, incumbent_schedule = (sampled[:2] if feedback_improves(sampled[1], greedy[1]) else greedy[:2])
+    if incumbent_schedule is not None and incumbent_schedule.feasible:
+        for q in (4, 8):
+            started = time.perf_counter()
+            feedback = lns.schedule_feedback_summary(incumbent_result.solution, incumbent_schedule,
+                blockers.get(plan_key(incumbent_result.solution, incumbent_result.directions), ()), CONFIG)
+            state, selected = feedback_prefix(incumbent_result, space, feedback, q, rng.randrange(2**32))
+            greedy = construct(baseline, state, selected, feedback)
+            sampled = construct(model, state, selected, feedback, sample=True)
+            update('repair' + str(q), sampled, greedy, started, incumbent_schedule)
+            for result, schedule, _, _ in (greedy, sampled):
+                if feedback_improves(schedule, incumbent_schedule):
+                    incumbent_result, incumbent_schedule = result, schedule
+    return rows
+
+
+def configure_feedback_worker(serialized):
+    configure_cpu()
+    global worker_feedback_model
+    worker_feedback_model = feedback_model(pickle.loads(serialized)).eval()
+
+
+def feedback_job(job):
+    name, parents, seed, stage, epoch, *limits = job
+    print(json.dumps(dict(event='feedback_start', stage=stage, epoch=epoch,
+                          layout_id=name, seed=seed)), flush=True)
+    options = dict(budget=None, reconstruction_limit=limits[0]) if limits else {}
+    row = dict(stage=stage, epoch=epoch, layout_id=name, seed=seed,
+               **run_feedback_gnn(parents, worker_feedback_model, seed, **options))
+    if limits:
+        row['source'] = FEEDBACK_FULL_SOURCE
+    return row
+
+
+def feedback_evaluate(model, layouts, epoch, workers, *, split='validation', reconstruction_limit=None):
+    path = FEEDBACK_TEST_CSV if split == 'test' else FEEDBACK_TRAIN_CSV
+    seeds = TEST_SEEDS if split == 'test' else (SEED,)
+    stage = 'full_validation' if split == 'validation' and reconstruction_limit is not None else split
+    extra = () if reconstruction_limit is None else (reconstruction_limit,)
+    jobs = [(name, parents, seed, stage, epoch, *extra) for name, parents in layouts for seed in seeds]
+    retained = [r for r in read_rows(path) if r['stage'] == stage and int(r['epoch']) == epoch
+                and (reconstruction_limit is None or r['source'] == FEEDBACK_FULL_SOURCE)]
+    completed = {(r['layout_id'], int(r['seed'])) for r in retained}
+    jobs = [job for job in jobs if (job[0], job[2]) not in completed]
+    with ProcessPoolExecutor(max_workers=workers, initializer=configure_feedback_worker,
+                             initargs=(pickle.dumps(model.state_dict()),)) as pool:
+        futures = [pool.submit(feedback_job, job) for job in jobs]
+        for future in as_completed(futures):
+            row = future.result()
+            print(json.dumps(row, ensure_ascii=False), flush=True)
+            feedback_write(path, [row])
+            retained.append(row)
+    return retained
+
+
+def feedback_summary(rows):
+    good = [r for r in rows if r['status'] == 'FEASIBLE']
+    return dict(runs=len(rows), feasible=len(good),
+        median_cmax_s=median(float(r['cmax_s']) for r in good) if good else None,
+        median_runtime_s=median(float(r['runtime_s']) for r in rows) if rows else None)
+
+
+def feedback_paired(rows, reference):
+    first = {(r['layout_id'], int(r['seed'])): r for r in rows}
+    second = {(r['layout_id'], int(r['seed'])): r for r in reference}
+    changes = []; wins = ties = losses = 0
+    for key in first.keys() & second.keys():
+        a, b = first[key], second[key]
+        if a['status'] == b['status'] == 'FEASIBLE':
+            change = (float(a['cmax_s']) / float(b['cmax_s']) - 1.) * 100.
+            changes.append(change)
+            wins += int(change < -1e-7); ties += int(abs(change) <= 1e-7); losses += int(change > 1e-7)
+    return dict(common=len(changes), wins=wins, ties=ties, losses=losses,
+                median_change_pct=median(changes) if changes else None)
+
+
+def train_feedback(workers, rounds, *, expanded=False):
+    configure_cpu(); torch.manual_seed(SEED)
+    base_layouts = load_layouts('train')
+    layouts = load_layouts('train_expanded') if expanded else base_layouts
+    validation = load_layouts('validation')
+    expected = (120, 11267, 10, 936) if expanded else (40, 3749, 10, 936)
+    if (len(layouts), sum(len(p) for _, p in layouts), len(validation), sum(len(p) for _, p in validation)) != expected:
+        raise ValueError('the requested packed weld-layout split was not loaded')
+    if expanded and layouts[:len(base_layouts)] != base_layouts:
+        raise ValueError('expanded packed layouts must preserve the original 40 examples')
+    model = feedback_model().eval()
+    selected = copy.deepcopy(model.state_dict())
+    saved = dict(state_dict=selected, initial_state_dict=selected, selected_epoch=0, seed=SEED,
+        hidden_dim=64, heads=4, workload_lookahead=True, joint_actions=True, schedule_feedback=True,
+        initialization='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD',
+        excluded_initialization='gnn_weld_layout_final.pt used HGA teachers',
+        training_layouts=[name for name, _ in layouts], training_parents=expected[1],
+        validation_layouts=[name for name, _ in validation], budget_s=EQUAL_TIME_LIMIT,
+        learning_rate=1e-4, deadlock_reward=-5., max_initial_attempts=3, removal_sizes=(4, 8),
+        history=[], test_eligible=False, training_complete=False)
+    start_epoch = 1
+    if expanded:
+        saved = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
+        if not saved['training_complete'] or FEEDBACK_TEST_CSV.exists():
+            raise ValueError('continue before formal TEST and after the current training round has finished')
+        start_epoch = saved['completed_epoch'] + 1
+        if start_epoch > rounds:
+            print('The requested total number of feedback rounds is already complete.', flush=True)
+            return saved
+        selected = saved['state_dict']
+        model = feedback_model(selected).eval()
+        saved.setdefault('forty_layout_state_dict', saved['last_state_dict'])
+        saved.setdefault('original_training_layouts', saved['training_layouts'])
+        saved.update(training_layouts=[name for name, _ in layouts], training_parents=expected[1],
+                     training_dataset='data/weld_layout/train_expanded.jsonl',
+                     continued_from_selected_epoch=saved['selected_epoch'], training_complete=False)
+        selected_rows = [r for r in read_rows(FEEDBACK_TRAIN_CSV)
+                         if r['stage'] == 'validation' and int(r['epoch']) == saved['selected_epoch']]
+        if len(selected_rows) != len(validation):
+            raise ValueError('the selected model must retain its complete original validation results')
+    elif FEEDBACK_MODEL.exists():
+        previous = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
+        if previous.get('training_complete') or previous.get('history'):
+            raise ValueError('the recorded feedback training already has results; preserve that experiment')
+        # Resume an interrupted initial validation from its unchanged weights.
+        saved = previous
+        selected = saved['state_dict']
+        model = feedback_model(selected).eval()
+    torch.save(saved, FEEDBACK_MODEL)
+    if not expanded:
+        initial_rows = feedback_evaluate(model, validation, 0, workers)
+        selected_rows = initial_rows
+        saved['history'].append(dict(epoch=0, **feedback_summary(initial_rows)))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    for epoch in range(start_epoch, rounds + 1):
+        baseline = feedback_model(selected).eval().requires_grad_(False)
+        model.train()
+        ordered = list(layouts); Random(SEED + epoch).shuffle(ordered)
+        for index, layout in enumerate(ordered):
+            rows = feedback_train_layout(model, baseline, layout, epoch, optimizer,
+                                         training_stage='train_expanded' if expanded else 'train')
+            feedback_write(FEEDBACK_TRAIN_CSV, rows)
+            print(json.dumps(dict(epoch=epoch, trained=index + 1, layout_id=layout[0], updates=len(rows),
+                                  b32_calls=sum(r['b32_calls'] for r in rows)), ensure_ascii=False), flush=True)
+        model.eval()
+        rows = feedback_evaluate(model, validation, epoch, workers)
+        summary = feedback_summary(rows); previous = feedback_summary(selected_rows)
+        pair = feedback_paired(rows, selected_rows)
+        improved = summary['feasible'] >= previous['feasible'] and pair['common'] > 0 and (
+            pair['median_change_pct'] < 0. or (summary['feasible'] > previous['feasible'] and pair['median_change_pct'] <= 0.))
+        saved['history'].append(dict(epoch=epoch, training_layouts=len(layouts),
+                                     training_parents=expected[1], paired_to_selected=pair, improved=improved, **summary))
+        saved['last_state_dict'] = copy.deepcopy(model.state_dict())
+        saved['completed_epoch'] = epoch
+        if improved:
+            selected = copy.deepcopy(model.state_dict()); selected_rows = rows
+            saved.update(state_dict=selected, selected_epoch=epoch, test_eligible=True)
+        saved.update(training_complete=True)
+        torch.save(saved, FEEDBACK_MODEL)
+        print(json.dumps(dict(history=saved['history'], test_eligible=saved['test_eligible']), ensure_ascii=False), flush=True)
+        if not improved:
+            break
+    return saved
+
+
+def test_feedback(workers):
+    saved = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
+    if not saved['training_complete'] or not saved.get('full_validation_complete') or not saved['test_eligible']:
+        print('Complete-run VALIDATION has not selected an eligible model; no formal TEST is run.', flush=True)
+        return
+    model = feedback_model(saved['state_dict']).eval()
+    feedback_evaluate(model, load_layouts('test'), saved['selected_epoch'], workers, split='test',
+                      reconstruction_limit=FEEDBACK_RECONSTRUCTIONS)
+
+
+def validate_feedback_complete(workers):
+    """Select weights on original VALIDATION under the user-chosen full stop."""
+    saved = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
+    if not saved['training_complete'] or FEEDBACK_TEST_CSV.exists():
+        raise ValueError('complete-run selection must follow training and precede formal TEST')
+    candidates = {0: saved['initial_state_dict'],
+                  saved['completed_epoch']: saved['last_state_dict']}
+    candidates.update(saved.get('round_state_dicts', {}))
+    candidates[saved['selected_epoch']] = saved['state_dict']
+    layouts = load_layouts('validation')
+    records, selected_epoch, selected_rows = [], None, None
+    for epoch, weights in sorted(candidates.items()):
+        rows = feedback_evaluate(feedback_model(weights).eval(), layouts, epoch, workers,
+                                 reconstruction_limit=FEEDBACK_RECONSTRUCTIONS)
+        summary = feedback_summary(rows)
+        record = dict(epoch=epoch, **summary)
+        if selected_rows is not None:
+            record['paired_to_selected'] = feedback_paired(rows, selected_rows)
+        previous = feedback_summary(selected_rows) if selected_rows is not None else None
+        if previous is None or (summary['feasible'], -(summary['median_cmax_s'] or math.inf)) > (
+                previous['feasible'], -(previous['median_cmax_s'] or math.inf)):
+            selected_epoch, selected_rows = epoch, rows
+        records.append(record)
+    reference = [dict(r, seed=SEED) for r in read_rows(BEAM_VALIDATION_CSV) if r['method'] == 'GNN_WIDTH1']
+    pair = feedback_paired(selected_rows, reference)
+    eligible = (feedback_summary(selected_rows)['feasible'] >= feedback_summary(reference)['feasible']
+                and pair['common'] > 0 and pair['median_change_pct'] < 0.)
+    saved.setdefault('pilot_selected_epoch', saved['selected_epoch'])
+    saved.setdefault('pilot_budget_s', saved.get('budget_s', EQUAL_TIME_LIMIT))
+    saved.update(state_dict=candidates[selected_epoch], selected_epoch=selected_epoch,
+        full_validation_complete=True, full_validation_history=records,
+        budget_s=None, reconstruction_limit=FEEDBACK_RECONSTRUCTIONS, stopping_condition='FIXED_RECONSTRUCTIONS',
+        formal_source=FEEDBACK_FULL_SOURCE, test_eligible=eligible,
+        full_validation_vs_previous_gnn=pair)
+    torch.save(saved, FEEDBACK_MODEL)
+    print(json.dumps(dict(full_validation_history=records, selected_epoch=selected_epoch,
+                         paired_to_previous_gnn=pair, test_eligible=eligible)), flush=True)
+
+
+def summarize_feedback():
+    """Read complete runs and original baselines without rewriting any evidence."""
+    rows = [r for r in read_rows(FEEDBACK_TEST_CSV) if r['source'] == FEEDBACK_FULL_SOURCE]
+    names = {r['layout_id'] for r in rows}
+    references = {'RULE/BEAM': [r for r in read_rows(FINAL_RESULTS / 'rule_beam_results.csv')
+                               if r['layout_id'] in names and r['method'] == 'RULE/BEAM']}
+    for method, (_, _, filename) in BASELINES.items():
+        references[method] = [r for r in read_rows(FINAL_RESULTS / filename)
+                              if r['layout_id'] in names and completed_baseline_row(r)]
+    def metrics(records):
+        feasible = [r for r in records if r['status'] == 'FEASIBLE']
+        times = [float(r['runtime_s']) for r in records if r.get('runtime_s')]
+        return dict(runs=len(records), feasible=len(feasible),
+                    median_cmax_s=median(float(r['cmax_s']) for r in feasible) if feasible else None,
+                    median_runtime_s=median(times) if times else None)
+    summary = dict(gnn=metrics(rows), baselines={name: metrics(group) for name, group in references.items()},
+                   paired={name: feedback_paired(rows, group) for name, group in references.items()})
+    gains = []
+    for row in rows:
+        if row['status'] != 'FEASIBLE':
+            continue
+        before = float(row['initial_cmax_s']) if row['initial_cmax_s'] else None
+        if row.get('diagnostic', '').startswith('{'):
+            before = json.loads(row['diagnostic']).get('initial_incumbent_cmax_s', before)
+        if before is not None:
+            gains.append((float(row['cmax_s']) / before - 1.) * 100.)
+    summary['search'] = dict(initial_greedy_feasible=sum(r['initial_status'] == 'FEASIBLE' for r in rows),
+        gain_pairs=len(gains), median_cmax_change_from_first_incumbent_pct=median(gains) if gains else None,
+        b32_calls=sum(int(r['b32_calls']) for r in rows), cache_hits=sum(int(r['cache_hits']) for r in rows),
+        reconstructions=sum(int(r['reconstructions']) for r in rows), accepted=sum(int(r['accepted']) for r in rows),
+        max_runtime_s=max((float(r['runtime_s']) for r in rows), default=None))
+    print(json.dumps(summary, ensure_ascii=False), flush=True)
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary'))
     parser.add_argument('--workers', type=int, default=7, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
     parser.add_argument('--representative', action='store_true', help='small/median/large layouts, first seed only')
+    parser.add_argument('--rounds', type=int, choices=(1, 2, 3), default=3, help='maximum feedback rounds; stop if validation does not improve')
     parser.add_argument('--time-limit', type=float, choices=(EQUAL_TIME_LIMIT,),
                         help='120-second TEST comparison; omit for the original full iteration budget')
     args = parser.parse_args()
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'baselines':
+    if args.stage == 'feedback-train':
+        train_feedback(args.workers, args.rounds)
+    elif args.stage == 'feedback-continue':
+        train_feedback(args.workers, args.rounds, expanded=True)
+    elif args.stage == 'feedback-full-validation':
+        validate_feedback_complete(args.workers)
+    elif args.stage == 'feedback-summary':
+        summarize_feedback()
+    elif args.stage == 'feedback-test':
+        test_feedback(args.workers)
+    elif args.stage == 'baselines':
         run_baselines(args.workers, args.method, split=args.split, representative=args.representative,
                       time_limit=args.time_limit)
     elif args.stage == 'hga-alpha-sensitivity':

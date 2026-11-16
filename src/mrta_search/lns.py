@@ -411,6 +411,79 @@ def _remove_parent_set(
     )
 
 
+def schedule_feedback_summary(current, schedule, blockers, config):
+    """Observed timeline costs and exact selected-rollout WAIT evidence only.
+
+    Forbidden interval coverage describes observed blockers, not a causal WAIT
+    decomposition. Geometry/proximity never creates a blocking relationship.
+    """
+    if not schedule.feasible:
+        raise ValueError('schedule feedback requires a feasible incumbent')
+    blocks = block_map(current, config)
+    processing, move, robot_wait = [0.] * 4, [0.] * 4, [0.] * 4
+    parent_costs = {p.parent_id: [0.] * 4 for p in current.parents}
+    parent_wait, parent_blocked = {}, {}
+    mapped_wait = {event.waiting.operation_id: event.delayed_block_id for event in blockers}
+
+    def parent_for(op):
+        block_id = mapped_wait.get(op.operation_id, op.block_id)
+        if block_id in blocks:
+            return blocks[block_id].parent_id
+        # The scheduler's MOVE/WAIT operation ID retains its destination index.
+        try:
+            index = int(op.operation_id.split(':B', 1)[1].split(':', 1)[0])
+            return blocks[current.routes[op.robot_id].block_ids[index]].parent_id
+        except (IndexError, KeyError, ValueError):
+            return None
+
+    for op in schedule.operations:
+        parent = parent_for(op)
+        if op.kind is OperationKind.WAIT:
+            robot_wait[op.robot_id] += op.duration
+            if parent is not None:
+                parent_wait[parent] = parent_wait.get(parent, 0.) + op.duration
+        elif op.kind is OperationKind.MOVE:
+            move[op.robot_id] += op.duration
+        else:
+            processing[op.robot_id] += op.duration
+        if parent is not None:
+            parent_costs[parent][op.robot_id] += op.duration
+    for event in blockers:
+        by_parent = {}
+        for _, block_id, intervals in event.blocker_intervals:
+            if block_id in blocks:
+                by_parent.setdefault(blocks[block_id].parent_id, []).extend(intervals)
+        for parent, intervals in by_parent.items():
+            end, covered = -math.inf, 0.
+            for lo, hi in sorted(intervals):
+                covered += max(0., hi - max(lo, end))
+                end = max(end, hi)
+            parent_blocked[parent] = parent_blocked.get(parent, 0.) + covered
+    maximum = max(max(schedule.robot_completion), config.numeric_epsilon)
+    peak_load = max(max(processing), config.numeric_epsilon)
+    criticality = [schedule.robot_completion[r] / maximum * (.5 + .5 * processing[r] / peak_load)
+                   for r in range(4)]
+    scores = {parent: sum(cost * criticality[r] for r, cost in enumerate(costs))
+                       + parent_blocked.get(parent, 0.) for parent, costs in parent_costs.items()}
+    return dict(completion=schedule.robot_completion, robot_wait=tuple(robot_wait),
+                parent_wait=parent_wait, parent_blocked=parent_blocked, scores=scores,
+                processing=tuple(processing), move=tuple(move))
+
+
+def select_feedback_bottleneck(current, feedback, *, q, seed):
+    """One completion/load/MOVE/observed-WAIT selector, closed at parent level."""
+    if not 1 <= q <= len(current.parents):
+        raise ValueError('invalid parent removal count')
+    scores = feedback['scores']
+    rng = random.Random(seed)
+    # Always include the largest observed contributor; vary the remaining
+    # context so deterministic greedy repair can explore different subproblems.
+    anchor = min(scores, key=lambda p: (-scores[p], p))
+    order = sorted((p for p in scores if p != anchor),
+                   key=lambda p: -math.log(max(rng.random(), 1e-15)) / max(scores[p], 1e-9))
+    return _remove_parent_set(current, [anchor, *order[:q - 1]])
+
+
 def shared_y_parent_links(
     current: CanonicalSolution,
     schedule: ScheduleResult,
