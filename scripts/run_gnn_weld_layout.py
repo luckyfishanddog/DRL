@@ -55,6 +55,8 @@ BASELINE_ITERATIONS = {'WAG+VNS': 500, 'HGA': 200000}
 BASELINE_SOURCES = {'WAG+VNS': 'PARTIAL_LNS_V1', 'HGA': 'ORIENTED_COORDINATED_VND_V1'}
 HGA_ROUTE_SOURCE = 'ORIENTED_ROUTE_VND_NATIVE_SELECT_V1'
 FORMAL_BASELINE_SOURCES = {**BASELINE_SOURCES, 'HGA': HGA_ROUTE_SOURCE}
+EQUAL_TIME_SOURCE = 'EQUAL_TIME_120S'
+EQUAL_TIME_LIMIT = 120.
 RESULT_FIELDS = ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'runtime_s', 'construct_s',
                  'cmax_5_s', 'cmax_30_s', 'cmax_60_s', 'native_cmax_s', 'native_cmax_5_s',
                  'native_cmax_30_s', 'native_cmax_60_s', 'max_processing_s', 'move_s', 'wait_s',
@@ -179,16 +181,19 @@ def baseline_run(parents, method, seed, budget, checkpoints, *, iterations=None,
                checkpoints=checkpoints, certify=False, candidate_evaluator=candidate_evaluator)
 
 
-def baseline_job(job):
+def baseline_job(job, *, time_limit=None):
     (name, parents), method, seed = job
+    equal_time = time_limit is not None
+    source = EQUAL_TIME_SOURCE if equal_time else FORMAL_BASELINE_SOURCES[method]
     started = time.perf_counter()
-    result = baseline_run(parents, method, seed, math.inf, () if method == 'HGA' else CHECKPOINTS,
+    result = baseline_run(parents, method, seed, time_limit if equal_time else math.inf,
+                          () if equal_time or method == 'HGA' else CHECKPOINTS,
                           iterations=BASELINE_ITERATIONS[method], candidate_evaluator=NATIVE_EVALUATORS[method],
                           formal=True)
     search_runtime = time.perf_counter() - started
-    complete = result.iterations == BASELINE_ITERATIONS[method]
+    complete = equal_time or result.iterations == BASELINE_ITERATIONS[method]
     print('BASELINE_STATS', json.dumps(dict(layout_id=name, method=method, seed=seed,
-          source=FORMAL_BASELINE_SOURCES[method], iterations=result.iterations,
+          source=source, iterations=result.iterations,
           accounting={key: value for key, value in result.accounting.items()
                       if value is None or isinstance(value, (int, float))})), flush=True)
     best = result.timely_best
@@ -199,7 +204,23 @@ def baseline_job(job):
         diagnostic = f"Native deadlocks={result.accounting['remaining_deadlock']} | {result.termination_reason}"
     else:
         diagnostic = '' if schedule.feasible else ' | '.join(schedule.diagnostics[:2])
-    if method == 'HGA':
+    if equal_time:
+        diagnostic = json.dumps(dict(phase='EQUAL_TIME', run_status='COMPLETED',
+            algorithm_source=FORMAL_BASELINE_SOURCES[method], time_limit_s=time_limit,
+            search_runtime_s=result.actual_runtime, search_call_runtime_s=search_runtime,
+            initialization_s=result.initialization_time, b32_runtime_s=b32_runtime,
+            iterations=result.iterations, termination_reason=result.termination_reason,
+            overshoot_s=result.overshoot, timely_best_completed_at_s=best.completed_at if best else None,
+            late_best_updates=sum(event.elapsed > time_limit for event in result.best_events),
+            native_calls=result.reference_calls, certifier_calls=result.certifier_calls,
+            vnd_unique_calls=result.accounting.get('vnd_unique_calls'),
+            vnd_cache_hits=result.accounting.get('vnd_cache_hits'),
+            vnd_native_candidate_evaluations=result.accounting.get('vnd_native_candidate_evaluations'),
+            vnd_pass_cap_hits=result.accounting.get('vnd_pass_cap_hits'),
+            vnd_candidate_cap_hits=result.accounting.get('vnd_candidate_cap_hits'),
+            b32_status=schedule.status.value if schedule else 'NO_TIMELY_CANDIDATE',
+            b32_diagnostic=diagnostic))
+    elif method == 'HGA':
         diagnostic = json.dumps(dict(phase='FULL', run_status='COMPLETED' if complete else 'INCOMPLETE',
             search_runtime_s=search_runtime, initialization_s=result.initialization_time,
             vnd_s=result.accounting['local_search_time'], native_coordination_s=result.accounting['scheduler_time'],
@@ -211,11 +232,12 @@ def baseline_job(job):
             b32_runtime_s=b32_runtime, b32_diagnostic=diagnostic))
     return dict(layout_id=name, seed=seed, method=method,
                 status=('INCOMPLETE' if not complete else
-                        schedule.status.value if schedule else 'NO_NATIVE_SOLUTION'),
+                        schedule.status.value if schedule else
+                        'NO_TIMELY_CANDIDATE' if equal_time else 'NO_NATIVE_SOLUTION'),
                 cmax_s=schedule.cmax if schedule and schedule.feasible else None,
                 runtime_s=time.perf_counter() - started,
                 b32_calls=int(schedule is not None), diagnostic=diagnostic,
-                source=FORMAL_BASELINE_SOURCES[method], iterations=result.iterations,
+                source=source, iterations=result.iterations,
                 native_cmax_s=best.schedule.cmax if best else None,
                 **baseline_metrics(best, schedule))
 
@@ -419,8 +441,39 @@ def completed_baseline_row(row):
     return True
 
 
-def configure_baseline_worker(hga_warmup=None):
-    """One compute thread; compile HGA before any measured formal job."""
+def completed_equal_time_row(row):
+    """Normal finite-budget returns count, including failed final B32 or no timely candidate."""
+    method = row.get('method')
+    try:
+        if method not in BASELINES or row.get('source') != EQUAL_TIME_SOURCE or int(row['seed']) not in TEST_SEEDS:
+            return False
+        detail = json.loads(row['diagnostic'])
+        if (detail.get('phase') != 'EQUAL_TIME' or detail.get('run_status') != 'COMPLETED'
+                or detail.get('algorithm_source') != FORMAL_BASELINE_SOURCES[method]
+                or detail.get('time_limit_s') != EQUAL_TIME_LIMIT
+                or int(row['iterations']) != detail['iterations']
+                or not 0 <= int(row['iterations']) <= BASELINE_ITERATIONS[method]):
+            return False
+        for value in (row['runtime_s'], detail['search_runtime_s']):
+            if not math.isfinite(float(value)) or float(value) <= 0.:
+                return False
+        if not math.isfinite(detail['b32_runtime_s']) or detail['b32_runtime_s'] < 0.:
+            return False
+        if row['status'] == 'NO_TIMELY_CANDIDATE':
+            return (int(row['b32_calls']) == 0 and detail['timely_best_completed_at_s'] is None
+                    and detail['b32_runtime_s'] == 0. and not row.get('cmax_s') and not row.get('native_cmax_s'))
+        if (row['status'] not in {status.value for status in ScheduleStatus} or int(row['b32_calls']) != 1
+                or not 0. <= detail['timely_best_completed_at_s'] <= EQUAL_TIME_LIMIT):
+            return False
+        if row['status'] == 'FEASIBLE':
+            return math.isfinite(float(row['cmax_s'])) and float(row['cmax_s']) > 0.
+        return not row.get('cmax_s')
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def configure_baseline_worker(hga_warmup=None, wag_warmup=None):
+    """One compute thread; JIT warm-up is outside every measured job."""
     from numba import set_num_threads
     configure_cpu()
     set_num_threads(1)
@@ -430,9 +483,20 @@ def configure_baseline_worker(hga_warmup=None):
                             candidate_evaluator=priority_schedule, formal=True)
         print('BASELINE_HGA_WARMUP', warm.iterations, time.perf_counter() - started,
               'excluded from measured jobs; no B32', flush=True)
+    if wag_warmup is not None:
+        started = time.perf_counter()
+        warm = baseline_run(wag_warmup, 'WAG+VNS', SEED, math.inf, (), iterations=20,
+                            candidate_evaluator=priority_schedule, formal=True)
+        print('BASELINE_WAG_WARMUP', warm.iterations, time.perf_counter() - started,
+              'Move/Swap/LNS', *(warm.accounting[key] for key in ('move_calls', 'swap_calls', 'lns_calls')),
+              'excluded from measured jobs; no B32', flush=True)
 
 
-def run_baselines(workers, only=None, *, split='validation', representative=False):
+def run_baselines(workers, only=None, *, split='validation', representative=False, time_limit=None):
+    if time_limit is not None and (time_limit != EQUAL_TIME_LIMIT or split != 'test'
+                                   or only not in BASELINES or representative):
+        raise ValueError('equal-time runs require one method, all TEST layouts and --time-limit 120')
+    is_completed = completed_baseline_row if time_limit is None else completed_equal_time_row
     layouts = load_layouts(split)
     seeds = TEST_SEEDS
     if representative:
@@ -444,31 +508,35 @@ def run_baselines(workers, only=None, *, split='validation', representative=Fals
     for path in paths.values():
         rows = read_rows(path)
         done.update((row['layout_id'], row['method'], int(row['seed'])) for row in rows
-                    if completed_baseline_row(row))
+                    if is_completed(row))
     jobs = [(layout, method, seed) for layout in layouts for seed in seeds for method in paths
             if (layout[0], method, seed) not in done]
     expected = {(layout[0], method, seed) for layout in layouts for seed in seeds for method in paths}
-    workers = max(1, min(workers, 3)) if 'HGA' in paths else workers
+    workers = max(1, min(workers, 3)) if 'HGA' in paths or time_limit is not None else workers
+    sources = {m: EQUAL_TIME_SOURCE if time_limit is not None else FORMAL_BASELINE_SOURCES[m] for m in paths}
     print('BASELINE_BATCH_START', json.dumps(dict(split=split, workers=workers, expected=len(expected),
-          completed=len(expected & done), remaining=len(jobs), sources={m: FORMAL_BASELINE_SOURCES[m] for m in paths})),
+          completed=len(expected & done), remaining=len(jobs), sources=sources, time_limit_s=time_limit)),
           flush=True)
     if not jobs:
         return []
     warmup = dict(load_layouts('validation'))['validation_07'] if 'HGA' in paths else None
+    wag_warmup = dict(load_layouts('validation'))['validation_07'] if time_limit is not None and 'WAG+VNS' in paths else None
     completed = []
-    with ProcessPoolExecutor(max_workers=workers, initializer=configure_baseline_worker, initargs=(warmup,)) as executor:
-        futures = {executor.submit(baseline_job, job): job for job in jobs}
+    with ProcessPoolExecutor(max_workers=workers, initializer=configure_baseline_worker,
+                             initargs=(warmup, wag_warmup)) as executor:
+        futures = {executor.submit(baseline_job, job, time_limit=time_limit): job for job in jobs}
         for future in as_completed(futures):
             try:
                 row = future.result()
             except Exception as error:
                 (name, _), method, seed = futures[future]
                 row = dict(layout_id=name, method=method, seed=seed, status='INCOMPLETE',
-                           source=FORMAL_BASELINE_SOURCES[method],
-                           diagnostic=json.dumps(dict(phase='FULL', run_status='INCOMPLETE', error=repr(error))))
+                           source=sources[method],
+                           diagnostic=json.dumps(dict(phase='FULL' if time_limit is None else 'EQUAL_TIME',
+                               run_status='INCOMPLETE', time_limit_s=time_limit, error=repr(error))))
             print('BASELINE', json.dumps(row), flush=True)
             write_rows(paths[row['method']], [row], append=True)
-            if completed_baseline_row(row):
+            if is_completed(row):
                 done.add((row['layout_id'], row['method'], int(row['seed'])))
                 completed.append(row)
             print('BASELINE_BATCH_PROGRESS', split, len(expected & done), '/', len(expected), flush=True)
@@ -1252,8 +1320,92 @@ def write_comparison():
     print('COMPARISON', len(rows), 'available rows of', 6 * len(layouts) * len(TEST_SEEDS), flush=True)
 
 
-def summarize_optimized_baselines():
+def summarize_equal_time_baselines():
+    """120-second TEST records, with seeds grouped before the layout comparison."""
+    layout_ids = {name for name, _ in load_layouts('test')}
+    records = [r for _, _, name in BASELINES.values() for r in read_rows(FINAL_RESULTS / name)
+               if completed_equal_time_row(r) and r['layout_id'] in layout_ids]
+    rows = list({(r['layout_id'], r['method'], int(r['seed'])): r for r in records}.values())
+    def average(values):
+        return sum(values) / len(values) if values else None
+    summaries = []
+    for method in BASELINES:
+        selected = [r for r in rows if r['method'] == method]
+        if not selected:
+            continue
+        details = [json.loads(r['diagnostic']) for r in selected]
+        cmax = [float(r['cmax_s']) for r in selected if r['status'] == 'FEASIBLE']
+        times = [float(r['runtime_s']) for r in selected]
+        search = [d['search_runtime_s'] for d in details]
+        b32_times = [d['b32_runtime_s'] for d in details]
+        iterations = [int(r['iterations']) for r in selected]
+        overshoot = [d['overshoot_s'] for d in details]
+        summary = dict(split='test', method=method, source=EQUAL_TIME_SOURCE,
+            algorithm_source=FORMAL_BASELINE_SOURCES[method], time_limit_s=EQUAL_TIME_LIMIT,
+            runs=len(selected), expected_runs=len(layout_ids) * len(TEST_SEEDS),
+            feasible=len(cmax), feasible_rate=len(cmax) / len(selected),
+            deadlock=sum(r['status'] == 'DEADLOCK' for r in selected),
+            no_timely_candidate=sum(r['status'] == 'NO_TIMELY_CANDIDATE' for r in selected),
+            mean_cmax_s=average(cmax), median_cmax_s=median(cmax) if cmax else None,
+            mean_runtime_s=average(times), median_runtime_s=median(times),
+            mean_search_runtime_s=average(search), median_search_runtime_s=median(search), max_search_runtime_s=max(search),
+            mean_b32_runtime_s=average(b32_times), median_b32_runtime_s=median(b32_times),
+            min_iterations=min(iterations), mean_iterations=average(iterations), median_iterations=median(iterations),
+            max_iterations=max(iterations), iteration_limit_runs=sum(n == BASELINE_ITERATIONS[method] for n in iterations),
+            time_limit_runs=sum(d['termination_reason'] == 'TIME_LIMIT' for d in details),
+            mean_overshoot_s=average(overshoot), median_overshoot_s=median(overshoot), max_overshoot_s=max(overshoot),
+            late_best_updates=sum(d['late_best_updates'] for d in details),
+            b32_calls=sum(int(r['b32_calls']) for r in selected))
+        print('BASELINE_EQUAL_TIME_SUMMARY', json.dumps(summary), flush=True)
+        summaries.append(summary)
+    by_method = {method: {(r['layout_id'], int(r['seed'])): r for r in rows if r['method'] == method}
+                 for method in BASELINES}
+    common = sorted(by_method['HGA'].keys() & by_method['WAG+VNS'].keys())
+    pairs = [(by_method['HGA'][key], by_method['WAG+VNS'][key]) for key in common]
+    feasible = [(h, w) for h, w in pairs if h['status'] == w['status'] == 'FEASIBLE']
+    delta = [float(h['cmax_s']) - float(w['cmax_s']) for h, w in feasible]
+    paired = dict(paired_runs=len(pairs), common_feasible=len(feasible),
+        wins=sum(d < -1.e-6 for d in delta), ties=sum(abs(d) <= 1.e-6 for d in delta),
+        losses=sum(d > 1.e-6 for d in delta), median_delta_s=median(delta) if delta else None,
+        median_change_pct=median(100. * (float(h['cmax_s']) / float(w['cmax_s']) - 1.)
+                                 for h, w in feasible) if feasible else None,
+        paired_mean_improvement_pct=100. * (sum(float(w['cmax_s']) for _, w in feasible)
+            - sum(float(h['cmax_s']) for h, _ in feasible)) / sum(float(w['cmax_s']) for _, w in feasible)
+            if feasible else None,
+        hga_only_feasible=sum(h['status'] == 'FEASIBLE' and w['status'] != 'FEASIBLE' for h, w in pairs),
+        wag_only_feasible=sum(w['status'] == 'FEASIBLE' and h['status'] != 'FEASIBLE' for h, w in pairs),
+        both_failed=sum(h['status'] != 'FEASIBLE' and w['status'] != 'FEASIBLE' for h, w in pairs))
+    print('BASELINE_EQUAL_TIME_PAIRED_RUNS', json.dumps(paired), flush=True)
+    layouts = []
+    for name in sorted(layout_ids):
+        selected = [(h, w) for h, w in feasible if h['layout_id'] == name]
+        h = median(float(h['cmax_s']) for h, _ in selected) if selected else None
+        w = median(float(w['cmax_s']) for _, w in selected) if selected else None
+        row = dict(layout_id=name, common_feasible_seeds=sorted(int(h['seed']) for h, _ in selected),
+            hga_feasible_seeds=sum(r['status'] == 'FEASIBLE' for key, r in by_method['HGA'].items() if key[0] == name),
+            wag_feasible_seeds=sum(r['status'] == 'FEASIBLE' for key, r in by_method['WAG+VNS'].items() if key[0] == name),
+            hga_median_cmax_s=h, wag_median_cmax_s=w,
+            delta_s=h - w if selected else None, change_pct=100. * (h / w - 1.) if selected else None)
+        print('BASELINE_EQUAL_TIME_LAYOUT', json.dumps(row), flush=True)
+        layouts.append(row)
+    available = [r for r in layouts if r['common_feasible_seeds']]
+    layout_paired = dict(paired_layouts=len(available), expected_layouts=len(layout_ids),
+        all_three_common_feasible=sum(len(r['common_feasible_seeds']) == 3 for r in available),
+        wins=sum(r['delta_s'] < -1.e-6 for r in available), ties=sum(abs(r['delta_s']) <= 1.e-6 for r in available),
+        losses=sum(r['delta_s'] > 1.e-6 for r in available),
+        mean_change_pct=average([r['change_pct'] for r in available]),
+        median_change_pct=median(r['change_pct'] for r in available) if available else None,
+        median_delta_s=median(r['delta_s'] for r in available) if available else None)
+    print('BASELINE_EQUAL_TIME_PAIRED_LAYOUTS', json.dumps(layout_paired), flush=True)
+    return dict(summaries=summaries, paired_runs=paired, layouts=layouts, paired_layouts=layout_paired)
+
+
+def summarize_optimized_baselines(*, time_limit=None):
     """Read the two result files and retained references; never rewrite history."""
+    if time_limit is not None:
+        if time_limit != EQUAL_TIME_LIMIT:
+            raise ValueError('the equal-time comparison uses 120 seconds')
+        return summarize_equal_time_baselines()
     records = [r for _, _, name in BASELINES.values() for r in read_rows(FINAL_RESULTS / name)
                if completed_baseline_row(r)]
     rows = list({(r['layout_id'], r['method'], int(r['seed'])): r for r in records}.values())
@@ -2285,10 +2437,15 @@ def main():
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
     parser.add_argument('--representative', action='store_true', help='small/median/large layouts, first seed only')
+    parser.add_argument('--time-limit', type=float, choices=(EQUAL_TIME_LIMIT,),
+                        help='120-second TEST comparison; omit for the original full iteration budget')
     args = parser.parse_args()
+    if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
+        parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
     if args.stage == 'baselines':
-        run_baselines(args.workers, args.method, split=args.split, representative=args.representative)
+        run_baselines(args.workers, args.method, split=args.split, representative=args.representative,
+                      time_limit=args.time_limit)
     elif args.stage == 'hga-alpha-sensitivity':
         hga_alpha_sensitivity()
     elif args.stage == 'hga-alpha-full-budget':
@@ -2302,7 +2459,7 @@ def main():
     elif args.stage == 'beam-validation':
         beam_validation(args.workers)
     elif args.stage == 'baseline-summary':
-        summarize_optimized_baselines()
+        summarize_optimized_baselines(time_limit=args.time_limit)
     elif args.stage == 'wag-deadlock-diagnosis':
         diagnose_wag_deadlocks(args.workers)
     elif args.stage == 'cmax-value':
