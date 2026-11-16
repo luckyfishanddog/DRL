@@ -81,7 +81,9 @@ def test_feedback_shortlist_keeps_robot_and_mode_representatives_without_outcome
     kept = [space.actions[i] for i in chosen]
     assert {r for a in kept for r in a.robots} == {r for a in available for r in a.robots}
     assert {a.pattern.kind for a in kept} == {a.pattern.kind for a in available}
-    assert len(chosen) <= c.COARSE_ASSIGNMENT_LIMIT and len({a.parent_id for a in kept}) > 1
+    assert len(chosen) == min(12, len(indices)) and c.COARSE_ASSIGNMENT_LIMIT == 8
+    assert len({a.parent_id for a in kept}) > 1
+    assert any(a.parent_id == b.parent_id and a.robots != b.robots for a in kept for b in kept)
 
 
 def test_feedback_parent_removal_closes_siblings_and_freezes_unremoved_directions():
@@ -139,7 +141,7 @@ def test_feedback_complete_schedule_and_blocker_evidence_are_evaluated_once(monk
 
 @pytest.mark.parametrize('status,cmax', [('DEADLOCK', None), ('NUMERIC_FAILURE', None),
                                       ('FEASIBLE', 10.), ('FEASIBLE', 11.)])
-def test_feedback_search_retains_incumbent_after_failed_or_nonimproving_repair(monkeypatch, status, cmax):
+def test_feedback_search_retains_best_after_failed_or_nonimproving_repair(monkeypatch, status, cmax):
     from mrta_reference.model import ScheduleResult, ScheduleStatus
     experiment, c, parents, model = _feedback_fixture()
     result = c.construct_vnext_gnn(parents, model, CONFIG)
@@ -158,7 +160,10 @@ def test_feedback_search_retains_incumbent_after_failed_or_nonimproving_repair(m
     monkeypatch.setattr(experiment, 'evaluate_once', evaluate)
     row = experiment.run_feedback_gnn(parents, model, 1, budget=10.)
     assert row['status'] == 'FEASIBLE' and row['cmax_s'] == row['initial_cmax_s'] == 10.
-    assert row['reconstructions'] > 0 and row['accepted'] == 0
+    assert row['reconstructions'] > 0
+    assert experiment.json.loads(row['diagnostic'])['best_improvements'] == 0
+    if status == 'FEASIBLE' and cmax == 10.:
+        assert row['accepted'] == row['reconstructions']
     assert row['b32_calls'] == len(constructions) and row['runtime_s'] <= 10.
 
 
@@ -242,7 +247,7 @@ def test_feedback_fixed_reconstruction_count_finishes_after_120_seconds(monkeypa
     assert row['b32_calls'] == 4
 
 
-def test_feedback_full_selection_uses_same_stop_and_prefers_actual_cmax_median(monkeypatch):
+def test_feedback_full_validation_uses_only_selected_weights_and_leaves_checkpoint_unchanged(monkeypatch):
     from types import SimpleNamespace
     import run_gnn_weld_layout as experiment
     weights = {i: {'weight': torch.tensor(float(i))} for i in (0, 2, 3)}
@@ -256,7 +261,7 @@ def test_feedback_full_selection_uses_same_stop_and_prefers_actual_cmax_median(m
         loaded.append(split)
         return [(r['layout_id'], ()) for r in reference]
     def evaluate(model, layouts, epoch, workers, **kwargs):
-        evaluated.append((epoch, kwargs['reconstruction_limit']))
+        evaluated.append((epoch, kwargs['reconstruction_limit'], model))
         return [dict(r, status='DEADLOCK' if epoch == 3 and i == 9 else 'FEASIBLE',
                      cmax_s=100. if epoch == 0 else (105. if epoch == 2 else ('' if i == 9 else 90.)))
                 for i, r in enumerate(reference)]
@@ -267,12 +272,221 @@ def test_feedback_full_selection_uses_same_stop_and_prefers_actual_cmax_median(m
     monkeypatch.setattr(experiment, 'feedback_evaluate', evaluate)
     monkeypatch.setattr(experiment, 'load_layouts', load)
     monkeypatch.setattr(experiment, 'read_rows', lambda path: reference)
+    monkeypatch.setattr(experiment, 'summarize_feedback', lambda **kwargs: dict(split=kwargs['split']))
     experiment.validate_feedback_complete(1)
-    assert evaluated == [(0, 100), (2, 100), (3, 100)] and loaded == ['validation']
-    assert stored[-1]['selected_epoch'] == 0 and stored[-1]['pilot_selected_epoch'] == 2
-    assert stored[-1]['full_validation_complete'] and stored[-1]['test_eligible']
-    assert stored[-1]['stopping_condition'] == 'FIXED_RECONSTRUCTIONS'
-    assert stored[-1]['budget_s'] is None and stored[-1]['pilot_budget_s'] == 120.
+    assert evaluated == [(2, 500, weights[2])] and loaded == ['validation']
+    assert stored == [] and saved['state_dict'] is weights[2]
+
+
+@pytest.mark.parametrize('status,cmax,draw,expected', [
+    ('FEASIBLE', 99., .99, True), ('FEASIBLE', 100., .99, True),
+    ('FEASIBLE', 101., .3, True), ('FEASIBLE', 101., .4, False),
+    ('DEADLOCK', None, 0., False), ('NUMERIC_FAILURE', None, 0., False)])
+def test_feedback_sa_uses_probability_and_rejects_failed_candidates(status, cmax, draw, expected):
+    from types import SimpleNamespace
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    import run_gnn_weld_layout as experiment
+    current = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100.)
+    candidate = ScheduleResult(ScheduleStatus(status), cmax=cmax)
+    assert experiment.feedback_accepts(candidate, current, 1., SimpleNamespace(random=lambda: draw)) is expected
+    assert not experiment.feedback_accepts(None, current, 1., SimpleNamespace(random=lambda: 0.))
+
+
+def test_feedback_sa_searches_from_accepted_current_and_returns_global_best(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, parents, model = _feedback_fixture()
+    result = c.construct_vnext_gnn(parents, model, CONFIG)
+    candidates = [replace(result, inference_seconds=float(i)) for i in range(5)]
+    # Candidate identity is observable independently of the mocked objective.
+    completions = [100., 100.1, 99., None, 101.]
+    built, evaluated, prefixes, temperatures = [], [], [], []
+    class AcceptUphill:
+        def __init__(self, seed): pass
+        def randrange(self, stop): return 1
+        def random(self): return 0.
+    def construct(*args, **kwargs):
+        answer = candidates[len(built)]
+        built.append(answer)
+        return answer
+    def evaluate(candidate, *args, **kwargs):
+        value = completions[len(evaluated)]
+        evaluated.append(candidate)
+        status = ScheduleStatus.DEADLOCK if value is None else ScheduleStatus.FEASIBLE
+        return ScheduleResult(status, cmax=value), True
+    def prefix(current, space, feedback, q, seed):
+        prefixes.append(current)
+        return result.oriented_state, {}
+    original_accepts = experiment.feedback_accepts
+    def accept(candidate, current, temperature, rng):
+        temperatures.append(temperature)
+        return original_accepts(candidate, current, temperature, rng)
+    monkeypatch.setattr(c, 'construct_vnext_gnn', construct)
+    monkeypatch.setattr(experiment, 'evaluate_once', evaluate)
+    monkeypatch.setattr(experiment, 'feedback_prefix', prefix)
+    monkeypatch.setattr(experiment, 'feedback_accepts', accept)
+    monkeypatch.setattr(experiment, 'Random', AcceptUphill)
+    row = experiment.run_feedback_gnn(parents, model, 1, reconstruction_limit=4)
+    assert prefixes == [candidates[0], candidates[1], candidates[2], candidates[2]]
+    assert row['cmax_s'] == 99. and row['accepted'] == 3 and row['b32_calls'] == 5
+    detail = experiment.json.loads(row['diagnostic'])
+    assert detail['current_cmax_s'] == 101. and detail['accepted_uphill'] == 2
+    assert detail['best_improvements'] == 1
+    assert temperatures == pytest.approx([.01 * 100. * .01 ** (k / 499.) for k in range(4)])
+
+
+def test_feedback_all_500_attempts_count_incomplete_and_expand_then_reset(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, _, model = _feedback_fixture()
+    parents = tuple(ParentWeld(f'p{i:02d}', (1. + i / 10., 9.), (1.5 + i / 10., 9.)) for i in range(20))
+    patterns = tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents)
+    solution = canonicalize(parents, patterns, {0: tuple(p.parent_id + '::whole' for p in parents)},
+                            CONFIG, scope=FORMAL_SCOPE_V2)
+    blocks = block_map(solution, CONFIG)
+    directions = ((0,) * len(parents), (), (), ())
+    state = experiment.lns.oriented_route_state(tuple(r.block_ids for r in solution.routes), directions, blocks, CONFIG)
+    result = c.JointCompletionResult(solution, directions, (), 0., oriented_state=state)
+    incomplete = c.JointCompletionResult(None, None, (), 0., rejection_reason='NO_COMPLETE_PARENT_ACTION')
+    built, evaluated, sizes, temperatures = [], [], [], []
+    def construct(*args, **kwargs):
+        built.append(1)
+        return result if len(built) in (1, 28) else incomplete
+    def evaluate(candidate, *args, **kwargs):
+        assert candidate.solution is not None
+        evaluated.append(1)
+        return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100. if len(evaluated) == 1 else 99.), True
+    def prefix(current, space, feedback, q, seed):
+        sizes.append(q)
+        return state, {}
+    monkeypatch.setattr(c, 'construct_vnext_gnn', construct)
+    monkeypatch.setattr(experiment, 'evaluate_once', evaluate)
+    monkeypatch.setattr(experiment, 'feedback_prefix', prefix)
+    original_accepts = experiment.feedback_accepts
+    def accept(candidate, current, temperature, rng):
+        temperatures.append(temperature)
+        return original_accepts(candidate, current, temperature, rng)
+    monkeypatch.setattr(experiment, 'feedback_accepts', accept)
+    row = experiment.run_feedback_gnn(parents, model, 7)
+    assert len(built) == 501 and len(evaluated) == row['b32_calls'] == 2
+    assert row['reconstruction_attempts'] == 500 and row['reconstructions'] == 1
+    assert row['incomplete'] == 499 and row['cmax_s'] == 99.
+    assert sizes[:25] == [8] * 25 and sizes[25:27] == [12, 12]
+    assert sizes[27:52] == [8] * 25 and sizes[52:] == [12] * 448
+    assert temperatures[0] == 1. and temperatures[-1] == pytest.approx(.01)
+
+
+def test_feedback_critical_quota_uses_real_completion_and_fills_insufficient_routes():
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, _, _ = _feedback_fixture()
+    parents = tuple(ParentWeld(f'p{i:02d}', (2., 9. if i < 14 else 2.), (3., 9. if i < 14 else 2.))
+                    for i in range(20))
+    patterns = tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents)
+    routes = {0: tuple(f'p{i:02d}::whole' for i in range(5)),
+              1: tuple(f'p{i:02d}::whole' for i in range(5, 14)),
+              2: tuple(f'p{i:02d}::whole' for i in range(14, 17)),
+              3: tuple(f'p{i:02d}::whole' for i in range(17, 20))}
+    solution = canonicalize(parents, patterns, routes, CONFIG, scope=FORMAL_SCOPE_V2)
+    schedule = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100., robot_completion=(50., 100., 30., 40.))
+    feedback = experiment.lns.schedule_feedback_summary(solution, schedule, (), CONFIG)
+    feedback['scores'] = {p.parent_id: float(i + 1) for i, p in enumerate(parents)}
+    space = c.parent_assignment_space(parents, CONFIG)
+    select = lambda q, seed: experiment.lns.select_feedback_bottleneck(solution, feedback, q=q, seed=seed,
+                                                                       assignment_space=space)
+    partial = select(10, 12)
+    critical = {f'p{i:02d}' for i in range(5, 14)}
+    assert len(set(partial.removed_parent_ids) & critical) == 7
+    assert partial == select(10, 12)
+    assert len(select(19, 12).removed_parent_ids) == 19
+    assert all(b.split('::')[0] not in partial.removed_parent_ids for route in partial.routes for b in route)
+    with pytest.raises(ValueError, match='invalid parent removal'):
+        select(0, 12)
+    singleton = canonicalize(parents[:1], patterns[:1], {0: ('p00::whole',)}, CONFIG, scope=FORMAL_SCOPE_V2)
+    empty = experiment.lns.select_feedback_bottleneck(singleton, {}, q=0, seed=12)
+    assert empty.removed_parent_ids == () and empty.routes[0] == ('p00::whole',)
+
+
+def test_feedback_validation_three_seeds_resumes_only_new_source(monkeypatch):
+    from types import SimpleNamespace
+    experiment, _, _, model = _feedback_fixture()
+    names = [f'validation_{i:02d}' for i in range(1, 11)]
+    def row(name, seed, source):
+        return dict(layout_id=name, seed=seed, stage='full_validation', epoch=0, source=source)
+    old = [row(name, seed, 'COMPLETE_100_RECONSTRUCTIONS') for name in names for seed in experiment.TEST_SEEDS]
+    current = [row(names[0], experiment.TEST_SEEDS[0], experiment.FEEDBACK_FULL_SOURCE)]
+    jobs, written = [], []
+    class Pool:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def submit(self, fn, job):
+            jobs.append(job)
+            return SimpleNamespace(result=lambda: row(job[0], job[2], experiment.FEEDBACK_FULL_SOURCE))
+    monkeypatch.setattr(experiment, 'read_rows', lambda path: old + current)
+    monkeypatch.setattr(experiment, 'ProcessPoolExecutor', Pool)
+    monkeypatch.setattr(experiment, 'as_completed', iter)
+    monkeypatch.setattr(experiment, 'feedback_write', lambda path, rows: written.extend(rows))
+    rows = experiment.feedback_evaluate(model, [(name, ()) for name in names], 0, 4, reconstruction_limit=500)
+    assert len(rows) == 30 and len(jobs) == len(written) == 29
+    assert {job[2] for job in jobs} == set(experiment.TEST_SEEDS) and all(job[-1] == 500 for job in jobs)
+    assert all(r['source'] == experiment.FEEDBACK_FULL_SOURCE for r in rows)
+
+
+@pytest.mark.parametrize('failure,eligible', [(None, True), ('feasibility', False),
+    ('wag_cmax', False), ('hga_cmax', False), ('wag_wins', False), ('wag_layouts', False)])
+def test_feedback_test_requires_all_four_validation_conditions(monkeypatch, failure, eligible):
+    import json
+    import run_gnn_weld_layout as experiment
+    rows = [dict(stage='full_validation', epoch=0, source=experiment.FEEDBACK_FULL_SOURCE,
+        layout_id=f'validation_{i:02d}', seed=seed, status='FEASIBLE', cmax_s=99., runtime_s=200.,
+        initial_status='FEASIBLE', initial_cmax_s=110., reconstruction_attempts=500,
+        reconstructions=500, accepted=1, b32_calls=501, cache_hits=0, incomplete=0, deadlocks=0,
+        numeric_failures=0) for i in range(1, 11) for seed in experiment.TEST_SEEDS]
+    if failure == 'feasibility':
+        rows[0] = dict(rows[0], status='DEADLOCK', cmax_s='')
+    references = {}
+    for method in experiment.BASELINES:
+        records = [dict(row, method=method, cmax_s=100., b32_calls=1,
+            source=experiment.FORMAL_BASELINE_SOURCES[method],
+            iterations=experiment.BASELINE_ITERATIONS[method],
+            diagnostic=json.dumps(dict(phase='FULL', run_status='COMPLETED'))) for row in rows]
+        for i, record in enumerate(records):
+            if failure == ('wag_cmax' if method == 'WAG+VNS' else 'hga_cmax'):
+                record['cmax_s'] = 98.
+            if method == 'WAG+VNS' and failure == 'wag_wins':
+                # Even-sized pairs have a negative median, yet wins == losses.
+                record['cmax_s'] = 100. if i < 15 else 98.5
+            if method == 'WAG+VNS' and failure == 'wag_layouts':
+                # Five layouts improve on all seeds, five regress on two seeds.
+                record['cmax_s'] = 100. if i < 15 or i % 3 == 0 else 98.
+        references[experiment.BASELINES[method][2]] = records
+    old = [dict(row, source='COMPLETE_100_RECONSTRUCTIONS', cmax_s=1.) for row in rows]
+    def read(path):
+        return rows + old if path == experiment.FEEDBACK_TRAIN_CSV else references.get(path.name, [])
+    monkeypatch.setattr(experiment, 'read_rows', read)
+    summary = experiment.summarize_feedback(split='validation')
+    assert summary['gnn']['runs'] == 30 and summary['test_eligible'] is eligible
+    if not eligible:
+        loaded = []
+        monkeypatch.setattr(experiment, 'load_layouts', lambda split: loaded.append(split))
+        monkeypatch.setattr(experiment.torch, 'load', lambda *a, **kw: pytest.fail('TEST loaded the model after failure'))
+        experiment.test_feedback(4)
+        assert loaded == []
+
+
+def test_feedback_initial_deadlock_gets_at_most_two_gnn_sampling_retries(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    experiment, c, parents, model = _feedback_fixture()
+    result = c.construct_vnext_gnn(parents, model, CONFIG)
+    sampling = []
+    def construct(*args, **kwargs):
+        sampling.append(kwargs.get('rng'))
+        return result
+    monkeypatch.setattr(c, 'construct_vnext_gnn', construct)
+    monkeypatch.setattr(experiment, 'evaluate_once', lambda *a, **kw:
+        (ScheduleResult(ScheduleStatus.DEADLOCK), True))
+    row = experiment.run_feedback_gnn(parents, model, 12)
+    assert len(sampling) == row['b32_calls'] == 3 and sampling[0] is None
+    assert sampling[1] is sampling[2] and sampling[1] is not None
+    assert row['status'] == 'DEADLOCK' and row['cmax_s'] is None and row['reconstruction_attempts'] == 0
 
 
 def test_ranked_parent_budgets_keep_gnn_priority_and_two_distinct_supplements():

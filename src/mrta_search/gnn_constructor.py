@@ -2095,7 +2095,8 @@ def representative_child_indices(variants, *, limit):
 
 
 def feedback_shortlist(space, indices, logits):
-    """Learned ranking with explicit robot, mode and parent representatives."""
+    """Twelve feedback-only assignments covering robots, modes and owners."""
+    limit = 12
     order = indices[torch.argsort(logits, descending=True, stable=True)].tolist()
     chosen, robots, kinds, parents = [], set(), set(), set()
     def add(index):
@@ -2118,12 +2119,18 @@ def feedback_shortlist(space, indices, logits):
             index = next((i for i in order if space.actions[i].pattern.kind is kind), None)
             if index is not None:
                 add(index)
+    # Retain a same-parent owner alternative as well as cross-parent coverage.
+    alternative = next((i for i in order if i not in chosen and any(
+        space.actions[i].parent_id == space.actions[j].parent_id
+        and space.actions[i].robots != space.actions[j].robots for j in chosen)), None)
+    if alternative is not None:
+        add(alternative)
     for index in order:
-        if len(chosen) >= COARSE_ASSIGNMENT_LIMIT:
+        if len(chosen) >= limit:
             break
         if space.actions[index].parent_id not in parents:
             add(index)
-    return tuple(dict.fromkeys((*chosen, *order)))[:COARSE_ASSIGNMENT_LIMIT]
+    return tuple(dict.fromkeys((*chosen, *order)))[:limit]
 
 
 def vnext_value_candidate_indices(space, plans, scores):
@@ -2153,7 +2160,7 @@ def vnext_value_candidate_indices(space, plans, scores):
 
 def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config, *,
                         assignment_indices=None, preserve_prefix=False, feedback=None):
-    """Rank up to eight assignments after their directed child insertions."""
+    """Rank directed insertions of eight assignments, or twelve with feedback."""
     from .lns import joint_block_candidates
 
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)

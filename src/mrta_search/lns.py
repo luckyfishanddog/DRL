@@ -422,7 +422,7 @@ def schedule_feedback_summary(current, schedule, blockers, config):
     blocks = block_map(current, config)
     processing, move, robot_wait = [0.] * 4, [0.] * 4, [0.] * 4
     parent_costs = {p.parent_id: [0.] * 4 for p in current.parents}
-    parent_wait, parent_blocked = {}, {}
+    parent_wait, parent_blocked, parent_move = {}, {}, {}
     mapped_wait = {event.waiting.operation_id: event.delayed_block_id for event in blockers}
 
     def parent_for(op):
@@ -444,6 +444,8 @@ def schedule_feedback_summary(current, schedule, blockers, config):
                 parent_wait[parent] = parent_wait.get(parent, 0.) + op.duration
         elif op.kind is OperationKind.MOVE:
             move[op.robot_id] += op.duration
+            if parent is not None:
+                parent_move[parent] = parent_move.get(parent, 0.) + op.duration
         else:
             processing[op.robot_id] += op.duration
         if parent is not None:
@@ -467,21 +469,63 @@ def schedule_feedback_summary(current, schedule, blockers, config):
                        + parent_blocked.get(parent, 0.) for parent, costs in parent_costs.items()}
     return dict(completion=schedule.robot_completion, robot_wait=tuple(robot_wait),
                 parent_wait=parent_wait, parent_blocked=parent_blocked, scores=scores,
-                processing=tuple(processing), move=tuple(move))
+                processing=tuple(processing), move=tuple(move), parent_move=parent_move,
+                parent_costs={parent: tuple(costs) for parent, costs in parent_costs.items()})
 
 
-def select_feedback_bottleneck(current, feedback, *, q, seed):
-    """One completion/load/MOVE/observed-WAIT selector, closed at parent level."""
+def select_feedback_bottleneck(current, feedback, *, q, seed, assignment_space=None):
+    """Remove about 70% from the real critical robot, closing whole parents.
+
+    Legal mode/owner alternatives take priority on the critical robot. Other
+    routes contribute high MOVE or exchangeable parents. Random weighted ranks
+    vary the subproblem reproducibly using actual timeline costs, never geometry
+    as a substitute for WAIT.
+    """
+    if q == 0 and len(current.parents) == 1:
+        return _remove_parent_set(current, ())
     if not 1 <= q <= len(current.parents):
         raise ValueError('invalid parent removal count')
     scores = feedback['scores']
     rng = random.Random(seed)
-    # Always include the largest observed contributor; vary the remaining
-    # context so deterministic greedy repair can explore different subproblems.
-    anchor = min(scores, key=lambda p: (-scores[p], p))
-    order = sorted((p for p in scores if p != anchor),
-                   key=lambda p: -math.log(max(rng.random(), 1e-15)) / max(scores[p], 1e-9))
-    return _remove_parent_set(current, [anchor, *order[:q - 1]])
+    critical = max(range(4), key=lambda r: (feedback['completion'][r], -r))
+    owners = {block: r for r, route in enumerate(current.routes) for block in route.block_ids}
+    critical_parents = {_parent_id(b) for b in current.routes[critical].block_ids}
+    flexible, exchangeable = set(), set()
+    if assignment_space is not None:
+        patterns = {p.parent_id: p for p in current.patterns}
+        assigned = {p: tuple(owners[b.block_id] for b in assignment_space.children[pattern])
+                    for p, pattern in patterns.items()}
+        for action in assignment_space.actions:
+            if action.pattern != patterns[action.parent_id] or action.robots != assigned[action.parent_id]:
+                flexible.add(action.parent_id)
+            if action.robots != assigned[action.parent_id]:
+                exchangeable.add(action.parent_id)
+    costs = feedback['parent_costs']
+    moves = feedback['parent_move']
+
+    def rank(pool, *, on_critical):
+        ranked = []
+        for parent in sorted(pool):
+            weight = (costs[parent][critical] + scores[parent] if on_critical
+                      else scores[parent] + moves.get(parent, 0.))
+            priority = parent in flexible if on_critical else parent in exchangeable
+            ranked.append((not priority, -math.log(max(rng.random(), 1e-15)) / max(weight, 1e-9), parent))
+        return [parent for _, _, parent in sorted(ranked)]
+
+    critical_order = rank(critical_parents, on_critical=True)
+    if critical_order:
+        anchor = min(critical_parents, key=lambda p: (
+            p not in flexible, -costs[p][critical], -scores[p], p))
+        critical_order.remove(anchor)
+        critical_order.insert(0, anchor)
+    critical_quota = max(1, round(.7 * q))
+    removed = critical_order[:critical_quota]
+    others = rank(set(scores) - critical_parents, on_critical=False)
+    removed.extend(others[:q - critical_quota])
+    # Either route group can be too small. Fill from remaining contributors.
+    remaining = sorted(set(scores) - set(removed), key=lambda p: (-scores[p], p))
+    removed.extend(remaining[:q - len(removed)])
+    return _remove_parent_set(current, removed)
 
 
 def shared_y_parent_links(
