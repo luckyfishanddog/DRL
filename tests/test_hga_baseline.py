@@ -36,6 +36,9 @@ from mrta_reference.model import (
 from mrta_reference.solution import block_map, canonicalize
 from mrta_search.neighborhood import make_raw_candidate
 
+# SAEAX shares only the existing numeric geometry/scorer with HGA. Keep its
+# directly related regressions here instead of adding another test file.
+
 
 def _parents():
     return tuple(
@@ -993,4 +996,176 @@ def test_explicit_hga_keeps_existing_finite_budget_callers_without_internal_b32(
     expired = h.run_adapted_hga_v2(parents, config, settings, seed=731, time_limit=1.e-12, checkpoints=())
     assert expired.iterations == 0 and expired.termination_reason == 'TIME_LIMIT'
     assert expired.timely_best is None and expired.certifier_calls == 0
+
+
+def _saeax_fixture():
+    import numpy as np
+    from mrta_search import saeax as s
+    config,parents,solution = _fixture()
+    parents = tuple(ParentWeld(p.parent_id,p.start,(p.start[0]+1.2,9.)) for p in parents)
+    solution = canonicalize(parents,solution.patterns,solution.routes,config,scope=FORMAL_SCOPE_V2)
+    w = s._HGAWorkspace(parents,config,FORMAL_SCOPE_V2)
+    def individual(sequences):
+        lookup = {name:i for i,name in enumerate(w.ids)}
+        routes = [np.array([lookup[n] for n in names],np.int64) for names in sequences]
+        directions = [np.zeros(len(r),np.int64) for r in routes]
+        costs,loads = s._route_statistics(routes,directions,w.travel,w.processing)
+        edges = s._numeric_edges([2*r+d for r,d in zip(routes,directions)],2*len(w.ids))
+        return s.Individual(routes,directions,w.initial_selected.copy(),float(max(costs)),costs,loads,
+            s.complete_identity(routes,directions,w.initial_selected),edges)
+    a = individual([r.block_ids for r in solution.routes])
+    b = individual([('a::whole','c::whole','b::whole','d::whole'),
+                    ('e::whole','g::whole','f::whole','h::whole'),(),()])
+    return s,w,a,b
+
+
+def test_saeax_directed_successor_predecessor_and_inactive_modes():
+    s,w,a,b = _saeax_fixture()
+    table,owners = s.enhanced_adjacency(a,b,a.selected,w)
+    u,v = int(a.routes[0][0]),int(a.routes[0][1])
+    assert any(row[0:3] == (v,0,0) for row in table[u,0])
+    assert any(row[0:3] == (u,1,0) for row in table[v,1])
+    assert owners[u] == [(0,0),(0,1)]
+    selected = a.selected.copy()
+    p = next(i for i,options in enumerate(w.options) if len(options)>1)
+    selected[p] = next(o for o in w.options[p] if o != selected[p])
+    inactive = set(w.pattern_nodes[a.selected[p]])-{-1}
+    table,_ = s.enhanced_adjacency(a,b,selected,w)
+    assert not any(node in inactive or row[0] in inactive
+        for (node,_),rows in table.items() for row in rows)
+    assert s.complete_identity(a.routes,a.directions,selected) != a.identity
+
+
+def test_saeax_crossover_recombines_both_parents_without_hga_route_repair(monkeypatch):
+    s,w,a,b = _saeax_fixture()
+    def forbidden(*args,**kwargs):
+        raise AssertionError('SAEAX crossover delegated to HGA repair')
+    monkeypatch.setattr(w,'repair',forbidden)
+    settings = s.SAEAXConfig(pattern_mutation_probability=0.,relocate_probability=0.,swap_probability=0.)
+    def arcs(item):
+        return {(int(r[k-1]),int(d[k-1]),int(r[k]),int(d[k]))
+                for r,d in zip(item.routes,item.directions) for k in range(1,len(r))}
+    aa,bb = arcs(a),arcs(b)
+    mixed = False
+    identities = set()
+    for seed in range(24):
+        routes,bits,selected,inherited,novel = s.adjacency_crossover(a,b,w,random.Random(seed),settings)
+        s.validate_individual(w,routes,bits,selected)
+        child_arcs = {(int(r[k-1]),int(d[k-1]),int(r[k]),int(d[k]))
+                      for r,d in zip(routes,bits) for k in range(1,len(r))}
+        mixed |= bool(child_arcs.intersection(aa-bb) and child_arcs.intersection(bb-aa))
+        assert inherited+novel == sum(max(0,len(r)-1) for r in routes)
+        identities.add(s.complete_identity(routes,bits,selected))
+        solution = w.solution(routes,selected)
+        _assert_valid(solution,w.config)
+    assert mixed
+    assert len(identities)>2
+
+
+@pytest.mark.parametrize('owner0',[0,1])
+@pytest.mark.parametrize('owner1',[2,3])
+def test_saeax_y_children_have_independent_owners_and_x_is_fixed(owner0,owner1):
+    import numpy as np
+    from mrta_search import saeax as s
+    parents = (ParentWeld('y',(3.,8.),(3.,4.)),ParentWeld('x',(1.,9.),(10.,9.)))
+    w = s._HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    selected = w.initial_selected.copy()
+    x = next(i for i,p in enumerate(w.parents) if p.parent_id=='x')
+    selected[x] = next(p for p in w.options[x] if w.patterns[p].kind is SplitKind.X_SPLIT)
+    routes = [[] for _ in range(4)]
+    for p in selected:
+        for child,n in enumerate(w.pattern_nodes[p]):
+            if n<0:
+                continue
+            owner = (owner0,owner1)[child] if w.patterns[p].kind is SplitKind.Y_SPLIT else child
+            routes[owner].append(int(n))
+    routes = [np.array(r,np.int64) for r in routes]
+    bits = [np.zeros(len(r),np.int64) for r in routes]
+    s.validate_individual(w,routes,bits,selected)
+    _assert_valid(w.solution(routes,selected),w.config)
+    bad = [r.copy() for r in routes]
+    node = next(int(n) for n in routes[0] if w.patterns[w.node_pattern[n]].kind is SplitKind.X_SPLIT)
+    bad[0] = bad[0][bad[0]!=node]
+    bad[1] = np.append(bad[1],node)
+    with pytest.raises(ValueError,match='qualification|ownership'):
+        s.validate_individual(w,bad,[np.zeros(len(r),np.int64) for r in bad],selected)
+
+
+def test_saeax_rejects_coverage_and_direction_corruption():
+    import numpy as np
+    s,w,a,_ = _saeax_fixture()
+    bad = [r.copy() for r in a.routes]
+    bad[0][0] = bad[0][1]
+    with pytest.raises(ValueError,match='duplicate'):
+        s.validate_individual(w,bad,a.directions,a.selected)
+    bits = [d.astype(float) for d in a.directions]
+    bits[0][0] = .5
+    with pytest.raises(ValueError,match='direction'):
+        s.validate_individual(w,a.routes,bits,a.selected)
+    with pytest.raises(ValueError,match='direction'):
+        s.validate_individual(w,a.routes,[np.empty(0,np.int64) for _ in range(4)],a.selected)
+
+
+def test_saeax_survival_keeps_global_elite_despite_diversity():
+    from dataclasses import replace
+    s,_,a,b = _saeax_fixture()
+    elite = replace(a,native_cmax=1.)
+    assert s.select_population([b,elite],1)[0] is elite
+
+
+@pytest.mark.parametrize('maximum,minimum,stagnation,expected,reason',[
+    (8,5,3,5,'STAGNATION'),(3,1,10,3,'MAX_GENERATIONS')])
+def test_saeax_natural_stop_accounting_and_b32_selection_are_separate(
+        monkeypatch,maximum,minimum,stagnation,expected,reason):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    s,w,_,_ = _saeax_fixture()
+    calls,progress = [],[]
+    monkeypatch.setattr(s,'_priority_arrays',lambda *args:(100.,None,None,None))
+    def b32(solution,config,*,scope,orientations):
+        assert progress[-1]['generation']==expected
+        calls.append((solution,orientations))
+        directions = tuple(orientations[r] for r in range(4))
+        return (ScheduleResult(ScheduleStatus.DEADLOCK,directions=directions) if len(calls)==1 else
+                ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.-100*len(calls),directions=directions))
+    monkeypatch.setattr(s,'reference_schedule_formal',b32)
+    settings = s.SAEAXConfig(population_size=4,offspring_per_generation=2,
+        min_generations=minimum,max_generations=maximum,stagnation_generations=stagnation)
+    parents = tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
+    result = s.run_saeax(parents,settings=settings,seed=987,progress_callback=progress.append)
+    assert result.generations==expected and result.valid_children==2*expected
+    assert result.termination_reason==reason
+    assert result.accounting['native_calls']==result.accounting['initialization_evaluations']+2*expected
+    assert result.accounting['native_best_cmax_s']==100.
+    assert result.status=='FEASIBLE' and result.cmax==700. and result.native_cmax==100.
+    assert result.accounting['b32_calls']==len(calls)==3
+    assert len({(x.canonical_json,tuple(d.items())) for x,d in calls})==3
+    assert result.runtime>=result.accounting['search_s']+result.accounting['b32_s']
+
+
+def test_saeax_repeated_children_stop_with_bounded_retries_and_no_fake_cmax(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    s,w,_,_ = _saeax_fixture()
+    monkeypatch.setattr(s,'_priority_arrays',lambda *args:(100.,None,None,None))
+    monkeypatch.setattr(s,'adjacency_crossover',lambda a,*args:
+        (a.routes,a.directions,a.selected,0,0))
+    monkeypatch.setattr(s,'reference_schedule_formal',lambda *args,**kwargs:ScheduleResult(ScheduleStatus.DEADLOCK))
+    result = s.run_saeax(w.parents,settings=s.SAEAXConfig(population_size=2,
+        offspring_per_generation=2,max_generations=80,min_generations=80,retries_per_child=2))
+    assert result.generations==0 and result.valid_children==0
+    assert result.termination_reason=='NOVEL_CHILD_RETRIES_EXHAUSTED'
+    assert result.accounting['construction_attempts']==4
+    assert result.accounting['native_calls']==1 and result.accounting['b32_calls']==1
+    assert result.cmax is None and result.native_cmax==100. and result.status=='DEADLOCK'
+    assert result.solution is not None and result.accounting['wait_is_partial'] is True
+
+
+def test_saeax_defaults_and_generation_bounds():
+    from mrta_search.saeax import SAEAXConfig
+    config = SAEAXConfig()
+    assert (config.population_size,config.offspring_per_generation,config.max_generations,
+            config.min_generations,config.stagnation_generations)==(12,4,400,80,120)
+    with pytest.raises(ValueError):
+        SAEAXConfig(max_generations=10)
+    with pytest.raises(ValueError):
+        SAEAXConfig(retries_per_child=0)
 

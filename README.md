@@ -9,22 +9,27 @@
 ## 方法
 
 - RULE/BEAM 用原单提案构造，作为快速基线。
-- WAG+VNS 保留 `n=10`、`p=0.50`、`Imax=500`，用各轨的固定优先级顺序调度计分。HGA 用固定作业区的最长路线周期时间计分，执行 30 次子代迭代，范围为 TEST 前四个排样。两者的 5、30、60 秒观测值为各自搜索目标，选出的最终方案各评价一次 B32。
-- 改进 GNN 在至多 8 个联合分配候选上先执行有向插入，再比较实际局部负载、空走和协调风险。TRAIN 使用 RULE/BEAM、WAG+VNS、HGA 教师及同前缀 B32 偏好。每组实验完成一次联合构造，重构版最多继续两轮瓶颈重构，记录完整流程的实际耗时。5、30、60 秒列保留时间观测值。
+- 正式 WAG+VNS 使用 `n=10`、`p=0.50`、500 轮；正式 HGA 使用显式方向、完整路线 M1–M6 VND、`μ=20/λ=10/α=20`、200,000 个有效子代。两者使用原生协调评价选择完整方案，最终各调用一次 B32。正式结果与历史短测、120 秒预算结果分开统计。
+- 4R-SAEAX 从双亲有向邻接组装路线片段，联合选择机器人、插入位置和方向，搜索使用既有原生协调内核，结束后最多 3 次 B32 选优。采用 12 个体、每代 4 子代、最多 400 代、至少 80 代、连续 120 代停滞停止，没有墙钟硬截止。
+- GNN 的联合构造、父级重构及子焊缝反馈实验保留为历史研究记录，本轮没有继续训练或增加神经网络模块。
+
+2026-11-17 已完成 3 个 TRAIN 预实验与 30 次 SAEAX VALIDATION：B32 可行 30/30，完整耗时中位 22.59 s；对 WAG/HGA 的共同可行 Cmax 配对中位变化为 **+0.445% / +1.202%**（正值更差），分别 6 胜 16 负与 0 胜 30 负。质量未达主算法要求，未启动 TEST。完整逐例结果、停止计数与失败分析见[报告第 14 节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#14-2026-11-174r-saeax-实现一次-train-预实验与完整-validation)及[唯一实验 CSV](results/saeax_validation.csv)。
 
 ## 运行
 
 在 `D:\pybullet_test\MRTA_GA\DRL` 中执行。
 
 ```powershell
-& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py baselines --method HGA
-& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py baselines --method 'WAG+VNS'
-& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py train
-& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py test
-& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py summary
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py summary
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py pilot --workers 1
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py validation --workers 3
 ```
 
-## 新数据实验
+以上实验入口保留已完成记录，已有 3 次预实验及 30 次验证时直接读取，不重复搜索或 B32。旧 GNN 与对照入口保留在原脚本中。
+
+## 新数据实验（早期记录）
+
+以下为历史阶段结果；当前正式对照及 SAEAX 结论以上述报告为准。
 
 上一轮新 TEST 上，RULE/BEAM、原始 GNN_VNEXT 和负载感知 GNN_VNEXT 的单提案 B32 可行数分别为 16/20、17/20、16/20。可行 Cmax 中位分别为 6,901.0、8,733.4、8,053.3 秒。详细结果与本轮实验进度见 [新排样实验报告](docs/GNN_WELD_LAYOUT_EXPERIMENT.md)。
 
