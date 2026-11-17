@@ -1169,3 +1169,89 @@ def test_saeax_defaults_and_generation_bounds():
     with pytest.raises(ValueError):
         SAEAXConfig(retries_per_child=0)
 
+
+def test_vnd_teacher_trace_preserves_search_and_observed_actions():
+    import numpy as np
+    from mrta_baselines import hga as h
+    config,parents,solution = _fixture()
+    solution = canonicalize(parents,solution.patterns,
+        {0:('a::whole','c::whole','b::whole','d::whole'),
+         1:solution.routes[1].block_ids,2:(),3:()},config)
+    w = h._HGAWorkspace(parents,config,None,patterns=solution.patterns)
+    routes = w.encode(solution)
+    bits = [np.zeros(len(r),np.int64) for r in routes]
+    args = (routes,bits,w.travel,w.processing,w.points,w.eligible,w.parent_index,
+            w.nearest,w.parameters,20,0,0,w.oriented_scratch)
+    plain = h._vnd_oriented_arrays(*args,np.zeros(4,np.int64),route_objective=True)
+    trace = h.make_vnd_trace(2*len(w.parents),per_move=2)
+    observed = h._vnd_oriented_arrays(*args,np.zeros(4,np.int64),route_objective=True,teacher_trace=trace)
+    assert plain[2:] == observed[2:]
+    for actual,expected in zip(observed[0]+observed[1],plain[0]+plain[1]):
+        np.testing.assert_array_equal(actual,expected)
+    states,directions,lengths,actions,counts,passes = trace
+    accepted = 0
+    for slot,pass_number in enumerate(passes):
+        if not pass_number:continue
+        rr = [states[slot,r,:lengths[slot,r]].copy() for r in range(4)]
+        db = [directions[slot,r,:lengths[slot,r]].copy() for r in range(4)]
+        assert sorted(int(n) for route in rr for n in route)==sorted(int(n) for route in routes for n in route)
+        for rows in actions[slot]:
+            for a in rows:
+                if a[0]<0:continue
+                move,u,v,ru,iu,rv,iv,ordinal,taken = (int(x) for x in a)
+                assert rr[ru][iu]==u and rr[rv][iv]==v and ordinal>0
+                sa,sb = h._move_segments(rr,move,ru,iu,rv,iv)
+                nr,nd = list(rr),list(db)
+                nr[ru],nd[ru] = h._materialize_segments(sa,rr),h._materialize_directions(sa,db)
+                if move!=4:nr[rv],nd[rv] = h._materialize_segments(sb,rr),h._materialize_directions(sb,db)
+                if taken:
+                    before=max(h._oriented_route_cost(r,d,w.travel,w.processing) for r,d in zip(rr,db))
+                    after=max(h._oriented_route_cost(r,d,w.travel,w.processing) for r,d in zip(nr,nd))
+                    assert after<before-1.e-8
+                    accepted += 1
+    assert accepted>0
+    assert max(passes)==plain[4]+1
+
+
+def test_vnd_teacher_observer_is_optional_and_never_calls_b32(monkeypatch):
+    import numpy as np
+    from dataclasses import replace
+    from mrta_baselines import hga as h,common
+    def forbidden(*args,**kwargs):raise AssertionError('unexpected B32/certifier')
+    monkeypatch.setattr(common.FormalReferenceEvaluator,'__call__',forbidden)
+    monkeypatch.setattr(common,'certify_schedule',forbidden)
+    class Observer:
+        def __init__(self):self.calls=[]
+        def begin(self,w,selected,elapsed,index):return h.make_vnd_trace(2*len(w.parents))
+        def end(self,w,selected,trace):self.calls.append(trace[-1].copy())
+    observer=Observer()
+    settings=replace(h.AdaptedHGAConfig(),vnd_objective='ROUTE_CYCLE',max_iterations=2)
+    result=h.run_adapted_hga_v2(_parents(),ScientificConfig(),settings,seed=66,
+        time_limit=float('inf'),checkpoints=(),vnd_observer=observer)
+    assert result.iterations==2 and len(observer.calls)>0
+    assert result.certifier_calls==0
+
+
+@pytest.mark.parametrize('move',[1,2,3,4,5,6])
+def test_vnd_action_context_matches_materialized_oriented_costs(move):
+    import numpy as np
+    from mrta_baselines import hga as h
+    config,parents,solution=_fixture()
+    w=h._HGAWorkspace(parents,config,None,patterns=solution.patterns)
+    routes=w.encode(solution)
+    bits=[np.arange(len(r),dtype=np.int64)%2 for r in routes]
+    ru,iu,rv,iv=(0,0,0,2) if move==4 else (0,1,1,1)
+    action=np.array([[move,routes[ru][iu],routes[rv][iv],ru,iu,rv,iv,1,0]],np.int64)
+    context,affected=h._vnd_candidate_context(routes,bits,action,w.travel,w.processing,
+        w.eligible,w.parent_index,w.oriented_scratch)
+    a,b=h._move_segments(routes,move,ru,iu,rv,iv)
+    rr,dd=list(routes),list(bits)
+    rr[ru],dd[ru]=h._materialize_segments(a,routes),h._materialize_directions(a,bits)
+    if move!=4:rr[rv],dd[rv]=h._materialize_segments(b,routes),h._materialize_directions(b,bits)
+    scale=sum(w.processing[n] for r in routes for n in r)/4
+    after=max(h._oriented_route_cost(r,d,w.travel,w.processing) for r,d in zip(rr,dd))
+    before=max(h._oriented_route_cost(r,d,w.travel,w.processing) for r,d in zip(routes,bits))
+    assert context[0,29]==pytest.approx(after/scale)
+    assert context[0,30]==pytest.approx((after-before)/scale)
+    assert affected[0,routes[ru][iu]] and affected[0,routes[rv][iv]]
+

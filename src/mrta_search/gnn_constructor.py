@@ -41,6 +41,137 @@ from mrta_reference.solution import canonicalize, block_map
 NODE_DIM = 20
 DYNAMIC_DIM = 13
 
+# Candidate ranking uses one small GNN; the existing allocation policies and
+# their parameters remain separate and are not loaded or retrained for it.
+VND_NODE_DIM = 32
+VND_ACTION_DIM = 35
+
+
+def _vnd_attention(layer, x, edge_index, edge_type):
+    """Vectorized form of the existing SparseGATLayer attention calculation."""
+    h = layer.linear(x).view(len(x),layer.heads,layer.width)
+    source,destination = edge_index
+    logits = torch.nn.functional.leaky_relu(
+        (h[source]*layer.src).sum(-1)+(h[destination]*layer.dst).sum(-1)+layer.relation(edge_type),.2)
+    index = destination[:,None].expand_as(logits)
+    maxima = logits.new_full((len(x),layer.heads),-torch.inf)
+    maxima.scatter_reduce_(0,index,logits,reduce='amax',include_self=True)
+    weights = torch.exp(logits-maxima[destination])
+    normalizer = weights.new_zeros((len(x),layer.heads))
+    normalizer.index_add_(0,destination,weights)
+    weights = weights/normalizer[destination].clamp_min(1.e-12)
+    output = h.new_zeros(h.shape)
+    output.index_add_(0,destination,weights[:,:,None]*h[source])
+    return output.reshape(len(x),-1)+layer.bias
+
+
+class HGAVNDCandidateGNN(nn.Module):
+    """One route-state encoder and a two-output priority/log-cost action head."""
+    def __init__(self, hidden_dim=32, heads=2):
+        super().__init__()
+        self.layer1 = SparseGATLayer(VND_NODE_DIM,hidden_dim,heads)
+        self.layer2 = SparseGATLayer(hidden_dim,hidden_dim,heads)
+        for layer in (self.layer1,self.layer2):
+            layer.relation = nn.Embedding(6,heads)
+            nn.init.zeros_(layer.relation.weight)
+        self.action = nn.Sequential(nn.Linear(5*hidden_dim+VND_ACTION_DIM,64),
+                                    nn.ReLU(),nn.Linear(64,2))
+
+    def forward(self, inputs):
+        h = torch.nn.functional.elu(_vnd_attention(self.layer1,inputs['nodes'],
+            inputs['edges'],inputs['relations']))
+        h = _vnd_attention(self.layer2,h,inputs['edges'],inputs['relations'])
+        indices = inputs['indices']
+        pooled = h.new_zeros((len(indices),h.shape[1]))
+        pooled.index_add_(0,inputs['affected_owner'],h[inputs['affected_nodes']])
+        counts = torch.bincount(inputs['affected_owner'],minlength=len(indices)).clamp_min(1)
+        pooled = pooled/counts[:,None]
+        return self.action(torch.cat((h[indices].reshape(len(indices),-1),pooled,inputs['features']),dim=1))
+
+
+def hga_vnd_inputs(workspace, routes, directions, actions, native_cmax):
+    """Inputs contain only the current state and action, never its outcome.
+
+    Relations: self, eligibility, successor, predecessor, same parent, owner.
+    Directed states, robot workloads and affected ranges are explicit. The
+    accepted flag (action column 8) and all candidate labels are ignored.
+    """
+    import numpy as np
+    from mrta_baselines.hga import _vnd_candidate_context,_oriented_route_cost
+    active = [int(n) for r in routes for n in r]
+    lookup = {n:i for i,n in enumerate(active)}
+    offset = len(active)
+    scale = max(1.,sum(workspace.processing[n] for n in active)/4)
+    loads = np.array([sum(workspace.processing[n] for n in r) for r in routes])
+    costs = np.array([_oriented_route_cost(r,d,workspace.travel,workspace.processing) for r,d in zip(routes,directions)])
+    moves = costs-loads
+    rows,edges,relations = [],[],[]
+    def edge(a,b,relation):
+        edges.append((a,b));relations.append(relation)
+    for r,(route,bits) in enumerate(zip(routes,directions)):
+        for k,(node,bit) in enumerate(zip(route,bits)):
+            node,bit = int(node),int(bit)
+            start,end = workspace.points[node,bit],workspace.points[node,1-bit]
+            pattern = workspace.patterns[workspace.node_pattern[node]]
+            row = [1.,0.,start[0]/20,start[1]/12,end[0]/20,end[1]/12,
+                float(np.linalg.norm(end-start))/24,workspace.processing[node]/scale,
+                *(float(x) for x in workspace.eligible[node]),
+                *(float(r==s) for s in range(4)),float(bit),k/max(1,len(route)-1),
+                loads[r]/scale,moves[r]/scale,max(loads)/scale,max(costs)/scale,
+                float(native_cmax is not None),native_cmax/scale if native_cmax is not None else 0.,
+                *(float(pattern.kind is kind) for kind in (SplitKind.WHOLE,SplitKind.Y_SPLIT,SplitKind.X_SPLIT)),
+                0. if workspace.node_child[node]==0 else float(workspace.node_child[node]==1),
+                1. if workspace.node_child[node]==0 else float(workspace.node_child[node]==2),
+                len(route)/max(1,offset),r/3,float(r%2==0)]
+            rows.append(row)
+            i = lookup[node]
+            for robot in range(4):
+                if workspace.eligible[node,robot]:
+                    edge(i,offset+robot,1);edge(offset+robot,i,1)
+            edge(i,offset+r,5);edge(offset+r,i,5)
+            if k:
+                before = lookup[int(route[k-1])]
+                edge(before,i,2);edge(i,before,3)
+    for r in range(4):
+        row = [0.]*VND_NODE_DIM
+        row[1],row[12+r] = 1.,1.
+        row[18:24] = [loads[r]/scale,moves[r]/scale,max(loads)/scale,max(costs)/scale,
+            float(native_cmax is not None),native_cmax/scale if native_cmax is not None else 0.]
+        row[29:32] = [len(routes[r])/max(1,offset),r/3,float(r%2==0)]
+        rows.append(row)
+    parents = {}
+    for node in active:
+        parents.setdefault(int(workspace.parent_index[node]),[]).append(lookup[node])
+    for group in parents.values():
+        for a in group:
+            for b in group:
+                if a!=b:edge(a,b,4)
+    for i in range(len(rows)):edge(i,i,0)
+    features,affected = _vnd_candidate_context(routes,directions,actions,workspace.travel,
+        workspace.processing,workspace.eligible,workspace.parent_index,workspace.oriented_scratch)
+    local = np.full(len(workspace.ids),-1,np.int64)
+    local[active] = np.arange(len(active))
+    affected_owner,affected_nodes = np.nonzero(affected)
+    affected_nodes = local[affected_nodes]
+    indices = np.column_stack((local[actions[:,1]],local[actions[:,2]],offset+actions[:,3],offset+actions[:,5]))
+    return dict(nodes=torch.tensor(rows,dtype=torch.float32),edges=torch.tensor(edges,dtype=torch.long).T.contiguous(),
+        relations=torch.tensor(relations,dtype=torch.long),indices=torch.tensor(indices,dtype=torch.long).reshape(-1,4),
+        features=torch.tensor(features,dtype=torch.float32).reshape(-1,VND_ACTION_DIM),
+        affected_nodes=torch.tensor(affected_nodes,dtype=torch.long),affected_owner=torch.tensor(affected_owner,dtype=torch.long))
+
+
+def batch_hga_vnd_inputs(groups):
+    result = {key:[] for key in groups[0]}
+    node_offset = action_offset = 0
+    for group in groups:
+        for key,value in group.items():
+            if key in ('edges','indices','affected_nodes'):value = value+node_offset
+            elif key=='affected_owner':value = value+action_offset
+            result[key].append(value)
+        node_offset += len(group['nodes'])
+        action_offset += len(group['features'])
+    return {key:torch.cat(values,dim=1 if key=='edges' else 0) for key,values in result.items()}
+
 
 @dataclass(frozen=True)
 class BlockRobotGraph:

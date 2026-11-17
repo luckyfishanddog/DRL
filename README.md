@@ -11,7 +11,10 @@
 - RULE/BEAM 用原单提案构造，作为快速基线。
 - 正式 WAG+VNS 使用 `n=10`、`p=0.50`、500 轮；正式 HGA 使用显式方向、完整路线 M1–M6 VND、`μ=20/λ=10/α=20`、200,000 个有效子代。两者使用原生协调评价选择完整方案，最终各调用一次 B32。正式结果与历史短测、120 秒预算结果分开统计。
 - 4R-SAEAX 从双亲有向邻接组装路线片段，联合选择机器人、插入位置和方向，搜索使用既有原生协调内核，结束后最多 3 次 B32 选优。采用 12 个体、每代 4 子代、最多 400 代、至少 80 代、连续 120 代停滞停止，没有墙钟硬截止。
-- GNN 的联合构造、父级重构及子焊缝反馈实验保留为历史研究记录，本轮没有继续训练或增加神经网络模块。
+- EG-GNN-PVND 第一阶段只学习 HGA 已访问动作的优先级与真实原生评价成本。20 个 TRAIN 轨迹中，15 个排样拟合、5 个排样留出；评分器为两层 hidden32/2头，共 14,938 参数，未重新训练原焊缝分配 GNN。
+- GNN 的联合构造、父级重构及子焊缝反馈实验保留为历史记录，本轮没有继续训练旧构造网络。
+
+EG-GNN-PVND 已完成教师采集、固定 12 轮训练和离线检验。留出观察池总体排序准确率 59.49%，首次原生改善评价数均值 15.33→6.72，但两个排样退化；真正优化已有可行 Cmax 的子集在计入决策开销后净变慢。**当前不值得进入阶段二，未接入 HGA 搜索，未跑 VALIDATION/TEST。** 详见[第一阶段报告](docs/GNN_WELD_LAYOUT_EXPERIMENT.md)，数据与模型分别保存在 [TRAIN教师](data/weld_layout/hga_vnd_teacher.jsonl.gz)和[评分器 checkpoint](models/eg_gnn_pvnd.pt)。
 
 2026-11-17 已完成 3 个 TRAIN 预实验与 30 次 SAEAX VALIDATION：B32 可行 30/30，完整耗时中位 22.59 s；对 WAG/HGA 的共同可行 Cmax 配对中位变化为 **+0.445% / +1.202%**（正值更差），分别 6 胜 16 负与 0 胜 30 负。质量未达主算法要求，未启动 TEST。完整逐例结果、停止计数与失败分析见[报告第 14 节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#14-2026-11-174r-saeax-实现一次-train-预实验与完整-validation)及[唯一实验 CSV](results/saeax_validation.csv)。
 
@@ -20,12 +23,15 @@
 在 `D:\pybullet_test\MRTA_GA\DRL` 中执行。
 
 ```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_eg_gnn_pvnd.py summary
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_eg_gnn_pvnd.py collect --workers 4
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_eg_gnn_pvnd.py fit
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py summary
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py pilot --workers 1
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py validation --workers 3
 ```
 
-以上实验入口保留已完成记录，已有 3 次预实验及 30 次验证时直接读取，不重复搜索或 B32。旧 GNN 与对照入口保留在原脚本中。
+EG 入口在已有20个教师排样及模型时直接读取，不重新采集或训练。SAEAX 入口在已有3次预实验及30次验证时直接读取，不重复搜索或B32。旧GNN与对照入口保留在原脚本中。
 
 ## 新数据实验（早期记录）
 

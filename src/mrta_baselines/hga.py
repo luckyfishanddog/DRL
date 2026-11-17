@@ -1279,9 +1279,110 @@ def _collect_oriented_candidates(all_ids, near, robot, position, lengths, longes
 
 
 @njit
+def _vnd_candidate_context(routes, directions, actions, travel, processing, eligible,
+                           parent_index, scratch):
+    """Cheap GNN action inputs using the existing oriented interval costs."""
+    loads,costs = np.zeros(4),np.zeros(4)
+    active_count = 0
+    for r in range(4):
+        _refresh_oriented_route(r,routes[r],directions[r],travel,processing,eligible,scratch)
+        costs[r] = _oriented_route_cost(routes[r],directions[r],travel,processing)
+        for n in routes[r]:loads[r] += processing[n]
+        active_count += len(routes[r])
+    scale = max(1.,sum(loads)/4)
+    features = np.zeros((len(actions),35))
+    affected = np.zeros((len(actions),len(processing)),np.bool_)
+    processing_prefix = scratch[7]
+    for index in range(len(actions)):
+        move,u,v,ru,iu,rv,iv = actions[index,:7]
+        a,b = _move_segments(routes,move,ru,iu,rv,iv)
+        new_loads,new_costs = loads.copy(),costs.copy()
+        new_costs[ru] = _oriented_segment_cost(a,ru,scratch,travel,parent_index)
+        new_loads[ru] = 0.
+        for source,lo,hi,reverse in a:
+            new_loads[ru] += processing_prefix[source,hi]-processing_prefix[source,lo]
+        if move!=4:
+            new_costs[rv] = _oriented_segment_cost(b,rv,scratch,travel,parent_index)
+            new_loads[rv] = 0.
+            for source,lo,hi,reverse in b:
+                new_loads[rv] += processing_prefix[source,hi]-processing_prefix[source,lo]
+        affected[index,u],affected[index,v] = True,True
+        if move==3:
+            affected[index,routes[ru][iu+1]] = True
+            affected[index,routes[rv][iv+1]] = True
+        elif move==4:
+            for k in range(min(iu,iv),max(iu,iv)+1):affected[index,routes[ru][k]] = True
+        elif move==5:
+            for n in routes[ru]:affected[index,n] = True
+            for n in routes[rv]:affected[index,n] = True
+        elif move==6:
+            for k in range(iu+1,len(routes[ru])):affected[index,routes[ru][k]] = True
+            for k in range(iv+1,len(routes[rv])):affected[index,routes[rv][k]] = True
+        affected_count,affected_processing = 0,0.
+        for n in range(len(processing)):
+            if affected[index,n]:
+                affected_count += 1
+                affected_processing += processing[n]
+        row = features[index]
+        row[move-1],row[6+ru],row[10+rv] = 1.,1.,1.
+        row[14:18] = np.array([iu/max(1,len(routes[ru])-1),iv/max(1,len(routes[rv])-1),
+                               float(directions[ru][iu]),float(directions[rv][iv])])
+        row[18:24] = np.array([loads[ru]/scale,loads[rv]/scale,(costs[ru]-loads[ru])/scale,
+            (costs[rv]-loads[rv])/scale,affected_count/max(1,active_count),affected_processing/scale])
+        row[24:31] = np.array([new_loads[ru]/scale,new_loads[rv]/scale,
+            (new_costs[ru]-costs[ru])/scale,(new_costs[rv]-costs[rv])/scale,
+            max(new_loads)/scale,max(new_costs)/scale,(max(new_costs)-max(costs))/scale])
+        row[31+ru] = 1.
+        if move!=4:row[31+rv] = 1.
+    return features,affected
+
+
+def make_vnd_trace(capacity, *, states=4, per_move=24):
+    """Bounded observations of visited route-VND states, never search limits.
+
+    Keep the first states and a rolling final state. Within each neighborhood
+    retain its first visited legal actions, plus its accepted action. Unvisited
+    actions are absent; native labels must be obtained by actual evaluation.
+    """
+    return (np.full((states,4,capacity),-1,np.int64),
+            np.zeros((states,4,capacity),np.int64),np.zeros((states,4),np.int64),
+            np.full((states,6,per_move,9),-1,np.int64),
+            np.zeros((states,6),np.int64),np.zeros(states,np.int64))
+
+
+@njit
+def _trace_vnd_state(trace, current, bits, pass_number):
+    nodes,directions,lengths,actions,counts,passes = trace
+    slot = min(pass_number-1,len(passes)-1)
+    nodes[slot,:,:] = -1
+    actions[slot,:,:,:] = -1
+    counts[slot,:] = 0
+    passes[slot] = pass_number
+    for r in range(4):
+        lengths[slot,r] = len(current[r])
+        nodes[slot,r,:len(current[r])] = current[r]
+        directions[slot,r,:len(current[r])] = bits[r]
+    return slot
+
+
+@njit
+def _trace_vnd_action(trace, slot, move, u, v, ru, iu, rv, iv, ordinal, accepted=False):
+    actions,counts = trace[3],trace[4]
+    index = counts[slot,move-1]
+    if not accepted:
+        counts[slot,move-1] += 1
+        if index >= actions.shape[2]:
+            return
+    else:
+        index = min(index-1,actions.shape[2]-1)
+    actions[slot,move-1,index,:] = np.array([move,u,v,ru,iu,rv,iv,ordinal,int(accepted)],np.int64)
+
+
+@njit
 def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligible, parent_index,
                            nearest, parameters, alpha, max_passes, candidate_cap, scratch,
-                           move_cache_hits=None, use_schedule_bound=True, route_objective=False):
+                           move_cache_hits=None, use_schedule_bound=True, route_objective=False,
+                           teacher_trace=None):
     """Complete oriented M1--M6, using coordinated or route-cycle Cmax.
 
     Route-cycle mode never schedules a candidate. Coordinated mode retains its
@@ -1324,6 +1425,9 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
         if max_passes > 0 and passes >= max_passes:
             return current, bits, score, operations, accepted, True, False, rejected
         passes += 1
+        trace_slot = -1
+        if teacher_trace is not None:
+            trace_slot = _trace_vnd_state(teacher_trace,current,bits,passes)
         for r in range(4):
             if dirty[r]:
                 _refresh_oriented_route(r, current[r], bits[r], travel, processing, eligible, scratch)
@@ -1401,6 +1505,8 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
                 lower = max(cu, cv)
                 if not math.isfinite(lower):
                     continue
+                if teacher_trace is not None:
+                    _trace_vnd_action(teacher_trace,trace_slot,move,u,v,ru,iu,rv,iv,operations)
                 guard = 1.e-8 * max(1., abs(score), abs(lower)) if math.isfinite(score) else 0.
                 if math.isfinite(score) and lower >= score + guard:
                     continue
@@ -1421,6 +1527,8 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
                     cv = 0. if move == 4 else _oriented_route_cost(candidate[rv], candidate_bits[rv], travel, processing)
                     value = max(cu, cv, untouched)
                     if value < score - 1.e-8:
+                        if teacher_trace is not None:
+                            _trace_vnd_action(teacher_trace,trace_slot,move,u,v,ru,iu,rv,iv,operations,True)
                         current, bits, score = candidate, candidate_bits, value
                         dirty[ru], dirty[rv] = True, True
                         improved = True
@@ -2418,7 +2526,7 @@ def _oriented_identity(routes, directions):
 
 
 def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoints, method_id,
-                             time_limit=math.inf):
+                             time_limit=math.inf, vnd_observer=None):
     """Explicit oriented individuals; the final experiment wrapper runs B32."""
     rng = random.Random(seed)
     evaluator = CommonBaselineEvaluator(parents, config, scope, time_limit=time_limit,
@@ -2458,11 +2566,15 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
         unique = previous is None
         if unique:
             hits = np.zeros(4, np.int64)
+            trace = (vnd_observer.begin(workspace,selected,evaluator.elapsed,accounting.candidate_count)
+                     if vnd_observer is not None else None)
             result, bits, score, operations, _, pass_hit, candidate_hit, rejected = _vnd_oriented_arrays(
                 routes, directions, workspace.travel, workspace.processing, workspace.points, workspace.eligible,
                 workspace.parent_index, workspace.nearest, workspace.parameters, settings.alpha,
                 settings.vnd_max_passes or 0, settings.vnd_candidate_cap or 0, workspace.oriented_scratch, hits,
-                route_objective=route_objective)
+                route_objective=route_objective,teacher_trace=trace)
+            if trace is not None:
+                vnd_observer.end(workspace,selected,trace)
             accounting.cheap_candidate_operations += operations
             accounting.vnd_candidate_operations += operations
             accounting.vnd_native_candidate_evaluations += int(hits[3])
@@ -2635,11 +2747,16 @@ def run_adapted_hga(
     method_id: str = METHOD_ID,
     certify: bool = False,
     candidate_evaluator: CandidateEvaluator | None = priority_schedule,
+    vnd_observer=None,
 ) -> BaselineResult:
+    if vnd_observer is not None and (hga_config.direction_encoding != 'EXPLICIT'
+                                    or hga_config.vnd_objective != 'ROUTE_CYCLE'):
+        raise ValueError('teacher observer records the existing explicit route-cycle HGA only')
     if candidate_evaluator is priority_schedule and not certify and common_seed is None:
         if hga_config.direction_encoding == 'EXPLICIT':
             return _run_hga_oriented_native(parents, scientific_config, hga_config, seed=seed,
-                scope=scope, checkpoints=checkpoints, method_id=method_id, time_limit=time_limit)
+                scope=scope, checkpoints=checkpoints, method_id=method_id, time_limit=time_limit,
+                vnd_observer=vnd_observer)
         if math.isinf(time_limit):
             return _run_hga_native(parents, scientific_config, hga_config, seed=seed,
                                    scope=scope, checkpoints=checkpoints, method_id=method_id)
@@ -2842,6 +2959,7 @@ def run_adapted_hga_v2(
     checkpoints: Sequence[float] = (5.0, 30.0, 60.0),
     certify: bool = False,
     candidate_evaluator: CandidateEvaluator | None = priority_schedule,
+    vnd_observer=None,
 ) -> BaselineResult:
     return run_adapted_hga(
         parents,
@@ -2854,4 +2972,5 @@ def run_adapted_hga_v2(
         method_id=METHOD_ID_V2,
         certify=certify,
         candidate_evaluator=candidate_evaluator,
+        vnd_observer=vnd_observer,
     )

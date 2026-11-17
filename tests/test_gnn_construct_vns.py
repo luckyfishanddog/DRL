@@ -4395,3 +4395,94 @@ def test_owner_cf_selects_forty_feasible_train_layouts_across_eight_strata():
     assert all(len(stratum['layouts']) == 5 for stratum in strata)
     assert all(name.startswith('train_') and teachers[name]['row']['status'] == 'FEASIBLE' for name in names)
 
+
+def test_vnd_graph_has_directed_routes_qualifications_and_no_outcome_leakage():
+    import numpy as np
+    from mrta_baselines.hga import _HGAWorkspace
+    from mrta_search.gnn_constructor import hga_vnd_inputs,HGAVNDCandidateGNN,batch_hga_vnd_inputs
+    parents=tuple(ParentWeld(chr(97+i),(1.+i*2.,9.),(2.+i*2.,9.)) for i in range(6))
+    w=_HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    active=[int(w.pattern_nodes[p,0]) for p in w.initial_selected]
+    routes=[np.array(active[:3],np.int64),np.array(active[3:],np.int64),np.empty(0,np.int64),np.empty(0,np.int64)]
+    directions=[np.array([0,1,0],np.int64),np.array([1,0,1],np.int64),np.empty(0,np.int64),np.empty(0,np.int64)]
+    action=np.array([[1,active[1],active[4],0,1,1,1,1,0],
+                     [4,active[0],active[2],0,0,0,2,2,1]],np.int64)
+    inputs=hga_vnd_inputs(w,routes,directions,action,1000.)
+    action[:,8]^=1
+    changed=hga_vnd_inputs(w,routes,directions,action,1000.)
+    assert all(torch.equal(value,changed[key]) for key,value in inputs.items())
+    assert inputs['nodes'].shape==(10,32) and inputs['features'].shape==(2,35)
+    relations=set(inputs['relations'].tolist())
+    assert {0,1,2,3,5}.issubset(relations)
+    edges={(int(a),int(b),int(t)) for (a,b),t in zip(inputs['edges'].T,inputs['relations'])}
+    assert (0,1,2) in edges and (1,0,3) in edges
+    model=HGAVNDCandidateGNN().eval()
+    with torch.no_grad():
+        single=model(inputs)
+        batched=model(batch_hga_vnd_inputs([inputs,inputs]))
+    assert torch.allclose(batched[:2],single,atol=1.e-6)
+    assert torch.allclose(batched[2:],single,atol=1.e-6)
+    loss=model(inputs).square().mean();loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_vnd_vectorized_attention_matches_existing_sparse_gat():
+    from mrta_ranker.model import SparseGATLayer
+    from mrta_search.gnn_constructor import _vnd_attention
+    torch.manual_seed(66)
+    layer=SparseGATLayer(6,8,2)
+    x=torch.randn(5,6)
+    edges=torch.tensor([[0,1,2,3,4,0,1,3],[0,1,2,3,4,1,0,1]])
+    relations=torch.tensor([0,0,0,0,0,1,2,3])
+    assert torch.allclose(_vnd_attention(layer,x,edges,relations),layer(x,edges,relations),atol=1.e-6)
+
+
+def test_eg_teacher_native_labels_are_separate_from_hga_acceptance(monkeypatch):
+    import numpy as np
+    import run_eg_gnn_pvnd as e
+    from mrta_baselines.hga import _HGAWorkspace
+    parents=tuple(ParentWeld(chr(97+i),(1.+i*2.,9.),(2.+i*2.,9.)) for i in range(4))
+    w=_HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    nodes=[int(w.pattern_nodes[p,0]) for p in w.initial_selected]
+    raw=dict(selected=w.initial_selected.tolist(),routes=[nodes,[],[],[]],directions=[[0]*4,[],[],[]],
+        elapsed_s=0.,individual_index=0,pass_number=1,visited_legal_per_move=[0,0,0,3,0,0],
+        actions=[[4,nodes[0],nodes[2],0,0,0,2,1,0],
+                 [4,nodes[0],nodes[3],0,0,0,3,2,1],
+                 [4,nodes[1],nodes[3],0,1,0,3,3,0]])
+    scores=iter([100.,90.,110.,float('nan')])
+    monkeypatch.setattr(e,'_priority_arrays',lambda *args:(next(scores),None,None,None))
+    groups,counts=e.label_observations(w,[raw,raw],'synthetic')
+    assert len(groups)==1 and counts['label_native_calls']==4
+    a,b,c=groups[0]['candidates']
+    assert a['positive'] and not a['teacher_accepted'] and a['improvement_s']==10.
+    assert not b['positive'] and b['teacher_accepted'] and b['improvement_s']==-10.
+    assert not c['label_known'] and c['native_status']=='NUMERIC_FAILURE'
+    assert c['native_cmax_s'] is None
+
+
+def test_eg_offline_first_improvement_uses_only_evaluated_candidates():
+    import numpy as np
+    import run_eg_gnn_pvnd as e
+    candidates=[dict(positive=p,native_eval_s=.01,materialize_s=.001) for p in (False,False,True)]
+    m=e.order_metrics(candidates,np.array([0.,0.,1.]))
+    assert m['original_evals']==3 and m['gnn_evals']==1
+    assert m['pairwise_accuracy']==1. and m['gnn_service_s']==pytest.approx(.011)
+    for c in candidates:c['positive']=False
+    m=e.order_metrics(candidates,np.array([0.,0.,1.]))
+    assert not m['has_improvement'] and m['original_evals']==m['gnn_evals']==3
+    assert m['pairwise_accuracy'] is None
+
+
+def test_eg_train_split_is_layout_disjoint_and_true_cmax_drives_preferences():
+    import run_eg_gnn_pvnd as e
+    layouts=e.training_layouts()
+    assert len({name for name,_,_ in layouts})==20
+    assert sum(role=='fit' for _,_,role in layouts)==15
+    assert sum(role=='holdout' for _,_,role in layouts)==5
+    assert all(name.startswith('train_') for name,_,_ in layouts)
+    scores=torch.zeros(2,requires_grad=True)
+    torch.manual_seed(2)
+    loss=e.ranking_loss(scores,torch.ones(2),[dict(native_cmax_s=90.),dict(native_cmax_s=80.)])
+    loss.backward()
+    assert scores.grad[1]<0 and scores.grad[0]>0
+
