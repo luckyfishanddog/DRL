@@ -18,6 +18,8 @@ EG-GNN-PVND 已完成教师采集、固定 12 轮训练和离线检验。留出�
 
 2026-11-17 已完成 3 个 TRAIN 预实验与 30 次 SAEAX VALIDATION：B32 可行 30/30，完整耗时中位 22.59 s；对 WAG/HGA 的共同可行 Cmax 配对中位变化为 **+0.445% / +1.202%**（正值更差），分别 6 胜 16 负与 0 胜 30 负。质量未达主算法要求，未启动 TEST。完整逐例结果、停止计数与失败分析见[报告第 14 节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#14-2026-11-174r-saeax-实现一次-train-预实验与完整-validation)及[唯一实验 CSV](results/saeax_validation.csv)。
 
+BR-SAEAX 随后完成同种子的三个 TRAIN：最终 Cmax 为 4432.852/5707.055/6100.694 s，相对 SAEAX 为 2 胜 1 负、配对中位变化 -0.401%；B32 可行 3/3，完整时间中位 26.90 s，实际停止于 364/313/400 代。但最终 Pmax 为 0 降、1 平、2 升，**未通过 TRAIN，不继续 VALIDATION/TEST**。1071 次合法联合重插及 32 次三机器人接力没有建立稳定负载改善，不能宣称超过 WAG/HGA。三条结果追加到原 CSV，详见[报告第 15 节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#15-2026-11-17br-saeax-多父焊缝瓶颈联合重插入train未通过)。
+
 ## 运行
 
 在 `D:\pybullet_test\MRTA_GA\DRL` 中执行。

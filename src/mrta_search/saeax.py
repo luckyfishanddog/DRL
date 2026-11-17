@@ -23,6 +23,11 @@ from mrta_baselines.wag_vns import _priority_arrays
 from mrta_reference.model import OperationKind, ScheduleStatus, ScientificConfig
 from mrta_reference.scheduler import reference_schedule_formal
 from mrta_reference.scope import FORMAL_SCOPE_V2
+from mrta_search.lns import _remove_parent_set, repair_partial_state_oriented
+
+
+BR_REPAIR_OPTIONS = dict(insertion_limit=4, max_insertion_evaluations=256,
+    coordination_proxy=True, direction_versions=2, allow_pattern_changes=False)
 
 
 @dataclass(frozen=True)
@@ -361,7 +366,124 @@ def mutate_child(routes, directions, workspace, rng, settings):
     return routes,directions
 
 
-def adjacency_crossover(first, second, workspace, rng, settings):
+def select_reinsertion_parents(routes, processing, costs, workspace, rng):
+    """Select heavy movable parents on a bottleneck and another source route.
+
+    processing/costs are the same exact P and P+MOVE statistics stored on an
+    Individual; neither a schedule nor a simulated WAIT enters this selector.
+    A receiving route with another transferable parent is preferred, allowing
+    chains rather than limiting repair to transfers to the lightest robot.
+    """
+    contributions = [{} for _ in range(4)]
+    destinations = {}
+    for r, route in enumerate(routes):
+        for node in route:
+            node, parent = int(node), int(workspace.parent_index[node])
+            alternatives = {s for s in range(4) if s != r and workspace.eligible[node,s]}
+            if not alternatives:
+                continue
+            contributions[r][parent] = contributions[r].get(parent,0.) + workspace.processing[node]
+            destinations.setdefault((r,parent),set()).update(alternatives)
+    available = set().union(*(set(row) for row in contributions))
+    if len(available) < 3:
+        return (), None
+    peak_p, peak_c = max(1.,max(processing)), max(1.,max(costs))
+    robots = sorted(range(4),key=lambda r:(
+        -(processing[r]/peak_p+costs[r]/peak_c),-processing[r],-costs[r],r))
+    # High-contribution parents lead, with seeded small perturbations to avoid
+    # always destroying the identical set when crossover reproduces a route.
+    ranked = [sorted(row,key=lambda p:(-row[p]*(.9+.2*rng.random()),p))
+              for row in contributions]
+    for critical in robots:
+        if not ranked[critical]:
+            continue
+        anchor = ranked[critical][0]
+        receivers = destinations[critical,anchor]
+        partners = [(r,p) for r in range(4) if r != critical for p in ranked[r] if p != anchor]
+        if not partners:
+            continue
+        partner_robot, partner = min(partners,key=lambda rp:(
+            -(rp[0] in receivers and bool(destinations[rp]-{critical})),
+            -(rp[0] in receivers),-contributions[rp[0]][rp[1]],rp))
+        chosen = [anchor,partner]
+        # Reserve the other source before filling primarily from the heavy
+        # route. Split siblings are subsequently removed as one whole parent.
+        remaining = ranked[critical]+ranked[partner_robot]+[
+            p for r in robots for p in ranked[r]]
+        for parent in remaining:
+            if parent not in chosen:
+                chosen.append(parent)
+                if len(chosen) == min(4,len(available)):
+                    break
+        return tuple(workspace.parents[p].parent_id for p in chosen), critical
+    return (), None
+
+
+def bottleneck_reinsert(routes, directions, selected, workspace, rng, accounting):
+    """Adapt one unscored numeric child to the existing bounded joint repair."""
+    accounting['reinsertion_attempts'] += 1
+    started = time.perf_counter()
+    reason = None
+    try:
+        costs, loads = _route_statistics(routes,directions,workspace.travel,workspace.processing)
+        parents, critical = select_reinsertion_parents(routes,loads,costs,workspace,rng)
+        if not parents:
+            reason = 'NO_MULTI_ROBOT_MOVABLE_SET'
+            return None
+        accounting['reinsertion_selected_parents'] += len(parents)
+        current = workspace.solution(routes,selected)
+        if (current.patterns != tuple(workspace.patterns[p] for p in selected) or
+            tuple(r.block_ids for r in current.routes) != tuple(
+                tuple(workspace.ids[n] for n in row) for row in routes)):
+            raise ValueError('canonicalization changed the pre-repair child')
+        bits = tuple(tuple(int(d) for d in row) for row in directions)
+        partial = _remove_parent_set(current,parents)
+        repaired = repair_partial_state_oriented(current,bits,partial,workspace.config,
+            seed=rng.randrange(2**32),**BR_REPAIR_OPTIONS)
+        accounting['reinsertion_evaluations'] += repaired.insertion_evaluations
+        if repaired.candidate is None or repaired.directions is None:
+            reason = repaired.rejection_reason or 'NO_REPAIRED_CANDIDATE'
+            return None
+        solution = repaired.candidate.solution
+        if solution.patterns != current.patterns:
+            raise ValueError('joint reinsertion changed a selected parent mode')
+        after = workspace.encode(solution)
+        db = [np.array(row,np.int64) for row in repaired.directions]
+        validate_individual(workspace,after,db,selected)
+        if not _heads_legal(after,db,workspace.points,workspace.parameters):
+            reason = 'ILLEGAL_REPAIRED_HEADS'
+            return None
+        if complete_identity(after,db,selected) == complete_identity(routes,directions,selected):
+            reason = 'UNCHANGED_REPAIR'
+            return None
+        old_owners = {int(n):r for r,row in enumerate(routes) for n in row}
+        transfers = [(int(n),old_owners[int(n)],r) for r,row in enumerate(after)
+                     for n in row if old_owners[int(n)] != r]
+        _, new_loads = _route_statistics(after,db,workspace.travel,workspace.processing)
+        accounting['reinsertion_successes'] += 1
+        accounting['reinsertion_transferred_blocks'] += len(transfers)
+        accounting['reinsertion_multi_source_transfers'] += int(len({a for _,a,_ in transfers}) >= 2)
+        chain = any(b == c and a != d for _,a,b in transfers for _,c,d in transfers)
+        accounting['reinsertion_chain_transfers'] += int(chain)
+        accounting['reinsertion_pmax_reduced'] += int(max(new_loads) < max(loads)-1.e-8)
+        if len(accounting['reinsertion_examples']) < 6:
+            accounting['reinsertion_examples'].append(dict(parents=parents,critical_robot=critical,
+                processing_before=loads.tolist(),processing_after=new_loads.tolist(),
+                transfers=[(workspace.ids[n],a,b) for n,a,b in transfers]))
+        return after,db
+    except ValueError as error:
+        reason = str(error)
+        return None
+    finally:
+        accounting['reinsertion_s'] += time.perf_counter()-started
+        if reason is not None:
+            accounting['reinsertion_fallbacks'] += 1
+            reasons = accounting['reinsertion_failure_reasons']
+            reasons[reason] = reasons.get(reason,0)+1
+
+
+def adjacency_crossover(first, second, workspace, rng, settings, *,
+                        bottleneck_reinsertion=False, accounting=None):
     selected = np.array([a if rng.random() < .5 else b for a,b in zip(first.selected,second.selected)],np.int64)
     if rng.random() < settings.pattern_mutation_probability:
         parents = [i for i,options in enumerate(workspace.options) if len(options)>1]
@@ -370,7 +492,12 @@ def adjacency_crossover(first, second, workspace, rng, settings):
             selected[p] = rng.choice([o for o in workspace.options[p] if o != selected[p]])
     fragments, arcs = adjacency_fragments(first,second,selected,workspace,rng,settings)
     routes,directions = assemble_fragments(fragments,workspace,rng)
-    routes,directions = mutate_child(routes,directions,workspace,rng,settings)
+    repaired = (bottleneck_reinsert(routes,directions,selected,workspace,rng,accounting)
+                if bottleneck_reinsertion else None)
+    if repaired is None:
+        routes,directions = mutate_child(routes,directions,workspace,rng,settings)
+    else:
+        routes,directions = repaired
     validate_individual(workspace,routes,directions,selected)
     inherited = novel = 0
     for route,bits in zip(routes,directions):
@@ -409,7 +536,7 @@ def final_shortlist(individuals):
 
 
 def run_saeax(parents, config=None, settings=None, *, seed=20261110,
-              scope=FORMAL_SCOPE_V2, progress_callback=None):
+              scope=FORMAL_SCOPE_V2, progress_callback=None, bottleneck_reinsertion=False):
     config, settings = config or ScientificConfig(), settings or SAEAXConfig()
     started = time.perf_counter()
     rng = random.Random(seed)
@@ -418,6 +545,13 @@ def run_saeax(parents, config=None, settings=None, *, seed=20261110,
         construction_attempts=0,initialization_evaluations=0,native_feasible_children=0,
         crossover_s=0.,native_s=0.,population_s=0.,b32_s=0.,initialization_s=0.,
         inherited_edges=0,new_edges=0,best_improvements=0)
+    if bottleneck_reinsertion:
+        accounting.update(reinsertion_attempts=0,reinsertion_successes=0,reinsertion_fallbacks=0,
+            reinsertion_selected_parents=0,reinsertion_evaluations=0,reinsertion_s=0.,
+            reinsertion_transferred_blocks=0,reinsertion_multi_source_transfers=0,
+            reinsertion_chain_transfers=0,reinsertion_pmax_reduced=0,
+            reinsertion_unique_children=0,reinsertion_native_feasible_children=0,
+            reinsertion_best_improvements=0,reinsertion_failure_reasons={},reinsertion_examples=[])
     seen, population, progress = {},[],[]
 
     def evaluate(routes,directions,selected,inherited=0,novel=0):
@@ -492,7 +626,10 @@ def run_saeax(parents, config=None, settings=None, *, seed=20261110,
             second = min(rng.sample(other,min(2,len(other))),key=lambda p:p.key) if other else first
             t = time.perf_counter()
             try:
-                r,d,s,inherit,novel = adjacency_crossover(first,second,workspace,rng,settings)
+                br_slot = bottleneck_reinsertion and not batch
+                successes = accounting.get('reinsertion_successes',0)
+                r,d,s,inherit,novel = adjacency_crossover(first,second,workspace,rng,settings,
+                    **(dict(bottleneck_reinsertion=True,accounting=accounting) if br_slot else {}))
             except ValueError:
                 accounting['crossover_s'] += time.perf_counter()-t
                 accounting['invalid_children'] += 1
@@ -504,6 +641,11 @@ def run_saeax(parents, config=None, settings=None, *, seed=20261110,
                 continue
             batch.append(item)
             children += 1
+            repaired_child = br_slot and accounting['reinsertion_successes'] > successes
+            if repaired_child:
+                accounting['reinsertion_unique_children'] += 1
+                accounting['reinsertion_native_feasible_children'] += int(math.isfinite(item.native_cmax))
+                accounting['reinsertion_best_improvements'] += int(item.native_cmax < best.native_cmax-1.e-8)
             accounting['native_feasible_children'] += int(math.isfinite(item.native_cmax))
             accounting['inherited_edges'] += inherit
             accounting['new_edges'] += novel

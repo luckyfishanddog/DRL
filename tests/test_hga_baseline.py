@@ -1255,3 +1255,170 @@ def test_vnd_action_context_matches_materialized_oriented_costs(move):
     assert context[0,30]==pytest.approx((after-before)/scale)
     assert affected[0,routes[ru][iu]] and affected[0,routes[rv][iv]]
 
+
+def _br_accounting():
+    counts = dict.fromkeys(('reinsertion_attempts','reinsertion_successes','reinsertion_fallbacks',
+        'reinsertion_selected_parents','reinsertion_evaluations','reinsertion_transferred_blocks',
+        'reinsertion_multi_source_transfers','reinsertion_chain_transfers','reinsertion_pmax_reduced'),0)
+    return dict(counts,reinsertion_s=0.,reinsertion_failure_reasons={},reinsertion_examples=[])
+
+
+def test_br_selection_has_heavy_and_other_movable_sources():
+    s,w,a,_ = _saeax_fixture()
+    for seed in range(12):
+        parents,critical = s.select_reinsertion_parents(a.routes,a.processing,a.costs,w,random.Random(seed))
+        assert 3 <= len(parents) <= 4 and len(set(parents))==len(parents)
+        sources = {r for r,route in enumerate(a.routes) for n in route
+                   if w.parents[w.parent_index[n]].parent_id in parents}
+        assert critical in sources and len(sources)>=2
+        assert all(any(w.parents[w.parent_index[n]].parent_id==p and
+            any(w.eligible[n,t] for t in range(4) if t!=r)
+            for r,route in enumerate(a.routes) for n in route) for p in parents)
+
+
+def test_br_fixed_mode_adapter_reuses_joint_repair_without_scheduling(monkeypatch):
+    import numpy as np
+    from mrta_search import lns
+    from mrta_search import saeax as s
+    def forbidden(*args,**kwargs):raise AssertionError('repair must not schedule or use timeline selectors')
+    monkeypatch.setattr(s,'_priority_arrays',forbidden)
+    monkeypatch.setattr(s,'reference_schedule_formal',forbidden)
+    monkeypatch.setattr(lns,'build_crrr_candidate',forbidden)
+    monkeypatch.setattr(lns,'select_bottleneck_parents',forbidden)
+    parents = (ParentWeld('y',(3.,8.),(3.,4.)),ParentWeld('x',(1.,9.),(10.,9.)),
+        ParentWeld('a',(2.,9.),(3.2,9.)),ParentWeld('b',(11.,9.),(12.2,9.)),
+        ParentWeld('c',(1.,3.),(2.2,3.)),ParentWeld('d',(12.,3.),(13.2,3.)))
+    w = s._HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    selected = w.initial_selected.copy()
+    xp = next(i for i,p in enumerate(w.parents) if p.parent_id=='x')
+    selected[xp] = next(p for p in w.options[xp] if w.patterns[p].kind is SplitKind.X_SPLIT)
+    active = {w.ids[n]:int(n) for p in selected for n in w.pattern_nodes[p] if n>=0}
+    sequences = (('x::0','y::0','a::whole'),('x::1','b::whole'),('y::1','c::whole'),('d::whole',))
+    routes = [np.array([active[n] for n in row],np.int64) for row in sequences]
+    bits = [np.zeros(len(r),np.int64) for r in routes]
+    s.validate_individual(w,routes,bits,selected)
+    monkeypatch.setattr(s,'select_reinsertion_parents',lambda *args:(('x','y','a','c'),0))
+    original = s.repair_partial_state_oriented
+    calls = []
+    def capture(current,directions,partial,config,**kwargs):
+        calls.append((current,partial,kwargs))
+        assert partial.removed_parent_ids==('a','c','x','y')
+        assert partial.routes==((),('b::whole',),(),('d::whole',))
+        assert {k:v for k,v in kwargs.items() if k!='seed'}==s.BR_REPAIR_OPTIONS
+        return original(current,directions,partial,config,**kwargs)
+    monkeypatch.setattr(s,'repair_partial_state_oriented',capture)
+    counts = _br_accounting()
+    repaired = s.bottleneck_reinsert(routes,bits,selected,w,random.Random(61),counts)
+    assert len(calls)==1 and counts['reinsertion_evaluations']<=256
+    assert repaired is not None and counts['reinsertion_successes']==1
+    rr,dd = repaired
+    s.validate_individual(w,rr,dd,selected)
+    solution = w.solution(rr,selected)
+    assert solution.patterns==calls[0][0].patterns
+    assert sorted(n for row in rr for n in row)==sorted(active.values())
+    for r,row in enumerate(rr):
+        assert all(w.eligible[n,r] for n in row)
+    np.testing.assert_array_equal(routes[0],[active[n] for n in sequences[0]])
+
+
+def test_br_failed_repair_falls_back_to_original_mutation(monkeypatch):
+    s,w,a,b = _saeax_fixture()
+    settings = s.SAEAXConfig()
+    expected = s.adjacency_crossover(a,b,w,random.Random(19),settings)
+    monkeypatch.setattr(s,'bottleneck_reinsert',lambda *args:None)
+    actual = s.adjacency_crossover(a,b,w,random.Random(19),settings,
+        bottleneck_reinsertion=True,accounting={})
+    assert s.complete_identity(*actual[:3])==s.complete_identity(*expected[:3])
+    assert actual[3:]==expected[3:]
+
+
+def test_br_one_effective_slot_per_generation_and_one_native_score(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    s,w,_,_ = _saeax_fixture()
+    calls,progress = [],[]
+    def reinsertion(routes,bits,selected,workspace,rng,accounting):
+        accounting['reinsertion_attempts']+=1
+        accounting['reinsertion_successes']+=1
+        calls.append(accounting['construction_attempts'])
+        return routes,bits
+    monkeypatch.setattr(s,'bottleneck_reinsert',reinsertion)
+    monkeypatch.setattr(s,'_priority_arrays',lambda *args:(100.,None,None,None))
+    def b32(solution,config,*,scope,orientations):
+        assert progress[-1]['generation']==3
+        return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,directions=tuple(orientations[r] for r in range(4)))
+    monkeypatch.setattr(s,'reference_schedule_formal',b32)
+    parents=tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
+    result=s.run_saeax(parents,settings=s.SAEAXConfig(max_generations=3,min_generations=1,
+        stagnation_generations=10),seed=987,bottleneck_reinsertion=True,progress_callback=progress.append)
+    a=result.accounting
+    assert result.generations==3 and result.valid_children==12
+    assert a['reinsertion_unique_children']==3
+    assert a['native_calls']==a['initialization_evaluations']+12
+    assert calls and min(calls)>0 and a['initialization_evaluations']==12
+    assert a['b32_calls']==3
+
+
+def test_br_paired_comparison_excludes_deadlock_and_pilot_requires_load_reduction(monkeypatch):
+    import runpy
+    from pathlib import Path
+    m=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/run_saeax.py'))
+    rows=[dict(layout_id='train_15',seed='20261110',status='FEASIBLE',cmax_s='90',runtime_s='20')]
+    ref={('train_15',20261110):dict(status='DEADLOCK',runtime_s='10',cmax_s='')}
+    assert m['paired_summary'](rows,ref)['pairs']==0
+    old=[dict(layout_id=n,seed='20261110',status='FEASIBLE',cmax_s='100',
+        max_processing_s='80',runtime_s='20') for n in ('train_15','train_34','train_28')]
+    new=[dict(r,cmax_s='90',runtime_s='25') for r in old]
+    monkeypatch.setitem(m['pilot_decision'].__globals__,'method_rows',lambda stage,method:new if method=='br' else old)
+    assert not m['pilot_decision']()['passed']
+    for r in new[:2]:r['max_processing_s']='79'
+    assert m['pilot_decision']()['passed']
+    new[2]['runtime_s']='61'
+    assert not m['pilot_decision']()['passed']
+
+
+def test_br_selection_includes_receiver_with_a_legal_third_robot():
+    import numpy as np
+    from mrta_search import saeax as s
+    lengths=(8.,7.,6.,5.,1.,.6,.5)
+    parents=tuple(ParentWeld(chr(97+i),(1.,6.),(1.+length,6.)) for i,length in enumerate(lengths))
+    w=s._HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    nodes=[int(w.pattern_nodes[p,0]) for p in w.initial_selected]
+    routes=[np.array(row,np.int64) for row in (nodes[:3],nodes[3:5],nodes[5:6],nodes[6:])]
+    bits=[np.zeros(len(r),np.int64) for r in routes]
+    costs,loads=s._route_statistics(routes,bits,w.travel,w.processing)
+    chosen,critical=s.select_reinsertion_parents(routes,loads,costs,w,random.Random(7))
+    assert critical==0 and 'd' in chosen
+    heavy=[n for n in routes[critical] if w.parents[w.parent_index[n]].parent_id in chosen]
+    receiver=nodes[3]
+    assert any(w.eligible[n,1] for n in heavy) and w.eligible[receiver,2]
+    assert 3<=len(chosen)<=4
+
+
+def test_br_completed_pilot_is_read_without_new_runs_or_writes(monkeypatch):
+    import runpy
+    from pathlib import Path
+    m=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/run_saeax.py'))
+    g=m['run_experiment'].__globals__
+    layouts=[(n,(None,)*size) for n,size in (('train_15',56),('train_34',90),('train_28',132))]
+    saved=[dict(stage='pilot',layout_id=n,seed='20261110',source=m['METHOD_SOURCES']['br']) for n,_ in layouts]
+    def forbidden(*args,**kwargs):raise AssertionError('completed experiment was rerun or appended')
+    monkeypatch.setitem(g,'load_layouts',lambda split:layouts)
+    monkeypatch.setitem(g,'read_rows',lambda:saved)
+    monkeypatch.setitem(g,'experiment_job',forbidden)
+    monkeypatch.setitem(g,'append_result',forbidden)
+    monkeypatch.setitem(g,'summarize',lambda *args:None)
+    m['run_experiment']('pilot',1,'br')
+
+
+def test_br_failed_train_does_not_load_validation_or_run_search(monkeypatch):
+    import runpy
+    from pathlib import Path
+    m=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/run_saeax.py'))
+    g=m['run_experiment'].__globals__
+    def forbidden(*args,**kwargs):raise AssertionError('new split touched after failed TRAIN')
+    monkeypatch.setitem(g,'pilot_decision',lambda:dict(passed=False))
+    monkeypatch.setitem(g,'load_layouts',forbidden)
+    monkeypatch.setitem(g,'experiment_job',forbidden)
+    with pytest.raises(ValueError,match='TRAIN criteria'):
+        m['run_experiment']('validation',1,'br')
+
