@@ -14,10 +14,12 @@ from mrta_reference.geometry import (
     robot_is_eligible,
 )
 from mrta_reference.model import (
+    CandidateKey,
     CandidateMove,
     CanonicalSolution,
     Operation,
     OperationKind,
+    MoveType,
     ParentWeld,
     RobotRoute,
     Route,
@@ -146,6 +148,15 @@ class OrientedRouteState:
     @property
     def travel(self) -> float:
         return sum(sum(arcs) for arcs in self.arc_costs)
+
+
+@dataclass(frozen=True)
+class ChildTransfer:
+    move: CandidateMove
+    action: OrientedInsertionAction
+    partial: OrientedRouteState
+    state: OrientedRouteState
+    solution: CanonicalSolution
 
 
 @dataclass(frozen=True)
@@ -423,31 +434,41 @@ def schedule_feedback_summary(current, schedule, blockers, config):
     processing, move, robot_wait = [0.] * 4, [0.] * 4, [0.] * 4
     parent_costs = {p.parent_id: [0.] * 4 for p in current.parents}
     parent_wait, parent_blocked, parent_move = {}, {}, {}
+    block_processing, block_move, block_wait = (dict.fromkeys(blocks, 0.) for _ in range(3))
     mapped_wait = {event.waiting.operation_id: event.delayed_block_id for event in blockers}
 
-    def parent_for(op):
+    def block_for(op):
         block_id = mapped_wait.get(op.operation_id, op.block_id)
         if block_id in blocks:
-            return blocks[block_id].parent_id
+            return block_id
         # The scheduler's MOVE/WAIT operation ID retains its destination index.
+        if not op.operation_id.startswith(f'R{op.robot_id}:B'):
+            return None
         try:
             index = int(op.operation_id.split(':B', 1)[1].split(':', 1)[0])
-            return blocks[current.routes[op.robot_id].block_ids[index]].parent_id
+            if index < 0:
+                return None
+            return current.routes[op.robot_id].block_ids[index]
         except (IndexError, KeyError, ValueError):
             return None
 
     for op in schedule.operations:
-        parent = parent_for(op)
+        block_id = block_for(op)
+        parent = blocks[block_id].parent_id if block_id in blocks else None
         if op.kind is OperationKind.WAIT:
             robot_wait[op.robot_id] += op.duration
             if parent is not None:
                 parent_wait[parent] = parent_wait.get(parent, 0.) + op.duration
+                block_wait[block_id] += op.duration
         elif op.kind is OperationKind.MOVE:
             move[op.robot_id] += op.duration
             if parent is not None:
                 parent_move[parent] = parent_move.get(parent, 0.) + op.duration
+                block_move[block_id] += op.duration
         else:
             processing[op.robot_id] += op.duration
+            if parent is not None:
+                block_processing[block_id] += op.duration
         if parent is not None:
             parent_costs[parent][op.robot_id] += op.duration
     for event in blockers:
@@ -470,7 +491,8 @@ def schedule_feedback_summary(current, schedule, blockers, config):
     return dict(completion=schedule.robot_completion, robot_wait=tuple(robot_wait),
                 parent_wait=parent_wait, parent_blocked=parent_blocked, scores=scores,
                 processing=tuple(processing), move=tuple(move), parent_move=parent_move,
-                parent_costs={parent: tuple(costs) for parent, costs in parent_costs.items()})
+                parent_costs={parent: tuple(costs) for parent, costs in parent_costs.items()},
+                block_processing=block_processing, block_move=block_move, block_wait=block_wait)
 
 
 def select_feedback_bottleneck(current, feedback, *, q, seed, assignment_space=None):
@@ -1295,6 +1317,84 @@ def joint_block_candidates(
             if _initial_error(points,config) is None:restored.append((inserted,action))
         if restored:rows=restored
     return tuple(rows)
+
+
+def select_feedback_child(current, feedback, config, *, seed=None):
+    """A movable block on the actual B32 bottleneck, without sibling removal."""
+    blocks = block_map(current, config)
+    patterns = {p.parent_id: p for p in current.patterns}
+    critical = max(range(4), key=lambda r: (feedback['completion'][r], -r))
+    candidates = [b for b in current.routes[critical].block_ids if any(
+        r != critical for r in joint_block_robots(blocks[b], patterns[blocks[b].parent_id], config))]
+    contribution = lambda b: feedback['block_processing'][b] + feedback['block_move'][b]
+    ordered = sorted(candidates, key=lambda b: (-contribution(b), b))
+    if not ordered:
+        return None
+    if seed is None:
+        return ordered[0]
+    # Vary among the four largest observed contributors; no geometric WAIT.
+    pool = ordered[:4]
+    return random.Random(seed).choices(pool, weights=[max(contribution(b), 1e-9) for b in pool])[0]
+
+
+def child_transfer_candidates(current, directions, block_id, config, *, destination_robot=None,
+                              insertion_limit=8):
+    """INTER_RELOCATE one block with joint position/direction/neighbour choices.
+
+    A sibling keeps its robot, route index and direction. Canonicalization may
+    merge consecutive same-robot children; such a pattern change is rejected,
+    including a merge of an unrelated parent exposed by removing this block.
+    """
+    from mrta_reference.candidate import apply_candidate
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+
+    blocks = block_map(current, config, scope=FORMAL_SCOPE_V2)
+    if block_id not in blocks:
+        raise ValueError('unknown child block')
+    block = blocks[block_id]
+    pattern = next(p for p in current.patterns if p.parent_id == block.parent_id)
+    owners = {b: (r, i, directions[r][i]) for r, route in enumerate(current.routes)
+              for i, b in enumerate(route.block_ids)}
+    source, position, _ = owners[block_id]
+    destinations = tuple(r for r in joint_block_robots(block, pattern, config)
+                         if r != source and (destination_robot is None or r == destination_robot))
+    if not destinations:
+        return ()
+    routes = tuple(tuple(b for b in route.block_ids if b != block_id) for route in current.routes)
+    bits = tuple(tuple(d for b, d in zip(route.block_ids, vector) if b != block_id)
+                 for route, vector in zip(current.routes, directions))
+    partial = oriented_route_state(routes, bits, blocks, config)
+    siblings = {b for b, value in blocks.items() if value.parent_id == block.parent_id and b != block_id}
+    answers = []
+    for destination in destinations:
+        variants = joint_block_candidates(partial, block, pattern, blocks, config,
+            insertion_limit=insertion_limit, robot_id=destination, check_initial_feasibility=True)
+        by_position = {}
+        for after, action in variants:
+            if action.position not in by_position:
+                move = CandidateMove(CandidateKey(current.revision, MoveType.INTER_RELOCATE,
+                    (block.parent_id,), source, destination, (position,), (action.position,)), (block_id,))
+                try:
+                    solution = apply_candidate(current, move, config, scope=FORMAL_SCOPE_V2)
+                except ValueError:
+                    solution = None
+                if solution is not None and (solution.patterns != current.patterns or
+                        tuple(r.block_ids for r in solution.routes) != after.routes):
+                    solution = None
+                by_position[action.position] = (move, solution)
+            move, solution = by_position[action.position]
+            if solution is None:
+                continue
+            after_owners = {b: (r, i, after.directions[r][i]) for r, route in enumerate(after.routes)
+                            for i, b in enumerate(route)}
+            if any(after_owners[b] != owners[b] for b in siblings):
+                continue
+            # The primitive can only flip immediate destination neighbours.
+            if any(after.routes[r] != routes[r] or after.directions[r] != bits[r]
+                   for r in range(4) if r != destination):
+                raise ValueError('child insertion changed an unrelated route')
+            answers.append(ChildTransfer(move, action, partial, after, solution))
+    return tuple(answers)
 
 
 def _oriented_parent_alternatives(

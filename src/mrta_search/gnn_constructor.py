@@ -1935,6 +1935,21 @@ class VNextGNN(_JointAssignmentGNN):
         fine = (insertion.reshape(count, 2) * mask).sum(1) / mask.sum(1).clamp_min(1.)
         return coarse + fine + inputs['outcomes'] @ self.joint_weights
 
+    def enable_child_transfer_head(self):
+        """One small action head; existing construction parameters stay intact."""
+        if getattr(self, 'child_transfer_head', None) is not None:
+            return self
+        hidden = self.policy[0].out_features
+        width = 5 * hidden + _VNEXT_FEATURE_DIM + 17
+        self.child_transfer_head = nn.Sequential(nn.Linear(width, hidden), nn.ReLU(), nn.Linear(hidden, 1))
+        self.register_buffer('child_transfer_mean', torch.zeros(width))
+        self.register_buffer('child_transfer_scale', torch.ones(width))
+        return self
+
+    def child_transfer_scores(self, rows):
+        normalized = (rows - self.child_transfer_mean) / self.child_transfer_scale
+        return self.child_transfer_head(normalized).squeeze(1)
+
     def enable_cmax_value(self):
         """Attach the only trainable head; old checkpoints keep their exact keys."""
         if self.joint_weights is None or not self.workload_lookahead:
@@ -2045,6 +2060,53 @@ def vnext_insertion_inputs(graph, state, variants, blocks, config):
         starts.gather(1, positions).squeeze(1) / horizon, finishes.gather(1, positions).squeeze(1) / horizon,
         torch.tensor([s.loads[robot] / horizon for s in states])), dim=1)
     return indices, torch.cat((local[:, _VNEXT_LOCAL_COLUMNS], dynamics), dim=1)
+
+
+@torch.no_grad()
+def child_transfer_inputs(space, embeddings, current, feedback, transfers, model, config):
+    """Frozen graph/insertion inputs plus observed loads for full block moves.
+
+    Nominal spatial features are inherited insertion inputs, never real WAIT.
+    The final scalar feature is the old, frozen insertion head's output; only
+    the new action head learns how to use it and the source-robot context.
+    """
+    blocks = block_map(current.solution, config, scope=FORMAL_SCOPE_V2)
+    nodes = {b.block_id: space.block_nodes[p, b.block_id]
+             for p in current.solution.patterns for b in space.children[p]}
+    graph = replace(space.graph, block_index=nodes)
+    groups = {}
+    for i, transfer in enumerate(transfers):
+        groups.setdefault((transfer.action.block_id, transfer.action.robot), []).append(i)
+    before = current.oriented_state
+    old_moves = [sum(arcs) for arcs in before.arc_costs]
+    rows = [None] * len(transfers)
+    for (block_id, destination), positions in groups.items():
+        group = [transfers[i] for i in positions]
+        variants = tuple((t.state, t.action) for t in group)
+        indices, features = vnext_insertion_inputs(graph, group[0].partial, variants, blocks, config)
+        context = embeddings[indices.clamp_min(0)] * (indices >= 0).unsqueeze(-1)
+        old_scores = model.insertion_logits(embeddings, indices, features)
+        source = group[0].move.key.source_robot_id
+        seconds = feedback['block_processing'][block_id]
+        loads = feedback['processing']
+        projected = list(loads)
+        projected[source] -= seconds
+        projected[destination] += seconds
+        for k, i in enumerate(positions):
+            transfer = transfers[i]
+            moves = [sum(arcs) for arcs in transfer.state.arc_costs]
+            extras = embeddings.new_tensor((seconds / 2500., loads[source] / 2500., loads[destination] / 2500.,
+                projected[source] / 2500., projected[destination] / 2500., max(loads) / 2500.,
+                max(projected) / 2500., (max(projected) - max(loads)) / 2500.,
+                old_moves[source] / 45., old_moves[destination] / 45.,
+                (moves[source] - old_moves[source]) / 45., (moves[destination] - old_moves[destination]) / 45.,
+                (sum(moves) - sum(old_moves)) / 45., feedback['completion'][source] / 2500.,
+                feedback['completion'][destination] / 2500., feedback['block_wait'][block_id] / 2500.))
+            normalized = (features[k] - model.insertion_mean) / model.insertion_scale
+            rows[i] = torch.cat((context[k].flatten(), embeddings[space.graph.robot_offset + source],
+                                 normalized, extras, old_scores[k:k + 1]))
+    width = 5 * embeddings.shape[1] + _VNEXT_FEATURE_DIM + 17
+    return torch.stack(rows) if rows else embeddings.new_empty((0, width))
 
 
 class VNextJointAction(NamedTuple):

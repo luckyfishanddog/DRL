@@ -1065,3 +1065,144 @@ WAG在validation_07的原3次运行全部DEADLOCK，因此该格没有Cmax配对
 最终代码再按用户指定命令复验，结果 **336 passed in 17.86s**。此前边界复验8项通过，保留了既有checkpoint完成检查，并仅对N=1的公式结果允许q=0；实际VALIDATION没有单父任务且checkpoint已完成，正式搜索路径及参数没有改变。已核对30个键完整唯一、失败Cmax为空、27次各500尝试、13500个完整候选、0个迟到候选，以及逐运行 `B32调用+缓存命中=初始构造次数+完整重构次数`。
 
 实现修改限于现有 `feedback_shortlist()`、`vnext_joint_actions()`说明、`schedule_feedback_summary()`、`select_feedback_bottleneck()`，以及原实验入口中的 `feedback_prefix()`、`run_feedback_gnn()`、新增的同文件函数 `feedback_accepts()`、`feedback_job()`、`feedback_evaluate()`、`feedback_summary()`、`feedback_paired()`、`validate_feedback_complete()`、`test_feedback()`、`summarize_feedback()`及CLI默认工作进程数。测试和报告继续修改原文件；本轮没有新增项目文件、独立脚本、模型、实验CSV、hash、manifest、注册表或额外认证器，也没有修改WAG/HGA主体、焊缝数据或科学约束。
+
+## 2026-11-17：真实B32偏好监督的子焊缝独立任务转移
+
+### 修改范围与子焊缝语义
+
+本轮保留上一轮父级500次实现和完整结果，新增本轮专用的block级路径。原始GNN联合构造和最多两次死锁采样恢复保持原逻辑，初始化仅使用 `models/gnn_schedule_feedback.pt` 当前选定的epoch 0。原模型没有更新，没有重新运行旧父级500次、WAG或HGA。
+
+修改现有文件及主要函数：
+
+- `src/mrta_search/lns.py`：扩展 `schedule_feedback_summary()` 返回 `block_processing`、`block_move`、`block_wait`；新增轻量记录 `ChildTransfer`、`select_feedback_child()` 和 `child_transfer_candidates()`。旧 `select_feedback_bottleneck()`、`_remove_parent_set()` 保留，普通子焊缝转移不调用父级移除。
+- `src/mrta_search/gnn_constructor.py`：在VNextGNN中增加可选 `enable_child_transfer_head()`、`child_transfer_scores()`，新增 `child_transfer_inputs()`；原GAT、分配、联合构造、插入网络及其权重不变。
+- `scripts/run_gnn_weld_layout.py`：新增 `child_feedback_model()`、`child_initial_state()`、`child_collect_job()`、`collect_child_preferences()`、`fit_child_head()`、`run_child_feedback_gnn()`、候选评价计数与偏好配对函数、并行验证及对照汇总函数、`child_feedback_experiment()` 和原CLI的 `child-feedback` 阶段。
+- `tests/test_gnn_construct_vns.py`：增加9个直接相关的参数化/回归用例，复用原测试文件。
+- 本报告与既有 `gnn_schedule_feedback_training_validation.csv` 继续追加。本轮唯一新增项目文件是经用户明确确认必要后保存的 `models/gnn_child_level_feedback.pt`，294470字节。
+
+普通转移动作由 `CandidateMove(INTER_RELOCATE)` 和现有 `OrientedInsertionAction` 共同表示，包含一个block_id、源机器人及位置、目标机器人及插入位置、方向和相邻方向调整。只从源路线删除该block及对应方向记录，再调用原 `joint_block_candidates()` 联合生成插入位置、方向及必要的目标路线邻居方向变化。子焊缝选择来自当前B32实际完工最晚机器人的路线，按子焊缝实际加工+MOVE贡献排序；训练固定选最高贡献可移动块，搜索在贡献最高的4个可移动块中按贡献随机抽取，再由GNN给该块的完整转移动作评分。没有按父任务数量计算普通破坏规模。
+
+WHOLE在现有合法机器人之间转移。Y_SPLIT只移动所指定的一个子段，兄弟子段的 `(机器人, 路线索引, 方向)` 必须与原解完全相同；兄弟在另一条路线时，该路线保持原状。其他未涉及路线的任务顺序和方向不变，源路线只删去被移动的一个block。目标路线允许原有有向插入操作的必要邻居翻转，但不能改动兄弟子段。X_SPLIT继续使用 `joint_block_robots()` 的固定空间子段机器人归属，没有其他合法接收者时不生成转移。
+
+候选复用原 `apply_candidate()`/`canonicalize()`，随后检查完整覆盖、路线一致及模式未变。移入位置使兄弟子段相邻，或移出任务使另一个父任务的同机子段变为相邻，都可能触发WHOLE归一化；只要canonical模式或路线因此改变，该候选就被拒绝。没有修改 `solution.py`、`candidate.py`、几何、拆分域、机器人资格、0.50 m最短拆分子段、路径/MOVE模型、ScientificConfig、FORMAL_SCOPE_V2或B32。
+
+子块WAIT只使用实际操作的block_id、B32阻塞映射中的delayed_block_id，或明确属于同一机器人且包含有效目的块索引的原B32操作ID。无法准确定位的WAIT仍累计在机器人级，不分摊给子块。12点名义空间特征仍作为原插入特征，未被称为真实WAIT。
+
+### 一次TRAIN采集与排序头训练
+
+只使用现有 `train_expanded.jsonl` 的120个TRAIN排样，种子20261110。每例按原GNN逻辑取得首个可行初解；若三次构造都死锁，则保留失败，不用文献算法回退。每个可行初解只选择一条瓶颈子焊缝，所有训练候选共享**同一个移出该block后的部分状态**。在原插入头排序基础上保留目标机器人、方向和位置多样性，最多选4个完整候选；仅这些完整候选调用原B32。原插入分数用于候选覆盖和作为可学习输入，不作为教师标签，也没有人为MOVE/负载/风险固定权重代替B32偏好。
+
+| 实际采集项 | 数量 |
+|---|---:|
+| TRAIN排样 | 120 |
+| 获得可行初解 | 110 |
+| 三次初解均死锁 | 10 |
+| 完整子焊缝转移候选 | 440 |
+| 候选B32可行 / DEADLOCK | 281 / 159 |
+| 产生有效偏好的状态组 | 86 |
+| 有效偏好对 | **445** |
+| 同为可行的真实Cmax偏好 | **258** |
+| 可行优于死锁的偏好 | **187** |
+| 新增真实B32调用 | **616 = 176次初解 + 440次候选** |
+| 缓存命中 / NUMERIC_FAILURE | 0 / 0 |
+
+剩余24个已有可行初解的状态中，18组的四个候选全死锁，6组的四个候选均可行但Cmax相同，没有为它们制造偏好。所有偏好都在各自同一部分状态内配对，没有跨排样、跨初始方案或跨移出子块状态配对，没有重复采集或添加相似数据来补数量。训练选中的子块分布为101个WHOLE块、9个Y_SPLIT子块；Y子块实际贡献24对偏好。这表明独立Y转移的监督覆盖仍较少，不能将445对全部描述为Y子段学习样本。
+
+沿用原两层GAT、hidden_dim=64、heads=4，冻结全部旧参数及旧归一化。新动作输入为357维：当前块、源机器人、目标机器人、插入前后邻块的5个64维嵌入，原20维有向插入特征，16维实际加工/当前负载/源目标MOVE变化/最大负载变化/完工与准确映射WAIT等上下文，以及冻结的原插入头标量输出。位置、方向和邻居翻转已包含在同一动作输入中。
+
+仅新增 `Linear(357,64) → ReLU → Linear(64,1)`，**22977个可训练参数**，输出S越高越优；没有第二套GNN、Critic、Value Head、独立可行性网络或新强化学习框架。新输入归一化仅由有偏好的TRAIN组拟合。对每对真实标签使用 `softplus(-(S_better-S_worse))`，同可行时Cmax较小者优先、可行优于死锁、双死锁/同Cmax/数值失败不配对。
+
+预先固定一次拟合：AdamW学习率0.001、weight_decay=1e-5、20遍、每批最多64对、训练种子20261110。按自然键排序后使用固定生成器洗牌，共140次更新；没有用VALIDATION选训练轮数或调整超参数。损失0.696467→0.203183只说明训练拟合，不作为算法有效性判断。保存后逐张量比较新模型中的所有旧键，均与原模型完全相同，旧GAT、旧评分头和旧归一化没有变化。
+
+新模型单独保存为 `models/gnn_child_level_feedback.pt`，含原固定GNN和新头、TRAIN归一化及真实训练/筛查结果。它是本轮实验产物，没有替换原正式模型。原 `gnn_schedule_feedback.pt` 仍为788675字节、原时间戳及选定epoch 0。
+
+### 小规模VALIDATION：预先确定的5例、单种子、100次
+
+按父焊缝数量及layout_id升序排序，固定取索引 `round(i*9/4), i=0..4`，即最小/四分位/中位/四分之三位/最大五例：validation_03(82)、validation_09(87)、validation_10(89)、validation_01(97)、validation_07(115)。没有根据历史性能避开初解失败排样。各用种子20261110、100次子焊缝转移尝试；默认正式搜索上限仍为500，没有增加搜索次数。
+
+每次尝试只选择一条子块，再对其完整合法目标机器人/位置/方向候选由新头评分并取最高分，生成完整方案后B32评价或复用原完整方案缓存。继续使用原current/best分离和SA接受：`T_k=0.01*C0*0.01**(k/499)`；100次筛查沿用正式500次的前100个温度，没有另外改接受规则。B32死锁不接纳，最终返回已有全局最优调度，不补评。没有独立方向阶段或父级破坏。
+
+下表均为同一排样、同一20261110种子，Cmax单位秒；“死锁”没有可行Cmax。旧GNN为原 `CMAX_FEEDBACK_ADAPTIVE_500`，WAG为 `PARTIAL_LNS_V1`/500轮，HGA为 `ORIENTED_ROUTE_VND_NATIVE_SELECT_V1`/200000有效子代且完整VND结束，全部只读复用。
+
+| 排样（父数） | 新子级100次Cmax | 旧父级500次Cmax | WAG Cmax | HGA Cmax | 新耗时/s | 新尝试数 | 新B32/缓存 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| validation_03 (82) | 死锁 | 死锁 | 5026.139 | 5003.849 | 24.111 | 0 | 3 / 0 |
+| validation_09 (87) | 5962.076 | 5705.444 | 5533.942 | 5471.734 | 15.309 | 100 | 5 / 96 |
+| validation_10 (89) | 6261.979 | 6258.219 | 死锁 | 5418.993 | 12.553 | 100 | 5 / 96 |
+| validation_01 (97) | 7088.001 | 6063.072 | 5591.128 | 5540.169 | 21.714 | 100 | 13 / 89 |
+| validation_07 (115) | 7052.429 | 6040.708 | 死锁 | 5631.193 | 35.345 | 100 | 10 / 92 |
+
+validation_03三次初始构造均原B32死锁，因此按原逻辑真实失败，未从不可行解开始转移，也未改初始构造来补可行率。其余四次均完整达到100次，共400次完整方案尝试，没有不完整候选或NUMERIC_FAILURE。失败始终保留在5次分母中。
+
+| 方法（本5例子集） | 最终B32可行 | 可行Cmax中位/s | 全部5次耗时中位/s |
+|---|---:|---:|---:|
+| 新GNN子级100次 | **4/5** | **6657.204** | **21.714** |
+| 旧GNN父级500次（复用） | 4/5 | 6051.890 | 1533.496 |
+| WAG+VNS（复用） | 3/5 | 5533.942 | 99.745 |
+| HGA（复用） | 5/5 | 5471.734 | 1020.141 |
+
+各方法独立可行集可能不同，下面仅对共同可行键计算Cmax胜平负与相对变化，正数表示新方法更差。100次对旧父级500次是用户预先指定的筛查，不代表等迭代单位或等计算量比较。
+
+| 对照 | 共同可行 | 新方法胜/平/负 | 配对Cmax变化中位 |
+|---|---:|---:|---:|
+| 旧GNN父级500次 | 4 | **0/0/4** | **+10.623%** |
+| WAG+VNS | 2 | **0/0/2** | **+17.254%** |
+| HGA | 4 | **0/0/4** | **+20.397%** |
+
+对旧GNN逐例变化为validation_09 +4.498%、validation_10 +0.060%、validation_01 +16.904%、validation_07 +16.748%；validation_03双方均死锁，不作为持平或胜利。对HGA相应变化为+8.961%、+15.556%、+27.938%、+25.239%；validation_03没有共同可行配对。WAG在validation_07/10失败不被算作新方法的Cmax胜利。
+
+### 停滞与失败原因
+
+筛查实际新增B32 **36次 = 9次初解 + 27次不同完整重构候选**；其余373次重构为现有缓存复用，`36+373=9+400`。373/400，即**93.25%**的尝试重复已有方案，不能将400次尝试描述为400个不同新方案的探索，也不能据21.714 s的短耗时宣称性能优势。当前解共接受7次（含1次劣解），全局最优仅改善6次。
+
+具体失败位置：
+
+1. **原始构造失败仍在**：validation_03与旧GNN相同，在三次初解构造后仍死锁，按本轮要求不修改初始构造，所以独立转移没有机会修复它。
+2. **验证动作排序没有带来Cmax收益**：validation_09没有接纳任何动作，100次尝试只新增4个重构候选评价；validation_10仅改善一次，也仅新增4个候选。固定当前状态下，评分头反复选取少数高贡献子块的同一个最高分动作，很多是已有的DEADLOCK或劣解；缓存省掉重复B32，但没有推进到新的动作。当前实现没有对已知失败动作继续向后遍历评分列表，搜索很早停滞。
+3. **分配峰值没有消除**：四个可行运行的单机加工峰值分别为5760.823、6037.037、6426.316、6752.953 s，逐例均已超过对应HGA完整Cmax。即使消除其当前MOVE/WAIT，也仍不足以击败HGA。validation_09保留了真实642.093 s的全机WAIT，不能假称全部WAIT为0，但只处理等待仍不能解决加工峰值。
+4. **监督覆盖与泛化有限**：445对来自86个同部分状态，其中独立Y子块只有9个状态、24对偏好。训练损失下降没有转化为VALIDATION上的正确排序或新的分配优势；没有据负结果继续补相似样本、重训、调参或增加网络。
+
+| 进入正式VALIDATION的条件 | 实际 | 达标 |
+|---|---|---|
+| 5/5最终可行 | 4/5 | 否 |
+| 至少4/5例优于旧GNN | 0例；4个共同可行配对全部落后 | 否 |
+| 配对Cmax中位低于旧GNN | +10.623% | 否 |
+| 至少3/5例优于HGA | 0例；4个共同可行配对全部落后 | 否 |
+
+**本轮没有达到成为论文主算法的要求。按预设规则，在这唯一一次小规模筛查后停止，没有执行10排样×3种子的正式500次VALIDATION，也没有运行TEST。** 新头确已用真实B32偏好训练，操作也确为独立block转移，但不能把实现正确或loss下降写成算法性能已经改善。
+
+### 执行、测试与产物保存
+
+在DRL目录中使用指定解释器。为了先完成训练/筛查、再按用户要求确认唯一新增模型文件的必要性，本次将checkpoint保留在原Python进程内存，确认后才保存，未重复采集或拟合：
+
+```powershell
+$childExperimentCode = @'
+import sys
+sys.path.insert(0, 'scripts')
+import run_gnn_weld_layout as experiment
+if __name__ == '__main__':
+    checkpoint = experiment.child_feedback_experiment(4)
+'@
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 -i -c $childExperimentCode
+```
+
+用户确认“必要，保存该模型”后，在上述交互进程中执行：
+
+```python
+model_stream = experiment.CHILD_MODEL.open('xb')
+experiment.torch.save(checkpoint, model_stream)
+model_stream.close()
+exit()
+```
+
+最终相关回归 **345 passed in 23.37s**（原336项加本轮9个直接相关用例），覆盖Y两个子段分别独立移动、兄弟机器人/索引/方向不变、WHOLE目标资格、X固定归属、唯一完整覆盖及模式保持、canonical自动WHOLE拒绝、联合位置/方向及邻居翻转、准确/不可映射WAIT、真实偏好标签规则、旧参数冻结、B32死锁保持当前/最优和完整方案缓存复用。
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 -m pytest -p no:cacheprovider tests/test_gnn_construct_vns.py tests/test_search_lns.py -q
+# 保存模型后的原入口回读核对：读已有checkpoint和5条筛查，不再次采集/拟合/评价B32。
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_gnn_weld_layout.py child-feedback --workers 4
+```
+
+原CSV仍使用既有列，TRAIN候选动作、357维冻结特征、真实状态/Cmax与同状态偏好存入该行diagnostic，便于复核且不另建数据文件。新增120条 `child_train_group`、1条 `child_train_fit`（source=`CHILD_BLOCK_B32_PAIRWISE_TRAIN_V1`），5条 `child_pilot`（source=`CHILD_BLOCK_B32_PAIRWISE_100_V1`）；原902行保留，现共**1028行**。正式source=`CHILD_BLOCK_B32_PAIRWISE_500_V1` 为0行。训练与筛查合计新增真实B32 **652=616+36次**，对照算法新增0次。采集单例耗时中位11.193 s，120例任务墙钟之和1772.737 s；筛查5例任务之和109.033 s，单例范围12.553–35.345 s。这些求解/采集时间包含图构建、推理和B32，不把并行任务时间之和称为批次墙钟，也不把缓存循环速度当作求解质量。
+
+原模型788675字节、WAG/HGA CSV 240/161行与105107/128721字节、旧TEST CSV 60行与18067字节均保持原状。没有改动原数据、原报告历史段落、旧对照算法或科学约束；没有新增脚本、CSV、哈希ID、manifest、运行注册表、独立认证器、第二套调度器或方向优化阶段。唯一新增项目文件为用户确认的 `models/gnn_child_level_feedback.pt`。

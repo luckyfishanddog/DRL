@@ -2957,9 +2957,368 @@ def summarize_feedback(*, split='test'):
     return summary
 
 
+CHILD_MODEL = ROOT / 'models' / 'gnn_child_level_feedback.pt'
+CHILD_TRAIN_SOURCE = 'CHILD_BLOCK_B32_PAIRWISE_TRAIN_V1'
+CHILD_PILOT_SOURCE = 'CHILD_BLOCK_B32_PAIRWISE_100_V1'
+CHILD_FULL_SOURCE = 'CHILD_BLOCK_B32_PAIRWISE_500_V1'
+CHILD_METHOD = 'GNN_CHILD_LEVEL_FEEDBACK'
+
+
+def child_feedback_model(weights=None):
+    original = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
+    model = feedback_model(original['state_dict']).requires_grad_(False)
+    model.enable_child_transfer_head()
+    if weights is not None:
+        model.load_state_dict(weights)
+    return model
+
+
+def child_counted_evaluation(result, context):
+    if result.solution is None:
+        context['counts']['incomplete'] += 1
+        return None
+    schedule, called = evaluate_once(result, context['seen'], blocker_cache=context['blockers'])
+    counts = context['counts']
+    counts['b32_calls'] += int(called)
+    counts['cache_hits'] += int(not called)
+    counts['deadlocks'] += int(schedule.status is ScheduleStatus.DEADLOCK)
+    counts['numeric_failures'] += int(schedule.status is ScheduleStatus.NUMERIC_FAILURE)
+    return schedule
+
+
+@torch.no_grad()
+def child_initial_state(parents, model, seed):
+    """The unchanged greedy/at-most-two-samples GNN initial construction."""
+    started = time.perf_counter()
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    context = dict(started=started, space=space, embeddings=model.encode_static(space.graph),
+        seen={}, blockers={}, rng=Random(seed), result=None, schedule=None, initial_attempts=0,
+        initial_status='NO_COMPLETE_SOLUTION', initial_cmax_s=None, failure='')
+    context['counts'] = dict(reconstruction_attempts=0, reconstructions=0, accepted=0, b32_calls=0,
+        cache_hits=0, deadlocks=0, numeric_failures=0, incomplete=0, late_candidates=0)
+    for attempt in range(3):
+        context['initial_attempts'] += 1
+        result = build_joint(parents, model, space=space, embeddings=context['embeddings'],
+            rng=None if attempt == 0 else context['rng'], deadline=None)
+        schedule = child_counted_evaluation(result, context)
+        status = schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED'
+        if attempt == 0:
+            context.update(initial_status=status, initial_cmax_s=schedule.cmax if schedule and schedule.feasible else None,
+                           construct_s=time.perf_counter() - started)
+        if schedule is not None and schedule.feasible:
+            context.update(result=result, schedule=schedule, failure='')
+            break
+        context['failure'] = result.rejection_reason or (' | '.join(schedule.diagnostics) if schedule else status)
+        if schedule is None or schedule.status is not ScheduleStatus.DEADLOCK:
+            break
+    context['last_status'] = status
+    return context
+
+
+def child_transfer_result(transfer):
+    return gnn.JointCompletionResult(transfer.solution, transfer.state.directions, (transfer.action,), 0.,
+                                     oriented_state=transfer.state)
+
+
+def child_training_indices(transfers, old_scores, limit=4):
+    """Old insertion ranking with robot/direction/position coverage, no labels."""
+    order = torch.argsort(old_scores, descending=True, stable=True).tolist()
+    if not order:
+        return ()
+    chosen = [order[0]]
+    for attribute in (lambda t: t.action.robot, lambda t: t.action.direction, lambda t: t.action.position):
+        covered = {attribute(transfers[i]) for i in chosen}
+        for i in order:
+            if len(chosen) >= limit:
+                break
+            if attribute(transfers[i]) not in covered:
+                chosen.append(i)
+                covered.add(attribute(transfers[i]))
+    return tuple(dict.fromkeys((*chosen, *order)))[:limit]
+
+
+def child_preference_pairs(outcomes):
+    """Preferences only within one layout and one identical removed-block state."""
+    pairs, kinds = [], []
+    for first in range(len(outcomes)):
+        for second in range(first + 1, len(outcomes)):
+            a, b = outcomes[first], outcomes[second]
+            if {a['status'], b['status']} - {'FEASIBLE', 'DEADLOCK'}:
+                continue
+            if a['status'] == b['status'] == 'FEASIBLE':
+                if math.isclose(a['cmax_s'], b['cmax_s'], rel_tol=1e-9, abs_tol=1e-6):
+                    continue
+                better, worse = (first, second) if a['cmax_s'] < b['cmax_s'] else (second, first)
+                kinds.append('CMAX')
+            elif a['status'] != b['status']:
+                better, worse = (first, second) if a['status'] == 'FEASIBLE' else (second, first)
+                kinds.append('FEASIBILITY')
+            else:
+                continue
+            pairs.append((better, worse))
+    return pairs, kinds
+
+
+@torch.no_grad()
+def child_collect_job(layout):
+    name, parents = layout
+    model = worker_feedback_model
+    context = child_initial_state(parents, model, SEED)
+    current, schedule = context['result'], context['schedule']
+    data = dict(initial_attempts=context['initial_attempts'], failure=context['failure'],
+                block_id=None, candidate_pool=0, candidates=[], features=[], pairs=[], pair_kinds=[])
+    if schedule is not None:
+        feedback = lns.schedule_feedback_summary(current.solution, schedule,
+            context['blockers'].get(plan_key(current.solution, current.directions), ()), CONFIG)
+        block_id = lns.select_feedback_child(current.solution, feedback, CONFIG)
+        data['block_id'] = block_id
+        transfers = lns.child_transfer_candidates(current.solution, current.directions, block_id, CONFIG) if block_id else ()
+        data['candidate_pool'] = len(transfers)
+        if not transfers:
+            data['failure'] = 'NO_MOVABLE_CRITICAL_BLOCK' if block_id is None else 'NO_PATTERN_PRESERVING_TRANSFER'
+        rows = gnn.child_transfer_inputs(context['space'], context['embeddings'], current, feedback, transfers, model, CONFIG)
+        chosen = child_training_indices(transfers, rows[:, -1])
+        for i in chosen:
+            transfer = transfers[i]
+            result = child_transfer_result(transfer)
+            outcome = child_counted_evaluation(result, context)
+            context['counts']['reconstruction_attempts'] += 1
+            context['counts']['reconstructions'] += 1
+            data['candidates'].append(dict(block_id=block_id, source=transfer.move.key.source_robot_id,
+                destination=transfer.action.robot, position=transfer.action.position, direction=transfer.action.direction,
+                neighbour_changes=transfer.action.neighbour_changes, status=outcome.status.value,
+                cmax_s=outcome.cmax if outcome.feasible else None))
+            data['features'].append(rows[i].tolist())
+        data['pairs'], data['pair_kinds'] = child_preference_pairs(data['candidates'])
+    row = dict(stage='child_train_group', epoch=1, layout_id=name, seed=SEED,
+        source=CHILD_TRAIN_SOURCE, method=CHILD_METHOD,
+        status='FEASIBLE' if schedule is not None else context['last_status'],
+        cmax_s=schedule.cmax if schedule is not None else None,
+        initial_status=context['initial_status'], initial_cmax_s=context['initial_cmax_s'],
+        construct_s=context['construct_s'], runtime_s=time.perf_counter() - context['started'],
+        **context['counts'], diagnostic=json.dumps(data))
+    return row
+
+
+def collect_child_preferences(workers):
+    layouts = load_layouts('train_expanded')
+    retained = [r for r in read_rows(FEEDBACK_TRAIN_CSV)
+                if r['source'] == CHILD_TRAIN_SOURCE and r['stage'] == 'child_train_group']
+    completed = {(r['layout_id'], int(r['seed'])) for r in retained}
+    pending = [layout for layout in layouts if (layout[0], SEED) not in completed]
+    original = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
+    print(json.dumps(dict(event='child_collection',completed=len(retained),remaining=len(pending))),flush=True)
+    if pending:
+        with ProcessPoolExecutor(max_workers=workers, initializer=configure_feedback_worker,
+                                 initargs=(pickle.dumps(original['state_dict']),)) as pool:
+            futures = [pool.submit(child_collect_job, layout) for layout in pending]
+            for future in as_completed(futures):
+                row = future.result()
+                feedback_write(FEEDBACK_TRAIN_CSV, [row])
+                retained.append(row)
+                data = json.loads(row['diagnostic'])
+                print(json.dumps(dict(event='child_collected',completed=len(retained),layout_id=row['layout_id'],
+                    status=row['status'],candidates=len(data['candidates']),pairs=len(data['pairs']),
+                    b32_calls=row['b32_calls'],runtime_s=row['runtime_s'])),flush=True)
+    return retained
+
+
+def fit_child_head(model, records):
+    """One predeclared fit: 20 passes, AdamW 1e-3, frozen encoder/old heads."""
+    groups = [json.loads(row['diagnostic']) for row in sorted(records, key=lambda r:(r['layout_id'],int(r['seed'])))]
+    groups = [group for group in groups if group['pairs']]
+    rows, pairs, kinds = [], [], []
+    for group in groups:
+        offset = len(rows)
+        rows.extend(group['features'])
+        pairs.extend((a + offset, b + offset) for a, b in group['pairs'])
+        kinds.extend(group['pair_kinds'])
+    summary = dict(train_layouts=len(records),initial_feasible=sum(r['status']=='FEASIBLE' for r in records),
+        preference_groups=len(groups),preferences=len(pairs),cmax_preferences=kinds.count('CMAX'),
+        feasibility_preferences=kinds.count('FEASIBILITY'),epochs=20,learning_rate=.001,updates=0)
+    if not pairs:
+        return dict(summary, status='NO_PREFERENCES')
+    inputs = torch.tensor(rows, dtype=torch.float32)
+    indices = torch.tensor(pairs, dtype=torch.long)
+    model.child_transfer_mean.copy_(inputs.mean(0))
+    scale = inputs.std(0, unbiased=False)
+    model.child_transfer_scale.copy_(torch.where(scale >= .1, scale, torch.ones_like(scale)))
+    optimizer = torch.optim.AdamW(model.child_transfer_head.parameters(), lr=.001, weight_decay=1e-5)
+    generator = torch.Generator().manual_seed(SEED)
+    def loss_for(batch):
+        scores = model.child_transfer_scores(inputs)
+        return torch.nn.functional.softplus(-(scores[batch[:, 0]] - scores[batch[:, 1]])).mean()
+    with torch.no_grad():
+        summary['initial_loss'] = float(loss_for(indices))
+    for _ in range(20):
+        order = torch.randperm(len(indices), generator=generator)
+        for batch in order.split(64):
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_for(indices[batch])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.child_transfer_head.parameters(), 1.)
+            optimizer.step()
+            summary['updates'] += 1
+    with torch.no_grad():
+        summary['final_loss'] = float(loss_for(indices))
+    summary.update(status='TRAINED',head_parameters=sum(p.numel() for p in model.child_transfer_head.parameters()))
+    return summary
+
+
+@torch.no_grad()
+def run_child_feedback_gnn(parents, model, seed, *, attempts=500, progress_observer=None):
+    context = child_initial_state(parents, model, seed)
+    current, current_schedule = context['result'], context['schedule']
+    best, best_schedule = current, current_schedule
+    c0 = current_schedule.cmax if current_schedule is not None else None
+    improvements = uphill = equal = 0
+    choices = {}
+    if current_schedule is not None:
+        for k in range(attempts):
+            counts = context['counts']
+            counts['reconstruction_attempts'] += 1
+            feedback = lns.schedule_feedback_summary(current.solution, current_schedule,
+                context['blockers'].get(plan_key(current.solution, current.directions), ()), CONFIG)
+            block_id = lns.select_feedback_child(current.solution, feedback, CONFIG,
+                                                  seed=context['rng'].randrange(2**32))
+            candidate = None
+            try:
+                transfers = lns.child_transfer_candidates(current.solution, current.directions, block_id, CONFIG) if block_id else ()
+                if transfers:
+                    inputs = gnn.child_transfer_inputs(context['space'], context['embeddings'], current,
+                                                        feedback, transfers, model, CONFIG)
+                    scores = model.child_transfer_scores(inputs)
+                    if not torch.isfinite(scores).all():
+                        raise ArithmeticError('NONFINITE_CHILD_SCORES')
+                    candidate = child_transfer_result(transfers[int(scores.argmax())])
+                    choices[block_id] = choices.get(block_id, 0) + 1
+            except (ValueError, ArithmeticError) as error:
+                context['failure'] = str(error)
+            if candidate is None:
+                counts['incomplete'] += 1
+            else:
+                counts['reconstructions'] += 1
+                schedule = child_counted_evaluation(candidate, context)
+                if feedback_improves(schedule, best_schedule):
+                    best, best_schedule = candidate, schedule
+                    improvements += 1
+                temperature = .01 * c0 * .01 ** (k / 499.)
+                if feedback_accepts(schedule, current_schedule, temperature, context['rng']):
+                    uphill += int(schedule.cmax > current_schedule.cmax)
+                    equal += int(schedule.cmax == current_schedule.cmax)
+                    current, current_schedule = candidate, schedule
+                    counts['accepted'] += 1
+            if progress_observer is not None and (k + 1) % 25 == 0:
+                progress_observer(dict(attempts=k + 1,best_cmax_s=best_schedule.cmax,
+                    b32_calls=counts['b32_calls'],runtime_s=time.perf_counter()-context['started']))
+    diagnostic = dict(initial_attempts=context['initial_attempts'],initial_incumbent_cmax_s=c0,
+        best_improvements=improvements,accepted_uphill=uphill,accepted_equal=equal,
+        current_cmax_s=current_schedule.cmax if current_schedule is not None else None,
+        selected_blocks=choices,failure=context['failure'] if best_schedule is None else '')
+    return dict(status='FEASIBLE' if best_schedule is not None else context['last_status'],
+        cmax_s=best_schedule.cmax if best_schedule is not None else None,
+        initial_status=context['initial_status'],initial_cmax_s=context['initial_cmax_s'],
+        construct_s=context['construct_s'],runtime_s=time.perf_counter()-context['started'],
+        **context['counts'],diagnostic=json.dumps(diagnostic),**final_metrics(best_schedule))
+
+
+def configure_child_worker(serialized):
+    configure_cpu()
+    global worker_child_model
+    worker_child_model = child_feedback_model(pickle.loads(serialized)).eval()
+
+
+def child_evaluation_job(job):
+    name, parents, seed, attempts, source, stage = job
+    print(json.dumps(dict(event='child_start',layout_id=name,seed=seed,attempts=attempts)),flush=True)
+    progress = lambda data: print(json.dumps(dict(event='child_progress',layout_id=name,seed=seed,**data)),flush=True)
+    return dict(stage=stage,epoch=1,layout_id=name,seed=seed,source=source,method=CHILD_METHOD,
+                **run_child_feedback_gnn(parents,worker_child_model,seed,attempts=attempts,progress_observer=progress))
+
+
+def evaluate_child_feedback(model, layouts, workers, *, formal=False):
+    source, stage = (CHILD_FULL_SOURCE,'child_validation') if formal else (CHILD_PILOT_SOURCE,'child_pilot')
+    seeds, attempts = (TEST_SEEDS,500) if formal else ((SEED,),100)
+    expected = {(name,seed) for name,_ in layouts for seed in seeds}
+    retained = [r for r in read_rows(FEEDBACK_TRAIN_CSV) if r['source']==source and r['stage']==stage
+                and (r['layout_id'],int(r['seed'])) in expected]
+    completed = {(r['layout_id'],int(r['seed'])) for r in retained}
+    jobs = [(name,parents,seed,attempts,source,stage) for name,parents in layouts for seed in seeds
+            if (name,seed) not in completed]
+    if jobs:
+        with ProcessPoolExecutor(max_workers=workers,initializer=configure_child_worker,
+                                 initargs=(pickle.dumps(model.state_dict()),)) as pool:
+            futures = [pool.submit(child_evaluation_job,job) for job in jobs]
+            for future in as_completed(futures):
+                row=future.result()
+                feedback_write(FEEDBACK_TRAIN_CSV,[row]);retained.append(row)
+                print(json.dumps(row),flush=True)
+    return retained
+
+
+def child_feedback_comparison(rows):
+    keys={(r['layout_id'],int(r['seed'])) for r in rows}
+    references={'GNN_PARENT_500':[r for r in read_rows(FEEDBACK_TRAIN_CSV)
+        if r['source']==FEEDBACK_FULL_SOURCE and (r['layout_id'],int(r['seed'])) in keys]}
+    for method,(_,_,filename) in BASELINES.items():
+        references[method]=[r for r in read_rows(FINAL_RESULTS/filename)
+            if completed_baseline_row(r) and (r['layout_id'],int(r['seed'])) in keys]
+    summary=dict(gnn=feedback_summary(rows),references={name:feedback_summary(group) for name,group in references.items()},
+        paired={name:feedback_paired(rows,group) for name,group in references.items()})
+    print(json.dumps(summary),flush=True)
+    return summary
+
+
+def child_feedback_experiment(workers):
+    """One TRAIN collection/fit, then prescribed pilot and conditional full VAL.
+
+    Return the checkpoint in memory; saving is a separate final action so the
+    requested new model file can be reviewed before creating it.
+    """
+    configure_cpu();torch.manual_seed(SEED)
+    if CHILD_MODEL.exists():
+        saved=torch.load(CHILD_MODEL,map_location='cpu',weights_only=True)
+        model=child_feedback_model(saved['state_dict']).eval()
+    else:
+        records=collect_child_preferences(workers)
+        model=child_feedback_model().eval()
+        training=fit_child_head(model,records)
+        saved=dict(state_dict=copy.deepcopy(model.state_dict()),seed=SEED,initialization='gnn_schedule_feedback.pt:state_dict',
+            base_selected_epoch=0,hidden_dim=64,heads=4,training=training,training_complete=training['status']=='TRAINED')
+        feedback_write(FEEDBACK_TRAIN_CSV,[dict(stage='child_train_fit',epoch=1,layout_id='TRAIN_120',seed=SEED,
+            source=CHILD_TRAIN_SOURCE,method=CHILD_METHOD,status=training['status'],loss=training.get('final_loss'),
+            steps=training['updates'],diagnostic=json.dumps(training))])
+        print(json.dumps(dict(event='child_trained',**training)),flush=True)
+        if not saved['training_complete']:
+            return saved
+    ordered=sorted(load_layouts('validation'),key=lambda item:(len(item[1]),item[0]))
+    pilot=[ordered[round(i*(len(ordered)-1)/4)] for i in range(5)]
+    print(json.dumps(dict(event='child_pilot_layouts',layouts=[(n,len(p)) for n,p in pilot])),flush=True)
+    rows=evaluate_child_feedback(model,pilot,workers)
+    summary=child_feedback_comparison(rows)
+    old,hga=summary['paired']['GNN_PARENT_500'],summary['paired']['HGA']
+    passed=(len(rows)==5 and summary['gnn']['feasible']==5 and old['wins']>=4 and
+            old['median_change_pct'] is not None and old['median_change_pct']<0 and hga['wins']>=3)
+    saved.update(pilot=summary,pilot_passed=passed,pilot_layouts=[name for name,_ in pilot])
+    if passed:
+        formal_rows=evaluate_child_feedback(model,ordered,workers,formal=True)
+        formal=child_feedback_comparison(formal_rows)
+        eligible=(len(formal_rows)==30 and formal['gnn']['feasible']==30 and all(
+            formal['paired'][name]['median_change_pct'] is not None and
+            formal['paired'][name]['median_change_pct']<0 and
+            formal['paired'][name]['wins']>formal['paired'][name]['losses'] for name in BASELINES))
+        saved.update(formal_validation=formal,test_eligible=eligible)
+    else:
+        saved['test_eligible']=False
+        print('Child pilot failed the predeclared requirements; no full VALIDATION or TEST is run.',flush=True)
+    print(json.dumps(dict(event='child_checkpoint_ready',path=str(CHILD_MODEL),pilot_passed=passed,
+                          test_eligible=saved['test_eligible'])),flush=True)
+    return saved
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback'))
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -2971,7 +3330,12 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'feedback-train':
+    if args.stage == 'child-feedback':
+        saved=child_feedback_experiment(args.workers)
+        if not CHILD_MODEL.exists() and saved['training_complete']:
+            with CHILD_MODEL.open('xb') as stream:
+                torch.save(saved,stream)
+    elif args.stage == 'feedback-train':
         train_feedback(args.workers, args.rounds)
     elif args.stage == 'feedback-continue':
         train_feedback(args.workers, args.rounds, expanded=True)

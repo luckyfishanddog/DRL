@@ -27,6 +27,151 @@ def _feedback_fixture():
     return experiment, c, parents, model
 
 
+@pytest.mark.parametrize('block,destination,sibling', [('a::0',3,'a::1'),('a::1',1,'a::0')])
+def test_child_transfer_moves_y_child_independently_and_keeps_sibling_exactly(block,destination,sibling):
+    from collections import Counter
+    from test_gnn_schedule_blocker_pilot import _selection_fixture
+    from mrta_search import lns
+    solution,_,_,config=_selection_fixture()
+    bits=((1,),(0,1),(0,),(1,))
+    before={b:(r,i,bits[r][i]) for r,route in enumerate(solution.routes) for i,b in enumerate(route.block_ids)}
+    transfers=lns.child_transfer_candidates(solution,bits,block,config,destination_robot=destination)
+    assert transfers
+    for transfer in transfers:
+        after={b:(r,i,transfer.state.directions[r][i]) for r,route in enumerate(transfer.state.routes)
+               for i,b in enumerate(route)}
+        assert after[sibling]==before[sibling]
+        assert after[block][0]==destination and transfer.move.block_ids==(block,)
+        assert transfer.solution.patterns==solution.patterns
+        assert Counter(b for route in transfer.state.routes for b in route)==Counter(before.keys())
+        assert transfer.state.directions[destination][transfer.action.position]==transfer.action.direction
+        assert len(transfer.partial.routes[before[block][0]])==len(solution.routes[before[block][0]].block_ids)-1
+        assert sibling in transfer.partial.routes[before[sibling][0]]
+
+
+def _child_whole_fixture():
+    from mrta_search import lns
+    parents=tuple(ParentWeld(name,(x,y),(x+1,y)) for name,x,y in
+                  [('a',2.,9.),('b',15.,9.),('c',2.,2.),('d',15.,2.)])
+    solution=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+        {i:(p.parent_id+'::whole',) for i,p in enumerate(parents)},CONFIG,scope=FORMAL_SCOPE_V2)
+    bits=((0,),)*4
+    state=lns.oriented_route_state(tuple(r.block_ids for r in solution.routes),bits,block_map(solution,CONFIG),CONFIG)
+    return solution,bits,state
+
+
+def test_child_whole_transfer_uses_existing_qualification_and_joint_directions():
+    from mrta_search import lns
+    from mrta_reference.model import MoveType
+    solution,bits,_=_child_whole_fixture()
+    assert not lns.child_transfer_candidates(solution,bits,'a::whole',CONFIG,destination_robot=2)
+    transfers=lns.child_transfer_candidates(solution,bits,'a::whole',CONFIG,destination_robot=1)
+    assert transfers and {t.action.direction for t in transfers}=={0,1}
+    assert {t.action.position for t in transfers}=={0,1}
+    assert any(t.action.neighbour_changes for t in transfers)
+    for t in transfers:
+        assert t.move.key.move_type is MoveType.INTER_RELOCATE
+        assert t.state.routes[0]==() and t.state.routes[2:]==tuple(r.block_ids for r in solution.routes[2:])
+        assert t.state.directions[2:]==bits[2:]
+        assert t.solution.patterns==solution.patterns
+
+
+def test_child_x_split_cannot_change_pinned_robot_ownership():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_reference.model import Rail
+    from mrta_search import lns
+    parent=ParentWeld('p',(7.2,5.8),(11.2,6.2))
+    pattern=next(p for p in build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)['p']
+                 if p.kind is SplitKind.X_SPLIT and p.rail is Rail.UPPER)
+    solution=canonicalize((parent,),(pattern,),{0:('p::0',),1:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    for block in ('p::0','p::1'):
+        assert lns.child_transfer_candidates(solution,((0,),(0,),(),()),block,CONFIG)==()
+
+
+def test_child_transfer_rejects_canonical_whole_merge_exposed_on_source_route():
+    from mrta_reference.geometry import build_legal_pattern_catalog
+    from mrta_search import lns
+    parents=(ParentWeld('q',(7.2,5.8),(11.2,6.2)),ParentWeld('a',(2.,9.),(3.,9.)),
+             ParentWeld('b',(17.,9.),(18.,9.)))
+    pattern=next(p for p in build_legal_pattern_catalog(parents,CONFIG,FORMAL_SCOPE_V2)['q']
+                 if p.kind is SplitKind.Y_SPLIT)
+    patterns=(pattern,SplitPattern('a',SplitKind.WHOLE),SplitPattern('b',SplitKind.WHOLE))
+    solution=canonicalize(parents,patterns,{0:('q::0','a::whole','q::1'),1:('b::whole',)},
+                          CONFIG,scope=FORMAL_SCOPE_V2)
+    assert any(p.kind is SplitKind.Y_SPLIT for p in solution.patterns)
+    assert not lns.child_transfer_candidates(solution,((0,0,0),(0,),(),()),'a::whole',CONFIG,destination_robot=1)
+
+
+def test_child_summary_maps_only_observed_wait_and_preserves_unmapped_robot_wait():
+    from mrta_search import lns
+    from mrta_reference.model import Operation,OperationKind,ScheduleResult,ScheduleStatus
+    solution,_,_=_child_whole_fixture()
+    operations=(Operation('R0:B0:WELD',0,OperationKind.WELD,0.,2.,(2.,9.),(3.,9.),0,'a::whole'),
+        Operation('R0:B0:MOVE',0,OperationKind.MOVE,2.,5.,(2.,9.),(3.,9.),0,None),
+        Operation('R0:B0:MOVE:WAIT',0,OperationKind.WAIT,5.,9.,(2.,9.),(2.,9.),0,None),
+        Operation('unknown:B0:WAIT',0,OperationKind.WAIT,9.,16.,(2.,9.),(2.,9.),0,None))
+    schedule=ScheduleResult(ScheduleStatus.FEASIBLE,operations,16.,(16.,0.,0.,0.))
+    feedback=lns.schedule_feedback_summary(solution,schedule,(),CONFIG)
+    assert feedback['block_processing']['a::whole']==2.
+    assert feedback['block_move']['a::whole']==3.
+    assert feedback['block_wait']['a::whole']==4. and feedback['robot_wait'][0]==11.
+    assert sum(feedback['block_wait'].values())==4.
+
+
+def test_child_preference_labels_exclude_ties_double_deadlocks_and_numeric_failures():
+    import run_gnn_weld_layout as e
+    outcomes=[dict(status='FEASIBLE',cmax_s=10.),dict(status='FEASIBLE',cmax_s=9.),
+              dict(status='FEASIBLE',cmax_s=10.),dict(status='DEADLOCK',cmax_s=None),
+              dict(status='DEADLOCK',cmax_s=None),dict(status='NUMERIC_FAILURE',cmax_s=None)]
+    pairs,kinds=e.child_preference_pairs(outcomes)
+    assert len(pairs)==8 and kinds.count('CMAX')==2 and kinds.count('FEASIBILITY')==6
+    assert (0,2) not in pairs and (3,4) not in pairs and all(5 not in pair for pair in pairs)
+    assert (1,0) in pairs and (1,2) in pairs
+
+
+def test_child_head_fits_same_state_pairs_without_updating_old_parameters():
+    import json
+    experiment,c,_,model=_feedback_fixture()
+    model.requires_grad_(False).enable_child_transfer_head()
+    width=model.child_transfer_mean.numel()
+    before={k:v.clone() for k,v in model.state_dict().items()}
+    records=[dict(layout_id='train_01',seed=experiment.SEED,status='FEASIBLE',diagnostic=json.dumps(
+        dict(features=[[-1.]*width,[1.]*width],pairs=[[1,0]],pair_kinds=['CMAX'])))]
+    summary=experiment.fit_child_head(model,records)
+    assert summary['preferences']==1 and summary['final_loss']<summary['initial_loss']
+    assert all(torch.equal(v,model.state_dict()[k]) for k,v in before.items()
+               if not k.startswith('child_transfer_'))
+    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('child_transfer_head.'))
+    assert model.cmax_value_head is None
+
+
+def test_child_search_keeps_current_and_best_when_b32_deadlocks_and_reuses_full_plan(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    experiment,c,_,model=_feedback_fixture()
+    model.requires_grad_(False).enable_child_transfer_head()
+    solution,bits,state=_child_whole_fixture()
+    result=c.JointCompletionResult(solution,bits,(),0.,oriented_state=state)
+    transfers=experiment.lns.child_transfer_candidates(solution,bits,'a::whole',CONFIG,destination_robot=1)[:1]
+    context=dict(started=time.perf_counter(),space=None,embeddings=None,seen={},blockers={},rng=random.Random(1),
+        result=result,schedule=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,robot_completion=(100.,0.,0.,0.)),
+        initial_attempts=1,initial_status='FEASIBLE',initial_cmax_s=100.,construct_s=0.,last_status='FEASIBLE',failure='')
+    context['counts']=dict(reconstruction_attempts=0,reconstructions=0,accepted=0,b32_calls=1,cache_hits=0,
+        deadlocks=0,numeric_failures=0,incomplete=0,late_candidates=0)
+    monkeypatch.setattr(experiment,'child_initial_state',lambda *a:context)
+    monkeypatch.setattr(experiment.lns,'select_feedback_child',lambda *a,**kw:'a::whole')
+    def generate(current,*args,**kwargs):
+        assert current is solution
+        return transfers
+    monkeypatch.setattr(experiment.lns,'child_transfer_candidates',generate)
+    monkeypatch.setattr(c,'child_transfer_inputs',lambda *a:torch.zeros((1,model.child_transfer_mean.numel())))
+    calls=[]
+    monkeypatch.setattr(experiment,'b32',lambda *a,**kw:calls.append(1) or ScheduleResult(ScheduleStatus.DEADLOCK))
+    row=experiment.run_child_feedback_gnn(solution.parents,model,1,attempts=3)
+    assert row['status']=='FEASIBLE' and row['cmax_s']==100. and row['accepted']==0
+    assert row['reconstruction_attempts']==row['reconstructions']==3
+    assert row['b32_calls']==2 and row['cache_hits']==2 and len(calls)==1
+
+
 def test_feedback_joint_trajectory_preserves_coverage_legality_and_replays_exact_logits():
     from collections import Counter
     from mrta_reference.geometry import robot_is_eligible
