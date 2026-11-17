@@ -20,6 +20,8 @@ EG-GNN-PVND 已完成教师采集、固定 12 轮训练和离线检验。留出�
 
 BR-SAEAX 随后完成同种子的三个 TRAIN：最终 Cmax 为 4432.852/5707.055/6100.694 s，相对 SAEAX 为 2 胜 1 负、配对中位变化 -0.401%；B32 可行 3/3，完整时间中位 26.90 s，实际停止于 364/313/400 代。但最终 Pmax 为 0 降、1 平、2 升，**未通过 TRAIN，不继续 VALIDATION/TEST**。1071 次合法联合重插及 32 次三机器人接力没有建立稳定负载改善，不能宣称超过 WAG/HGA。三条结果追加到原 CSV，详见[报告第 15 节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#15-2026-11-17br-saeax-多父焊缝瓶颈联合重插入train未通过)。
 
+LA-4R-EAX-NSGA-II 已按用户提供的 Gao 论文第4.4节及图9实现独立增强邻接表交叉、四机器人联合归属/顺序/方向构造和三目标 NSGA-II。20个体、每代10子代、最多500代、120代停滞、最终一次B32的三个 TRAIN 已完成：B32可行2/3，两个共同可行配对均落后于SAEAX，Cmax变化中位 **+35.121%**；完整时间中位22.52 s，停止于427/133/330代。8900个有效子代仅73个原生可行，**TRAIN未通过，未进入VALIDATION/TEST**。实现见 [eax_nsga2.py](src/mrta_search/eax_nsga2.py)，入口见 [run_eax_nsga2.py](scripts/run_eax_nsga2.py)，详细负结果及命令见[报告第16节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#16-2026-11-17la-4r-eax-nsga-ii全文核对实现及train筛查负结果)。三条结果继续追加到原CSV，全部历史记录保留。
+
 ## 运行
 
 在 `D:\pybullet_test\MRTA_GA\DRL` 中执行。

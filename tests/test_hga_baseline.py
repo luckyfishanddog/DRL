@@ -1422,3 +1422,314 @@ def test_br_failed_train_does_not_load_validation_or_run_search(monkeypatch):
     with pytest.raises(ValueError,match='TRAIN criteria'):
         m['run_experiment']('validation',1,'br')
 
+
+def test_eax_nsga_defaults_are_the_requested_natural_budget():
+    from mrta_search.eax_nsga2 import EAXNSGAConfig
+    s=EAXNSGAConfig()
+    assert (s.population_size,s.offspring_per_generation,s.max_generations,
+        s.min_generations,s.stagnation_generations,s.retries_per_child)==(20,10,500,100,120,12)
+    with pytest.raises(ValueError):EAXNSGAConfig(retries_per_child=0)
+    with pytest.raises(ValueError):EAXNSGAConfig(max_generations=10)
+
+
+def test_eax_table_uses_both_directed_parents_and_ignores_their_owners():
+    import numpy as np
+    from dataclasses import replace
+    from mrta_search import eax_nsga2 as e
+    _,w,a,b=_saeax_fixture()
+    settings=e.EAXNSGAConfig(adjacency_mutation_probability=0.)
+    active,table,parent,detail=e.enhanced_adjacency(a,b,a.selected,w,random.Random(4),settings)
+    swapped=replace(b,routes=[b.routes[1],b.routes[0],*b.routes[2:]],
+        directions=[b.directions[1],b.directions[0],*b.directions[2:]])
+    other=e.enhanced_adjacency(a,swapped,a.selected,w,random.Random(4),settings)
+    np.testing.assert_array_equal(table,other[1])
+    local={int(n):i for i,n in enumerate(active)}
+    u,v=map(int,a.routes[0][:2])
+    assert parent[2*local[u],2*local[v]] and parent[2*local[v]+1,2*local[u]+1]
+    ds=[w.travel[int(r[k-1]),int(r[k]),int(d[k-1]),int(d[k])]
+        for p in (a,b) for r,d in zip(p.routes,p.directions) for k in range(1,len(r))]
+    assert detail['distance_threshold_m']==pytest.approx(np.quantile(ds,.75)*w.config.empty_speed)
+    selected=a.selected.copy()
+    p=next(i for i,options in enumerate(w.options) if len(options)>1)
+    selected[p]=next(v for v in w.options[p] if v!=selected[p])
+    active2=e.enhanced_adjacency(a,b,selected,w,random.Random(4),settings)[0]
+    assert not set(active2).intersection(set(w.pattern_nodes[a.selected[p]])-{-1})
+
+
+def test_eax_mutation_actually_inserts_directed_neighbours():
+    from mrta_search import eax_nsga2 as e
+    _,w,a,b=_saeax_fixture()
+    active,table,parent,detail=e.enhanced_adjacency(a,b,a.selected,w,random.Random(9),
+        e.EAXNSGAConfig(adjacency_mutation_probability=1.))
+    assert detail['mutation_entries']>0
+    assert table.sum()==detail['threshold_adjacency_entries']+detail['mutation_entries']
+    assert parent.sum()-detail['threshold_adjacency_entries']==detail['threshold_excluded_entries']
+    assert table.shape==(2*len(active),2*len(active))
+
+
+def _eax_mixed_fixture():
+    import numpy as np
+    from mrta_search import eax_nsga2 as e
+    parents=(ParentWeld('y',(3.,8.),(3.,4.)),ParentWeld('x',(1.,9.),(10.,9.)),
+        ParentWeld('a',(2.,9.),(3.2,9.)),ParentWeld('b',(11.,9.),(12.2,9.)),
+        ParentWeld('c',(1.,3.),(2.2,3.)),ParentWeld('d',(12.,3.),(13.2,3.)))
+    w=e._HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    selected=w.initial_selected.copy()
+    xp=next(i for i,p in enumerate(w.parents) if p.parent_id=='x')
+    selected[xp]=next(p for p in w.options[xp] if w.patterns[p].kind is SplitKind.X_SPLIT)
+    lookup={w.ids[n]:int(n) for p in selected for n in w.pattern_nodes[p] if n>=0}
+    def item(sequences):
+        rr=[np.array([lookup[n] for n in row],np.int64) for row in sequences]
+        dd=[np.zeros(len(r),np.int64) for r in rr]
+        costs,loads=e._route_statistics(rr,dd,w.travel,w.processing)
+        e.validate_individual(w,rr,dd,selected)
+        return e.Individual(rr,dd,selected.copy(),1000.,costs,loads,e.complete_identity(rr,dd,selected),np.empty(0,np.int64))
+    a=item((('x::0','y::0','a::whole'),('x::1','b::whole'),('y::1','c::whole'),('d::whole',)))
+    b=item((('x::0','a::whole'),('x::1','y::0','b::whole'),('c::whole',),('y::1','d::whole')))
+    return e,w,a,b
+
+
+def test_eax_joint_construction_reallocates_and_preserves_all_split_rules(monkeypatch):
+    from mrta_search import saeax,lns
+    e,w,a,b=_eax_mixed_fixture()
+    def forbidden(*args,**kwargs):raise AssertionError('new EAX delegated construction or scheduled a partial')
+    for name in ('adjacency_crossover','assemble_fragments','mutate_child'):
+        monkeypatch.setattr(saeax,name,forbidden)
+    monkeypatch.setattr(lns,'repair_partial_state_oriented',forbidden)
+    monkeypatch.setattr(e,'_priority_arrays',forbidden)
+    monkeypatch.setattr(e,'reference_schedule_formal',forbidden)
+    monkeypatch.setattr(w,'repair',forbidden)
+    settings=e.EAXNSGAConfig(pattern_mutation_probability=0.)
+    successes,changed,identities=0,False,set()
+    y_owners=set()
+    for seed in range(24):
+        try:rr,dd,ss,detail=e.adjacency_crossover(a,b,w,random.Random(seed),settings)
+        except ValueError:continue
+        successes+=1
+        e.validate_individual(w,rr,dd,ss)
+        assert tuple(ss)==tuple(a.selected)
+        actual=w.solution(rr,ss)
+        assert actual.patterns==tuple(w.patterns[p] for p in ss)
+        owners={w.ids[n]:r for r,row in enumerate(rr) for n in row}
+        assert owners['x::0']==0 and owners['x::1']==1
+        assert owners['y::0'] in (0,1) and owners['y::1'] in (2,3)
+        y_owners.add((owners['y::0'],owners['y::1']))
+        changed |= detail['owner_changes_vs_first']>0
+        identities.add(e.complete_identity(rr,dd,ss))
+        assert detail['few_neighbour_choices']+detail['nearest_fallbacks']==sum(map(len,rr))-1
+    assert successes>0 and changed and len(identities)>1 and len(y_owners)>1
+
+
+def test_eax_nsga_nondominated_ranks_and_constraint_precedence():
+    import numpy as np
+    from mrta_search.eax_nsga2 import rank_and_crowding
+    values=np.array([[10.,5.,9.],[12.,4.,7.],[8.,8.,8.],[20.,10.,20.],
+                     [np.inf,0.,0.],[np.inf,-100.,-100.]])
+    ranks,crowding=rank_and_crowding(values)
+    np.testing.assert_array_equal(ranks,[0,0,0,1,2,2])
+    np.testing.assert_array_equal(crowding[-2:],[0.,0.])
+    assert np.isfinite(crowding[-2:]).all()
+
+
+def test_eax_nsga_crowding_is_normalized_and_constant_axes_contribute_zero():
+    import numpy as np
+    from mrta_search.eax_nsga2 import rank_and_crowding
+    values=np.array([[0.,10.,10.],[1.,9.,9.],[2.,8.,8.],[3.,7.,7.]])
+    ranks,crowding=rank_and_crowding(values)
+    assert (ranks==0).all() and np.isinf(crowding[[0,-1]]).all()
+    np.testing.assert_allclose(crowding[1:3],[2.,2.])
+    _,crowding=rank_and_crowding(np.array([[0.,1.,3.],[0.,2.,2.],[0.,3.,1.]]))
+    assert crowding[1]==pytest.approx(2.)
+
+
+def test_eax_nsga_environment_retains_nondominated_tradeoffs_and_deduplicates():
+    import numpy as np
+    from dataclasses import replace
+    from mrta_search import eax_nsga2 as e
+    _,_,a,_=_saeax_fixture()
+    points=[(10.,5.,9.),(12.,4.,7.),(8.,8.,8.),(20.,10.,20.),(float('inf'),0.,0.)]
+    pop=[replace(a,native_cmax=c,processing=np.array([p,0,0,0]),
+        costs=np.array([p+m,0,0,0]),identity=(i,)) for i,(c,p,m) in enumerate(points)]
+    result=e.select_population(pop+[pop[0]],3)
+    assert {x.identity for x in result}=={(0,),(1,),(2,)}
+    assert e.final_key(pop[2])<e.final_key(pop[0])
+
+
+@pytest.mark.parametrize('maximum,minimum,stagnation,expected,reason',[
+    (8,5,3,5,'STAGNATION'),(3,1,10,3,'MAX_GENERATIONS')])
+def test_eax_nsga_natural_stop_and_exactly_one_final_b32(monkeypatch,maximum,minimum,stagnation,expected,reason):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    from mrta_search import eax_nsga2 as e
+    calls,native_calls,progress=[],[],[]
+    def native(*args):
+        native_calls.append(1)
+        return 100.,None,None,None
+    monkeypatch.setattr(e,'_priority_arrays',native)
+    def b32(solution,config,*,scope,orientations):
+        assert progress[-1]['generation']==expected
+        calls.append(solution)
+        return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=777.,directions=tuple(orientations[r] for r in range(4)))
+    monkeypatch.setattr(e,'reference_schedule_formal',b32)
+    parents=tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
+    settings=e.EAXNSGAConfig(population_size=6,offspring_per_generation=3,
+        max_generations=maximum,min_generations=minimum,stagnation_generations=stagnation)
+    result=e.run_eax_nsga2(parents,settings=settings,seed=987,progress_callback=progress.append)
+    assert result.generations==expected and result.valid_children==3*expected
+    assert result.termination_reason==reason and result.accounting['search_complete']
+    assert result.accounting['native_calls']==len(native_calls)==6+3*expected
+    assert result.accounting['b32_calls']==len(calls)==len(result.final_candidates)==1
+    assert result.cmax==777. and result.native_cmax==100.
+    assert result.runtime>=result.accounting['search_s']+result.accounting['b32_s']
+
+
+def test_eax_final_b32_deadlock_is_kept_without_fallback(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    from mrta_search import eax_nsga2 as e
+    monkeypatch.setattr(e,'_priority_arrays',lambda *args:(100.,None,None,None))
+    calls=[]
+    def b32(*args,**kwargs):
+        calls.append(1)
+        return ScheduleResult(ScheduleStatus.DEADLOCK)
+    monkeypatch.setattr(e,'reference_schedule_formal',b32)
+    parents=tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
+    result=e.run_eax_nsga2(parents,settings=e.EAXNSGAConfig(population_size=4,offspring_per_generation=2,
+        max_generations=1,min_generations=1),seed=987)
+    assert result.status=='DEADLOCK' and result.cmax is None and result.native_cmax==100.
+    assert result.accounting['b32_calls']==len(calls)==1
+    assert result.final_candidates[0]['cmax_s'] is None and result.accounting['wait_is_partial']
+
+
+def test_eax_duplicate_child_retries_are_per_slot_and_do_not_complete_a_generation(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    from mrta_search import eax_nsga2 as e
+    _,w,a,b=_saeax_fixture()
+    detail=dict.fromkeys(('distance_threshold_m','inherited_edges','new_edges','mutation_entries',
+        'threshold_adjacency_entries','threshold_excluded_entries','parental_adjacency_entries','few_neighbour_choices','nearest_fallbacks',
+        'deferred_nodes','owner_changes_vs_first','owner_changes_vs_second'),0)
+    calls=[]
+    def crossed(*args):
+        calls.append(1)
+        item=b if len(calls)==2 else a
+        return item.routes,item.directions,item.selected.copy(),dict(detail)
+    monkeypatch.setattr(e,'adjacency_crossover',crossed)
+    monkeypatch.setattr(e,'_priority_arrays',lambda *args:(100.,None,None,None))
+    monkeypatch.setattr(e,'reference_schedule_formal',lambda *args,orientations,**kwargs:
+        ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,directions=tuple(orientations[r] for r in range(4))))
+    result=e.run_eax_nsga2(w.parents,settings=e.EAXNSGAConfig(population_size=2,offspring_per_generation=2,
+        max_generations=2,min_generations=1),seed=7)
+    assert len(calls)==2+12 and result.accounting['construction_attempts']==12
+    assert result.generations==0 and result.valid_children==0
+    assert result.termination_reason=='NOVEL_CHILD_RETRIES_EXHAUSTED'
+    assert not result.accounting['search_complete'] and result.accounting['native_calls']==2
+
+
+def test_eax_pilot_uses_b32_quality_and_time_with_pmax_diagnostic_only(monkeypatch):
+    import runpy,json
+    from pathlib import Path
+    m=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/run_eax_nsga2.py'))
+    old={ (n,20261110):dict(status='FEASIBLE',cmax_s='100',runtime_s='20') for n in m['PILOTS']}
+    rows=[dict(layout_id=n,seed='20261110',status='FEASIBLE',cmax_s='90',runtime_s='50',
+        max_processing_s='10000',diagnostic=json.dumps(dict(accounting=dict(search_complete=True)))) for n in m['PILOTS']]
+    g=m['pilot_decision'].__globals__
+    monkeypatch.setitem(g,'method_rows',lambda stage:rows)
+    monkeypatch.setitem(g,'saeax_rows',lambda stage:old)
+    assert m['pilot_decision']()['passed']
+    rows[0]['status']='DEADLOCK';rows[0]['cmax_s']=''
+    assert not m['pilot_decision']()['passed']
+    rows[0]['status']='FEASIBLE';rows[0]['cmax_s']='90'
+    for r in rows:r['runtime_s']='104'
+    assert not m['pilot_decision']()['passed']
+
+
+def test_eax_failed_train_prevents_further_split_access(monkeypatch):
+    import runpy
+    from pathlib import Path
+    m=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/run_eax_nsga2.py'))
+    g=m['run_experiment'].__globals__
+    def forbidden(*args,**kwargs):raise AssertionError('new split/search accessed after failed TRAIN')
+    monkeypatch.setitem(g,'pilot_decision',lambda:dict(passed=False))
+    monkeypatch.setitem(g,'load_layouts',forbidden)
+    monkeypatch.setitem(g,'experiment_job',forbidden)
+    with pytest.raises(ValueError,match='TRAIN screening'):
+        m['run_experiment']('validation',1)
+
+
+def test_eax_threshold_matches_gao_short_and_both_long_cases():
+    import numpy as np
+    from types import SimpleNamespace
+    from mrta_search import eax_nsga2 as e
+    travel=np.zeros((10,10,2,2))
+    for i,d in enumerate((1.,1.,1.,1.,1.,100.,101.,1.,1.)):travel[i,i+1,0,0]=d
+    w=SimpleNamespace(pattern_nodes=np.column_stack((np.arange(10),np.full(10,-1))),
+        ids=tuple(map(str,range(10))),parent_index=np.arange(10),travel=travel,
+        config=SimpleNamespace(empty_speed=.2))
+    p=SimpleNamespace(routes=[np.arange(10),[],[],[]],directions=[np.zeros(10,np.int64),[],[],[]])
+    _,table,_,detail=e.enhanced_adjacency(p,p,np.arange(10),w,random.Random(4),
+        e.EAXNSGAConfig(adjacency_mutation_probability=0.))
+    assert detail['distance_threshold_m']==pytest.approx(.2)
+    assert not table[2*5,2*6]  # 1/100: discard the long successor
+    assert table[2*6+1,2*5+1] and table[2*6,2*7]  # 100/101: retain both
+    assert not table[2*7+1,2*6+1]  # 101/1: discard the long predecessor
+    assert table[2*2+1,2*1+1] and table[2*2,2*3]  # both short retained
+    assert table[2*9+1,2*8+1]  # open-route endpoint retained
+
+
+def test_eax_initialization_exhaustion_preserves_actual_evaluation_counts(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    from mrta_search import eax_nsga2 as e
+    _,w,a,_=_saeax_fixture()
+    detail=dict.fromkeys(('distance_threshold_m','inherited_edges','new_edges','mutation_entries',
+        'threshold_adjacency_entries','threshold_excluded_entries','parental_adjacency_entries',
+        'few_neighbour_choices','nearest_fallbacks','deferred_nodes','owner_changes_vs_first','owner_changes_vs_second'),0)
+    monkeypatch.setattr(e,'adjacency_crossover',lambda *args:(a.routes,a.directions,a.selected.copy(),dict(detail)))
+    monkeypatch.setattr(e,'_priority_arrays',lambda *args:(100.,None,None,None))
+    monkeypatch.setattr(e,'reference_schedule_formal',lambda *args,orientations,**kwargs:
+        ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,directions=tuple(orientations[r] for r in range(4))))
+    result=e.run_eax_nsga2(w.parents,settings=e.EAXNSGAConfig(population_size=2,
+        max_generations=1,min_generations=1),seed=7)
+    assert result.termination_reason=='INITIALIZATION_RETRIES_EXHAUSTED'
+    assert not result.accounting['search_complete']
+    assert result.accounting['initialization_attempts']==13 and result.accounting['native_calls']==1
+    assert result.accounting['initialization_evaluations']==1 and result.accounting['duplicate_children']==12
+    assert result.generations==result.valid_children==0 and result.accounting['b32_calls']==1
+
+
+def test_eax_joint_position_processing_and_move_match_full_route_recomputation():
+    import numpy as np
+    from mrta_search import eax_nsga2 as e
+    from mrta_search.saeax import _heads_legal
+    _,w,a,_=_saeax_fixture()
+    active=np.array(sorted(int(n) for p in a.selected for n in w.pattern_nodes[p] if n>=0),np.int64)
+    node=int(active[3])
+    rows=[np.array([n for n in active[:6] if n!=node],np.int64),active[6:].copy(),
+          np.empty(0,np.int64),np.empty(0,np.int64)]
+    directions=[np.arange(len(r),dtype=np.int64)%2 for r in rows]
+    loads_and_costs=e._route_statistics(rows,directions,w.travel,w.processing)
+    costs,loads=loads_and_costs
+    rr,dd=np.zeros((4,len(active)),np.int64),np.zeros((4,len(active)),np.int64)
+    lengths=np.array([len(r) for r in rows],np.int64)
+    for r in range(4):rr[r,:lengths[r]],dd[r,:lengths[r]]=rows[r],directions[r]
+    local=np.full(len(w.ids),-1,np.int64);local[active]=np.arange(len(active))
+    table=np.zeros((2*len(active),2*len(active)),np.bool_)
+    r,k,d,delta=e._joint_position(node,0,local,table,rr,dd,lengths,loads,costs,
+        w.travel,w.processing,w.eligible,w.parent_index,w.points,w.parameters)
+    assert r==1  # R0 has five blocks, R1 has two: release the heavy route.
+    possible=[]
+    chosen=None
+    for robot in range(4):
+        if not w.eligible[node,robot]:continue
+        for position in range(len(rows[robot])+1):
+            for bit in range(2):
+                nr,nd=list(rows),list(directions)
+                nr[robot]=np.insert(nr[robot],position,node)
+                nd[robot]=np.insert(nd[robot],position,bit)
+                if not _heads_legal(nr,nd,w.points,w.parameters):continue
+                nc,np_=e._route_statistics(nr,nd,w.travel,w.processing)
+                dm=float(sum(nc-np_)-sum(costs-loads))
+                score=(float(max(np_)),float(max(nc)),dm)
+                possible.append(score)
+                if (robot,position,bit)==(r,k,d):chosen=score
+    assert chosen is not None
+    assert chosen==pytest.approx(min(possible))
+    assert delta==pytest.approx(chosen[2])
+
