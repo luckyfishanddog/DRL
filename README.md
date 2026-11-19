@@ -22,6 +22,8 @@ BR-SAEAX 随后完成同种子的三个 TRAIN：最终 Cmax 为 4432.852/5707.05
 
 LA-4R-EAX-NSGA-II 已按用户提供的 Gao 论文第4.4节及图9实现独立增强邻接表交叉、四机器人联合归属/顺序/方向构造和三目标 NSGA-II。20个体、每代10子代、最多500代、120代停滞、最终一次B32的三个 TRAIN 已完成：B32可行2/3，两个共同可行配对均落后于SAEAX，Cmax变化中位 **+35.121%**；完整时间中位22.52 s，停止于427/133/330代。8900个有效子代仅73个原生可行，**TRAIN未通过，未进入VALIDATION/TEST**。实现见 [eax_nsga2.py](src/mrta_search/eax_nsga2.py)，入口见 [run_eax_nsga2.py](scripts/run_eax_nsga2.py)，详细负结果及命令见[报告第16节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#16-2026-11-17la-4r-eax-nsga-ii全文核对实现及train筛查负结果)。三条结果继续追加到原CSV，全部历史记录保留。
 
+BC-ECS 已完成本次运行内实际生成 SAEAX 初解的3个 TRAIN及30次 VALIDATION，未读取历史最优解。TRAIN为3/3可行、对SAEAX 2胜1平，时间中位30.49 s，通过筛查；VALIDATION为30/30可行、对SAEAX 19胜11平，但对WAG共同可行22对为7胜15负、Cmax变化中位 **+0.0969%**，对HGA为0胜30负、**+1.0829%**。完整时间中位31.65 s，包含初始化、逐出链和全部B32。**质量未达标，本轮停止，未启动TEST或继续调参。** 实现见 [bc_ecs.py](src/mrta_search/bc_ecs.py)，独立入口见 [run_bc_ecs.py](scripts/run_bc_ecs.py)，33条结果追加到原CSV，调用计数、停止原因及全部逐例数据见[报告第17节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#17-2026-11-18bc-ecs-实现train通过及完整validation负结果)。
+
 ## 运行
 
 在 `D:\pybullet_test\MRTA_GA\DRL` 中执行。

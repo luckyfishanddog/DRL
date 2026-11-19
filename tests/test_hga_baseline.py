@@ -1733,3 +1733,275 @@ def test_eax_joint_position_processing_and_move_match_full_route_recomputation()
     assert chosen==pytest.approx(min(possible))
     assert delta==pytest.approx(chosen[2])
 
+
+def _bc_initial_fixture():
+    from mrta_search import bc_ecs as c
+    from mrta_search.saeax import SAEAXResult
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    _,w,a,b=_saeax_fixture()
+    solution=w.solution(a.routes,a.selected)
+    vectors=tuple(tuple(int(d) for d in row) for row in a.directions)
+    schedule=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.,directions=vectors)
+    accounting=dict(native_calls=12,b32_calls=3,b32_s=0.,search_s=0.,
+        processing_s=a.processing.tolist(),move_s=float(sum(a.costs-a.processing)),wait_s=0.)
+    initial=SAEAXResult('FEASIBLE',1000.,solution,vectors,schedule,900.,0,0,'STAGNATION',0.,accounting)
+    return c,w,a,b,initial
+
+
+def _bc_fake_candidates(c,w,item,count=6):
+    import numpy as np
+    for index in range(count):
+        rr=[r.copy() for r in item.routes]
+        dd=[d.copy() for d in item.directions]
+        for bit in range(3):
+            if (index+1)&(1<<bit):dd[0][bit+1]^=1
+        cc,pp=c._route_statistics(rr,dd,w.travel,w.processing)
+        key=c.complete_identity(rr,dd,item.selected)
+        yield rr,dd,cc,pp,key,dict(kind='TWO_ROBOT_EXCHANGE',parents=['a','e'],
+            transfers=[],variant=0,wait_anchored=False)
+
+
+def test_bc_default_budget_and_conservative_bound_comparisons():
+    from mrta_search.bc_ecs import BCECSConfig,cannot_improve
+    assert (BCECSConfig().max_candidates,BCECSConfig().stagnation_candidates)==(6000,1500)
+    with pytest.raises(ValueError):BCECSConfig(max_candidates=0)
+    assert not cannot_improve(100.,100.,100)
+    assert not cannot_improve(100.+1e-9,100.,100)
+    assert cannot_improve(101.,100.,100)
+    assert not cannot_improve(100.,float('inf'),100)
+
+
+def test_bc_assignment_processing_is_exact_for_joint_exchange():
+    import numpy as np
+    c,w,a,_,_=_bc_initial_fixture()
+    owners=np.full(len(w.ids),-1,np.int64)
+    for r,row in enumerate(a.routes):owners[row]=r
+    nodes=np.array([a.routes[0][1],a.routes[1][2]],np.int64)
+    targets=np.array([1,0],np.int64)
+    projected=c.assignment_loads(a.processing,nodes,owners,targets,w.processing)
+    rows=[r[~np.isin(r,nodes)].copy() for r in a.routes]
+    for node,target in zip(nodes,targets):rows[target]=np.append(rows[target],node)
+    _,actual=c._route_statistics(rows,[np.zeros(len(r),np.int64) for r in rows],w.travel,w.processing)
+    np.testing.assert_allclose(projected,actual,atol=1e-9)
+
+
+def test_bc_chain_plans_include_two_robot_exchange_and_three_robot_cycle():
+    import itertools,numpy as np
+    from mrta_search import bc_ecs as c
+    parents=tuple(ParentWeld(chr(97+i),(1.+2*i,6.),(2.+2*i,6.)) for i in range(9))
+    w=c._HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    nodes=[int(w.pattern_nodes[p,0]) for p in w.initial_selected]
+    rows=[np.array(r,np.int64) for r in (nodes[:4],nodes[4:6],nodes[6:8],nodes[8:])]
+    bits=[np.zeros(len(r),np.int64) for r in rows]
+    costs,loads=c._route_statistics(rows,bits,w.travel,w.processing)
+    item=c.Individual(rows,bits,w.initial_selected.copy(),10000.,costs,loads,
+        c.complete_identity(rows,bits,w.initial_selected),np.empty(0,np.int64))
+    plans=list(itertools.islice(c.chain_plans(item,w,np.zeros(len(parents)),random.Random(3)),500))
+    assert any(len(p)==1 for p in plans)
+    assert any(len(p)==2 and p[-1][2]==p[0][1] for p in plans)
+    assert any(len(p)==3 and p[-1][2]==p[0][1] and len({a[1] for a in p})==3 for p in plans)
+    for plan in plans:
+        assert plan[0][1] in (int(np.argmax(loads)),int(np.argmax(costs)))
+        assert len({int(w.parent_index[n]) for n,_,_ in plan})==len(plan)
+        for node,source,target in plan:
+            assert node in rows[source] and target!=source and w.eligible[node,target]
+        for a,b in zip(plan,plan[1:]):assert a[2]==b[1]
+
+
+def test_bc_parent_closed_repair_keeps_y_independent_and_x_fixed(monkeypatch):
+    import numpy as np
+    from mrta_search import bc_ecs as c
+    parents=(ParentWeld('y',(3.,8.),(3.,4.)),ParentWeld('x',(1.,9.),(10.,9.)),
+        ParentWeld('a',(2.,9.),(3.2,9.)),ParentWeld('b',(11.,9.),(12.2,9.)),
+        ParentWeld('c',(1.,3.),(2.2,3.)),ParentWeld('d',(12.,3.),(13.2,3.)))
+    w=c._HGAWorkspace(parents,ScientificConfig(),FORMAL_SCOPE_V2)
+    selected=w.initial_selected.copy()
+    xp=next(i for i,p in enumerate(w.parents) if p.parent_id=='x')
+    selected[xp]=next(p for p in w.options[xp] if w.patterns[p].kind is SplitKind.X_SPLIT)
+    lookup={w.ids[n]:int(n) for p in selected for n in w.pattern_nodes[p] if n>=0}
+    sequences=(('x::0','y::0','a::whole'),('x::1','b::whole'),('y::1','c::whole'),('d::whole',))
+    rows=[np.array([lookup[n] for n in r],np.int64) for r in sequences]
+    bits=[np.zeros(len(r),np.int64) for r in rows]
+    costs,loads=c._route_statistics(rows,bits,w.travel,w.processing)
+    item=c.Individual(rows,bits,selected,10000.,costs,loads,c.complete_identity(rows,bits,selected),np.empty(0,np.int64))
+    solution=w.solution(rows,selected)
+    chain=((lookup['y::0'],0,1),(lookup['b::whole'],1,0))
+    assignments=list(c.chain_assignments(chain,item,w))
+    assert {int(targets[list(nodes).index(lookup['y::1'])]) for _,nodes,targets in assignments}=={2,3}
+    captured=[]
+    original=c._remove_parent_set
+    def remove(current,parent_ids):
+        partial=original(current,parent_ids);captured.append(partial)
+        assert set(parent_ids)=={'b','y'}
+        assert not any(n.startswith(('b::','y::')) for r in partial.routes for n in r)
+        return partial
+    monkeypatch.setattr(c,'_remove_parent_set',remove)
+    successes=0
+    for ps,nodes,targets in assignments:
+        for variant in (0,1):
+            repaired=c.construct_chain(item,solution,w,ps,nodes,targets,chain,variant)
+            if repaired is None:continue
+            rr,dd=repaired;successes+=1
+            c.validate_individual(w,rr,dd,selected)
+            owners={w.ids[n]:r for r,row in enumerate(rr) for n in row}
+            assert owners['x::0']==0 and owners['x::1']==1
+            assert owners['y::0']==1 and owners['b::whole']==0
+            assert w.solution(rr,selected).patterns==solution.patterns
+    assert successes>0 and captured
+    xn=np.array([lookup['x::0'],lookup['x::1']],np.int64)
+    with pytest.raises(ValueError,match='fixed X'):
+        c.construct_chain(item,solution,w,(xp,),xn,np.array([1,0],np.int64),((xn[0],0,1),),0)
+
+
+def test_bc_wait_feedback_uses_observed_native_wait_only():
+    import numpy as np
+    c,w,a,_,_=_bc_initial_fixture()
+    node=int(a.routes[0][0]);ops=np.zeros((2,9))
+    ops[0,0],ops[0,7],ops[0,8]=12.5,node,4
+    ops[1,0],ops[1,7],ops[1,8]=99.,node,0
+    actual=c.observed_native_waits([ops],w)
+    assert sum(actual)==12.5 and actual[w.parent_index[node]]==12.5
+
+
+@pytest.mark.parametrize('status,cmax,reason',[
+    ('FEASIBLE',850.,'IMPROVED_B32'),('FEASIBLE',1100.,'INITIAL_B32_BETTER_OR_EQUAL'),
+    ('DEADLOCK',None,'FINAL_B32_FAILED')])
+def test_bc_one_in_run_seed_and_one_final_b32_with_cached_fallback(monkeypatch,status,cmax,reason):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    c,w,a,_,initial=_bc_initial_fixture()
+    seeds,finals,native=[],[],[]
+    def seed(parents,config,**kwargs):
+        seeds.append(kwargs)
+        return initial
+    monkeypatch.setattr(c,'run_saeax',seed)
+    monkeypatch.setattr(c,'chain_candidates',lambda item,solution,workspace,*args:
+        _bc_fake_candidates(c,workspace,item,1))
+    def scored(*args):
+        native.append(1)
+        return 800.,None,[],None
+    monkeypatch.setattr(c,'_priority_arrays',scored)
+    def b32(solution,config,*,scope,orientations):
+        finals.append(solution)
+        return ScheduleResult(ScheduleStatus(status),cmax=cmax,directions=tuple(orientations[r] for r in range(4)))
+    monkeypatch.setattr(c,'reference_schedule_formal',b32)
+    result=c.run_bc_ecs(w.parents,settings=c.BCECSConfig(max_candidates=1,stagnation_candidates=10),seed=99)
+    assert len(seeds)==len(native)==len(finals)==1 and seeds[0]['seed']==99
+    assert result.accounting['native_calls']==13 and result.accounting['bc_native_calls']==1
+    assert result.accounting['b32_calls']==4 and result.accounting['final_b32_calls']==1
+    assert result.accounting['return_reason']==reason and result.status=='FEASIBLE'
+    assert result.cmax==(850. if reason=='IMPROVED_B32' else 1000.)
+    if reason!='IMPROVED_B32':assert result.schedule is initial.schedule
+    if status=='DEADLOCK':assert result.final_candidate['cmax_s'] is None
+    assert result.runtime>=result.accounting['initialization_s']+result.accounting['chain_search_s']+result.accounting['final_b32_s']
+
+
+@pytest.mark.parametrize('value',[950.,float('inf')])
+def test_bc_stagnation_counts_actual_evaluations_and_native_rejection_is_not_b32_deadlock(monkeypatch,value):
+    c,w,_,_,initial=_bc_initial_fixture()
+    monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
+    monkeypatch.setattr(c,'chain_candidates',lambda item,solution,workspace,*args:
+        _bc_fake_candidates(c,workspace,item,6))
+    monkeypatch.setattr(c,'_priority_arrays',lambda *args:(value,None,[],None))
+    def forbidden(*args,**kwargs):raise AssertionError('unimproved candidate or initial was scheduled again')
+    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    result=c.run_bc_ecs(w.parents,settings=c.BCECSConfig(max_candidates=10,stagnation_candidates=3))
+    assert result.termination_reason=='STAGNATION' and result.accounting['bc_native_calls']==3
+    assert result.accounting['stagnation_at_stop']==3 and result.accounting['b32_calls']==3
+    assert result.cmax==1000. and result.schedule is initial.schedule
+    assert result.accounting['native_nonfinite_candidates']==(3 if value==float('inf') else 0)
+    assert result.final_candidate is None
+
+
+def test_bc_initialization_failure_does_not_run_a_chain_or_extra_b32(monkeypatch):
+    c,w,_,_,initial=_bc_initial_fixture()
+    initial.status='DEADLOCK';initial.cmax=None
+    monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
+    def forbidden(*args,**kwargs):raise AssertionError('search started without a feasible initial schedule')
+    monkeypatch.setattr(c,'chain_candidates',forbidden)
+    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    result=c.run_bc_ecs(w.parents)
+    assert result.termination_reason=='INITIALIZATION_FAILED' and result.cmax is None
+    assert result.accounting['bc_native_calls']==0 and result.accounting['b32_calls']==3
+
+
+def _bc_candidate_counts():
+    return dict.fromkeys(('chain_plans','assignment_combinations','processing_pruned','route_bound_pruned',
+        'construction_rejected','complete_constructed'),0)
+
+
+def test_bc_processing_bound_prunes_before_construction_and_does_not_fake_evaluations(monkeypatch):
+    import numpy as np
+    c,w,a,_,initial=_bc_initial_fixture()
+    def forbidden(*args,**kwargs):raise AssertionError('processing-pruned plan was constructed or scored')
+    monkeypatch.setattr(c,'construct_chain',forbidden)
+    monkeypatch.setattr(c,'_priority_arrays',forbidden)
+    counts=_bc_candidate_counts()
+    candidates=list(c.chain_candidates(a,initial.solution,w,np.zeros(len(w.parents)),random.Random(3),1.,counts))
+    assert candidates==[] and counts['processing_pruned']>0 and counts['complete_constructed']==0
+
+
+def test_bc_complete_directed_route_bound_prunes_without_native_or_b32(monkeypatch):
+    import numpy as np
+    c,w,a,_,initial=_bc_initial_fixture()
+    def forbidden(*args,**kwargs):raise AssertionError('complete-bound pruning called an evaluator')
+    monkeypatch.setattr(c,'_priority_arrays',forbidden)
+    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    counts=_bc_candidate_counts()
+    target=float(max(a.processing))+1.
+    candidates=list(c.chain_candidates(a,initial.solution,w,np.zeros(len(w.parents)),random.Random(3),target,counts))
+    assert candidates==[] and counts['complete_constructed']>0
+    assert counts['route_bound_pruned']==counts['complete_constructed']
+
+
+def test_bc_real_complete_candidate_bounds_do_not_exceed_finite_native_cmax():
+    import itertools,numpy as np
+    c,w,a,_,initial=_bc_initial_fixture()
+    counts=_bc_candidate_counts()
+    candidates=list(itertools.islice(c.chain_candidates(a,initial.solution,w,
+        np.zeros(len(w.parents)),random.Random(3),1500.,counts),12))
+    assert candidates
+    for rr,dd,cc,pp,_,_ in candidates:
+        native,_,_,_=c._priority_arrays(rr,w.travel,w.processing,w.points,w.parameters,dd)
+        if np.isfinite(native):
+            assert max(pp)<=max(cc)+1e-7 and max(cc)<=native+1e-7
+
+
+def test_bc_entry_train_criteria_use_actual_b32_and_complete_time(monkeypatch):
+    import json
+    from mrta_search import bc_ecs as b
+    old={(name,20261110):dict(status='FEASIBLE',cmax_s='100',runtime_s='20') for name in b.PILOTS}
+    rows=[dict(layout_id=name,seed='20261110',status='FEASIBLE',cmax_s=str(score),runtime_s='50',
+        diagnostic=json.dumps(dict(accounting=dict(search_complete=True))))
+        for name,score in zip(b.PILOTS,(90.,95.,100.))]
+    monkeypatch.setattr(b,'method_rows',lambda stage:rows)
+    monkeypatch.setattr(b,'saeax_rows',lambda stage:old)
+    assert b.pilot_decision()['passed']
+    rows[0]['status']='DEADLOCK';rows[0]['cmax_s']=''
+    assert not b.pilot_decision()['passed']
+    rows[0]['status']='FEASIBLE';rows[0]['cmax_s']='90'
+    for r in rows:r['runtime_s']='104'
+    assert not b.pilot_decision()['passed']
+
+
+def test_bc_entry_failed_train_does_not_access_validation(monkeypatch):
+    from mrta_search import bc_ecs as b
+    def forbidden(*args,**kwargs):raise AssertionError('VALIDATION accessed without passed TRAIN')
+    monkeypatch.setattr(b,'pilot_decision',lambda:dict(passed=False))
+    monkeypatch.setattr(b,'load_layouts',forbidden)
+    monkeypatch.setattr(b,'experiment_job',forbidden)
+    with pytest.raises(ValueError,match='TRAIN screening'):
+        b.run_experiment('validation',1)
+
+
+def test_bc_entry_skips_saved_runs_without_writes_or_initialization(monkeypatch):
+    from mrta_search import bc_ecs as b
+    layouts=[(name,()) for name in b.PILOTS]
+    saved=[dict(layout_id=name,seed='20261110') for name in b.PILOTS]
+    def forbidden(*args,**kwargs):raise AssertionError('saved BC result was repeated or appended')
+    monkeypatch.setattr(b,'load_layouts',lambda split:layouts)
+    monkeypatch.setattr(b,'method_rows',lambda stage:saved)
+    monkeypatch.setattr(b,'experiment_job',forbidden)
+    monkeypatch.setattr(b,'append_result',forbidden)
+    monkeypatch.setattr(b,'summarize',lambda stage:None)
+    b.run_experiment('pilot',1)
+
