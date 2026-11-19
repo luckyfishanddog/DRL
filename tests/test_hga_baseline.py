@@ -2005,3 +2005,223 @@ def test_bc_entry_skips_saved_runs_without_writes_or_initialization(monkeypatch)
     monkeypatch.setattr(b,'summarize',lambda stage:None)
     b.run_experiment('pilot',1)
 
+
+@pytest.mark.parametrize('node_offset', [0, 2, 5, 7])
+def test_rcig_joint_insertion_matches_existing_action_pool_and_full_cost(node_offset):
+    import numpy as np
+    from mrta_search import rc_ig as c
+    from mrta_search.lns import joint_block_candidates, oriented_route_state, oriented_time_score
+    _, w, item, _ = _saeax_fixture()
+    node = int(np.concatenate(item.routes)[node_offset])
+    rows = [r[r != node].copy() for r in item.routes]
+    bits = [np.arange(len(r), dtype=np.int64) % 2 for r in rows]
+    solution = w.solution(item.routes, item.selected)
+    blocks = block_map(solution, w.config)
+    state = oriented_route_state(tuple(tuple(w.ids[n] for n in r) for r in rows),
+        tuple(tuple(int(d) for d in r) for r in bits), blocks, w.config)
+    pattern = w.patterns[int(w.node_pattern[node])]
+    reference = joint_block_candidates(state, blocks[w.ids[node]], pattern, blocks, w.config,
+        insertion_limit=sum(map(len, rows))+1)
+    by_position = {}
+    for after, action in reference:
+        score = oriented_time_score(after)
+        key = action.robot, action.position
+        if key not in by_position or score < by_position[key]:
+            by_position[key] = score
+    actual = c.insertion_options(node, rows, bits, w, dict(insertion_states=0))
+    assert len(actual) == min(2, len(by_position))
+    for (rr, dd, score, actions), expected in zip(actual, sorted(by_position.values())):
+        cc, pp = c._route_statistics(rr, dd, w.travel, w.processing)
+        assert score == pytest.approx((max(cc), sum(cc)), abs=1e-8)
+        assert score == pytest.approx(expected, abs=1e-7)
+        c.validate_individual(w, rr, dd, item.selected)
+        assert c._heads_legal(rr, dd, w.points, w.parameters)
+        action = actions[0]
+        r, k = action['robot'], action['position']
+        assert rr[r][k] == node and dd[r][k] == action['direction']
+        for name, old, new in action['neighbour_changes']:
+            assert old != new
+            assert dd[r][list(w.ids[n] for n in rr[r]).index(name)] == new
+
+
+def test_rcig_catalog_modes_parent_coverage_y_qualification_and_fixed_x():
+    import numpy as np
+    from mrta_search import rc_ig as c
+    parents = (ParentWeld('y', (3.,8.), (3.,4.)), ParentWeld('x', (1.,9.), (10.,9.)),
+        ParentWeld('a', (2.,9.), (3.2,9.)), ParentWeld('b', (11.,9.), (12.2,9.)),
+        ParentWeld('c', (1.,3.), (2.2,3.)), ParentWeld('d', (12.,3.), (13.2,3.)))
+    w = c._HGAWorkspace(parents, ScientificConfig(), FORMAL_SCOPE_V2)
+    selected = w.initial_selected.copy()
+    xp = next(i for i,p in enumerate(w.parents) if p.parent_id == 'x')
+    selected[xp] = next(p for p in w.options[xp] if w.patterns[p].kind is SplitKind.X_SPLIT)
+    lookup = {w.ids[n]:int(n) for p in selected for n in w.pattern_nodes[p] if n >= 0}
+    names = (('a::whole','x::0','y::0'), ('b::whole','x::1'), ('c::whole','y::1'), ('d::whole',))
+    rows = [np.array([lookup[n] for n in r], np.int64) for r in names]
+    bits = [np.zeros(len(r), np.int64) for r in rows]
+    costs, loads = c._route_statistics(rows, bits, w.travel, w.processing)
+    item = c.Individual(rows, bits, selected, 10000., costs, loads,
+        c.complete_identity(rows,bits,selected), np.empty(0,np.int64))
+    kinds = set()
+    original_options = w.options
+    for parent in (xp, next(i for i,p in enumerate(w.parents) if p.parent_id == 'y')):
+        for pattern in original_options[parent]:
+            w.options = tuple((pattern,) if i == parent else v for i,v in enumerate(original_options))
+            a = dict(insertion_states=0, mode_trials=0)
+            result = c.repair_parents(item, (parent,), w, a)
+            assert result is not None
+            rr, dd, ss, trace = result
+            c.validate_individual(w,rr,dd,ss)
+            assert ss[parent] == pattern
+            kinds.add(w.patterns[pattern].kind)
+            solution = w.solution(rr,ss)
+            assert tuple(r.block_ids for r in solution.routes) == tuple(tuple(w.ids[n] for n in r) for r in rr)
+            for r,row in enumerate(rr):
+                for n in row:
+                    assert w.eligible[n,r]
+                    if w.patterns[w.node_pattern[n]].kind is SplitKind.X_SPLIT:
+                        assert r == (0 if w.patterns[w.node_pattern[n]].rail.value == 'UPPER' else 2)+int(w.node_child[n])-1
+            assert len(trace) == 1 and trace[0]['parent_id'] == w.parents[parent].parent_id
+    assert kinds == {SplitKind.WHOLE, SplitKind.Y_SPLIT, SplitKind.X_SPLIT}
+    w.options = original_options
+    repaired = c.repair_parents(item, (xp, 0, 1), w, dict(insertion_states=0, mode_trials=0))
+    assert repaired is not None
+    c.validate_individual(w, *repaired[:3])
+
+
+@pytest.mark.parametrize('status,cmax,reason', [
+    ('FEASIBLE', 850., 'IMPROVED_B32'), ('FEASIBLE', 1100., 'INITIAL_B32_BETTER_OR_EQUAL'),
+    ('DEADLOCK', None, 'FINAL_B32_FAILED')])
+def test_rcig_500_attempts_distinct_evaluations_one_b32_and_cached_fallback(monkeypatch,status,cmax,reason):
+    from types import SimpleNamespace
+    from mrta_search import rc_ig as c
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    _, w, item, _, initial = _bc_initial_fixture()
+    calls = dict(seed=0, repair=0, native=0, final=0)
+    def seed(*args, **kwargs):
+        calls['seed'] += 1
+        assert kwargs['seed'] == 99
+        return initial
+    fake = next(_bc_fake_candidates(c,w,item,1))
+    def repair(*args):
+        calls['repair'] += 1
+        return None if calls['repair'] % 2 == 0 else (fake[0],fake[1],item.selected.copy(),[])
+    def score(*args):
+        calls['native'] += 1
+        return 800.,None,[],None
+    def final(*args, orientations, **kwargs):
+        calls['final'] += 1
+        return ScheduleResult(ScheduleStatus(status),cmax=cmax,
+            directions=tuple(orientations[r] for r in range(4)))
+    elapsed = [0.]
+    def clock():
+        elapsed[0] += 10.
+        return elapsed[0]
+    monkeypatch.setattr(c,'time',SimpleNamespace(perf_counter=clock))
+    monkeypatch.setattr(c,'run_saeax',seed)
+    monkeypatch.setattr(c,'repair_parents',repair)
+    monkeypatch.setattr(c,'_priority_arrays',score)
+    monkeypatch.setattr(c,'reference_schedule_formal',final)
+    result = c.run_rc_ig(w.parents,seed=99)
+    a = result.accounting
+    assert calls == dict(seed=1,repair=500,native=1,final=1)
+    assert result.iterations == 500 and result.termination_reason == 'ITERATION_LIMIT'
+    assert a['construction_failures'] == 250 and a['duplicate_candidates'] == 249
+    assert a['native_calls'] == 13 and a['ig_native_calls'] == 1
+    assert a['b32_calls'] == 4 and a['final_b32_calls'] == 1
+    assert result.runtime > 90 and result.runtime >= a['initialization_s']+a['ig_search_s']+a['final_b32_s']
+    assert a['return_reason'] == reason and a['search_complete']
+    if reason == 'IMPROVED_B32':
+        assert result.cmax == 850. and result.native_cmax == 800.
+    else:
+        assert result.schedule is initial.schedule and result.cmax == initial.cmax
+    if status == 'DEADLOCK':
+        assert result.final_candidate['cmax_s'] is None
+
+
+def test_rcig_annealing_accepts_worse_rejects_infeasible_and_returns_global_best(monkeypatch):
+    from mrta_search import rc_ig as c
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    _, w, item, _, initial = _bc_initial_fixture()
+    candidates = iter(_bc_fake_candidates(c,w,item,3))
+    values = iter((800.,850.,float('inf')))
+    monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
+    def repaired(*args):
+        f = next(candidates)
+        return f[0], f[1], item.selected.copy(), []
+    class RNG:
+        def __init__(self,*args):pass
+        def random(self):return 0.
+    monkeypatch.setattr(c.random,'Random',RNG)
+    monkeypatch.setattr(c,'destroy_parents',lambda *args:(0,1,2))
+    monkeypatch.setattr(c,'repair_parents',repaired)
+    monkeypatch.setattr(c,'_priority_arrays',lambda *args:(next(values),None,[],None))
+    monkeypatch.setattr(c,'reference_schedule_formal',lambda *args,orientations,**kwargs:
+        ScheduleResult(ScheduleStatus.FEASIBLE,cmax=900.,directions=tuple(orientations[r] for r in range(4))))
+    result = c.run_rc_ig(w.parents,settings=c.RCIGConfig(max_iterations=3))
+    assert result.accounting['accepted_improvements'] == 1
+    assert result.accounting['accepted_worse'] == 1
+    assert result.accounting['native_nonfinite_candidates'] == 1
+    assert result.native_cmax == 800. and result.cmax == 900.
+    assert result.progress[-1]['current_native_cmax_s'] == 850.
+
+
+@pytest.mark.parametrize('value',[950.,float('inf')])
+def test_rcig_no_global_native_improvement_never_reschedules_initial(monkeypatch,value):
+    from mrta_search import rc_ig as c
+    _,w,item,_,initial = _bc_initial_fixture()
+    f = next(_bc_fake_candidates(c,w,item,1))
+    monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
+    monkeypatch.setattr(c,'repair_parents',lambda *args:(f[0],f[1],item.selected.copy(),[]))
+    monkeypatch.setattr(c,'_priority_arrays',lambda *args:(value,None,[],None))
+    def forbidden(*args,**kwargs):raise AssertionError('unexpected B32')
+    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    result = c.run_rc_ig(w.parents,settings=c.RCIGConfig(max_iterations=2))
+    assert result.schedule is initial.schedule and result.accounting['final_b32_calls'] == 0
+    assert result.accounting['return_reason'] == 'NO_NATIVE_IMPROVEMENT'
+
+
+def test_rcig_defaults_initial_failure_and_destroy_size(monkeypatch):
+    import numpy as np
+    from mrta_search import rc_ig as c
+    _,w,item,_,initial = _bc_initial_fixture()
+    assert c.RCIGConfig().max_iterations == 500
+    with pytest.raises(ValueError):c.RCIGConfig(max_iterations=501)
+    removed = c.destroy_parents(item,w,np.ones(len(w.parents)),np.zeros(4),random.Random(8))
+    assert len(removed) == len(set(removed)) == 3
+    initial.status = 'DEADLOCK';initial.cmax = None
+    monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
+    def forbidden(*args,**kwargs):raise AssertionError('search without feasible seed')
+    monkeypatch.setattr(c,'repair_parents',forbidden)
+    result = c.run_rc_ig(w.parents)
+    assert result.iterations == 0 and result.termination_reason == 'INITIALIZATION_FAILED'
+
+
+def test_rcig_experiment_uses_in_run_train_results_and_no_train_time_limit(monkeypatch):
+    import json, run_rc_ig as entry
+    rows = [dict(layout_id=name, seed='20261110', status='FEASIBLE', cmax_s=str(score),runtime_s='1000',
+        diagnostic=json.dumps(dict(accounting=dict(search_complete=True),
+            initial_saeax=dict(status='FEASIBLE',cmax_s=100.,runtime_s=10.))))
+        for name,score in zip(entry.PILOTS,(90.,95.,100.))]
+    monkeypatch.setattr(entry,'method_rows',lambda stage:rows)
+    assert entry.pilot_decision()['passed']
+    rows[0]['cmax_s'] = '100'
+    assert not entry.pilot_decision()['passed']
+    def forbidden(*args,**kwargs):raise AssertionError('dataset accessed after failed TRAIN')
+    monkeypatch.setattr(entry,'load_layouts',forbidden)
+    with pytest.raises(ValueError,match='TRAIN screening'):
+        entry.run_experiment('validation',1)
+
+
+def test_rcig_shared_csv_reader_handles_full_repair_traces():
+    import csv, io
+    from run_saeax import read_rows
+    class MemoryCSV:
+        def exists(self):return True
+        def open(self,**kwargs):return io.StringIO('diagnostic\n'+('x'*200000)+'\n')
+    previous = csv.field_size_limit()
+    try:
+        csv.field_size_limit(131072)
+        assert read_rows(MemoryCSV()) == [dict(diagnostic='x'*200000)]
+    finally:
+        csv.field_size_limit(previous)
+

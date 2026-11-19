@@ -57,6 +57,7 @@ def load_layouts(split):
 def read_rows(path=RESULTS):
     if not path.exists():
         return []
+    csv.field_size_limit(2**31-1)  # Full parent-repair traces exceed CSV's 128 KiB default.
     with path.open(encoding='utf-8-sig',newline='') as stream:
         return list(csv.DictReader(stream))
 
