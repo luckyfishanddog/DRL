@@ -4957,3 +4957,115 @@ def test_loadfirst_failed_cover_screen_reports_reason_without_loading_empty_plan
     assert row['status']=='INFEASIBLE' and row['b32_calls']==0
     assert row['diagnostic']=='NO_LEGAL_FOUR_ROBOT_COVER' and written==[row]
 
+
+def _priority_plan_fixture():
+    import run_gnn_weld_layout as e
+    parents=tuple(ParentWeld(f'r{r}p{i}',(8.+i*.85+(r%2)*.12,9. if r<2 else 3.),
+                            (8.6+i*.85+(r%2)*.12+i*.025,9. if r<2 else 3.))
+                  for r in range(4) for i in range(4))
+    patterns=tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents)
+    solution=canonicalize(parents,patterns,{r:tuple(f'r{r}p{i}::whole' for i in range(4)) for r in range(4)},
+                          CONFIG,scope=FORMAL_SCOPE_V2)
+    plan=e.gnn.JointCompletionResult(solution,((0,1,0,1),)*4,(),0.)
+    return e,plan
+
+
+def test_priority_native_evaluation_preserves_genes_caches_and_never_calls_b32(monkeypatch):
+    e,plan=_priority_plan_fixture()
+    def forbidden(*args,**kwargs):pytest.fail('B32 or GNN generation in native evaluation')
+    monkeypatch.setattr(e,'b32',forbidden)
+    monkeypatch.setattr(e,'schedule_explicit',forbidden)
+    monkeypatch.setattr(e.gnn,'construct_vnext_gnn',forbidden)
+    original=e.priority_schedule;calls=[]
+    def observed(solution,config,**kwargs):
+        assert kwargs['directions']==plan.directions
+        calls.append(1)
+        return original(solution,config,**kwargs)
+    monkeypatch.setattr(e,'priority_schedule',observed)
+    cache={}
+    schedule,progress,called,_=e.priority_once(plan,cache)
+    again=e.priority_once(plan,cache)
+    assert called and not again[2] and again[3]==0. and len(calls)==1
+    assert schedule.directions==plan.directions and again[0] is schedule
+    row=e.priority_result_row('fixture',plan,schedule,progress)
+    assert row['evaluator']==e.PRIORITY_EVALUATOR
+    if schedule.feasible:
+        assert row['cmax_s']==max(row[f'completion_r{r}_s'] for r in range(4))
+        for r in range(4):
+            assert row[f'completion_r{r}_s']==pytest.approx(sum(row[f'{kind}_r{r}_s'] for kind in ('processing','move','wait')))
+
+
+def test_priority_deadlock_partial_wait_and_completion_are_never_complete_metrics():
+    from mrta_reference.model import Operation,OperationKind
+    e,plan=_priority_plan_fixture()
+    op=Operation('partial',0,OperationKind.WAIT,0.,20.,(1.,9.),(1.,9.),0,None)
+    schedule=ScheduleResult(ScheduleStatus.DEADLOCK,(op,),directions=plan.directions)
+    row=e.priority_result_row('fixture',plan,schedule,dict(rejected_pairs=1))
+    assert row['cmax_s'] is None and row['wait_s'] is None
+    assert all(row[f'{kind}_r{r}_s'] is None for kind in ('wait','completion') for r in range(4))
+
+
+def test_priority_load_protection_and_feasible_acceptance_are_hard():
+    e,_=_priority_plan_fixture()
+    limits=dict(pmax_limit_s=101.,spread_limit_s=22.)
+    assert e.priority_load_allowed((101.,99.,80.,79.),limits)
+    assert not e.priority_load_allowed((101.01,99.,80.,79.01),limits)
+    assert not e.priority_load_allowed((101.,99.,80.,78.99),limits)
+    feasible=lambda c:ScheduleResult(ScheduleStatus.FEASIBLE,cmax=c)
+    dead=ScheduleResult(ScheduleStatus.DEADLOCK)
+    assert e.priority_native_better(feasible(99.),{},999.,feasible(100.),{},1.)
+    assert not e.priority_native_better(feasible(101.),{},1.,feasible(100.),{},999.)
+    assert not e.priority_native_better(dead,dict(rejected_pairs=0),1.,feasible(100.),{},999.)
+    assert e.priority_native_better(feasible(999.),{},999.,dead,dict(rejected_pairs=0),1.)
+    assert e.priority_native_better(dead,dict(rejected_pairs=1),999.,dead,dict(rejected_pairs=2),1.)
+    assert not e.priority_native_better(dead,dict(rejected_pairs=1),100.,dead,dict(rejected_pairs=1),100.)
+
+
+def test_priority_all_six_existing_oriented_moves_preserve_tasks_patterns_qualifications():
+    from collections import Counter
+    e,plan=_priority_plan_fixture()
+    w=e.native_hga._HGAWorkspace(plan.solution.parents,CONFIG,FORMAL_SCOPE_V2,patterns=plan.solution.patterns)
+    routes,bits,groups=e.priority_oriented_candidates(plan,w,random.Random(20261110))
+    assert tuple(groups)==(4,5,6,1,2,3) and all(groups.values())
+    expected=Counter(b for route in plan.solution.routes for b in route.block_ids)
+    for move,items in groups.items():
+        item=items[0];candidate=e.priority_materialize(plan,w,routes,bits,item)
+        assert candidate is not None and candidate.solution.patterns==plan.solution.patterns
+        assert Counter(b for route in candidate.solution.routes for b in route.block_ids)==expected
+        assert all(route.block_ids for route in candidate.solution.routes)
+        new=w.encode(candidate.solution)
+        assert all(w.eligible[node,r] for r,route in enumerate(new) for node in route)
+        assert [sum(w.processing[node] for node in route) for route in new]==pytest.approx(item[3])
+        for r,segments in ((item[2][3],item[4]),) if move==4 else ((item[2][3],item[4]),(item[2][5],item[5])):
+            expected_bits=tuple(int(1-b if reverse else b)
+                for source,lo,hi,reverse in segments
+                for b in (bits[source][lo:hi][::-1] if reverse else bits[source][lo:hi]))
+            assert candidate.directions[r]==expected_bits
+        if move==4:
+            r=item[2][3]
+            assert (candidate.solution.routes[r],candidate.directions[r])!=(plan.solution.routes[r],plan.directions[r])
+
+
+def test_priority_vnd_budget_completed_resume_and_no_forbidden_evaluation(monkeypatch):
+    e,plan=_priority_plan_fixture();written=[];calls=[]
+    monkeypatch.setattr(e,'read_rows',lambda path:[{k:str(v) if v is not None else '' for k,v in row.items()} for row in written])
+    monkeypatch.setattr(e,'priority_write',lambda rows:written.extend(dict(row) for row in rows))
+    def evaluate(solution,config,*,directions,progress):
+        calls.append(e.plan_key(solution,directions))
+        progress.update(rejected_pairs=2,pair_status=(-1,-1),cross_rejected=False)
+        return ScheduleResult(ScheduleStatus.DEADLOCK,directions=directions)
+    monkeypatch.setattr(e,'priority_schedule',evaluate)
+    monkeypatch.setattr(e,'b32',lambda *a,**kw:pytest.fail('native VND called B32'))
+    cache={}
+    final=e.priority_vnd_case('fixture',20261110,plan,None,cache,budget=9)
+    candidates=[r for r in written if r['stage']=='candidate']
+    assert 0<len(candidates)<=9 and len(calls)<=10 and len(set(calls))==len(calls)
+    assert int(final['candidate_index'])==len(candidates)
+    assert all(e.priority_load_allowed(tuple(r[f'processing_r{k}_s'] for k in range(4)),r) for r in candidates)
+    for pass_index in {r['pass_index'] for r in candidates}:
+        moves=[int(r['move_id'][1:]) for r in candidates if r['pass_index']==pass_index]
+        assert moves==sorted(moves,key=(4,5,6,1,2,3).index)
+    before=len(calls),len(written)
+    resumed=e.priority_vnd_case('fixture',20261110,plan,None,cache,budget=9)
+    assert resumed['stage']=='final' and (len(calls),len(written))==before
+

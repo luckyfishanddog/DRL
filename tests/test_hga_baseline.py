@@ -898,6 +898,25 @@ def test_oriented_vnd_repairs_two_native_rejected_pairs_in_successive_moves():
     assert value == _priority_arrays(current, w.travel, w.processing, w.points, w.parameters, bits)[0]
 
 
+@pytest.mark.parametrize('rejected',[False,True])
+def test_priority_progress_is_passive_and_matches_existing_coordinated_pair_rule(rejected):
+    import math
+    import numpy as np
+    from mrta_baselines import hga as h
+    w,solution=_oriented_wait_fixture(rejected)
+    routes=w.encode(solution)
+    directions=[np.array([0,0,1,0][:len(route)],np.int64) for route in routes]
+    bits=tuple(tuple(int(b) for b in route) for route in directions)
+    original=h.priority_schedule(solution,w.config,directions=bits)
+    progress={}
+    observed=h.priority_schedule(solution,w.config,directions=bits,progress=progress)
+    assert observed.canonical_json()==original.canonical_json() and observed.directions==bits
+    empty=[np.empty((0,9)) for _ in range(4)]
+    _,_,pairs,_,_=h._fixed_native_update(routes,directions,w.points,w.processing,w.parameters,
+        empty,np.zeros(2),empty,empty,np.ones(4,np.bool_),np.inf)
+    assert progress['rejected_pairs']==sum(not math.isfinite(value) for value in pairs)
+
+
 @pytest.mark.parametrize('route_objective', (False, True))
 def test_oriented_prefix_bounds_match_complete_native_search_with_waits(route_objective):
     import numpy as np

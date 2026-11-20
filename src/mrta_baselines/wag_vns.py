@@ -847,7 +847,7 @@ def _numeric_follow(fixed, following, rf, rr, dx, dy, eps, spatial_skip=False, t
 
 
 @njit
-def _priority_arrays(routes, travel, processing, points, parameters, fixed_directions=None):
+def _priority_arrays(routes, travel, processing, points, parameters, fixed_directions=None, pair_status=None):
     """Same two-priority rule as WAG, plus four-robot initial/cross checks.
 
     This is a native scorer: no dispatch tree, recovery, certification or B32.
@@ -857,6 +857,7 @@ def _priority_arrays(routes, travel, processing, points, parameters, fixed_direc
                   else [bits.copy() for bits in fixed_directions])
     operations = [np.empty((0, 9)) for _ in range(4)]
     completion = np.zeros(4)
+    failed=False
     for left in (0, 2):
         right = left + 1
         if fixed_directions is not None:
@@ -866,11 +867,19 @@ def _priority_arrays(routes, travel, processing, points, parameters, fixed_direc
                 a, b = points[routes[left][0], bit0[0]], points[routes[right][0], bit1[0]]
                 if (a[0] + dx > b[0] + eps or
                         (abs(a[0] - b[0]) <= dx + eps and abs(a[1] - b[1]) <= dy + eps)):
-                    return np.inf, directions, operations, completion
+                    if pair_status is None:
+                        return np.inf, directions, operations, completion
+                    pair_status[left//2]=-1
+                    failed=True
+                    continue
         else:
             best, bit0, bit1 = _priority_pair_directions(routes, left, travel, processing, points, parameters)
         if not math.isfinite(best):
-            return np.inf, directions, operations, completion
+            if pair_status is None:
+                return np.inf, directions, operations, completion
+            pair_status[left//2]=-1
+            failed=True
+            continue
         directions[left], directions[right] = bit0, bit1
         a = _numeric_templates(routes[left], bit0, points, processing, speed, pre, post)
         b = _numeric_templates(routes[right], bit1, points, processing, speed, pre, post)
@@ -882,13 +891,21 @@ def _priority_arrays(routes, travel, processing, points, parameters, fixed_direc
             if not math.isfinite(wait) or wait > 0.:
                 reverse, reverse_wait = _numeric_follow(b, a, right, left, dx, dy, eps)
             if not math.isfinite(wait) and not math.isfinite(reverse_wait):
-                return np.inf, directions, operations, completion
+                if pair_status is None:
+                    return np.inf, directions, operations, completion
+                pair_status[left//2]=-1
+                failed=True
+                continue
             forward_cmax = max(a[-1, 6], followed[-1, 6]) if math.isfinite(wait) else np.inf
             reverse_cmax = max(b[-1, 6], reverse[-1, 6]) if math.isfinite(reverse_wait) else np.inf
             if reverse_cmax < forward_cmax:
                 operations[left], operations[right] = reverse, b
             else:
                 operations[left], operations[right] = a, followed
+        if pair_status is not None:
+            pair_status[left//2]=1
+    if failed:
+        return np.inf, directions, operations, completion
     for r in range(4):
         completion[r] = operations[r][-1, 6] if len(operations[r]) else 0.
     # A native feasible score must not hide interference across the two rails.
@@ -946,7 +963,7 @@ def _schedule_from_arrays(value, directions, operations, completion, ids, policy
                           directions=vectors, reference_policy_id=policy)
 
 
-def priority_schedule(solution, config, directions=None):
+def priority_schedule(solution, config, directions=None, *, progress=None):
     """Shared lightweight four-robot native objective for the two baselines."""
     blocks = block_map(solution, config)
     ids, index, points, travel, processing = _tables_for(blocks, config)
@@ -960,7 +977,16 @@ def priority_schedule(solution, config, directions=None):
             or np.any((vectors[r] != 0) & (vectors[r] != 1)) for r in range(4))):
         raise ValueError("explicit directions must contain one 0/1 value per routed block")
     policy = "NATIVE_PRIORITY_FOUR_ROBOTS" + ("_EXPLICIT_DIRECTIONS" if vectors is not None else "")
-    return _schedule_from_arrays(*_priority_arrays(routes, travel, processing, points, parameters, vectors), ids, policy)
+    if progress is None:
+        return _schedule_from_arrays(*_priority_arrays(routes, travel, processing, points, parameters, vectors), ids, policy)
+    if vectors is None:
+        raise ValueError('priority progress requires explicit directions')
+    pair_status=np.zeros(2,np.int64)
+    schedule=_schedule_from_arrays(*_priority_arrays(routes,travel,processing,points,parameters,vectors,pair_status),ids,policy)
+    progress.update(pair_status=tuple(int(x) for x in pair_status),
+                    rejected_pairs=int(np.sum(pair_status<0)),
+                    cross_rejected=bool(not schedule.feasible and np.all(pair_status==1)))
+    return schedule
 
 
 def nearest_addition(

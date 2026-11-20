@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import copy
@@ -16,6 +17,7 @@ from statistics import median
 import sys
 import time
 
+import numpy as np
 import torch
 from torch.nn import functional as F
 
@@ -29,6 +31,7 @@ from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
 from mrta_baselines import AdaptedHGAConfig, AdaptedWAGConfig, run_adapted_hga_v2, run_adapted_wag_vns_v2
 from mrta_baselines.wag_vns import priority_schedule
+import mrta_baselines.hga as native_hga
 from mrta_search import gnn_constructor as gnn, lns
 from mrta_search.direction import _fixed_first_dp
 from mrta_search.initialization import build_oriented_insertion_beam
@@ -4857,9 +4860,302 @@ def imitation_loadfirst_pilot(*,screen_only=False):
     return finals
 
 
+PRIORITY_RESULTS=FINAL_RESULTS/'gnn_priority_vnd_pilot.csv'
+PRIORITY_EVALUATOR='NATIVE_PRIORITY_FOUR_ROBOTS_EXPLICIT_DIRECTIONS'
+PRIORITY_FIELDS=('stage','layout_id','seed','method','lambda','evaluator','source_b32_status','source_b32_s',
+    'status','cmax_s',*(f'{kind}_r{r}_s' for kind in ('processing','move','wait','completion') for r in range(4)),
+    *(f'robot_task_count_r{r}' for r in range(4)),'max_processing_s','processing_spread_s','move_s','wait_s',
+    'runtime_s','evaluation_s','native_calls','cache_hits','candidate_index','pass_index','move_id',
+    'robots','parent_ids','before_segments','after_segments','accepted','initial_status',
+    'initial_pmax_s','initial_spread_s','pmax_limit_s','spread_limit_s','initial_move_s',
+    'rejected_pairs','route_cycle_s','progress','solution','schedule','diagnostic')
+
+
+def priority_write(rows):
+    with PRIORITY_RESULTS.open('a' if PRIORITY_RESULTS.exists() else 'w',encoding='utf-8',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=PRIORITY_FIELDS)
+        if stream.tell()==0:writer.writeheader()
+        writer.writerows({k:r.get(k) for k in PRIORITY_FIELDS} for r in rows)
+        stream.flush()
+
+
+def priority_saved_schedule(row):
+    data=json.loads(row['schedule'])
+    operations=tuple(Operation(x['id'],x['robot'],OperationKind(x['kind']),x['start_time'],x['end_time'],
+        tuple(x['start']),tuple(x['end']),x['sequence'],x['block']) for x in data['operations'])
+    return ScheduleResult(ScheduleStatus(data['status']),operations,data['cmax'],tuple(data['completion']),
+        diagnostics=tuple(data['diagnostics']),directions=tuple(tuple(d) for d in data['directions']),
+        source='NATIVE_PRIORITY',reference_policy_id=PRIORITY_EVALUATOR)
+
+
+def priority_cache(name,parents,space):
+    cache={}
+    for row in read_rows(PRIORITY_RESULTS):
+        if row['layout_id']!=name or not row.get('solution') or not row.get('schedule'):continue
+        plan=deadlock_plan(parents,row['solution'],space)
+        cache[plan_key(plan.solution,plan.directions)]=(priority_saved_schedule(row),json.loads(row['progress']))
+    return cache
+
+
+def priority_once(plan,cache):
+    key=plan_key(plan.solution,plan.directions)
+    if key in cache:return (*cache[key],False,0.)
+    progress={};started=time.perf_counter()
+    schedule=priority_schedule(plan.solution,CONFIG,directions=plan.directions,progress=progress)
+    elapsed=time.perf_counter()-started
+    if schedule.directions!=plan.directions:raise ValueError('priority evaluator changed explicit GNN directions')
+    cache[key]=(schedule,progress)
+    return schedule,progress,True,elapsed
+
+
+def priority_result_row(name,plan,schedule,progress,**values):
+    metrics=routeaware_metrics(plan,schedule)
+    # Only the existing model/template costs are reused here, not its B32
+    # evaluator or DEADLOCK metadata. Native failed timelines are unavailable.
+    metrics={k:v for k,v in metrics.items() if k in PRIORITY_FIELDS}
+    for kind in ('wait','completion'):
+        for r in range(4):metrics.setdefault(f'{kind}_r{r}_s',None)
+    metrics.setdefault('wait_s',None)
+    loads=[metrics[f'processing_r{r}_s'] for r in range(4)]
+    cycle=max(loads[r]+metrics[f'move_r{r}_s'] for r in range(4))
+    return dict(layout_id=name,evaluator=PRIORITY_EVALUATOR,status=schedule.status.value,
+        cmax_s=schedule.cmax if schedule.feasible else None,**metrics,
+        rejected_pairs=progress['rejected_pairs'],route_cycle_s=cycle,progress=json.dumps(progress),
+        solution=json.dumps(pack_directed_plan(plan)),schedule=schedule.canonical_json(),**values)
+
+
+def priority_history_diagnosis():
+    """Rescore saved complete LoadFirst genes; no GNN, B32 or certification."""
+    configure_cpu();priority_write([])
+    layouts=dict(ppo_layouts('validation'))
+    spaces={n:gnn.parent_assignment_space(layouts[n],CONFIG) for n in IMITATION_CASES}
+    caches={n:priority_cache(n,layouts[n],spaces[n]) for n in IMITATION_CASES}
+    done={n:set() for n in IMITATION_CASES};catalog={n:{} for n in IMITATION_CASES}
+    for row in read_rows(PRIORITY_RESULTS):
+        if row['stage']=='history' and row.get('solution'):
+            plan=deadlock_plan(layouts[row['layout_id']],row['solution'],spaces[row['layout_id']])
+            done[row['layout_id']].add(plan_key(plan.solution,plan.directions))
+    if LOADFIRST_RESULTS.exists():
+        csv.field_size_limit(2**31-1)
+        with LOADFIRST_RESULTS.open(encoding='utf-8',newline='') as stream:
+            for old in csv.DictReader(stream):
+                name=old['layout_id']
+                if name not in catalog or old['stage'] not in ('initial','candidate') or not old.get('solution'):continue
+                plan=deadlock_plan(layouts[name],old['solution'],spaces[name]);key=plan_key(plan.solution,plan.directions)
+                if key not in catalog[name]:catalog[name][key]=(plan,old)
+                elif old['b32_calls']=='1':catalog[name][key]=(plan,old)
+    else:
+        for old in read_rows(ROUTEAWARE_RESULTS):
+            name=old['layout_id']
+            if name in catalog and old['stage']=='initial' and old.get('solution'):
+                plan=deadlock_plan(layouts[name],old['solution'],spaces[name])
+                catalog[name][plan_key(plan.solution,plan.directions)]=(plan,old)
+    count=0
+    for name in IMITATION_CASES:
+        for key,(plan,old) in catalog[name].items():
+            if key in done[name]:continue
+            schedule,progress,called,elapsed=priority_once(plan,caches[name])
+            priority_write([priority_result_row(name,plan,schedule,progress,stage='history',seed=SEED,
+                method='LoadFirst-history',**{'lambda':old['method'].split('lambda')[-1] if 'lambda' in old['method'] else ''},
+                source_b32_status=old['status'],source_b32_s=old.get('b32_s'),
+                evaluation_s=elapsed,native_calls=int(called),cache_hits=int(not called),
+                diagnostic=json.dumps(dict(source_method=old['method'],source_round=old.get('round'))))])
+            count+=1
+            if count%100==0:print('PRIORITY_HISTORY',count,name,flush=True)
+    history=[r for r in read_rows(PRIORITY_RESULTS) if r['stage']=='history']
+    summary={name:dict(total=sum(r['layout_id']==name for r in history),
+        feasible=sum(r['layout_id']==name and r['status']=='FEASIBLE' for r in history),
+        b32_deadlock_to_feasible=sum(r['layout_id']==name and r['source_b32_status']=='DEADLOCK' and r['status']=='FEASIBLE' for r in history))
+        for name in IMITATION_CASES}
+    print('PRIORITY_HISTORY_SUMMARY',json.dumps(summary),flush=True)
+    return history
+
+
+def priority_native_better(schedule,progress,cycle,current,current_progress,current_cycle):
+    if current.feasible:
+        return schedule.feasible and schedule.cmax<current.cmax-1e-8
+    if schedule.feasible:return True
+    return (progress['rejected_pairs'],cycle)<(current_progress['rejected_pairs'],current_cycle-1e-8)
+
+
+def priority_load_allowed(loads,limits):
+    return (max(loads)<=limits['pmax_limit_s']+1e-8 and
+            max(loads)-min(loads)<=limits['spread_limit_s']+1e-8)
+
+
+def priority_oriented_candidates(plan,workspace,rng,*,deadlock=True):
+    """Reuse HGA's candidate kernel and all six oriented segment operators."""
+    w=workspace;routes=w.encode(plan.solution)
+    bits=[np.asarray(d,np.int64) for d in plan.directions]
+    for r in range(4):
+        native_hga._refresh_oriented_route(r,routes[r],bits[r],w.travel,w.processing,w.eligible,w.oriented_scratch)
+    costs=[native_hga._oriented_route_cost(route,d,w.travel,w.processing) for route,d in zip(routes,bits)]
+    active=np.concatenate(routes);alpha=min(20,max(1,len(active)-1));active_set=set(active.tolist())
+    near=np.full((len(w.processing),alpha),-1,np.int64)
+    for u in active:
+        values=[v for v in w.nearest[u] if v!=u and v in active_set][:alpha]
+        near[u,:len(values)]=values
+    actions=np.empty((6,len(active)*alpha,2),np.int64);counts=np.zeros(6,np.int64)
+    scratch=w.oriented_scratch;robot,position=scratch[5],scratch[6]
+    native_hga._collect_oriented_candidates(active,near,robot,position,scratch[2],int(np.argmax(costs)),actions,counts)
+    groups={m:[] for m in (4,5,6,1,2,3)}
+    for move in groups:
+        pairs=set()
+        for u,v in actions[move-1,:counts[move-1]]:
+            u,v=int(u),int(v)
+            if move in (2,3,4,6):
+                pair=tuple(sorted((u,v)))
+                if pair in pairs:continue
+                pairs.add(pair)
+            ru,iu,rv,iv=int(robot[u]),int(position[u]),int(robot[v]),int(position[v])
+            a,b=native_hga._move_segments(routes,move,ru,iu,rv,iv)
+            ca=native_hga._oriented_segment_cost(a,ru,scratch,w.travel,w.parent_index)
+            cb=0. if move==4 else native_hga._oriented_segment_cost(b,rv,scratch,w.travel,w.parent_index)
+            if not math.isfinite(ca+cb):continue
+            cycle=max(ca,cb,*(costs[r] for r in range(4) if r not in (ru,rv)))
+            loads=[sum(w.processing[n] for n in route) for route in routes]
+            loads[ru]=sum(float(scratch[7][source,hi]-scratch[7][source,lo]) for source,lo,hi,_ in a)
+            if move!=4:loads[rv]=sum(float(scratch[7][source,hi]-scratch[7][source,lo]) for source,lo,hi,_ in b)
+            groups[move].append((cycle,rng.random(),(move,u,v,ru,iu,rv,iv),tuple(loads),a,b))
+        # Cycle cost is only a DEADLOCK search hint. A feasible incumbent is
+        # improved solely by actual priority_schedule Cmax, without that hint.
+        groups[move].sort(key=(lambda item:(item[0],item[1])) if deadlock else (lambda item:item[1]))
+    return routes,bits,groups
+
+
+def priority_materialize(plan,w,routes,bits,item):
+    _,_,action,loads,a,b=item;move,u,v,ru,iu,rv,iv=action
+    rr=list(routes);dd=list(bits)
+    for r,segments in ((ru,a),) if move==4 else ((ru,a),(rv,b)):
+        rr[r]=native_hga._materialize_segments(segments,routes)
+        dd[r]=native_hga._materialize_directions(segments,bits)
+    if not all(len(route) for route in rr):return None
+    solution=w.solution(rr,w.initial_selected)
+    expected=tuple(tuple(w.ids[n] for n in route) for route in rr)
+    if tuple(r.block_ids for r in solution.routes)!=expected:return None
+    if solution.patterns!=plan.solution.patterns:raise ValueError('route VND changed frozen GNN patterns')
+    return gnn.JointCompletionResult(solution,tuple(tuple(int(b) for b in route) for route in dd),(),0.)
+
+
+def priority_vnd_case(name,seed,initial,space,cache,*,budget=100):
+    saved=[r for r in read_rows(PRIORITY_RESULTS) if r['layout_id']==name and r['seed']==str(seed) and r['method']=='GNN-Priority-VND']
+    final=next((r for r in reversed(saved) if r['stage']=='final'),None)
+    if final:return final
+    started=time.perf_counter();rng=Random(seed)
+    w=native_hga._HGAWorkspace(initial.solution.parents,CONFIG,FORMAL_SCOPE_V2,patterns=initial.solution.patterns)
+    initial_schedule,initial_progress,called,elapsed=priority_once(initial,cache)
+    initial_row=priority_result_row(name,initial,initial_schedule,initial_progress,stage='initial',seed=seed,
+        method='GNN-Priority-VND',native_calls=int(called),cache_hits=int(not called),evaluation_s=elapsed)
+    pmax=initial_row['max_processing_s'];spread=initial_row['processing_spread_s']
+    limits=dict(initial_status=initial_schedule.status.value,initial_pmax_s=pmax,initial_spread_s=spread,
+        pmax_limit_s=1.01*pmax,spread_limit_s=spread+20.,initial_move_s=initial_row['move_s'])
+    current=initial;current_schedule=initial_schedule;current_progress=initial_progress
+    current_row=initial_row;cycle=initial_row['route_cycle_s']
+    visited={plan_key(initial.solution,initial.directions)};counter=0;pass_index=0
+    old_initial=next((r for r in saved if r['stage']=='initial'),None)
+    calls=int(old_initial['native_calls']) if old_initial else int(called)
+    hits=int(old_initial['cache_hits']) if old_initial else int(not called)
+    if not saved:priority_write([dict(initial_row,**limits)])
+    stop='100 complete neighbour candidate slots exhausted';pruned=Counter()
+    while counter<budget:
+        pass_index+=1;routes,bits,groups=priority_oriented_candidates(current,w,rng,deadlock=not current_schedule.feasible)
+        improvement=None;best_deadlock=None
+        order=(4,5,6,1,2,3)
+        for order_index,move in enumerate(order):
+            allowance=max(1,(budget-counter)//(len(order)-order_index));used=0
+            for item in groups[move]:
+                if used>=allowance or counter>=budget:break
+                loads=item[3]
+                if not priority_load_allowed(loads,limits):
+                    pruned['load']+=1;continue
+                try:candidate=priority_materialize(current,w,routes,bits,item)
+                except ValueError:
+                    pruned['canonical']+=1;continue
+                if candidate is None:pruned['nonempty_or_order']+=1;continue
+                key=plan_key(candidate.solution,candidate.directions)
+                if key in visited:pruned['duplicate']+=1;continue
+                visited.add(key);counter+=1;used+=1
+                schedule,progress,called,elapsed=priority_once(candidate,cache)
+                old=next((r for r in saved if r['stage']=='candidate' and int(r['candidate_index'])==counter),None)
+                calls+=int(old['native_calls']) if old else int(called)
+                hits+=int(old['cache_hits']) if old else int(not called)
+                robots=tuple(sorted({item[2][3],item[2][5]}))
+                before=[dict(robot=r,route=current.solution.routes[r].block_ids,directions=current.directions[r]) for r in robots]
+                after=[dict(robot=r,route=candidate.solution.routes[r].block_ids,directions=candidate.directions[r]) for r in robots]
+                old_genes={b:(r,d) for r,route in enumerate(current.solution.routes)
+                           for b,d in zip(route.block_ids,current.directions[r])}
+                new_genes={b:(r,d) for r,route in enumerate(candidate.solution.routes)
+                           for b,d in zip(route.block_ids,candidate.directions[r])}
+                affected={b for b in old_genes if old_genes[b]!=new_genes[b]}
+                affected.update(w.ids[n] for n in item[2][1:3])
+                parents=sorted({b.split('::')[0] for b in affected})
+                row=priority_result_row(name,candidate,schedule,progress,stage='candidate',seed=seed,method='GNN-Priority-VND',
+                    candidate_index=counter,pass_index=pass_index,move_id=f'M{move}',robots=json.dumps(robots),parent_ids=json.dumps(parents),
+                    before_segments=json.dumps(before),after_segments=json.dumps(after),native_calls=int(called),cache_hits=int(not called),
+                    evaluation_s=elapsed,diagnostic=json.dumps(dict(action=item[2],before_pmax=current_row['max_processing_s'],
+                        before_spread=current_row['processing_spread_s'],before_move=current_row['move_s'],before_status=current_schedule.status.value)))
+                better=priority_native_better(schedule,progress,row['route_cycle_s'],current_schedule,current_progress,cycle)
+                row['accepted']=int(better and schedule.feasible)
+                if old is None:priority_write([dict(row,**limits)])
+                if schedule.feasible and better:
+                    improvement=(candidate,schedule,progress,row);break
+                if not schedule.feasible and better and (best_deadlock is None or
+                    (progress['rejected_pairs'],row['route_cycle_s'])<(best_deadlock[2]['rejected_pairs'],best_deadlock[3]['route_cycle_s'])):
+                    best_deadlock=(candidate,schedule,progress,row)
+            if improvement is not None or counter>=budget:break
+            if move==6 and best_deadlock is not None:break
+        chosen=improvement or best_deadlock
+        if chosen is None:stop='no improvement in the bounded ordered neighbourhood pass';break
+        was_deadlock=not current_schedule.feasible
+        current,current_schedule,current_progress,current_row=chosen;cycle=current_row['route_cycle_s']
+        if was_deadlock and current_schedule.feasible:
+            priority_write([dict(current_row,stage='repair',runtime_s=time.perf_counter()-started,**limits)])
+        priority_write([dict(current_row,stage='accepted',accepted=1,**limits)])
+    final=dict(current_row,stage='final',seed=seed,method='GNN-Priority-VND',runtime_s=time.perf_counter()-started,
+        native_calls=calls,cache_hits=hits,candidate_index=counter,diagnostic=json.dumps(dict(stop=stop,pruned=dict(pruned),
+        evaluation='priority_schedule only',seed_role='neighbour tie ordering; deterministic saved GNN initial genes reused')),**limits)
+    priority_write([final])
+    print('PRIORITY_VND_FINAL',json.dumps({k:final.get(k) for k in ('layout_id','seed','status','cmax_s','candidate_index','native_calls','move_s','wait_s','runtime_s')}),flush=True)
+    return final
+
+
+def priority_pilot():
+    priority_history_diagnosis()
+    layouts=dict(ppo_layouts('validation'));source=read_rows(LOADFIRST_RESULTS)
+    starts={r['layout_id']:r for r in source if r['stage']=='screen' and r['method']==loadfirst_method(.25)}
+    originals={r['layout_id']:r for r in read_rows(IMITATION_RESULTS) if r['method']=='GNN_IMITATION'}
+    native_refs={}
+    for r in read_rows(PPO_RESULTS):
+        if r['stage']=='baseline' and r['layout_id'] in IMITATION_CASES:
+            detail=json.loads(r['diagnostic']);native_refs[r['layout_id'],int(r['seed']),r['method']]=detail
+    done={(r['stage'],r['layout_id'],r['seed'],r['method']) for r in read_rows(PRIORITY_RESULTS)}
+    finals=[]
+    for name in IMITATION_CASES:
+        space=gnn.parent_assignment_space(layouts[name],CONFIG);cache=priority_cache(name,layouts[name],space)
+        initial=deadlock_plan(layouts[name],starts[name]['solution'],space)
+        original=deadlock_plan(layouts[name],json.loads(originals[name]['diagnostic'])['solution'],space)
+        for seed in TEST_SEEDS:
+            for method,plan in (('GNN-Original',original),('GNN-LoadFirst',initial)):
+                if ('reference',name,str(seed),method) in done:continue
+                schedule,progress,called,elapsed=priority_once(plan,cache)
+                priority_write([priority_result_row(name,plan,schedule,progress,stage='reference',seed=seed,method=method,
+                    evaluation_s=elapsed,native_calls=int(called),cache_hits=int(not called),diagnostic='saved deterministic GNN genes, explicit directions')])
+            for method in ('HGA','WAG+VNS'):
+                if ('reference',name,str(seed),method) in done:continue
+                detail=native_refs.get((name,seed,method))
+                priority_write([dict(stage='reference',layout_id=name,seed=seed,method=method,evaluator='historical priority_schedule native_cmax_s',
+                    status='FEASIBLE' if detail and detail.get('native_cmax_s') not in (None,'') else 'MISSING',
+                    cmax_s=detail.get('native_cmax_s') if detail else None,native_calls=0,
+                    diagnostic=json.dumps(dict(source='gnn_ppo_scale.csv native_cmax_s',
+                        reason='historical native scalar only; no saved routes/directions; missing seeds left blank; no full baseline search')))])
+            finals.append(priority_vnd_case(name,seed,initial,space,cache))
+    print('PRIORITY_PILOT_SUMMARY',json.dumps(dict(feasible=sum(r['status']=='FEASIBLE' for r in finals),total=len(finals))),flush=True)
+    return finals
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -4873,10 +5169,11 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'imitation-loadfirst-screen':imitation_loadfirst_pilot(screen_only=True)
+    if args.stage in ('imitation-priority-vnd','imitation-deadlock-pilot'):priority_pilot()
+    elif args.stage == 'imitation-priority-diagnosis':priority_history_diagnosis()
+    elif args.stage == 'imitation-loadfirst-screen':imitation_loadfirst_pilot(screen_only=True)
     elif args.stage == 'imitation-loadfirst-pilot':imitation_loadfirst_pilot()
     elif args.stage == 'imitation-routeaware-pilot':imitation_routeaware_pilot()
-    elif args.stage == 'imitation-deadlock-pilot':imitation_deadlock_pilot(resume_unresolved=args.resume_unresolved)
     elif args.stage == 'imitation-teachers':imitation_teachers(args.workers)
     elif args.stage == 'imitation-train':imitation_train()
     elif args.stage == 'imitation-select':imitation_select()
