@@ -3674,9 +3674,539 @@ def ppo_smoke():
     print('PPO_SMOKE',json.dumps(update),flush=True)
 
 
+IMITATION_MODEL = ROOT/'models/gnn_weld_layout_imitation.pt'
+IMITATION_RESULTS = FINAL_RESULTS/'gnn_imitation_balance_pilot.csv'
+IMITATION_CASES = ('scale_validation_0031','scale_validation_0095','scale_validation_0067',
+                   'scale_validation_0076','scale_validation_0084','scale_validation_0100')
+IMITATION_FIELDS = ('stage','layout_id','parent_count','seed','method','status','cmax_s',
+    'robot_task_count_r0','robot_task_count_r1','robot_task_count_r2','robot_task_count_r3',
+    'processing_r0_s','processing_r1_s','processing_r2_s','processing_r3_s','max_processing_s',
+    'move_s','wait_s','runtime_s','b32_calls','four_robot_cover_possible','wait_for_graph','diagnostic','source')
+
+
+def imitation_model(weights=None, *, balance=True):
+    # The original workload Actor has no Critic or schedule-feedback head.
+    model = joint_model(weights)
+    model.imitation_balance = balance
+    return model
+
+
+def imitation_hga_selection():
+    rows = [json.loads(line) for line in (PPO_DATA/'train.jsonl').read_text(encoding='utf-8').splitlines()]
+    ordered = sorted(rows, key=lambda r:(len(r['parents']),r['layout_id']))
+    selected = []
+    for k in range(4):
+        group = sorted(ordered[k*len(rows)//4:(k+1)*len(rows)//4],
+                       key=lambda r:(len(r['parts']),r['rectangle_utilization'],r['layout_id']))
+        row = group[len(group)//2]
+        selected.append(dict(layout_id=row['layout_id'],parent_count=len(row['parents']),
+                             part_count=len(row['parts']),rectangle_utilization=row['rectangle_utilization'],
+                             parent_count_stratum=k))
+    return selected
+
+
+def imitation_saved():
+    if IMITATION_MODEL.exists():
+        return torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)
+    source = torch.load(EXPANDED_MODEL,map_location='cpu',weights_only=True)
+    expanded = dict(load_layouts('train_expanded'))
+    training = dict(ppo_layouts('train'))
+    teachers = []
+    for sample in source['teachers']:
+        name = sample['layout_id']
+        if name not in training or expanded[name] != training[name]:
+            raise ValueError(f'{name}: saved teacher geometry differs from TRAIN')
+        for record in sample['records']:
+            row,plan = record['row'],record.get('plan')
+            if row['status'] != 'FEASIBLE':
+                continue
+            if row['method']=='WAG+VNS' and row.get('iterations')!=500:
+                continue
+            if not plan or not all(k in plan for k in ('patterns','routes','directions')):
+                continue
+            if not math.isfinite(row['cmax_s']) or len(plan['routes'])!=4 or any(
+                    len(r)!=len(d) for r,d in zip(plan['routes'],plan['directions'])):
+                raise ValueError(f'{name}: incomplete feasible demonstration')
+            teachers.append(dict(layout_id=name,**record))
+    model = imitation_model()
+    return dict(seed=SEED,initialization='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD',
+                initial_state_dict=copy.deepcopy(model.state_dict()),teachers=teachers,
+                hga_selection=imitation_hga_selection(),hga_records=[],training_complete=False,
+                history=[],validation={},pilot=[])
+
+
+def imitation_save(saved):
+    torch.save(saved,IMITATION_MODEL)
+
+
+def imitation_hga_job(layout):
+    configure_cpu()
+    name,parents = layout
+    started = time.perf_counter()
+    print('IMITATION_HGA_START',name,len(parents),flush=True)
+    result = baseline_run(parents,'HGA',SEED,math.inf,(),iterations=200000,
+                          candidate_evaluator=priority_schedule,formal=True)
+    if result.iterations!=200000:
+        raise ValueError(f'{name}: HGA ended before 200000 effective offspring')
+    best = result.timely_best
+    plan = gnn.JointCompletionResult(best.solution if best else None,best.directions if best else None,(),
+                                   time.perf_counter()-started)
+    schedule = b32(plan) if best is not None else None
+    row = dict(layout_id=name,method='HGA',seed=SEED,iterations=result.iterations,
+               status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
+               cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
+               runtime_s=time.perf_counter()-started,b32_calls=int(schedule is not None),
+               diagnostic=list(schedule.diagnostics) if schedule is not None else [],
+               wait_for_graph=schedule.wait_for_graph if schedule is not None else (),
+               **baseline_metrics(best,schedule))
+    return dict(layout_id=name,row=row,plan=pack_directed_plan(plan))
+
+
+def imitation_teachers(workers):
+    saved = imitation_saved()
+    imitation_save(saved)
+    done = {r['layout_id'] for r in saved['hga_records']}
+    training = dict(ppo_layouts('train'))
+    jobs = [(r['layout_id'],training[r['layout_id']]) for r in saved['hga_selection'] if r['layout_id'] not in done]
+    print('IMITATION_TEACHERS_RECOVERED',len(saved['teachers']),
+          len({r['layout_id'] for r in saved['teachers']}),'HGA_SELECTION',saved['hga_selection'],flush=True)
+    if jobs:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for future in as_completed([pool.submit(imitation_hga_job,job) for job in jobs]):
+                record = future.result()
+                saved['hga_records'].append(record)
+                imitation_save(saved)
+                print('IMITATION_HGA_RESULT',json.dumps(record['row']),flush=True)
+    return saved
+
+
+@torch.no_grad()
+def imitation_evaluate(layout, model, *, method='GNN_IMITATION', seen=None):
+    name,parents = layout
+    started = time.perf_counter()
+    space = gnn.parent_assignment_space(parents,CONFIG)
+    forecast_trace = []
+    def observe(state, selected, plans, scores):
+        chosen = plans[int(scores.argmax())]
+        assignment = space.actions[chosen.assignment_index]
+        forecast_trace.append(dict(parent_id=assignment.parent_id,mode=assignment.pattern.kind.value,
+            owners=assignment.robots,processing_forecast_s=(chosen.assignment_features[-8:-4]*2500.).tolist(),
+            processing_after_s=chosen.state.loads,candidate_count=len(plans),
+            owner_alternatives=len({space.actions[p.assignment_index].robots for p in plans})))
+    result = gnn.construct_vnext_gnn(parents,model.eval(),CONFIG,space=space,
+        **(dict(step_observer=observe) if getattr(model,'imitation_balance',False) else {}))
+    schedule,called = evaluate_once(result,{} if seen is None else seen)
+    metrics = beam_validation_metrics(result)
+    loads = [metrics.get(f'processing_r{r}_s') for r in range(4)]
+    diagnostic = dict(coverage=space.coverage_diagnostic(),
+        rejection=result.rejection_reason,solution=pack_directed_plan(result),
+        schedule_diagnostic=list(schedule.diagnostics) if schedule is not None else [],
+        baseline_deadlock=schedule.baseline_deadlock if schedule is not None else None,
+        recovery_exhausted=schedule.recovery_exhausted if schedule is not None else None,
+        wait_for_graph=schedule.wait_for_graph if schedule is not None else ())
+    if forecast_trace:
+        diagnostic['processing_forecast_trace']=forecast_trace
+    if schedule is not None and not schedule.feasible and result.solution is not None:
+        blocks = block_map(result.solution,CONFIG,scope=FORMAL_SCOPE_V2)
+        templates = [op for r,route in enumerate(result.solution.routes)
+            for op in build_operation_templates(RobotRoute(r,tuple(blocks[b] for b in route.block_ids),
+                                                           result.directions[r]),CONFIG)]
+        diagnostic['operation_templates']=[dict(id=op.operation_id,robot=op.robot_id,kind=op.kind.value,
+            start=op.start,end=op.end,duration=op.duration) for op in templates]
+        diagnostic['wait_observation']='WAIT accumulated in the committed partial B32 timeline; full Cmax unavailable'
+        diagnostic['last_committed_operations']=[dict(id=op.operation_id,robot=op.robot_id,kind=op.kind.value,
+            start=op.start,end=op.end,start_s=op.start_time,end_s=op.end_time)
+            for r in range(4) for op in tuple(o for o in schedule.operations if o.robot_id==r)[-3:]]
+    counts = ({f'robot_task_count_r{r}':len(route.block_ids) for r,route in enumerate(result.solution.routes)}
+              if result.solution is not None else {})
+    return dict(layout_id=name,seed=SEED,method=method,parent_count=len(parents),
+        status=schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED',
+        cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
+        runtime_s=time.perf_counter()-started,b32_calls=int(called),**counts,**metrics,
+        four_robot_cover_possible=space.four_robot_cover_possible,
+        max_processing_s=max(loads) if all(p is not None for p in loads) else None,
+        wait_s=sum(op.duration for op in schedule.operations if op.kind is OperationKind.WAIT)
+               if schedule is not None else None,
+        wait_for_graph=json.dumps(schedule.wait_for_graph if schedule is not None else ()),
+        diagnostic=json.dumps(diagnostic,ensure_ascii=False))
+
+
+def imitation_best_teachers(saved):
+    best = {}
+    for record in (*saved['teachers'],*saved['hga_records']):
+        if record['row']['status']!='FEASIBLE' or record.get('plan') is None:
+            continue
+        name = record['layout_id']
+        if name not in best or record['row']['cmax_s']<best[name]['row']['cmax_s']:
+            best[name] = record
+    return best
+
+
+@torch.no_grad()
+def imitation_replay(layout, record, model, *, joint_stride=8):
+    """Replay every parent into its exact teacher route and directed position.
+
+    Position enumeration is complete for the bounded coarse assignment pool.
+    Structural sampling may bound negatives, but can never remove a positive.
+    No B32, native evaluation, or labels from another split are used here.
+    """
+    name,parents = layout
+    space = gnn.parent_assignment_space(parents,CONFIG)
+    result = unpack_directed_plan(parents,record['plan'],space)
+    routes = tuple(r.block_ids for r in result.solution.routes)
+    bits = tuple(tuple(d) for d in result.directions)
+    if routes!=tuple(tuple(r) for r in record['plan']['routes']):
+        raise ValueError(f'{name}: canonicalization changed the teacher routes')
+    labels = sorted(gnn.parent_assignment_targets(result.solution,CONFIG),
+                    key=lambda a:(-sum(CONFIG.process_time(b.length) for b in space.children[a.pattern]),a.parent_id))
+    all_blocks = block_map(result.solution,CONFIG,scope=FORMAL_SCOPE_V2)
+    all_nodes = {b.block_id:space.block_nodes[a.pattern,b.block_id] for a in labels for b in space.children[a.pattern]}
+    embeddings = model.encode_static(space.graph)
+    state = lns.oriented_route_state(((),)*4,((),)*4,{},CONFIG)
+    kept,selected = set(),{}
+    assignment_steps,insertion_steps,joint_steps,trace = [],[],[],[]
+    rescued = 0
+    while labels:
+        pending = {a.parent_id for a in labels}
+        blocks = {b:all_blocks[b] for b in kept}
+        nodes = {b:all_nodes[b] for b in kept}
+        indices,features = model.assignment_features(space,embeddings,state,blocks,pending,CONFIG)
+        coverage = gnn.coverage_preserving_assignments(space,indices,state,pending)
+        indices,features = indices[coverage],features[coverage]
+        positions = {int(index):i for i,index in enumerate(indices)}
+        prepared = None
+        # Same-robot split siblings need their actual separating teacher block
+        # to have been inserted first; defer such parents rather than inventing
+        # an action absent from the legal atomic-parent space.
+        for assignment in labels:
+            target = space.action_index[assignment]
+            if target not in positions:
+                continue
+            children = space.children[assignment.pattern]
+            local = {**blocks,**{b.block_id:b for b in children}}
+            graph = replace(space.graph,block_index={**nodes,**{b.block_id:all_nodes[b.block_id] for b in children}})
+            after,visible = state,set(kept)
+            fine_steps,actions,retained_features,retained_indices = [],[],[],[]
+            local_rescued,risk = 0,0.
+            for child,robot in zip(children,assignment.robots):
+                visible.add(child.block_id)
+                teacher = project_routes(routes,bits,visible,all_blocks)
+                variants = lns.joint_block_candidates(after,child,assignment.pattern,local,CONFIG,
+                    robot_id=robot,insertion_limit=max(8,len(after.routes[robot])+1),
+                    check_initial_feasibility=False,prefer_legal_start_recovery=False)
+                matches = [i for i,(v,_) in enumerate(variants) if v.routes==teacher.routes and v.directions==teacher.directions]
+                if not matches:
+                    break
+                chosen = list(gnn.structural_child_indices(variants,limit=12))
+                if matches[0] not in chosen:
+                    chosen.append(matches[0]);local_rescued+=1
+                variants = tuple(variants[i] for i in chosen)
+                answer = chosen.index(matches[0])
+                ix,inputs = gnn.vnext_insertion_inputs(graph,after,variants,local,CONFIG)
+                fine_steps.append((ix,inputs,F.one_hot(torch.tensor(answer),len(variants)).float()))
+                retained_features.append(inputs[answer]);retained_indices.append(ix[answer])
+                risk = max(risk,float(inputs[answer,-8]+2*inputs[answer,-7]+.5*inputs[answer,-4]))
+                after,action = variants[answer]
+                actions.append(action)
+            if len(actions)==len(children):
+                prepared=(assignment,target,after,visible,fine_steps,tuple(actions),
+                          tuple(retained_features),tuple(retained_indices),local_rescued,risk)
+                break
+        if prepared is None:
+            raise ValueError(f'{name}: teacher cannot be represented as complete-parent actions; pending={sorted(pending)}')
+        assignment,target,after,visible,fine_steps,actions,fine_features,fine_indices,count,risk = prepared
+        answer = positions[target]
+        assignment_steps.append((indices,features,F.one_hot(torch.tensor(answer),len(indices)).float()))
+        insertion_steps.extend(fine_steps)
+        rescued+=count
+        if len(trace)%joint_stride==0 or len(labels)==1:
+            negative,_ = gnn.vnext_joint_actions(space,embeddings,model,state,blocks,nodes,pending,CONFIG,
+                                                prefer_start_recovery=False)
+            negative = [p for p in negative if not (p.assignment_index==target and
+                        p.state.routes==after.routes and p.state.directions==after.directions)]
+            expected = features[answer,-8:-4]
+            moves = [sum(arcs) for arcs in after.arc_costs]
+            lo = [min((min(all_blocks[b].start[0],all_blocks[b].end[0]) for b in r),default=math.inf) for r in after.routes]
+            hi = [max((max(all_blocks[b].start[0],all_blocks[b].end[0]) for b in r),default=-math.inf) for r in after.routes]
+            overlap = sum(max(0.,hi[r]+CONFIG.interference_dx-lo[r+1]) for r in (0,2))/20.
+            peak = float(expected.max())
+            outcome = features.new_tensor((peak,peak-float(expected.min()),
+                max(p+m for p,m in zip(after.loads,moves))/2500.,(after.travel-state.travel)/45.,overlap,risk))
+            positive = gnn.VNextJointAction(target,after,actions,features[answer],outcome,fine_features,fine_indices)
+            plans = (*negative,positive)
+            joint_steps.append((gnn.vnext_policy_inputs(space,plans,model),len(plans)-1))
+        trace.append(dict(parent_id=assignment.parent_id,assignment_index=target,
+                          actions=[(a.block_id,a.robot,a.position,a.direction) for a in actions]))
+        state,kept = after,visible
+        selected[assignment.parent_id]=assignment.pattern
+        labels.remove(assignment)
+    if state.routes!=routes or state.directions!=bits:
+        raise ValueError(f'{name}: teacher-forcing did not restore the exact complete directed solution')
+    return dict(layout_id=name,space=space,assignment=Choices.from_steps(assignment_steps),
+                insertion=Choices.from_steps(insertion_steps),joint=joint_steps,
+                evidence=dict(teacher=record['row']['method'],cmax_s=record['row']['cmax_s'],
+                    parent_steps=len(trace),insertion_steps=len(insertion_steps),joint_steps=len(joint_steps),
+                    rescued_teacher_insertions=rescued,exact_routes_and_directions=True),trace=trace)
+
+
+def imitation_choice_loss(logits, choices):
+    losses,correct = [],0
+    for score,target in zip(logits.split(choices.sizes),choices.targets.split(choices.sizes)):
+        losses.append(-(target*score.log_softmax(0)).sum())
+        correct+=int(target[score.argmax()]>0)
+    return torch.stack(losses).mean(),correct/len(losses)
+
+
+def imitation_validation_layouts():
+    # Six requested pilot cases are kept out of epoch selection.
+    ordered = sorted((r for r in ppo_layouts('validation') if r[0] not in IMITATION_CASES),
+                     key=lambda r:(len(r[1]),r[0]))
+    return [ordered[(2*i+1)*len(ordered)//16] for i in range(8)]
+
+
+def imitation_train(prepared_samples=None):
+    configure_cpu();torch.manual_seed(SEED)
+    saved = imitation_saved()
+    if saved['training_complete']:
+        print('IMITATION_TRAIN_ALREADY_COMPLETE',saved['selected_epoch'],flush=True);return saved
+    if len(saved['hga_records'])!=4:
+        raise ValueError('finish the four already-selected complete HGA teachers before joint imitation')
+    training = dict(ppo_layouts('train'))
+    teachers = imitation_best_teachers(saved)
+    model = imitation_model(saved.get('last_state_dict',saved['initial_state_dict'])).train()
+    optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4,weight_decay=1e-4)
+    if 'optimizer_state_dict' in saved:
+        optimizer.load_state_dict(saved['optimizer_state_dict'])
+    samples = []
+    prepared_samples = {} if prepared_samples is None else prepared_samples
+    preparation = time.perf_counter()
+    for name,record in sorted(teachers.items()):
+        sample = prepared_samples.get(name)
+        if sample is None or sample['evidence']['cmax_s']!=record['row']['cmax_s']:
+            sample = imitation_replay((name,training[name]),record,model)
+        samples.append(sample)
+        print('IMITATION_REPLAY',len(samples),'/',len(teachers),name,json.dumps(sample['evidence']),flush=True)
+    saved['teacher_replay'] = {s['layout_id']:dict(**s['evidence'],trace=s['trace']) for s in samples}
+    saved['settings'] = dict(epochs=6,learning_rate=3e-4,weight_decay=1e-4,assignment_loss=1.,
+        insertion_loss=1.,joint_loss=.5,joint_stride=8,processing_band_fraction=.01,hidden_dim=64,heads=4,
+        selection_layouts=[r[0] for r in imitation_validation_layouts()])
+    saved['preparation_s']=time.perf_counter()-preparation
+    imitation_save(saved)
+    for epoch in range(saved.get('completed_epoch',0)+1,7):
+        started = time.perf_counter()
+        rng = Random(SEED+epoch)
+        order = list(range(len(samples)));rng.shuffle(order)
+        statistics = []
+        for i in order:
+            sample=samples[i];space=sample['space']
+            optimizer.zero_grad(set_to_none=True)
+            embeddings = model.encode_static(space.graph)
+            choice = sample['assignment']
+            assignment_loss,assignment_accuracy = imitation_choice_loss(
+                model.assignment_scores(model.embed_assignment_rows(space,embeddings,choice.indices,choice.features)),choice)
+            choice = sample['insertion']
+            insertion_loss,insertion_accuracy = imitation_choice_loss(
+                model.insertion_logits(embeddings,choice.indices,choice.features),choice)
+            joint_losses = [F.cross_entropy(gnn.imitation_joint_scores(space,embeddings,model,inputs)[None],
+                torch.tensor([target])) for inputs,target in sample['joint']]
+            joint_loss = torch.stack(joint_losses).mean()
+            loss = assignment_loss+insertion_loss+.5*joint_loss
+            loss.backward()
+            gradient = float(torch.nn.utils.clip_grad_norm_(model.parameters(),1.))
+            if not math.isfinite(float(loss.detach())) or not math.isfinite(gradient):
+                raise ArithmeticError('nonfinite joint imitation optimization')
+            optimizer.step()
+            statistics.append((float(assignment_loss.detach()),float(insertion_loss.detach()),
+                float(joint_loss.detach()),assignment_accuracy,insertion_accuracy,gradient))
+        history = dict(epoch=epoch,runtime_s=time.perf_counter()-started,
+            **dict(zip(('assignment_loss','insertion_loss','joint_loss','assignment_accuracy','insertion_accuracy','gradient_norm'),
+                       [sum(v[k] for v in statistics)/len(statistics) for k in range(6)])))
+        saved['history'].append(history)
+        saved.update(completed_epoch=epoch,last_state_dict=copy.deepcopy(model.state_dict()),
+                     optimizer_state_dict=optimizer.state_dict())
+        print('IMITATION_EPOCH',json.dumps(history),flush=True)
+        if epoch in (2,4,6):
+            seen = pickle.loads(saved['validation_seen']) if 'validation_seen' in saved else {}
+            rows = [imitation_evaluate(layout,model.eval(),method='GNN_IMITATION_SELECTION',
+                                      seen=seen.setdefault(layout[0],{}))
+                    for layout in imitation_validation_layouts()]
+            saved['validation_seen']=pickle.dumps(seen)
+            saved['validation'][epoch]=rows
+            good=[r for r in rows if r['status']=='FEASIBLE']
+            key=(len(good),-median(r['cmax_s'] for r in good) if good else -math.inf)
+            if 'selected_key' not in saved or key>tuple(saved['selected_key']):
+                saved.update(selected_key=key,selected_epoch=epoch,state_dict=copy.deepcopy(model.state_dict()))
+            model.train()
+        imitation_save(saved)
+    saved['training_complete']=True
+    saved['changed_parameter_tensors']={prefix:sum(not torch.equal(v,saved['initial_state_dict'][k])
+        for k,v in saved['state_dict'].items() if k.startswith(prefix))
+        for prefix in ('layer1.','layer2.','geometry_skip.','policy.','insertion_head.','joint_weights')}
+    imitation_save(saved)
+    return saved
+
+
+def imitation_select():
+    """Re-evaluate retained epochs after restoring the existing head preference."""
+    saved=imitation_saved()
+    if saved.get('legal_start_selection_complete'):
+        return saved
+    if not saved['training_complete']:
+        raise ValueError('finish the fixed six training epochs before final selection')
+    weights={saved['selected_epoch']:saved['state_dict'],saved['completed_epoch']:saved['last_state_dict']}
+    saved['selection_before_legal_start_preference']=saved['validation']
+    saved['selection_state_dicts']=weights
+    saved['validation']={}
+    seen=pickle.loads(saved['validation_seen'])
+    best=None
+    for epoch,state_dict in sorted(weights.items()):
+        model=imitation_model(state_dict).eval()
+        rows=[imitation_evaluate(layout,model,method='GNN_IMITATION_SELECTION',seen=seen.setdefault(layout[0],{}))
+              for layout in imitation_validation_layouts()]
+        saved['validation'][epoch]=rows
+        good=[r for r in rows if r['status']=='FEASIBLE']
+        key=(len(good),-median(r['cmax_s'] for r in good) if good else -math.inf)
+        if best is None or key>best:
+            best=key;saved.update(selected_epoch=epoch,selected_key=key,state_dict=copy.deepcopy(state_dict))
+        print('IMITATION_FINAL_SELECTION',epoch,len(good),'/',len(rows),key[1],flush=True)
+    saved['validation_seen']=pickle.dumps(seen)
+    saved['legal_start_selection_complete']=True
+    saved['settings'].update(final_selection_epochs=sorted(weights),legal_start_preference=True,
+                              teacher_prefix_start_preference=False)
+    saved['changed_parameter_tensors']={prefix:sum(not torch.equal(v,saved['initial_state_dict'][k])
+        for k,v in saved['state_dict'].items() if k.startswith(prefix))
+        for prefix in ('layer1.','layer2.','geometry_skip.','policy.','insertion_head.','joint_weights')}
+    imitation_save(saved)
+    return saved
+
+
+def imitation_write(rows):
+    with IMITATION_RESULTS.open('a' if IMITATION_RESULTS.exists() else 'w',encoding='utf-8',newline='') as stream:
+        writer = csv.DictWriter(stream,fieldnames=IMITATION_FIELDS)
+        if stream.tell()==0:
+            writer.writeheader()
+        writer.writerows({key:row.get(key) for key in IMITATION_FIELDS} for row in rows)
+
+
+def imitation_references():
+    """Reuse the recorded PPO/classical B32 results; evaluate the raw GNN once."""
+    layouts = dict(ppo_layouts('validation'))
+    done = {(r['layout_id'],r['method']) for r in read_rows(IMITATION_RESULTS)}
+    old = read_rows(PPO_RESULTS)
+    for name in IMITATION_CASES:
+        parents = layouts[name]
+        space = None
+        for method in ('WAG+VNS','HGA','PPO_1000','GNN_ORIGINAL'):
+            if (name,method) in done:
+                continue
+            if method=='GNN_ORIGINAL':
+                original = gnn.VNextGNN(workload_lookahead=True)
+                source = torch.load(MODEL,map_location='cpu',weights_only=True)
+                original.load_state_dict(source['models']['GNN_VNEXT_WORKLOAD']['state_dict'])
+                row = imitation_evaluate((name,parents),original,method=method)
+                row['source']='GNN_VNEXT_WORKLOAD original checkpoint; original feature/scoring semantics'
+            else:
+                matches = [r for r in old if r['layout_id']==name and (
+                    r['stage']=='baseline' and r['method']==method or
+                    method=='PPO_1000' and r['stage']=='validation' and r['size']=='1000')]
+                if len(matches)!=1:
+                    raise ValueError(f'{name}: expected exactly one existing {method} reference')
+                source = matches[0]
+                detail = json.loads(source['diagnostic'])
+                row = {k:source.get(k) for k in ('status','cmax_s','runtime_s','move_s','wait_s','max_processing_s')}
+                row.update(layout_id=name,parent_count=len(parents),seed=SEED,method=method,b32_calls=0,
+                           source='reused gnn_ppo_scale.csv; no repeated search or B32')
+                if method=='PPO_1000':
+                    space = gnn.parent_assignment_space(parents,CONFIG) if space is None else space
+                    plan = unpack_directed_plan(parents,detail['solution'],space)
+                    row.update(beam_validation_metrics(plan))
+                    row.update({f'robot_task_count_r{r}':len(route.block_ids) for r,route in enumerate(plan.solution.routes)})
+                else:
+                    row.update({f'processing_r{r}_s':detail.get(f'processing_r{r}_s') for r in range(4)})
+                    # These historical rows did not save routes. Task counts
+                    # cannot be inferred from workload sums without inventing data.
+                    detail['task_count_missing_reason']='historical baseline row has processing totals but no full routes; baseline rerun prohibited'
+                row['diagnostic']=json.dumps(detail,ensure_ascii=False)
+                row['wait_for_graph']='[]' if source['status']=='FEASIBLE' else None
+            row.update(stage='pilot_reference',parent_count=len(parents))
+            if all(row.get(f'processing_r{r}_s') not in (None,'') for r in range(4)):
+                row['max_processing_s']=max(float(row[f'processing_r{r}_s']) for r in range(4))
+            if 'four_robot_cover_possible' not in row:
+                space = gnn.parent_assignment_space(parents,CONFIG) if space is None else space
+                row['four_robot_cover_possible']=space.four_robot_cover_possible
+            imitation_write([row])
+            print('IMITATION_REFERENCE',json.dumps({k:v for k,v in row.items() if k!='diagnostic'}),flush=True)
+
+
+def imitation_pilot():
+    saved = imitation_select()
+    if not saved['training_complete']:
+        raise ValueError('complete joint imitation before the six-case pilot')
+    imitation_references()
+    layouts = dict(ppo_layouts('validation'))
+    model = imitation_model(saved['state_dict']).eval()
+    done = {r['layout_id'] for r in read_rows(IMITATION_RESULTS) if r['method']=='GNN_IMITATION'}
+    retained = {r['layout_id']:r for r in saved['pilot']}
+    for name in IMITATION_CASES:
+        if name in done:
+            continue
+        row = retained.get(name)
+        if row is None:
+            row = imitation_evaluate((name,layouts[name]),model)
+            row.update(stage='pilot',parent_count=len(layouts[name]),source=f'full joint imitation epoch {saved["selected_epoch"]}')
+            saved['pilot'].append(row)
+            imitation_save(saved)
+        imitation_write([row])
+        print('IMITATION_PILOT',json.dumps({k:v for k,v in row.items() if k!='diagnostic'}),flush=True)
+    saved['pilot_summary']=imitation_summary()
+    imitation_save(saved)
+    return saved
+
+
+def imitation_summary():
+    rows = read_rows(IMITATION_RESULTS)
+    grouped = {method:[r for r in rows if r['method']==method and r['layout_id'] in IMITATION_CASES]
+               for method in ('GNN_ORIGINAL','PPO_1000','GNN_IMITATION','WAG+VNS','HGA')}
+    def numeric_median(values,key):
+        numbers=[float(r[key]) for r in values if r.get(key) not in (None,'')]
+        return median(numbers) if numbers else None
+    summary = {}
+    for method,values in grouped.items():
+        good = [r for r in values if r['status']=='FEASIBLE']
+        summary[method]=dict(cases=len(values),feasible=len(good),
+            median_cmax_s=numeric_median(good,'cmax_s'),median_pmax_s=numeric_median(values,'max_processing_s'),
+            median_move_s=numeric_median(values,'move_s'),median_runtime_s=numeric_median(values,'runtime_s'))
+    new = grouped['GNN_IMITATION']
+    complete = len(new)==6 and all(r['status']=='FEASIBLE' for r in new)
+    covered = len(new)==6 and all(all(r.get(f'robot_task_count_r{i}') not in (None,'') and
+                  int(r[f'robot_task_count_r{i}'])>0 for i in range(4))
+                  for r in new if r['four_robot_cover_possible']=='True')
+    paired = {}
+    for method in ('GNN_ORIGINAL','PPO_1000','WAG+VNS','HGA'):
+        lookup = {r['layout_id']:r for r in grouped[method]}
+        pairs = [(r,lookup[r['layout_id']]) for r in new if r['layout_id'] in lookup]
+        wins = [r['layout_id'] for r,ref in pairs if r['status']=='FEASIBLE' and
+                ref['status']=='FEASIBLE' and float(r['cmax_s'])<float(ref['cmax_s'])-1e-8]
+        changes=[100*(float(r['max_processing_s'])/float(ref['max_processing_s'])-1)
+                 for r,ref in pairs if r.get('max_processing_s') and ref.get('max_processing_s')]
+        paired[method]=dict(wins=wins,non_wins=[r['layout_id'] for r,ref in pairs if r['layout_id'] not in wins],
+                           median_pmax_change_pct=median(changes) if changes else None)
+    pmax = summary['GNN_IMITATION']['median_pmax_s']
+    # Quantify 'clearly lower' before pilot outcomes: at least 10% lower median.
+    processing = pmax is not None and all(summary[m]['median_pmax_s'] is not None and
+                     pmax<=.9*summary[m]['median_pmax_s'] for m in ('GNN_ORIGINAL','PPO_1000'))
+    quality = complete and all(len(paired[m]['wins'])>=4 and
+        summary['GNN_IMITATION']['median_cmax_s']<summary[m]['median_cmax_s'] for m in ('WAG+VNS','HGA'))
+    output = dict(methods=summary,paired=paired,all_six_feasible=complete,four_robot_coverage=covered,
+                  pmax_improved_at_least_10pct=processing,cmax_conditions_met=quality,
+                  proceed_to_twenty=bool(complete and covered and processing and quality))
+    print('IMITATION_SUMMARY',json.dumps(output),flush=True)
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
@@ -3689,7 +4219,13 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'ppo-scale-smoke':ppo_smoke()
+    if args.stage == 'imitation-teachers':imitation_teachers(args.workers)
+    elif args.stage == 'imitation-train':imitation_train()
+    elif args.stage == 'imitation-select':imitation_select()
+    elif args.stage == 'imitation-references':imitation_references()
+    elif args.stage == 'imitation-pilot':imitation_pilot()
+    elif args.stage == 'imitation-summary':imitation_summary()
+    elif args.stage == 'ppo-scale-smoke':ppo_smoke()
     elif args.stage == 'ppo-scale-train':ppo_train(args.workers)
     elif args.stage == 'ppo-scale-baselines':ppo_baselines(args.workers)
     elif args.stage == 'ppo-scale-validation':ppo_validation(args.workers,args.size)

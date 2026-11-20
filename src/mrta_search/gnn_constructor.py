@@ -1636,6 +1636,39 @@ class ParentAssignmentSpace:
         return {action: index for index, action in enumerate(self.actions)}
 
     @cached_property
+    def robot_masks(self):
+        return tuple(sum(1 << robot for robot in set(action.robots)) for action in self.actions)
+
+    @cached_property
+    def parent_robot_masks(self):
+        grouped = {parent: set() for parent in self.parent_ids}
+        for action, mask in zip(self.actions, self.robot_masks):
+            grouped[action.parent_id].add(mask)
+        return {parent: tuple(sorted(masks)) for parent, masks in grouped.items()}
+
+    def coverage_masks(self, pending):
+        """Exact 16-state OR DP over one legal assignment per remaining parent."""
+        reachable = {0}
+        for parent in self.parent_ids:
+            if parent in pending:
+                reachable = {covered | mask for covered in reachable for mask in self.parent_robot_masks[parent]}
+        return frozenset(reachable)
+
+    @cached_property
+    def four_robot_cover_possible(self):
+        return 15 in self.coverage_masks(self.parent_ids)
+
+    def coverage_diagnostic(self):
+        reachable = self.coverage_masks(self.parent_ids)
+        available = 0
+        for mask in reachable:
+            available |= mask
+        return dict(four_robot_cover_possible=15 in reachable, reachable_masks=sorted(reachable),
+                    robots_without_legal_task=[r for r in range(4) if not available & (1 << r)],
+                    reason=('legal four-robot cover exists' if 15 in reachable else
+                            'no combination of one legal pattern/owner tuple per parent covers all four robots'))
+
+    @cached_property
     def workload_profiles(self):
         """Processing profiles from legal whole/split and owner tuples."""
         profiles = []
@@ -1748,7 +1781,7 @@ _WORKLOAD_FEATURES = 24
 
 
 @torch.no_grad()
-def _forecast_workload(space, indices, projected, state, pending_mask):
+def _forecast_workload(space, indices, projected, state, pending_mask, *, include_move=False):
     """One greedy pass over remaining parents, batched across candidate actions."""
     if not len(indices):
         return projected.new_empty((0, _WORKLOAD_FEATURES))
@@ -1758,7 +1791,10 @@ def _forecast_workload(space, indices, projected, state, pending_mask):
     forced_robot, order = space.workload_profiles
     forced_robot = forced_robot.to(projected)
     forced = (forced_robot[pending_mask].sum(0) - forced_robot[candidate_parents]).clamp_min(0.)
-    expected = projected + move + forced
+    # MOVE remains a separate feature; it must not enter processing Pmax.
+    # Historical policies can explicitly retain their original input semantics.
+    movement = move if include_move else torch.zeros_like(move)
+    expected = projected + movement + forced
     pending = pending_mask.tolist()
     for parent, work, rail_work in order:
         if not pending[parent]:
@@ -1772,7 +1808,7 @@ def _forecast_workload(space, indices, projected, state, pending_mask):
         remaining = (candidate_parents != parent)[:, None]
         expected += work[selected] * remaining
         forced += rail_work[selected] * remaining
-    flexible = (expected - projected - move - forced).clamp_min(0.)
+    flexible = (expected - projected - movement - forced).clamp_min(0.)
     peak = expected.amax(1, keepdim=True)
     same_rail_gap = expected[:, ::2] - expected[:, 1::2]
     return torch.cat((current, move, forced, flexible, expected, peak,
@@ -1801,7 +1837,8 @@ class _JointAssignmentGNN(ParentAssignmentGNN):
         indices, rows = indices[keep], rows[keep]
         pending_mask = torch.tensor([p in pending for p in space.parent_ids], device=indices.device)
         if self.workload_lookahead:
-            forecast = _forecast_workload(space, indices, rows[:, -4:], state, pending_mask)
+            forecast = _forecast_workload(space, indices, rows[:, -4:], state, pending_mask,
+                                          include_move=not getattr(self, 'imitation_balance', False))
             return indices, torch.cat((rows, forecast), dim=1)
         work = space.remaining_processing.to(rows)
         remaining = (work[pending_mask].sum(0) - work[space.action_parents.to(indices.device)[indices]]).clamp_min(0.)
@@ -1828,8 +1865,46 @@ class CoarseToFineGNN(_JointAssignmentGNN):
         return self.policy(coarse_rows).squeeze(1) + self.insertion_logits(fine_rows, use_coordination=use_coordination)
 
 
-def shortlist_assignments(space, indices, logits, *, owner_alternatives=False):
+def shortlist_assignments(space, indices, logits, *, owner_alternatives=False, processing=None):
     """Retain learned scores, with slots for distinct parents and mode families."""
+    if processing is not None:
+        peak = processing.amax(1)
+        # A 1% processing band permits owner diversity without allowing the
+        # learned score to overrule a materially better final processing load.
+        tolerance = max(1. / 2500., .01 * float(peak.min()))
+        keep = peak <= peak.min() + tolerance
+        gaps = (processing[:, ::2] - processing[:, 1::2]).abs().sum(1)
+        keep &= gaps <= gaps[keep].min() + tolerance
+        eligible = torch.where(keep)[0].tolist()
+        order = sorted(eligible, key=lambda i: (-float(logits[i]), float(peak[i]), int(indices[i])))
+        chosen = []
+        def add(position):
+            index = int(indices[position])
+            if index not in chosen and len(chosen) < COARSE_ASSIGNMENT_LIMIT:
+                chosen.append(index)
+        add(min(eligible, key=lambda i: (float(peak[i]), float(gaps[i]), -float(logits[i]))))
+        owners = set()
+        for i in order:
+            owner = space.actions[int(indices[i])].robots
+            if owner not in owners:
+                add(i)
+                owners.add(owner)
+            if len(chosen) >= 4:
+                break
+        for kind in (SplitKind.X_SPLIT, SplitKind.Y_SPLIT, SplitKind.WHOLE):
+            for i in order:
+                if space.actions[int(indices[i])].pattern.kind is kind:
+                    add(i)
+                    break
+        parents = {space.actions[i].parent_id for i in chosen}
+        for i in order:
+            parent = space.actions[int(indices[i])].parent_id
+            if parent not in parents:
+                add(i)
+                parents.add(parent)
+        for i in order:
+            add(i)
+        return tuple(chosen)
     order = indices[torch.argsort(logits, descending=True, stable=True)].tolist()
     chosen, parents, kinds = [], set(), set()
     for index in order:
@@ -1999,8 +2074,11 @@ class VNextGNN(_JointAssignmentGNN):
 
     def __init__(self, hidden_dim: int = 64, heads: int = 4, *, workload_lookahead: bool = False,
                  joint_actions: bool = False, cmax_value: bool = False, bounded_assignment: bool = False,
-                 schedule_feedback: bool = False):
+                 schedule_feedback: bool = False, imitation_balance: bool = False):
         super().__init__(hidden_dim, heads, workload_lookahead=workload_lookahead)
+        if imitation_balance and (not workload_lookahead or not joint_actions or schedule_feedback or cmax_value):
+            raise ValueError('imitation balancing uses the existing workload joint actor without extra heads')
+        self.imitation_balance = imitation_balance
         self.schedule_feedback = schedule_feedback
         if schedule_feedback:
             if not joint_actions or cmax_value:
@@ -2282,6 +2360,36 @@ class VNextJointAction(NamedTuple):
     insertion_indices: tuple[torch.Tensor, ...] = ()
 
 
+def coverage_preserving_assignments(space, indices, state, pending):
+    """Exact 16-state OR DP, retaining only assignments with a full completion."""
+    if not space.four_robot_cover_possible:
+        return torch.ones_like(indices, dtype=torch.bool)
+    parents = [p for p in space.parent_ids if p in pending]
+    masks = space.parent_robot_masks
+    prefix = [{0}]
+    for parent in parents:
+        prefix.append({a | b for a in prefix[-1] for b in masks[parent]})
+    suffix = [None] * (len(parents) + 1)
+    suffix[-1] = {0}
+    for i in range(len(parents) - 1, -1, -1):
+        suffix[i] = {a | b for a in suffix[i + 1] for b in masks[parents[i]]}
+    remaining = {p: {a | b for a in prefix[i] for b in suffix[i + 1]} for i, p in enumerate(parents)}
+    covered = sum(1 << r for r, route in enumerate(state.routes) if route)
+    return torch.tensor([any(covered | space.robot_masks[i] | mask == 15
+                             for mask in remaining[space.actions[i].parent_id]) for i in indices.tolist()],
+                        device=indices.device, dtype=torch.bool)
+
+
+def imitation_joint_scores(space, embeddings, model, plans):
+    """The original joint actor plus its existing directed insertion head."""
+    inputs = plans if isinstance(plans,dict) else vnext_policy_inputs(space, plans, model)
+    coarse = model.joint_scores(space, embeddings, inputs['indices'], inputs['assignment'], inputs['outcomes'])
+    fine = model.insertion_logits(embeddings, inputs['insertion_indices'].reshape(-1, 4),
+                                 inputs['insertion_features'].reshape(-1, _VNEXT_FEATURE_DIM)).reshape(-1, 2)
+    mask = inputs['insertion_mask']
+    return coarse + .65 * (fine * mask).sum(1) / mask.sum(1).clamp_min(1.)
+
+
 def vnext_policy_inputs(space, plans, model, feedback=None):
     """Compact exact replay rows, without a retained trajectory autograd graph."""
     reference = plans[0].assignment_features
@@ -2384,11 +2492,17 @@ def vnext_value_candidate_indices(space, plans, scores):
 
 
 def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config, *,
-                        assignment_indices=None, preserve_prefix=False, feedback=None):
+                        assignment_indices=None, preserve_prefix=False, feedback=None, prefer_start_recovery=True):
     """Rank directed insertions of eight assignments, or twelve with feedback."""
     from .lns import joint_block_candidates
 
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
+    balancing = getattr(model, 'imitation_balance', False)
+    if balancing:
+        keep = coverage_preserving_assignments(space, indices, state, pending)
+        indices, features = indices[keep], features[keep]
+        if not len(indices):
+            return (), features.new_empty(0)
     rows = model.embed_assignment_rows(space, embeddings, indices, features)
     use_feedback = getattr(model, 'schedule_feedback', False)
     if use_feedback:
@@ -2397,7 +2511,9 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     # The coarse stage uses the workload forecast. Reranking adds the actual
     # change in route MOVE and the spatial risk after committing both children.
     positions = {index: i for i, index in enumerate(indices.tolist())}
-    shortlist = (feedback_shortlist(space, indices, logits) if use_feedback and assignment_indices is None else
+    shortlist = (shortlist_assignments(space, indices, logits, owner_alternatives=True,
+                                      processing=features[:, -8:-4]) if balancing and assignment_indices is None else
+                 feedback_shortlist(space, indices, logits) if use_feedback and assignment_indices is None else
                  shortlist_assignments(space, indices, logits + features[:, -4:-2] @ model.joint_weights[:2],
                                        owner_alternatives=True) if assignment_indices is None
                  else tuple(index for index in assignment_indices if index in positions))
@@ -2421,7 +2537,9 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
             expanded = []
             for partial, actions, risk, retained_inputs, retained_indices in partials:
                 variants = joint_block_candidates(partial, child, assignment.pattern, local_blocks, config,
-                                                  robot_id=robot, check_initial_feasibility=False)
+                                                  robot_id=robot, check_initial_feasibility=False,
+                                                  **(dict(insertion_limit=max(8,len(partial.routes[robot])+1),
+                                                          prefer_legal_start_recovery=prefer_start_recovery) if balancing else {}))
                 if preserve_prefix:
                     variants = tuple((after, action) for after, action in variants if not action.neighbour_changes)
                 if not variants:
@@ -2435,7 +2553,9 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                 if use_feedback:
                     retained = range(len(variants))
                 else:
-                    fine = .65 * model.insertion_logits(embeddings, ix, inputs) - move_delta / 32. - 1.5 * risk_by_option
+                    fine = .65 * model.insertion_logits(embeddings, ix, inputs)
+                    if not balancing:
+                        fine = fine - move_delta / 32. - 1.5 * risk_by_option
                     keep = 2 if len(children) == 2 and child_index == 0 else 1
                     retained = torch.argsort(fine, descending=True, stable=True)[:keep].tolist()
                 for i in retained:
@@ -2447,16 +2567,33 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
         assignment_features = features[positions[index]]
         for after, actions, risk, retained_inputs, retained_indices in partials:
             moves = before_move.new_tensor([sum(arcs) for arcs in after.arc_costs])
-            expected = assignment_features[-8:-4] + (moves - before_move) / 2500.
+            expected = assignment_features[-8:-4]
+            if not balancing:
+                expected = expected + (moves - before_move) / 2500.
             peak = float(expected.max())
             nominal = max(p + m for p, m in zip(after.loads, moves.tolist())) / 2500.
             outcome = moves.new_tensor((peak, peak - float(expected.min()), nominal,
                                         (after.travel - state.travel) / 45., overlap, risk))
             plans.append(VNextJointAction(index, after, actions, assignment_features, outcome, retained_inputs, retained_indices))
-    legal = legal_assignment_starts(plans, blocks, space, config)
+    legal = (tuple(range(len(plans))) if balancing and not prefer_start_recovery else
+             legal_assignment_starts(plans, blocks, space, config))
     plans = tuple(plans[i] for i in legal)
     if not plans:
         return plans, logits[:0]
+    if balancing:
+        # Apply processing priorities again to the actual surviving insertions.
+        # No learned score can resurrect an assignment outside these bands.
+        forecast = torch.stack([p.assignment_features[-8:-4] for p in plans])
+        peaks = forecast.amax(1)
+        tolerance = max(1. / 2500., .01 * float(peaks.min()))
+        keep = peaks <= peaks.min() + tolerance
+        gaps = (forecast[:, ::2] - forecast[:, 1::2]).abs().sum(1)
+        keep &= gaps <= gaps[keep].min() + tolerance
+        positions = torch.where(keep)[0].tolist()
+        # Stable score ties use actual MOVE and spatial risk last.
+        positions.sort(key=lambda i: (plans[i].state.travel, float(plans[i].outcome[-1]), i))
+        plans = tuple(plans[i] for i in positions)
+        return plans, imitation_joint_scores(space, embeddings, model, plans)
     if use_feedback:
         return plans, model.feedback_scores(space, embeddings, vnext_policy_inputs(space, plans, model, feedback))
     selection = torch.tensor([positions[p.assignment_index] for p in plans], dtype=torch.long)
@@ -2537,6 +2674,8 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
     completed, failures = [], []
     for partial in beam:
         try:
+            if getattr(model,'imitation_balance',False) and space.four_robot_cover_possible and not all(partial.state.routes):
+                raise ValueError('LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
             solution = canonicalize(parents, partial.selected.values(), dict(enumerate(partial.state.routes)),
                                     config, scope=FORMAL_SCOPE_V2)
             if tuple(route.block_ids for route in solution.routes) != partial.state.routes:
@@ -2616,6 +2755,9 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
         if decision_observer is not None:
             decision_observer(assignment, plan.actions, state)
     solution = canonicalize(parents, selected.values(), dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
+    if getattr(model,'imitation_balance',False) and space.four_robot_cover_possible and not all(state.routes):
+        return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,
+                                     rejection_reason='LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
     if tuple(route.block_ids for route in solution.routes) != state.routes:
         return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
                                      rejection_reason='CANONICALIZATION_CHANGED_DIRECTED_ROUTES')

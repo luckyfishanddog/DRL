@@ -4607,3 +4607,136 @@ def test_ppo_scale_summary_does_not_allow_test_for_incomplete_or_worse_validatio
     assert result['complete'] and result['processing_passed'] and result['time_passed']
     assert not result['quality_passed'] and not result['passed']
 
+
+def _imitation_fixture():
+    import run_gnn_weld_layout as e
+    from mrta_search import gnn_constructor as c
+    e.configure_cpu();torch.manual_seed(23)
+    parents=tuple(ParentWeld(name,(x,y),(x+2,y)) for name,x,y in
+                  [('a',1.,9.),('b',16.,9.),('c',1.,2.),('d',16.,2.)])
+    solution=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+        {r:(p.parent_id+'::whole',) for r,p in enumerate(parents)},CONFIG,scope=FORMAL_SCOPE_V2)
+    result=c.JointCompletionResult(solution,((1,),)*4,(),0.)
+    record=dict(row=dict(method='fixture',status='FEASIBLE',cmax_s=1000.),plan=e.pack_directed_plan(result))
+    model=c.VNextGNN(16,4,workload_lookahead=True,joint_actions=True,imitation_balance=True)
+    return e,c,parents,model,record
+
+
+def test_imitation_coverage_dp_matches_brute_force_and_detects_coupled_impossibility():
+    from itertools import product
+    e,c,parents,model,record=_imitation_fixture()
+    for layout in (parents,(ParentWeld('vertical',(2.,4.),(2.,8.)),),parents[:2]):
+        space=c.parent_assignment_space(layout,CONFIG)
+        masks=space.parent_robot_masks
+        brute={0}
+        for values in product(*(masks[p] for p in space.parent_ids)):
+            covered=0
+            for value in values:covered|=value
+            brute.add(covered)
+        assert space.four_robot_cover_possible==(15 in brute)
+    single=c.parent_assignment_space((ParentWeld('vertical',(2.,4.),(2.,8.)),),CONFIG)
+    assert not single.four_robot_cover_possible
+    assert single.coverage_diagnostic()['robots_without_legal_task']==[]
+
+
+def test_imitation_last_assignment_cannot_abandon_a_coverable_robot():
+    e,c,parents,model,record=_imitation_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    solution=e.unpack_directed_plan(parents,record['plan'],space).solution
+    blocks=block_map(solution,CONFIG)
+    state=e.lns.oriented_route_state((('a::whole',),(),('c::whole',),('d::whole',)),
+                                    ((1,),(),(1,),(1,)),blocks,CONFIG)
+    indices=torch.tensor([i for i,a in enumerate(space.actions) if a.parent_id=='b'])
+    keep=c.coverage_preserving_assignments(space,indices,state,{'b'})
+    assert keep.any() and (~keep).any()
+    assert all(bool(ok)==bool(space.robot_masks[i]&2) for i,ok in zip(indices.tolist(),keep.tolist()))
+
+
+def test_imitation_processing_forecast_does_not_include_move():
+    e,c,parents,model,record=_imitation_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    state=e.lns.oriented_route_state(((),)*4,((),)*4,{},CONFIG)
+    indices=torch.arange(len(space.actions));projected=space.processing.clone()
+    pending=torch.ones(len(parents),dtype=torch.bool)
+    moved=replace(state,arc_costs=((10000.,),(9000.,),(8000.,),(7000.,)))
+    first=c._forecast_workload(space,indices,projected,state,pending)
+    second=c._forecast_workload(space,indices,projected,moved,pending)
+    assert torch.equal(first[:,-8:],second[:,-8:])
+    assert not torch.equal(first[:,4:8],second[:,4:8])
+    legacy=c._forecast_workload(space,indices,projected,moved,pending,include_move=True)
+    assert not torch.equal(first[:,-8:],legacy[:,-8:])
+
+
+def test_imitation_shortlist_preserves_owner_modes_and_excludes_high_score_overload():
+    from types import SimpleNamespace
+    e,c,parents,model,record=_imitation_fixture()
+    actions=[SimpleNamespace(parent_id=str(i),robots=owner,pattern=SimpleNamespace(kind=kind))
+             for i,(owner,kind) in enumerate([((0,),SplitKind.WHOLE),((1,),SplitKind.WHOLE),
+                 ((0,1),SplitKind.X_SPLIT),((0,2),SplitKind.Y_SPLIT),((3,),SplitKind.WHOLE)])]
+    work=torch.tensor([[2.,2.,2.,2.]]*4+[[1.,1.,1.,6.]])
+    chosen=c.shortlist_assignments(SimpleNamespace(actions=actions),torch.arange(5),
+        torch.tensor([0.,1.,2.,3.,1e8]),processing=work)
+    assert set(chosen)=={0,1,2,3}
+
+
+def test_imitation_teacher_forcing_keeps_exact_routes_directions_and_pruned_positive(monkeypatch):
+    e,c,parents,model,record=_imitation_fixture()
+    monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('B32 called on a teacher prefix'))
+    monkeypatch.setattr(c,'structural_child_indices',lambda variants,**k:(0,))
+    sample=e.imitation_replay(('train_fixture',parents),record,model,joint_stride=2)
+    assert sample['evidence']['parent_steps']==len(parents)
+    assert sample['evidence']['exact_routes_and_directions']
+    assert sample['evidence']['rescued_teacher_insertions']>0
+    assert len(sample['insertion'].sizes)==4
+    assert all(a[2]==0 and a[3]==1 for row in sample['trace'] for a in row['actions'])
+
+
+def test_imitation_supervision_updates_both_gats_and_all_existing_actor_scores():
+    e,c,parents,model,record=_imitation_fixture()
+    sample=e.imitation_replay(('train_fixture',parents),record,model,joint_stride=1)
+    embeddings=model.encode_static(sample['space'].graph)
+    a=sample['assignment'];ins=sample['insertion']
+    first,_=e.imitation_choice_loss(model.assignment_scores(model.embed_assignment_rows(
+        sample['space'],embeddings,a.indices,a.features)),a)
+    second,_=e.imitation_choice_loss(model.insertion_logits(embeddings,ins.indices,ins.features),ins)
+    joint=torch.stack([torch.nn.functional.cross_entropy(c.imitation_joint_scores(
+        sample['space'],embeddings,model,inputs)[None],torch.tensor([answer])) for inputs,answer in sample['joint']]).mean()
+    (first+second+.5*joint).backward()
+    for prefix in ('layer1.','layer2.','policy.','insertion_head.','joint_weights'):
+        assert any(p.grad is not None and bool(p.grad.abs().sum()>0)
+                   for name,p in model.named_parameters() if name.startswith(prefix))
+    assert not any('value_head' in name or 'critic' in name for name,_ in model.named_parameters())
+
+
+def test_imitation_real_constructor_covers_four_robots_without_changing_physical_rules():
+    e,c,parents,model,record=_imitation_fixture()
+    result=c.construct_vnext_gnn(parents,model,CONFIG)
+    assert result.solution is not None and all(route.block_ids for route in result.solution.routes)
+    assert {b.split('::')[0] for route in result.solution.routes for b in route.block_ids}=={p.parent_id for p in parents}
+    for route in result.solution.routes:
+        assert all(robot_is_eligible(block_map(result.solution,CONFIG)[b],route.robot_id,CONFIG) for b in route.block_ids)
+
+
+def test_imitation_resume_reuses_completed_b32_after_csv_permission_failure(monkeypatch):
+    e,c,parents,model,record=_imitation_fixture()
+    saved=dict(training_complete=True,state_dict={},selected_epoch=2,pilot=[],legal_start_selection_complete=True)
+    calls,written=[],[]
+    monkeypatch.setattr(e,'imitation_saved',lambda:saved)
+    monkeypatch.setattr(e,'imitation_model',lambda *a,**k:model)
+    monkeypatch.setattr(e,'imitation_references',lambda:None)
+    monkeypatch.setattr(e,'ppo_layouts',lambda split:[(name,parents) for name in e.IMITATION_CASES])
+    monkeypatch.setattr(e,'read_rows',lambda path:[])
+    monkeypatch.setattr(e,'imitation_save',lambda state:None)
+    monkeypatch.setattr(e,'imitation_summary',lambda:{})
+    def evaluate(layout,model):
+        calls.append(layout[0])
+        return dict(layout_id=layout[0],method='GNN_IMITATION',b32_calls=1)
+    monkeypatch.setattr(e,'imitation_evaluate',evaluate)
+    monkeypatch.setattr(e,'imitation_write',lambda rows:(_ for _ in ()).throw(PermissionError('fixture CSV denied')))
+    with pytest.raises(PermissionError):
+        e.imitation_pilot()
+    assert len(calls)==len(saved['pilot'])==1
+    monkeypatch.setattr(e,'imitation_write',lambda rows:written.extend(rows))
+    e.imitation_pilot()
+    assert len(calls)==len(set(calls))==len(written)==6
+
