@@ -2492,9 +2492,10 @@ def vnext_value_candidate_indices(space, plans, scores):
 
 
 def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config, *,
-                        assignment_indices=None, preserve_prefix=False, feedback=None, prefer_start_recovery=True):
+                        assignment_indices=None, preserve_prefix=False, feedback=None, prefer_start_recovery=True,
+                        fixed_directions=None):
     """Rank directed insertions of eight assignments, or twelve with feedback."""
-    from .lns import joint_block_candidates
+    from .lns import joint_block_candidates, prefer_joint_legal_starts
 
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
     balancing = getattr(model, 'imitation_balance', False)
@@ -2539,9 +2540,17 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                 variants = joint_block_candidates(partial, child, assignment.pattern, local_blocks, config,
                                                   robot_id=robot, check_initial_feasibility=False,
                                                   **(dict(insertion_limit=max(8,len(partial.routes[robot])+1),
-                                                          prefer_legal_start_recovery=prefer_start_recovery) if balancing else {}))
+                                                          prefer_legal_start_recovery=prefer_start_recovery and not fixed_directions) if balancing else {}))
                 if preserve_prefix:
                     variants = tuple((after, action) for after, action in variants if not action.neighbour_changes)
+                if fixed_directions:
+                    variants = tuple((after, action) for after, action in variants
+                                     if all(block not in fixed_directions or direction == fixed_directions[block]
+                                            for block, _, direction in action.neighbour_changes))
+                    # Apply the existing head preference after eliminating
+                    # forbidden flips, before learned/structural pruning.
+                    if prefer_start_recovery:
+                        variants = prefer_joint_legal_starts(variants,local_blocks,config)
                 if not variants:
                     continue
                 representatives = (representative_child_indices(variants, limit=6 if len(children) == 1 else 4)
@@ -2619,6 +2628,8 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
     from .lns import oriented_route_state
 
     started = time.perf_counter()
+    fixed_directions = ({b:d for route,bits in zip(state.routes,state.directions) for b,d in zip(route,bits)}
+                        if state is not None and getattr(model,'imitation_balance',False) else None)
     space = parent_assignment_space(parents, config) if space is None else space
     embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
     selected = {} if selected is None else dict(selected)
@@ -2638,7 +2649,8 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
                                              rejection_reason='TIME_LIMIT')
             try:
                 plans, scores = vnext_joint_actions(space, embeddings, model, partial.state, partial.blocks,
-                                                    partial.nodes, partial.pending, config)
+                                                    partial.nodes, partial.pending, config,
+                                                    **(dict(fixed_directions=fixed_directions) if fixed_directions else {}))
                 if not plans:
                     raise ValueError('NO_COMPLETE_PARENT_ACTION')
                 if not torch.isfinite(scores).all():
@@ -2707,6 +2719,8 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
                                            step_observer=step_observer, decision_observer=decision_observer)
     started = time.perf_counter()
     preserve_prefix = getattr(model, 'schedule_feedback', False) and state is not None
+    fixed_directions = ({b:d for route,bits in zip(state.routes,state.directions) for b,d in zip(route,bits)}
+                        if state is not None and getattr(model,'imitation_balance',False) else None)
     space = parent_assignment_space(parents, config) if space is None else space
     embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
     selected = {} if selected is None else dict(selected)
@@ -2722,6 +2736,8 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
             return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,
                                          rejection_reason='TIME_LIMIT')
         options = dict(feedback=feedback, preserve_prefix=preserve_prefix) if getattr(model, 'schedule_feedback', False) else {}
+        if fixed_directions:
+            options['fixed_directions'] = fixed_directions
         plans, scores = vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config, **options)
         if not plans:
             return JointCompletionResult(None, None, tuple(actions), time.perf_counter() - started,

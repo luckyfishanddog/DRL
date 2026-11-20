@@ -282,6 +282,7 @@ class RecoverySummary:
     branch_points_considered: int
     frontier_exhausted: bool
     best_plan: tuple[ForcedDispatchDecision, ...] = ()
+    last_deadlock: ScheduleResult | None = None
 
 
 def limited_discrepancy_recovery(
@@ -366,6 +367,7 @@ def limited_discrepancy_recovery(
     max_discrepancies = 0
     best: ScheduleResult | None = None
     best_plan: tuple[ForcedDispatchDecision, ...] = ()
+    last_deadlock = baseline.result
 
     while frontier and rollouts < rollout_budget:
         frontier_started = time.perf_counter()
@@ -401,6 +403,8 @@ def limited_discrepancy_recovery(
             if best is None or candidate_key < (best.cmax, best.canonical_json()):
                 best = outcome.result
                 best_plan = item.plan
+        elif outcome.result.status is ScheduleStatus.DEADLOCK:
+            last_deadlock = outcome.result
 
         if (
             outcome.result.status is ScheduleStatus.DEADLOCK
@@ -441,4 +445,5 @@ def limited_discrepancy_recovery(
         len(considered),
         not frontier,
         best_plan,
+        last_deadlock=last_deadlock,
     )

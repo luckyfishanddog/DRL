@@ -5,7 +5,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from itertools import product
@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
 from mrta_reference.geometry import optimize_directions, oriented_endpoints
-from mrta_reference.model import Operation, OperationKind, ParentWeld, RobotRoute, ScheduleResult, ScheduleStatus, ScientificConfig
+from mrta_reference.model import DeadlockBlockage, Operation, OperationKind, ParentWeld, RobotRoute, ScheduleResult, ScheduleStatus, ScientificConfig
 from mrta_reference.scheduler import build_operation_templates, earliest_safe_start, selected_schedule_wait_blockers
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
@@ -4204,11 +4204,236 @@ def imitation_summary():
     return output
 
 
+DEADLOCK_RESULTS = FINAL_RESULTS/'gnn_deadlock_repair_pilot.csv'
+DEADLOCK_FIELDS = ('stage','layout_id','parent_count','seed','repair_attempt','repair_round','candidate_rank',
+    'origin_attempt','neighbour_layers','removed_parent_ids','status','cmax_s',
+    'robot_task_count_r0','robot_task_count_r1','robot_task_count_r2','robot_task_count_r3',
+    'processing_r0_s','processing_r1_s','processing_r2_s','processing_r3_s','max_processing_s',
+    'same_rail_gap_01_s','same_rail_gap_23_s','move_s','wait_s','runtime_s','construct_s','b32_s','b32_calls',
+    'blocked_operation_count','wait_for_graph','deadlock_blockages','diagnostic','reconstruction_failure','solution')
+
+
+def deadlock_write(rows):
+    with DEADLOCK_RESULTS.open('a' if DEADLOCK_RESULTS.exists() else 'w',encoding='utf-8',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=DEADLOCK_FIELDS)
+        if stream.tell()==0:
+            writer.writeheader()
+        writer.writerows({k:row.get(k) for k in DEADLOCK_FIELDS} for row in rows)
+        stream.flush()
+
+
+def deadlock_plan(parents, snapshot, space):
+    if isinstance(snapshot,str):
+        snapshot=json.loads(snapshot)
+    snapshot=dict(snapshot,routes=tuple(tuple(r) for r in snapshot['routes']),
+                  directions=tuple(tuple(d) for d in snapshot['directions']))
+    result=unpack_directed_plan(parents,snapshot,space)
+    if tuple(r.block_ids for r in result.solution.routes)!=snapshot['routes']:
+        raise ValueError('saved directed plan changed during canonicalization')
+    return result
+
+
+def deadlock_schedule(row):
+    def operation(value):
+        return None if value is None else Operation(**dict(value,kind=OperationKind(value['kind']),
+            start=tuple(value['start']),end=tuple(value['end'])))
+    evidence=[]
+    for item in json.loads(row.get('deadlock_blockages') or '[]'):
+        evidence.append(DeadlockBlockage(**dict(item,
+            blocked_operation=operation(item['blocked_operation']),
+            blocked_block_ids=tuple(item['blocked_block_ids']),blocked_parent_ids=tuple(item['blocked_parent_ids']),
+            blocker_operation_ids=tuple(item['blocker_operation_ids']),
+            blocker_operations=tuple(operation(x) for x in item['blocker_operations']),
+            blocker_block_ids=tuple(tuple(x) for x in item['blocker_block_ids']),
+            blocker_parent_ids=tuple(tuple(x) for x in item['blocker_parent_ids']))))
+    diagnostics=json.loads(row.get('diagnostic') or '{}')
+    return ScheduleResult(ScheduleStatus(row['status']),
+        cmax=float(row['cmax_s']) if row.get('cmax_s') not in (None,'') else None,
+        wait_for_graph=tuple((r,tuple(peers)) for r,peers in json.loads(row.get('wait_for_graph') or '[]')),
+        diagnostics=tuple(diagnostics.get('schedule_diagnostics',())),deadlock_blockages=tuple(evidence),
+        deadlock_evidence_source=diagnostics.get('evidence_source'))
+
+
+def deadlock_result_row(name, result, schedule, **values):
+    # Recompute from all four final directed routes, independently of the
+    # forecast and the incremental construction state's cached loads/arcs.
+    metrics=beam_validation_metrics(replace(result,oriented_state=None))
+    loads=[metrics[f'processing_r{r}_s'] for r in range(4)]
+    return dict(layout_id=name,parent_count=len(result.solution.parents),seed=SEED,
+        status=schedule.status.value,cmax_s=schedule.cmax if schedule.feasible else None,
+        **{f'robot_task_count_r{r}':len(route.block_ids) for r,route in enumerate(result.solution.routes)},
+        **metrics,max_processing_s=max(loads),same_rail_gap_01_s=abs(loads[0]-loads[1]),
+        same_rail_gap_23_s=abs(loads[2]-loads[3]),
+        wait_s=sum(op.duration for op in schedule.operations if op.kind is OperationKind.WAIT),
+        blocked_operation_count=len(schedule.deadlock_blockages),
+        wait_for_graph=json.dumps(schedule.wait_for_graph),
+        deadlock_blockages=json.dumps([asdict(item) for item in schedule.deadlock_blockages]),
+        diagnostic=json.dumps(dict(schedule_diagnostics=schedule.diagnostics,
+            evidence_source=schedule.deadlock_evidence_source,baseline_deadlock=schedule.baseline_deadlock,
+            recovery_rollouts=schedule.recovery_rollouts,rollout_budget=schedule.rollout_budget,
+            recovery_exhausted=schedule.recovery_exhausted,frontier_exhausted=schedule.frontier_exhausted)),
+        solution=json.dumps(pack_directed_plan(result)),**values)
+
+
+def deadlock_reconstruct(current, partial, model, space, embeddings):
+    """Existing joint GNN continuation, retaining all untouched directed tasks."""
+    pending=set(partial.removed_parent_ids)
+    selected={p.parent_id:p for p in current.solution.patterns if p.parent_id not in pending}
+    blocks={b.block_id:b for pattern in selected.values() for b in space.children[pattern]}
+    old_bits={b:d for route,bits in zip(current.solution.routes,current.directions)
+              for b,d in zip(route.block_ids,bits)}
+    bits=tuple(tuple(old_bits[b] for b in route) for route in partial.routes)
+    state=lns.oriented_route_state(partial.routes,bits,blocks,CONFIG)
+    rebuilt=gnn.construct_vnext_gnn(current.solution.parents,model,CONFIG,state=state,selected=selected,
+                                  space=space,embeddings=embeddings,beam_width=2)
+    for candidate in rebuilt.candidates or ((rebuilt,) if rebuilt.solution is not None else ()):
+        routes=tuple(r.block_ids for r in candidate.solution.routes)
+        for robot,route in enumerate(partial.routes):
+            kept=set(route)
+            if tuple(b for b in routes[robot] if b in kept)!=route:
+                raise ValueError('local GNN changed untouched route order or ownership')
+            actual=dict(zip(routes[robot],candidate.directions[robot]))
+            if any(actual[b]!=old_bits[b] for b in route):
+                raise ValueError('local GNN changed an untouched direction')
+        if len(candidate.solution.patterns)!=len(current.solution.parents):
+            raise ValueError('local GNN did not restore every pending parent')
+        if space.four_robot_cover_possible and not all(routes):
+            raise ValueError('local GNN lost legal four-robot coverage')
+    return rebuilt
+
+
+def deadlock_initial(name, parents, original, space):
+    result=deadlock_plan(parents,json.loads(original['diagnostic'])['solution'],space)
+    if original['status']=='FEASIBLE':
+        # Reuse 0067 verbatim; no initial reconstruction and no repeated B32.
+        row={k:original.get(k) for k in DEADLOCK_FIELDS}
+        row.update(stage='initial',repair_attempt=0,repair_round=0,candidate_rank=0,seed=SEED,
+            b32_calls=0,runtime_s=0.,construct_s=0.,b32_s=0.,blocked_operation_count=0,
+            deadlock_blockages='[]',solution=json.dumps(pack_directed_plan(result)),
+            diagnostic=json.dumps(dict(reused='gnn_imitation_balance_pilot.csv',schedule_diagnostics=[])))
+        row['same_rail_gap_01_s']=abs(float(row['processing_r0_s'])-float(row['processing_r1_s']))
+        row['same_rail_gap_23_s']=abs(float(row['processing_r2_s'])-float(row['processing_r3_s']))
+        return row
+    started=time.perf_counter()
+    schedule=b32(result)
+    elapsed=time.perf_counter()-started
+    return deadlock_result_row(name,result,schedule,stage='initial',repair_attempt=0,repair_round=0,
+        candidate_rank=0,construct_s=0.,b32_s=elapsed,runtime_s=elapsed,b32_calls=1)
+
+
+def deadlock_repair_case(name, parents, original, model, *, resume_unresolved=False):
+    started=time.perf_counter()
+    rows=[r for r in read_rows(DEADLOCK_RESULTS) if r['layout_id']==name]
+    finals=[r for r in rows if r['stage']=='final']
+    if finals and (not resume_unresolved or finals[-1]['status']=='FEASIBLE' or
+                   sum(r['stage']=='candidate' for r in rows)>=12):
+        return finals[-1]
+    space=gnn.parent_assignment_space(parents,CONFIG)
+    if not any(r['stage']=='initial' for r in rows):
+        row=deadlock_initial(name,parents,original,space)
+        deadlock_write([row]);rows.append(row)
+        print('DEADLOCK_INITIAL',name,row['status'],'blocked',row['blocked_operation_count'],flush=True)
+    evaluated=[r for r in rows if r['stage'] in ('initial','candidate')]
+    seen={plan_key(plan.solution,plan.directions) for plan in
+          (deadlock_plan(parents,r['solution'],space) for r in evaluated)}
+    fresh=[r for r in evaluated if r['stage']=='candidate']
+    count=len(fresh)
+    feasible=[r for r in evaluated if r['status']=='FEASIBLE']
+    if feasible:
+        best=min(feasible,key=lambda r:float(r['cmax_s']))
+    else:
+        deadlocks=[r for r in evaluated if r['status']=='DEADLOCK']
+        if not deadlocks:
+            best=evaluated[-1]
+        else:
+            latest=max(int(r.get('repair_round') or 0) for r in deadlocks)
+            best=min((r for r in deadlocks if int(r.get('repair_round') or 0)==latest),
+                     key=lambda r:(int(r['blocked_operation_count']),float(r['max_processing_s']),float(r['move_s'])))
+    embeddings=model.encode_static(space.graph)
+    round_index=max((int(r.get('repair_round') or 0) for r in rows),default=0)
+    layers=1
+    stop='already feasible' if best['status']=='FEASIBLE' else 'new complete candidate budget exhausted'
+    while best['status']=='DEADLOCK' and count<12:
+        current=deadlock_plan(parents,best['solution'],space)
+        schedule=deadlock_schedule(best)
+        partial=lns.select_deadlock_blocker_parents(current.solution,schedule,CONFIG,neighbour_layers=layers)
+        if partial is None:
+            stop='no mapped direct blocker parents';break
+        round_index+=1
+        construction=time.perf_counter()
+        rebuilt=deadlock_reconstruct(current,partial,model,space,embeddings)
+        construction=time.perf_counter()-construction
+        candidates=(rebuilt.candidates or ((rebuilt,) if rebuilt.solution is not None else ()))[:2]
+        next_deadlocks=[];new_count=0
+        for rank,candidate in enumerate(candidates):
+            key=plan_key(candidate.solution,candidate.directions)
+            if key in seen:
+                continue
+            seen.add(key)
+            if count>=12:
+                break
+            count+=1;new_count+=1
+            evaluation=time.perf_counter()
+            outcome=b32(candidate)
+            evaluation=time.perf_counter()-evaluation
+            row=deadlock_result_row(name,candidate,outcome,stage='candidate',repair_attempt=count,
+                repair_round=round_index,candidate_rank=rank,origin_attempt=int(best['repair_attempt']),
+                neighbour_layers=layers,removed_parent_ids=json.dumps(partial.removed_parent_ids),
+                construct_s=construction if new_count==1 else 0.,b32_s=evaluation,
+                runtime_s=(construction if new_count==1 else 0.)+evaluation,b32_calls=1)
+            deadlock_write([row]);rows.append(row)
+            print('DEADLOCK_CANDIDATE',name,count,outcome.status.value,'blocked',row['blocked_operation_count'],
+                  'Pmax',row['max_processing_s'],'removed',len(partial.removed_parent_ids),flush=True)
+            if outcome.feasible:
+                best=row;stop='B32 feasible';break
+            if outcome.status is ScheduleStatus.DEADLOCK:
+                next_deadlocks.append(row)
+        if best['status']=='FEASIBLE':
+            break
+        if next_deadlocks:
+            best=min(next_deadlocks,key=lambda r:(r['blocked_operation_count'],r['max_processing_s'],r['move_s']))
+            layers=1
+            continue
+        reason=(rebuilt.rejection_reason or ('only INFEASIBLE/NUMERIC_FAILURE candidates' if new_count else
+                                            'all complete candidates duplicate previous directed plans'))
+        deadlock_write([dict(stage='failure',layout_id=name,seed=SEED,repair_attempt=count,repair_round=round_index,
+            origin_attempt=best['repair_attempt'],neighbour_layers=layers,removed_parent_ids=json.dumps(partial.removed_parent_ids),
+            b32_calls=0,construct_s=construction if not new_count else 0.,reconstruction_failure=reason)])
+        if layers==1:
+            layers=2
+        else:
+            stop=reason;break
+    final=dict(best,stage='final',origin_attempt=best['repair_attempt'],repair_attempt=count,b32_calls=0,
+               runtime_s=time.perf_counter()-started,reconstruction_failure=stop)
+    deadlock_write([final])
+    print('DEADLOCK_FINAL',json.dumps({k:v for k,v in final.items() if k not in
+          ('solution','diagnostic','deadlock_blockages')}),flush=True)
+    return final
+
+
+@torch.no_grad()
+def imitation_deadlock_pilot(*, resume_unresolved=False):
+    configure_cpu()
+    # Open the sole output before expensive evaluations; a denied file write
+    # must not consume an unrecorded B32 call or rerun the old initial GNN.
+    deadlock_write([])
+    saved=torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)
+    model=imitation_model(saved['state_dict'],balance=True).eval()
+    source={r['layout_id']:r for r in read_rows(IMITATION_RESULTS) if r['method']=='GNN_IMITATION'}
+    layouts=dict(ppo_layouts('validation'))
+    final=[deadlock_repair_case(name,layouts[name],source[name],model,resume_unresolved=resume_unresolved)
+           for name in IMITATION_CASES]
+    print('DEADLOCK_PILOT_SUMMARY',json.dumps(dict(feasible=sum(r['status']=='FEASIBLE' for r in final),
+        cases=len(final),new_complete_candidates=sum(int(r['repair_attempt']) for r in final))),flush=True)
+    return final
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
+    parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
     parser.add_argument('--representative', action='store_true', help='small/median/large layouts, first seed only')
@@ -4219,7 +4444,8 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'imitation-teachers':imitation_teachers(args.workers)
+    if args.stage == 'imitation-deadlock-pilot':imitation_deadlock_pilot(resume_unresolved=args.resume_unresolved)
+    elif args.stage == 'imitation-teachers':imitation_teachers(args.workers)
     elif args.stage == 'imitation-train':imitation_train()
     elif args.stage == 'imitation-select':imitation_select()
     elif args.stage == 'imitation-references':imitation_references()

@@ -422,6 +422,38 @@ def _remove_parent_set(
     )
 
 
+def select_deadlock_blocker_parents(current, schedule, config, *, neighbour_layers=1):
+    """Close direct terminal blocker tasks and one (at most two) route layers.
+
+    Uses structured DEADLOCK evidence, including both MOVE endpoints. No WAIT
+    durations, text diagnostics, geometric proxy, or random route removal.
+    """
+    from mrta_reference.model import ScheduleStatus
+    if schedule.status is not ScheduleStatus.DEADLOCK:
+        raise ValueError('deadlock parent selection requires DEADLOCK')
+    if neighbour_layers not in (1, 2):
+        raise ValueError('deadlock destruction supports one or two direct neighbour layers')
+    blocks = block_map(current, config)
+    known = {p.parent_id for p in current.parents}
+    evidence = schedule.deadlock_blockages
+    blocking = {parent for event in evidence for parents in event.blocker_parent_ids
+                for parent in parents if parent in known}
+    if not blocking:
+        return None
+    removed = blocking | {parent for event in evidence for parent in event.blocked_parent_ids if parent in known}
+    for _ in range(neighbour_layers):
+        adjacent = set(removed)
+        for route in current.routes:
+            for position, block in enumerate(route.block_ids):
+                if blocks[block].parent_id not in removed:
+                    continue
+                for index in (position-1, position+1):
+                    if 0 <= index < len(route.block_ids):
+                        adjacent.add(blocks[route.block_ids[index]].parent_id)
+        removed = adjacent
+    return _remove_parent_set(current, removed)
+
+
 def schedule_feedback_summary(current, schedule, blockers, config):
     """Observed timeline costs and exact selected-rollout WAIT evidence only.
 
@@ -1310,13 +1342,19 @@ def joint_block_candidates(
             if first_only:
                 return tuple(rows)
     if not check_initial_feasibility and prefer_legal_start_recovery:
-        restored=[]
-        for inserted,action in rows:
-            points={r:oriented_endpoints(blocks[route[0]],inserted.directions[r][0])[0]
-                    for r,route in enumerate(inserted.routes) if route}
-            if _initial_error(points,config) is None:restored.append((inserted,action))
-        if restored:rows=restored
+        rows=prefer_joint_legal_starts(rows,blocks,config)
     return tuple(rows)
+
+
+def prefer_joint_legal_starts(variants, blocks, config):
+    """Existing initial-head preference, also applied after fixed-bit filtering."""
+    restored=[]
+    for inserted,action in variants:
+        points={r:oriented_endpoints(blocks[route[0]],inserted.directions[r][0])[0]
+                for r,route in enumerate(inserted.routes) if route}
+        if _initial_error(points,config) is None:
+            restored.append((inserted,action))
+    return tuple(restored or variants)
 
 
 def select_feedback_child(current, feedback, config, *, seed=None):

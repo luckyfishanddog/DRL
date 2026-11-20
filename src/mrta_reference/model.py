@@ -267,6 +267,25 @@ class Operation:
 
 
 @dataclass(frozen=True)
+class DeadlockBlockage:
+    """One terminal dispatch cursor and its direct, unmodified ESS blockers.
+
+    Block tuples contain both ends of MOVE arcs. Parallel blocker tuples keep
+    unknown operation IDs (None operation, empty task tuples) without guessing.
+    """
+    robot_id: int
+    next_template_index: int
+    ready_time: float
+    blocked_operation: Operation
+    blocked_block_ids: tuple[str, ...]
+    blocked_parent_ids: tuple[str, ...]
+    blocker_operation_ids: tuple[str, ...]
+    blocker_operations: tuple[Operation | None, ...]
+    blocker_block_ids: tuple[tuple[str, ...], ...]
+    blocker_parent_ids: tuple[tuple[str, ...], ...]
+
+
+@dataclass(frozen=True)
 class ScheduleResult:
     status: ScheduleStatus
     operations: tuple[Operation, ...] = ()
@@ -294,6 +313,11 @@ class ScheduleResult:
     rollout_budget: int = 0
     max_discrepancies_used: int = 0
     branch_points_considered: int = 0
+    # Diagnostic evidence is deliberately outside canonical_json's scientific
+    # timeline. A failed recovery retains its historical baseline timeline,
+    # while these fields describe its last actual DEADLOCK continuation.
+    deadlock_blockages: tuple[DeadlockBlockage, ...] = ()
+    deadlock_evidence_source: str | None = None
 
     @property
     def feasible(self) -> bool:

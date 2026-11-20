@@ -18,6 +18,7 @@ from .geometry import (
 )
 from .model import (
     CanonicalSolution,
+    DeadlockBlockage,
     Operation,
     OperationKind,
     RobotRoute,
@@ -744,6 +745,49 @@ def _validated_reference_templates(
     return templates, None
 
 
+def operation_task_blocks(operation: Operation, templates_by_robot) -> tuple[str, ...]:
+    """Map a real operation to its task; MOVE/WAIT retain arc endpoints.
+
+    A generated WAIT has the delayed template's sequence_index, including when
+    that template is a MOVE with no block_id. IDs not present in the supplied
+    templates are never interpreted as invented parent identities.
+    """
+    items = tuple(templates_by_robot.get(operation.robot_id, ()))
+    matches = [i for i, item in enumerate(items) if item.operation_id == operation.operation_id]
+    if not matches and operation.kind is OperationKind.WAIT:
+        matches = [i for i, item in enumerate(items) if item.sequence_index == operation.sequence_index]
+    index = matches[0] if len(matches) == 1 else None
+    target = operation.block_id
+    if target is None and index is not None and operation.kind in (OperationKind.MOVE, OperationKind.WAIT):
+        target = next((item.block_id for item in items[index:] if item.block_id is not None), None)
+    if target is None:
+        return ()
+    delayed = items[index] if index is not None else operation
+    source = (next((item.block_id for item in reversed(items[:index]) if item.block_id is not None), None)
+              if index is not None and delayed.kind is OperationKind.MOVE else None)
+    return tuple(dict.fromkeys(block for block in (source, target) if block is not None))
+
+
+def _task_parents(block_ids):
+    return tuple(dict.fromkeys(block.rsplit('::', 1)[0] for block in block_ids if '::' in block))
+
+
+def _deadlock_blockages(templates, next_index, completion, fixed_operations, blocker_ids_by_robot):
+    fixed = {op.operation_id: op for op in fixed_operations}
+    evidence = []
+    for robot, ids in sorted(blocker_ids_by_robot.items()):
+        index = next_index[robot]
+        if index >= len(templates[robot]):
+            continue
+        blocked = templates[robot][index]
+        block_ids = operation_task_blocks(blocked, templates)
+        blockers = tuple(fixed.get(op_id) for op_id in ids)
+        tasks = tuple(operation_task_blocks(op, templates) if op is not None else () for op in blockers)
+        evidence.append(DeadlockBlockage(robot,index,completion[robot],blocked,block_ids,_task_parents(block_ids),
+            tuple(ids),blockers,tasks,tuple(_task_parents(blocks) for blocks in tasks)))
+    return tuple(evidence)
+
+
 def reference_schedule_from_templates_slow(
     templates_by_robot: Mapping[int, Sequence[Operation]],
     config: ScientificConfig,
@@ -817,6 +861,8 @@ def reference_schedule_from_templates_slow(
                         ]
                     ),
                     directions,
+                    deadlock_blockages=_deadlock_blockages(templates,next_index,completion,fixed,blocker_ids_by_robot),
+                    deadlock_evidence_source='initial dispatch deadlock',
                 )
                 if profile is not None:
                     profile.scheduler_main_loop_time += time.perf_counter() - main_started
@@ -1148,6 +1194,9 @@ class _OptimizedDispatchKernel:
                 ]
             ),
             self.directions,
+            deadlock_blockages=_deadlock_blockages(self.templates,state.next_index,state.completion,
+                                                  state.fixed_operations,blocker_ids_by_robot),
+            deadlock_evidence_source='initial dispatch deadlock',
         )
 
 
@@ -1611,6 +1660,11 @@ def _limited_discrepancy_dispatch_recovery_slow(
         rollout_budget=summary.rollout_budget,
         max_discrepancies_used=summary.max_discrepancies_used,
         branch_points_considered=summary.branch_points_considered,
+        deadlock_blockages=(summary.last_deadlock.deadlock_blockages
+            if summary.result.status is ScheduleStatus.DEADLOCK and summary.last_deadlock is not None
+            else summary.result.deadlock_blockages),
+        deadlock_evidence_source=('last recovery deadlock' if summary.result.status is ScheduleStatus.DEADLOCK
+            and summary.recovery_rollouts else summary.result.deadlock_evidence_source),
     )
 
 
@@ -1690,6 +1744,11 @@ def _limited_discrepancy_dispatch_recovery_optimized(
         rollout_budget=summary.rollout_budget,
         max_discrepancies_used=summary.max_discrepancies_used,
         branch_points_considered=summary.branch_points_considered,
+        deadlock_blockages=(summary.last_deadlock.deadlock_blockages
+            if summary.result.status is ScheduleStatus.DEADLOCK and summary.last_deadlock is not None
+            else summary.result.deadlock_blockages),
+        deadlock_evidence_source=('last recovery deadlock' if summary.result.status is ScheduleStatus.DEADLOCK
+            and summary.recovery_rollouts else summary.result.deadlock_evidence_source),
     )
 
 
