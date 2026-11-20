@@ -1865,8 +1865,86 @@ class CoarseToFineGNN(_JointAssignmentGNN):
         return self.policy(coarse_rows).squeeze(1) + self.insertion_logits(fine_rows, use_coordination=use_coordination)
 
 
-def shortlist_assignments(space, indices, logits, *, owner_alternatives=False, processing=None):
+def bounded_route_pareto(objectives, scores, *, limit, groups=None):
+    """Bounded Pareto retention, then the unchanged learned score.
+
+    Dimensions are separate costs, never a fitted/hand-weighted time model.
+    Reserve Q/M corners and owner/mode/parent diversity by dominance count.
+    """
+    if not len(scores) or limit<=0:
+        return ()
+    costs=objectives.detach()
+    scores=scores.detach()
+    dominates=(costs[:,None,:]<=costs[None,:,:]).all(2) & (costs[:,None,:]<costs[None,:,:]).any(2)
+    counts=dominates.sum(0).tolist()
+    order=sorted(range(len(scores)),key=lambda i:(counts[i],-float(scores[i]),i))
+    threshold=counts[order[min(limit,len(order))-1]]
+    eligible=[i for i in order if counts[i]<=threshold]
+    chosen=[]
+    def add(i):
+        if i not in chosen and len(chosen)<limit:
+            chosen.append(i)
+    # Qmax and actual route MOVE are explicit corners; P spread stays secondary.
+    for column in range(min(2,costs.shape[1])):
+        add(min(eligible,key=lambda i:(counts[i],float(costs[i,column]),-float(scores[i]),i)))
+    add(order[0])
+    if groups is not None:
+        columns = (1,2,0,*range(3,len(groups[0])))
+        for column in columns:
+            covered={groups[i][column] for i in chosen}
+            for i in eligible:
+                if groups[i][column] not in covered:
+                    add(i);covered.add(groups[i][column])
+                if len(chosen)>=max(4,limit-2):
+                    break
+    for i in order:
+        add(i)
+    return tuple(sorted(chosen,key=lambda i:(-float(scores[i]),i)))
+
+
+def route_assignment_objectives(space, indices, features, state, blocks, config):
+    """External coarse P+MOVE proxy; checkpoint features remain untouched.
+
+    The arc splice estimate holds current neighbour bits fixed and examines
+    the two directions only to screen assignments. GNN still commits the
+    position/direction jointly; this does not optimize or rewrite a route.
+    """
+    moves=[sum(arcs) for arcs in state.arc_costs]
+    endpoints={b:oriented_endpoints(blocks[b],bit) for route,bits in zip(state.routes,state.directions)
+               for b,bit in zip(route,bits)}
+    cache={};rows=[]
+    for i,index in enumerate(indices.tolist()):
+        action=space.actions[index];projected=moves.copy()
+        for child,robot in zip(space.children[action.pattern],action.robots):
+            key=(action.pattern,child.block_id,robot)
+            if key not in cache:
+                route=state.routes[robot];best=math.inf
+                for position in range(len(route)+1):
+                    before=endpoints[route[position-1]][1] if position else None
+                    after=endpoints[route[position]][0] if position<len(route) else None
+                    removed=state.arc_costs[robot][position-1] if before is not None and after is not None else 0.
+                    for bit in (0,1):
+                        start,end=oriented_endpoints(child,bit)
+                        delta=((math.dist(before,start)/config.empty_speed if before is not None else 0.)+
+                               (math.dist(end,after)/config.empty_speed if after is not None else 0.)-removed)
+                        best=min(best,delta)
+                cache[key]=best
+            projected[robot]+=cache[key]
+        move=features.new_tensor(projected).clamp_min(0.)
+        processing=features[i,-8:-4]*2500.
+        rows.append(torch.stack(((processing+move).max(),move.sum(),processing.max()-processing.min(),
+                                  (processing[::2]-processing[1::2]).abs().sum())))
+    return torch.stack(rows)
+
+
+def shortlist_assignments(space, indices, logits, *, owner_alternatives=False, processing=None,
+                          route_objectives=None):
     """Retain learned scores, with slots for distinct parents and mode families."""
+    if route_objectives is not None:
+        groups=[(space.actions[i].parent_id,space.actions[i].robots,space.actions[i].pattern.kind)
+                for i in indices.tolist()]
+        return tuple(int(indices[i]) for i in bounded_route_pareto(route_objectives,logits,
+                     limit=COARSE_ASSIGNMENT_LIMIT,groups=groups))
     if processing is not None:
         peak = processing.amax(1)
         # A 1% processing band permits owner diversity without allowing the
@@ -2499,6 +2577,7 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
 
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
     balancing = getattr(model, 'imitation_balance', False)
+    route_aware = getattr(model, 'route_aware', False)
     if balancing:
         keep = coverage_preserving_assignments(space, indices, state, pending)
         indices, features = indices[keep], features[keep]
@@ -2512,7 +2591,10 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     # The coarse stage uses the workload forecast. Reranking adds the actual
     # change in route MOVE and the spatial risk after committing both children.
     positions = {index: i for i, index in enumerate(indices.tolist())}
-    shortlist = (shortlist_assignments(space, indices, logits, owner_alternatives=True,
+    shortlist = (shortlist_assignments(space,indices,logits,route_objectives=
+                    route_assignment_objectives(space,indices,features,state,blocks,config))
+                 if route_aware and assignment_indices is None else
+                 shortlist_assignments(space, indices, logits, owner_alternatives=True,
                                       processing=features[:, -8:-4]) if balancing and assignment_indices is None else
                  feedback_shortlist(space, indices, logits) if use_feedback and assignment_indices is None else
                  shortlist_assignments(space, indices, logits + features[:, -4:-2] @ model.joint_weights[:2],
@@ -2565,8 +2647,15 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                     fine = .65 * model.insertion_logits(embeddings, ix, inputs)
                     if not balancing:
                         fine = fine - move_delta / 32. - 1.5 * risk_by_option
-                    keep = 2 if len(children) == 2 and child_index == 0 else 1
-                    retained = torch.argsort(fine, descending=True, stable=True)[:keep].tolist()
+                    if route_aware:
+                        processing=features[positions[index],-8:-4]*2500.
+                        moves=inputs.new_tensor([[sum(arcs) for arcs in after.arc_costs] for after,_ in variants])
+                        costs=torch.stack(((processing+moves).amax(1),moves.sum(1),
+                                           inputs[:,-8],inputs[:,-7],inputs[:,-4]),1)
+                        retained=bounded_route_pareto(costs,fine,limit=2)
+                    else:
+                        keep = 2 if len(children) == 2 and child_index == 0 else 1
+                        retained = torch.argsort(fine, descending=True, stable=True)[:keep].tolist()
                 for i in retained:
                     after, action = variants[i]
                     expanded.append((after, (*actions, action), max(risk, float(risk_by_option[i])),
@@ -2589,6 +2678,19 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     plans = tuple(plans[i] for i in legal)
     if not plans:
         return plans, logits[:0]
+    if route_aware:
+        scores=imitation_joint_scores(space,embeddings,model,plans)
+        costs=[];groups=[]
+        for plan in plans:
+            processing=plan.assignment_features[-8:-4]*2500.
+            moves=processing.new_tensor([sum(arcs) for arcs in plan.state.arc_costs])
+            costs.append(torch.stack(((processing+moves).max(),moves.sum(),processing.max()-processing.min(),
+                (processing[::2]-processing[1::2]).abs().sum(),plan.outcome[4],plan.outcome[5])))
+            action=space.actions[plan.assignment_index]
+            groups.append((action.parent_id,action.robots,action.pattern.kind,
+                           tuple(a.direction for a in plan.actions)))
+        retained=bounded_route_pareto(torch.stack(costs),scores,limit=16,groups=groups)
+        return tuple(plans[i] for i in retained),scores[list(retained)]
     if balancing:
         # Apply processing priorities again to the actual surviving insertions.
         # No learned score can resurrect an assignment outside these bands.
@@ -2686,7 +2788,8 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
     completed, failures = [], []
     for partial in beam:
         try:
-            if getattr(model,'imitation_balance',False) and space.four_robot_cover_possible and not all(partial.state.routes):
+            if (getattr(model,'route_aware',False) or
+                getattr(model,'imitation_balance',False) and space.four_robot_cover_possible) and not all(partial.state.routes):
                 raise ValueError('LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
             solution = canonicalize(parents, partial.selected.values(), dict(enumerate(partial.state.routes)),
                                     config, scope=FORMAL_SCOPE_V2)
@@ -2771,7 +2874,8 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
         if decision_observer is not None:
             decision_observer(assignment, plan.actions, state)
     solution = canonicalize(parents, selected.values(), dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
-    if getattr(model,'imitation_balance',False) and space.four_robot_cover_possible and not all(state.routes):
+    if (getattr(model,'route_aware',False) or
+        getattr(model,'imitation_balance',False) and space.four_robot_cover_possible) and not all(state.routes):
         return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,
                                      rejection_reason='LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
     if tuple(route.block_ids for route in solution.routes) != state.routes:
@@ -2787,6 +2891,11 @@ def construct_vnext_gnn(parents, model, config, *, decision_observer=None, space
                         feedback=None, policy_observer=None):
     """Construct greedily (width one), or return up to two global joint beam plans."""
     from .lns import joint_block_candidates, oriented_route_state
+
+    if getattr(model,'route_aware',False):
+        space=parent_assignment_space(parents,config) if space is None else space
+        if not space.four_robot_cover_possible:
+            return JointCompletionResult(None,None,(),0.,rejection_reason='NO_LEGAL_FOUR_ROBOT_COVER')
 
     if beam_width not in (1, 2):
         raise ValueError('supported joint beam widths are 1 and 2')

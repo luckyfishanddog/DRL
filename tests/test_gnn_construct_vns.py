@@ -4740,3 +4740,114 @@ def test_imitation_resume_reuses_completed_b32_after_csv_permission_failure(monk
     e.imitation_pilot()
     assert len(calls)==len(set(calls))==len(written)==6
 
+
+def test_routeaware_retains_higher_processing_lower_move_without_changing_original_band():
+    from types import SimpleNamespace
+    e,c,_,_,_=_imitation_fixture()
+    actions=[SimpleNamespace(parent_id=str(i),robots=(i%4,),pattern=SimpleNamespace(kind=SplitKind.WHOLE))
+             for i in range(20)]
+    space=SimpleNamespace(actions=actions)
+    processing=torch.tensor([[100.,100.,100.,100.]]+[[103.,99.,99.,99.]]*19)
+    scores=torch.arange(20,dtype=torch.float32)
+    original=c.shortlist_assignments(space,torch.arange(20),scores,processing=processing)
+    costs=torch.tensor([[160.,200.,0.,0.]]+[[110.+i,20.+i,4.,1.] for i in range(19)])
+    retained=c.shortlist_assignments(space,torch.arange(20),scores,route_objectives=costs)
+    assert original==(0,)
+    assert 1 in retained and len(retained)<=c.COARSE_ASSIGNMENT_LIMIT
+    assert len({actions[i].robots for i in retained})>1
+    assert len(c.bounded_route_pareto(costs,scores,limit=16))<=16
+
+
+def test_routeaware_features_scores_and_joint_direction_semantics_stay_checkpoint_compatible():
+    e,c,parents,model,record=_imitation_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    state=e.lns.oriented_route_state(((),)*4,((),)*4,{},CONFIG)
+    embeddings=model.encode_static(space.graph)
+    before=model.assignment_features(space,embeddings,state,{},set(space.parent_ids),CONFIG)
+    model.route_aware=True
+    after=model.assignment_features(space,embeddings,state,{},set(space.parent_ids),CONFIG)
+    assert torch.equal(before[0],after[0]) and torch.equal(before[1],after[1])
+    plans,scores=c.vnext_joint_actions(space,embeddings,model,state,{}, {},set(space.parent_ids),CONFIG)
+    assert 0<len(plans)<=16 and torch.allclose(scores,c.imitation_joint_scores(space,embeddings,model,plans))
+    assert all(plan.actions and all(action.direction in (0,1) for action in plan.actions) for plan in plans)
+    assert all(torch.allclose(plan.outcome[:2],torch.stack((plan.assignment_features[-8:-4].max(),
+        plan.assignment_features[-8:-4].max()-plan.assignment_features[-8:-4].min()))) for plan in plans)
+    result=c.construct_vnext_gnn(parents,model,CONFIG)
+    assert result.solution is not None and all(route.block_ids for route in result.solution.routes)
+    impossible=(ParentWeld('vertical',(2.,4.),(2.,8.)),)
+    rejected=c.construct_vnext_gnn(impossible,model,CONFIG)
+    assert rejected.solution is None and rejected.rejection_reason=='NO_LEGAL_FOUR_ROBOT_COVER'
+
+
+def test_routeaware_real_wait_changes_selected_parent_and_missing_history_has_no_fake_critical_robot():
+    from mrta_reference.model import Operation
+    e,c,parents,model,record=_imitation_fixture()
+    current=e.unpack_directed_plan(parents,record['plan'],c.parent_assignment_space(parents,CONFIG))
+    def choose(parent):
+        op=Operation('observed-WAIT',2,OperationKind.WAIT,0.,20.,(0.,0.),(0.,0.),0,parent+'::whole')
+        schedule=ScheduleResult(ScheduleStatus.FEASIBLE,operations=(op,),cmax=100.,robot_completion=(100.,90.,80.,70.))
+        return e.lns.select_routeaware_bottleneck(current.solution,current.directions,schedule,(),CONFIG,q=2,seed=1)
+    first,info=choose('c');second,_=choose('d')
+    assert set(first.removed_parent_ids)=={'a','c'} and set(second.removed_parent_ids)=={'a','d'}
+    assert info['critical_robot']==0 and info['feedback']['robot_wait'][2]==20.
+    minimal=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.)
+    _,missing=e.lns.select_routeaware_bottleneck(current.solution,current.directions,minimal,(),CONFIG,q=2,seed=1)
+    assert missing['critical_robot'] is None and missing['feedback'] is None
+    metrics=e.routeaware_metrics(current,minimal,historical=dict(wait_s=12.))
+    assert metrics['wait_s']==12. and 'wait_r0_s' not in metrics and 'completion_r0_s' not in metrics
+
+
+def test_routeaware_acceptance_uses_real_cmax_before_processing_and_deadlock_wait_is_partial():
+    from mrta_reference.model import Operation
+    e,c,parents,model,record=_imitation_fixture()
+    incumbent=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.)
+    assert not e.routeaware_improves(replace(incumbent,cmax=101.),dict(processing_spread_s=0.),incumbent,
+                                    dict(processing_spread_s=100.))
+    assert not e.routeaware_improves(ScheduleResult(ScheduleStatus.DEADLOCK),{},incumbent,{})
+    metrics=dict(move_s=10.,processing_spread_s=1.,**{f'wait_r{r}_s':1. for r in range(4)})
+    worse=dict(metrics,wait_r0_s=2.)
+    assert e.routeaware_improves(incumbent,metrics,incumbent,worse)
+    result=e.unpack_directed_plan(parents,record['plan'],c.parent_assignment_space(parents,CONFIG))
+    op=Operation('observed-WAIT',0,OperationKind.WAIT,0.,7.,(0.,0.),(0.,0.),0)
+    deadlock=ScheduleResult(ScheduleStatus.DEADLOCK,operations=(op,))
+    row=e.routeaware_result_row('fixture','GNN-RouteAware',result,deadlock,())
+    assert row['partial_wait_s']==7. and 'wait_s' not in row and 'wait_r0_s' not in row
+    restored=e.routeaware_schedule(row)
+    assert restored.operations==deadlock.operations and restored.canonical_json()==deadlock.canonical_json()
+
+
+def test_routeaware_full_schedule_and_wait_evidence_persist_without_repeat_b32(monkeypatch):
+    from mrta_reference.scheduler import ScheduleWaitBlockers
+    e,c,parents,model,record=_imitation_fixture()
+    result=e.unpack_directed_plan(parents,record['plan'],c.parent_assignment_space(parents,CONFIG))
+    blocks=block_map(result.solution,CONFIG)
+    ops=tuple(op for r,route in enumerate(result.solution.routes) for op in e.build_operation_templates(
+        e.RobotRoute(r,tuple(blocks[b] for b in route.block_ids),result.directions[r]),CONFIG))
+    completion=tuple(max(op.end_time for op in ops if op.robot_id==r) for r in range(4))
+    schedule=ScheduleResult(ScheduleStatus.FEASIBLE,ops,max(completion),completion,directions=result.directions)
+    wait=replace(ops[0],operation_id='WAIT',kind=OperationKind.WAIT,end_time=3.)
+    event=ScheduleWaitBlockers(wait,ops[0],ops[0].block_id,(('blocker','b::whole',((0.,3.),)),))
+    row=e.routeaware_result_row('fixture','GNN-RouteAware',result,schedule,(event,))
+    restored=e.routeaware_schedule(row)
+    assert restored.canonical_json()==schedule.canonical_json()
+    assert e.routeaware_wait_blockers(row)==(event,)
+    seen={e.plan_key(result.solution,result.directions):restored}
+    monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('repeated B32 on a persisted full plan'))
+    assert e.evaluate_once(result,seen,blocker_cache={})==(restored,False)
+
+
+def test_routeaware_history_skips_old_text_notes_and_reuses_known_plan_without_timeline(monkeypatch):
+    import json
+    e,c,parents,model,record=_imitation_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    row=dict(layout_id='fixture',status='FEASIBLE',cmax_s='1000.',
+             diagnostic=json.dumps(dict(solution=record['plan'])))
+    monkeypatch.setattr(e,'read_rows',lambda path:[dict(row,diagnostic='old failure note'),row]
+                        if path==e.PPO_RESULTS else [])
+    seen,blockers,records=e.routeaware_history('fixture',parents,space)
+    result=e.deadlock_plan(parents,record['plan'],space)
+    key=e.plan_key(result.solution,result.directions)
+    assert len(seen)==1 and seen[key].feasible and not seen[key].operations
+    monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('historical plan repeated'))
+    assert e.evaluate_once(result,seen,blocker_cache=blockers)[1] is False
+

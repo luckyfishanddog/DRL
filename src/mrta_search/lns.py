@@ -527,6 +527,60 @@ def schedule_feedback_summary(current, schedule, blockers, config):
                 block_processing=block_processing, block_move=block_move, block_wait=block_wait)
 
 
+def select_routeaware_bottleneck(current, directions, schedule, blockers, config, *, q, seed,
+                                 assignment_space=None):
+    """Use the real critical/WAIT parents plus a costly directed route arc.
+
+    Historical cached schedules without operations have no measured completion
+    or WAIT. Their fallback selects actual MOVE arc endpoints and neighbours;
+    it never invents a critical robot from ScheduleResult's zero defaults.
+    Both callers use the same q/seed stream and whole-parent removal.
+    """
+    if not schedule.feasible:
+        raise ValueError('route feedback requires a feasible schedule')
+    if not 1 <= q <= len(current.parents):
+        raise ValueError('invalid parent removal count')
+    blocks = block_map(current, config)
+    state = oriented_route_state(tuple(r.block_ids for r in current.routes), directions, blocks, config)
+    arcs = sorted(((cost,r,i) for r,values in enumerate(state.arc_costs) for i,cost in enumerate(values)),
+                  key=lambda item: (-item[0],item[1],item[2]))
+    anchors=[];feedback=None
+    if schedule.operations:
+        feedback=schedule_feedback_summary(current,schedule,blockers,config)
+        critical=max(range(4),key=lambda r:(schedule.robot_completion[r],-r))
+        critical_parents={_parent_id(b) for b in current.routes[critical].block_ids}
+        anchors.append(min(critical_parents,key=lambda p:(-feedback['parent_costs'][p][critical],p)))
+        waits=sorted((p for p,w in feedback['parent_wait'].items() if w>config.numeric_epsilon),
+                     key=lambda p:(-feedback['parent_wait'][p],p))
+        if waits:
+            anchors.append(waits[0])
+        # Exact selected-rollout blocking intervals, not geometric proximity.
+        blocked=sorted(feedback['parent_blocked'],key=lambda p:(-feedback['parent_blocked'][p],p))
+        anchors.extend(blocked[:1])
+        fallback=select_feedback_bottleneck(current,feedback,q=q,seed=seed,assignment_space=assignment_space)
+        fill=list(fallback.removed_parent_ids)
+    else:
+        critical=None
+        fill=sorted(p.parent_id for p in current.parents)
+        random.Random(seed).shuffle(fill)
+    if arcs:
+        _,robot,index=arcs[(seed % min(3,len(arcs)))]
+        route=state.routes[robot]
+        anchors.extend(_parent_id(route[i]) for i in (index,index+1))
+        neighbours=[_parent_id(route[i]) for i in (index-1,index+2) if 0<=i<len(route)]
+    else:
+        neighbours=[]
+    selected=list(dict.fromkeys((*anchors,*neighbours,*fill)))[:q]
+    if len(selected)<q:
+        selected.extend(p for p in sorted(b.parent_id for b in current.parents) if p not in selected)
+        selected=selected[:q]
+    return _remove_parent_set(current,selected), dict(
+        source='B32 critical/WAIT + directed MOVE' if feedback is not None else
+               'historical timeline missing; directed MOVE only',
+        critical_robot=critical,anchors=list(dict.fromkeys(anchors)),
+        feedback=feedback)
+
+
 def select_feedback_bottleneck(current, feedback, *, q, seed, assignment_space=None):
     """Remove about 70% from the real critical robot, closing whole parents.
 

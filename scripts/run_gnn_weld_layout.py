@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 
 from mrta_reference.geometry import optimize_directions, oriented_endpoints
 from mrta_reference.model import DeadlockBlockage, Operation, OperationKind, ParentWeld, RobotRoute, ScheduleResult, ScheduleStatus, ScientificConfig
-from mrta_reference.scheduler import build_operation_templates, earliest_safe_start, selected_schedule_wait_blockers
+from mrta_reference.scheduler import ScheduleWaitBlockers, build_operation_templates, earliest_safe_start, selected_schedule_wait_blockers
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
 from mrta_baselines import AdaptedHGAConfig, AdaptedWAGConfig, run_adapted_hga_v2, run_adapted_wag_vns_v2
@@ -4428,9 +4428,311 @@ def imitation_deadlock_pilot(*, resume_unresolved=False):
     return final
 
 
+ROUTEAWARE_RESULTS = FINAL_RESULTS/'gnn_routeaware_pilot.csv'
+ROUTEAWARE_ROUNDS = 6
+ROUTEAWARE_FIELDS = ('stage','layout_id','parent_count','seed','method','round','candidate_rank','origin_round',
+    'removed_parent_ids','status','cmax_s',
+    *(f'{kind}_r{r}_s' for kind in ('processing','move','wait','completion') for r in range(4)),
+    *(f'robot_task_count_r{r}' for r in range(4)),
+    'max_processing_s','processing_spread_s','move_s','wait_s','partial_wait_s','metrics_missing_reason',
+    'runtime_s','construct_s','b32_s','b32_calls','cache_hits','blocked_operation_count',
+    'wait_for_graph','deadlock_blockages','solution','schedule','wait_blockers','feedback','diagnostic')
+
+
+def routeaware_write(rows):
+    with ROUTEAWARE_RESULTS.open('a' if ROUTEAWARE_RESULTS.exists() else 'w',encoding='utf-8',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=ROUTEAWARE_FIELDS)
+        if stream.tell()==0:
+            writer.writeheader()
+        writer.writerows({k:row.get(k) for k in ROUTEAWARE_FIELDS} for row in rows)
+        stream.flush()
+
+
+def routeaware_operation(value):
+    return Operation(**dict(value,kind=OperationKind(value['kind']),
+                            start=tuple(value['start']),end=tuple(value['end'])))
+
+
+def routeaware_schedule(row):
+    schedule=deadlock_schedule(row)
+    if not row.get('schedule'):
+        return schedule
+    data=json.loads(row['schedule'])
+    operations=tuple(Operation(op['id'],op['robot'],OperationKind(op['kind']),op['start_time'],op['end_time'],
+                               tuple(op['start']),tuple(op['end']),op['sequence'],op['block'])
+                     for op in data['operations'])
+    return replace(schedule,operations=operations,robot_completion=tuple(data['completion']),
+                   directions=tuple(tuple(d) for d in data['directions']),diagnostics=tuple(data['diagnostics']))
+
+
+def routeaware_wait_blockers(row):
+    return tuple(ScheduleWaitBlockers(routeaware_operation(event['waiting']),
+        routeaware_operation(event['delayed_operation']),event['delayed_block_id'],
+        tuple((op,block,tuple(tuple(interval) for interval in intervals))
+              for op,block,intervals in event['blocker_intervals']))
+        for event in json.loads(row.get('wait_blockers') or '[]'))
+
+
+def routeaware_metrics(result,schedule,*,historical=None):
+    """Full P/M from B32 templates; full W/C only from a feasible timeline."""
+    blocks=block_map(result.solution,CONFIG,scope=FORMAL_SCOPE_V2)
+    processing=[0.]*4;move=[0.]*4;wait=[0.]*4
+    for r,route in enumerate(result.solution.routes):
+        robot_route=RobotRoute(r,tuple(blocks[b] for b in route.block_ids),result.directions[r])
+        for op in build_operation_templates(robot_route,CONFIG):
+            (move if op.kind is OperationKind.MOVE else processing)[r]+=op.duration
+    for op in schedule.operations:
+        if op.kind is OperationKind.WAIT:
+            wait[op.robot_id]+=op.duration
+    metrics=dict(**{f'processing_r{r}_s':p for r,p in enumerate(processing)},
+        **{f'move_r{r}_s':m for r,m in enumerate(move)},
+        **{f'robot_task_count_r{r}':len(route.block_ids) for r,route in enumerate(result.solution.routes)},
+        max_processing_s=max(processing),processing_spread_s=max(processing)-min(processing),move_s=sum(move))
+    if schedule.feasible and schedule.operations:
+        metrics.update(**{f'wait_r{r}_s':w for r,w in enumerate(wait)},
+                       **{f'completion_r{r}_s':c for r,c in enumerate(schedule.robot_completion)},wait_s=sum(wait))
+        # Ordinary data consistency check, never another scheduler or Cmax model.
+        for r in range(4):
+            if not math.isclose(processing[r]+move[r]+wait[r],schedule.robot_completion[r],abs_tol=1e-6):
+                raise ValueError('B32 timeline does not match complete P/M/W')
+    elif schedule.feasible:
+        metrics.update(wait_s=(historical or {}).get('wait_s'),
+                       metrics_missing_reason='historical full timeline missing; per-robot WAIT/completion unavailable; no repeated B32')
+    else:
+        metrics.update(partial_wait_s=sum(wait) if schedule.operations else
+                       (historical or {}).get('partial_wait_s',(historical or {}).get('wait_s')),
+                       metrics_missing_reason='non-feasible timeline is partial; full WAIT/completion unavailable')
+    return metrics
+
+
+def routeaware_improves(candidate,metrics,incumbent,incumbent_metrics):
+    if not candidate.feasible:
+        return False
+    if incumbent is None or not incumbent.feasible:
+        return True
+    if candidate.cmax!=incumbent.cmax:
+        return candidate.cmax<incumbent.cmax
+    if all(m.get(f'wait_r{r}_s') not in (None,'') for m in (metrics,incumbent_metrics) for r in range(4)):
+        first=max(float(metrics[f'wait_r{r}_s']) for r in range(4))
+        second=max(float(incumbent_metrics[f'wait_r{r}_s']) for r in range(4))
+        if first!=second:
+            return first<second
+    return (float(metrics['move_s']),float(metrics['processing_spread_s'])) < (
+            float(incumbent_metrics['move_s']),float(incumbent_metrics['processing_spread_s']))
+
+
+def routeaware_history(name,parents,space):
+    """Use existing (patterns,routes,directions) keys across both experiments."""
+    seen={};blockers={};records={}
+    sources=[]
+    for path in (PPO_RESULTS,IMITATION_RESULTS):
+        for row in read_rows(path):
+            if row.get('layout_id')!=name:
+                continue
+            diagnostic=row.get('diagnostic') or '{}'
+            if not diagnostic.lstrip().startswith('{'):
+                continue  # Older numeric-failure notes carry no saved plan.
+            detail=json.loads(diagnostic)
+            if detail.get('solution'):
+                sources.append(dict(row,solution=json.dumps(detail['solution']),
+                                    diagnostic=json.dumps(dict(schedule_diagnostics=detail.get('schedule_diagnostic',())))))
+    sources.extend(r for r in read_rows(DEADLOCK_RESULTS) if r['layout_id']==name and r.get('solution'))
+    sources.extend(r for r in read_rows(ROUTEAWARE_RESULTS) if r['layout_id']==name and r.get('solution'))
+    for row in sources:
+        if row.get('status') not in {status.value for status in ScheduleStatus}:
+            continue
+        result=deadlock_plan(parents,row['solution'],space)
+        key=plan_key(result.solution,result.directions)
+        schedule=routeaware_schedule(row)
+        # Do not replace saved full timelines with minimal historical records.
+        if key in seen and seen[key].operations and not schedule.operations:
+            continue
+        seen[key]=schedule;records[key]=row
+        blockers[key]=routeaware_wait_blockers(row)
+    return seen,blockers,records
+
+
+def routeaware_result_row(name,method,result,schedule,events,*,historical=None,**values):
+    return dict(layout_id=name,parent_count=len(result.solution.parents),seed=SEED,method=method,
+        status=schedule.status.value,cmax_s=schedule.cmax if schedule.feasible else None,
+        **routeaware_metrics(result,schedule,historical=historical),
+        blocked_operation_count=len(schedule.deadlock_blockages),
+        wait_for_graph=json.dumps(schedule.wait_for_graph),
+        deadlock_blockages=json.dumps([asdict(item) for item in schedule.deadlock_blockages]),
+        solution=json.dumps(pack_directed_plan(result)),
+        schedule=schedule.canonical_json() if schedule.operations else None,
+        wait_blockers=json.dumps([asdict(event) for event in events]),
+        diagnostic=json.dumps(dict(schedule_diagnostics=schedule.diagnostics,
+            evidence_source=schedule.deadlock_evidence_source),ensure_ascii=False),**values)
+
+
+@torch.no_grad()
+def routeaware_case(name,parents,model,method):
+    previous=[r for r in read_rows(ROUTEAWARE_RESULTS) if r['layout_id']==name and r['method']==method]
+    if any(r['stage']=='final' for r in previous):
+        return next(r for r in reversed(previous) if r['stage']=='final')
+    started=time.perf_counter()
+    space=gnn.parent_assignment_space(parents,CONFIG)
+    seen,blockers,records=routeaware_history(name,parents,space)
+    embeddings=model.encode_static(space.graph)
+    model.route_aware=method=='GNN-RouteAware'
+    initial_rows=[r for r in previous if r['stage']=='initial']
+    if initial_rows:
+        initial_row=initial_rows[-1]
+        initial=deadlock_plan(parents,initial_row['solution'],space)
+    else:
+        construction=time.perf_counter()
+        initial=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,embeddings=embeddings)
+        construction=time.perf_counter()-construction
+        if initial.solution is None:
+            row=dict(stage='final',layout_id=name,method=method,seed=SEED,status='INFEASIBLE',
+                     b32_calls=0,cache_hits=0,runtime_s=time.perf_counter()-started,diagnostic=initial.rejection_reason)
+            routeaware_write([row]);return row
+        if method=='GNN-Original':
+            old=next(r for r in read_rows(IMITATION_RESULTS) if r['layout_id']==name and r['method']=='GNN_IMITATION')
+            old_plan=deadlock_plan(parents,json.loads(old['diagnostic'])['solution'],space)
+            if plan_key(initial.solution,initial.directions)!=plan_key(old_plan.solution,old_plan.directions):
+                raise ValueError(f'{name}: original construction did not reproduce archived full plan')
+        key=plan_key(initial.solution,initial.directions)
+        evaluation=time.perf_counter()
+        schedule,called=evaluate_once(initial,seen,blocker_cache=blockers)
+        elapsed=time.perf_counter()-evaluation
+        initial_row=routeaware_result_row(name,method,initial,schedule,blockers.get(key,()),
+            historical=records.get(key),stage='initial',round=0,candidate_rank=0,b32_calls=int(called),
+            cache_hits=int(not called),construct_s=construction,b32_s=elapsed if called else 0.,
+            runtime_s=time.perf_counter()-started)
+        detail=json.loads(initial_row['diagnostic'])
+        detail.update(checkpoint=str(IMITATION_MODEL.relative_to(ROOT)),seed=SEED,
+            scientific_parameters=CONFIG.scientific_mapping(),scope='FORMAL_SCOPE_V2',
+            reconstruction_rounds=ROUTEAWARE_ROUNDS,beam_width=2,initial_width=1,
+            original_full_plan_reproduced=method=='GNN-Original')
+        initial_row['diagnostic']=json.dumps(detail,ensure_ascii=False)
+        routeaware_write([initial_row]);previous.append(initial_row);records[key]=initial_row
+        print('ROUTEAWARE_INITIAL',name,method,initial_row['status'],initial_row['cmax_s'],'new_B32',int(called),flush=True)
+    initial_key=plan_key(initial.solution,initial.directions)
+    current=initial;current_row=initial_row;current_schedule=seen[initial_key]
+    best=initial if current_schedule.feasible else None
+    best_row=initial_row if best else None
+    best_schedule=current_schedule if best else None
+    rounds=sorted((r for r in previous if r['stage']=='round'),key=lambda r:int(r['round']))
+    if rounds:
+        current_row=rounds[-1]
+        current=deadlock_plan(parents,current_row['solution'],space)
+        current_schedule=seen[plan_key(current.solution,current.directions)]
+        feasible=[r for r in previous if r.get('status')=='FEASIBLE' and r.get('solution')]
+        for row in feasible:
+            result=deadlock_plan(parents,row['solution'],space)
+            schedule=seen[plan_key(result.solution,result.directions)]
+            if routeaware_improves(schedule,row,best_schedule,best_row):
+                best,best_row,best_schedule=result,row,schedule
+    first_round=int(rounds[-1]['round'])+1 if rounds else 1
+    for round_index in range(first_round,ROUTEAWARE_ROUNDS+1):
+        round_started=time.perf_counter()
+        origin_round=current_row['round']
+        key=plan_key(current.solution,current.directions)
+        if current_schedule.feasible:
+            partial,feedback=lns.select_routeaware_bottleneck(current.solution,current.directions,current_schedule,
+                blockers.get(key,()),CONFIG,q=min(len(parents),max(4,round(.1*len(parents)))),
+                seed=SEED+round_index,assignment_space=space)
+        elif current_schedule.status is ScheduleStatus.DEADLOCK:
+            partial=lns.select_deadlock_blocker_parents(current.solution,current_schedule,CONFIG,
+                                                       neighbour_layers=1 if round_index%2 else 2)
+            feedback=dict(source='structured B32 DEADLOCK blockers')
+        else:
+            partial=None;feedback=dict(source='no valid feasible/deadlock origin')
+        construction=time.perf_counter()
+        rebuilt=deadlock_reconstruct(current,partial,model,space,embeddings) if partial is not None else None
+        construction=time.perf_counter()-construction
+        candidates=() if rebuilt is None else (rebuilt.candidates or ((rebuilt,) if rebuilt.solution is not None else ()))[:2]
+        outcomes=[]
+        for rank,candidate in enumerate(candidates):
+            candidate_key=plan_key(candidate.solution,candidate.directions)
+            evaluation=time.perf_counter()
+            schedule,called=evaluate_once(candidate,seen,blocker_cache=blockers)
+            elapsed=time.perf_counter()-evaluation
+            row=routeaware_result_row(name,method,candidate,schedule,blockers.get(candidate_key,()),
+                historical=records.get(candidate_key),stage='candidate',round=round_index,candidate_rank=rank,
+                origin_round=origin_round,removed_parent_ids=json.dumps(partial.removed_parent_ids),
+                b32_calls=int(called),cache_hits=int(not called),b32_s=elapsed if called else 0.,
+                runtime_s=elapsed,feedback=json.dumps(feedback))
+            # A resumed unfinished round reuses its saved evaluation and row.
+            saved=next((r for r in previous if r['stage']=='candidate' and int(r['round'])==round_index
+                        and int(r['candidate_rank'])==rank),None)
+            if saved is None:
+                routeaware_write([row]);previous.append(row)
+            else:
+                row=saved
+            records[candidate_key]=row
+            outcomes.append((candidate,schedule,row))
+            if routeaware_improves(schedule,row,best_schedule,best_row):
+                best,best_schedule,best_row=candidate,schedule,row
+            print('ROUTEAWARE_CANDIDATE',name,method,round_index,rank,schedule.status.value,schedule.cmax,
+                  'new_B32',int(called),'removed',len(partial.removed_parent_ids),flush=True)
+        if best is not None:
+            current,current_schedule,current_row=best,best_schedule,best_row
+        else:
+            deadlocks=[entry for entry in outcomes if entry[1].status is ScheduleStatus.DEADLOCK]
+            if deadlocks:
+                current,current_schedule,current_row=min(deadlocks,key=lambda entry:(
+                    len(entry[1].deadlock_blockages),float(entry[2]['move_s']),float(entry[2]['processing_spread_s'])))
+        row=dict(current_row,stage='round',round=round_index,origin_round=origin_round,b32_calls=0,cache_hits=0,
+                 construct_s=construction,b32_s=0.,runtime_s=time.perf_counter()-round_started,
+                 removed_parent_ids=json.dumps(partial.removed_parent_ids) if partial else '[]',
+                 feedback=json.dumps(feedback))
+        if not candidates:
+            row['diagnostic']=json.dumps(dict(rejection=rebuilt.rejection_reason if rebuilt else 'no mapped feedback'))
+        routeaware_write([row]);previous.append(row)
+    row=dict(best_row if best is not None else current_row,stage='final',round=ROUTEAWARE_ROUNDS,
+        runtime_s=sum(float(r.get('runtime_s') or 0) for r in previous if r['stage'] in ('initial','round')),
+        construct_s=sum(float(r.get('construct_s') or 0) for r in previous if r['stage'] in ('initial','round')),
+        b32_s=sum(float(r.get('b32_s') or 0) for r in previous if r['stage'] in ('initial','candidate')),
+        b32_calls=sum(int(r.get('b32_calls') or 0) for r in previous if r['stage'] in ('initial','candidate')),
+        cache_hits=sum(int(r.get('cache_hits') or 0) for r in previous if r['stage'] in ('initial','candidate')))
+    routeaware_write([row])
+    print('ROUTEAWARE_FINAL',json.dumps({k:row.get(k) for k in ('layout_id','method','status','cmax_s','move_s',
+        'wait_s','runtime_s','b32_calls','cache_hits')}),flush=True)
+    return row
+
+
+def imitation_routeaware_pilot():
+    configure_cpu()
+    # The only new artifact was explicitly approved by the user. Opening it
+    # before B32 also makes a denied destination fail without losing a run.
+    routeaware_write([])
+    done={(r['layout_id'],r['method']) for r in read_rows(ROUTEAWARE_RESULTS) if r['stage']=='reference'}
+    for old in read_rows(IMITATION_RESULTS):
+        if old['layout_id'] not in IMITATION_CASES or old['method'] not in ('WAG+VNS','HGA'):
+            continue
+        if (old['layout_id'],old['method']) in done:
+            continue
+        detail=json.loads(old['diagnostic'])
+        if int(old['seed'])!=SEED or detail['iterations']!=BASELINE_ITERATIONS[old['method']]:
+            raise ValueError('historical classical reference has a different seed/budget')
+        loads=[float(old[f'processing_r{r}_s']) for r in range(4)]
+        row=dict(old,stage='reference',b32_calls=0,cache_hits=1,processing_spread_s=max(loads)-min(loads),
+            metrics_missing_reason='historical baseline has no saved full routes/timeline; per-robot MOVE/WAIT/completion and task counts unavailable',
+            diagnostic=json.dumps(dict(reference=detail,scientific_parameters=CONFIG.scientific_mapping(),
+                scope='FORMAL_SCOPE_V2',budget_note='historical WAG500/HGA200000; different from GNN 6x2; descriptive comparison only'),
+                ensure_ascii=False))
+        routeaware_write([row])
+    torch.manual_seed(SEED)
+    saved=torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)
+    model=imitation_model(saved['state_dict']).eval()
+    layouts=dict(ppo_layouts('validation'))
+    finals=[]
+    for method in ('GNN-Original','GNN-RouteAware'):
+        for name in IMITATION_CASES:
+            finals.append(routeaware_case(name,layouts[name],model,method))
+    print('ROUTEAWARE_SUMMARY',json.dumps({method:dict(
+        feasible=sum(r['status']=='FEASIBLE' for r in finals if r['method']==method),
+        b32_calls=sum(int(r['b32_calls']) for r in finals if r['method']==method))
+        for method in ('GNN-Original','GNN-RouteAware')}),flush=True)
+    return finals
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -4444,7 +4746,8 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'imitation-deadlock-pilot':imitation_deadlock_pilot(resume_unresolved=args.resume_unresolved)
+    if args.stage == 'imitation-routeaware-pilot':imitation_routeaware_pilot()
+    elif args.stage == 'imitation-deadlock-pilot':imitation_deadlock_pilot(resume_unresolved=args.resume_unresolved)
     elif args.stage == 'imitation-teachers':imitation_teachers(args.workers)
     elif args.stage == 'imitation-train':imitation_train()
     elif args.stage == 'imitation-select':imitation_select()
