@@ -4439,8 +4439,9 @@ ROUTEAWARE_FIELDS = ('stage','layout_id','parent_count','seed','method','round',
     'wait_for_graph','deadlock_blockages','solution','schedule','wait_blockers','feedback','diagnostic')
 
 
-def routeaware_write(rows):
-    with ROUTEAWARE_RESULTS.open('a' if ROUTEAWARE_RESULTS.exists() else 'w',encoding='utf-8',newline='') as stream:
+def routeaware_write(rows, *, path=None):
+    path=ROUTEAWARE_RESULTS if path is None else path
+    with path.open('a' if path.exists() else 'w',encoding='utf-8',newline='') as stream:
         writer=csv.DictWriter(stream,fieldnames=ROUTEAWARE_FIELDS)
         if stream.tell()==0:
             writer.writeheader()
@@ -4521,7 +4522,7 @@ def routeaware_improves(candidate,metrics,incumbent,incumbent_metrics):
             float(incumbent_metrics['move_s']),float(incumbent_metrics['processing_spread_s']))
 
 
-def routeaware_history(name,parents,space):
+def routeaware_history(name,parents,space,*,extra_rows=()):
     """Use existing (patterns,routes,directions) keys across both experiments."""
     seen={};blockers={};records={}
     sources=[]
@@ -4538,6 +4539,7 @@ def routeaware_history(name,parents,space):
                                     diagnostic=json.dumps(dict(schedule_diagnostics=detail.get('schedule_diagnostic',())))))
     sources.extend(r for r in read_rows(DEADLOCK_RESULTS) if r['layout_id']==name and r.get('solution'))
     sources.extend(r for r in read_rows(ROUTEAWARE_RESULTS) if r['layout_id']==name and r.get('solution'))
+    sources.extend(r for r in extra_rows if r['layout_id']==name and r.get('solution'))
     for row in sources:
         if row.get('status') not in {status.value for status in ScheduleStatus}:
             continue
@@ -4567,27 +4569,37 @@ def routeaware_result_row(name,method,result,schedule,events,*,historical=None,*
 
 
 @torch.no_grad()
-def routeaware_case(name,parents,model,method):
-    previous=[r for r in read_rows(ROUTEAWARE_RESULTS) if r['layout_id']==name and r['method']==method]
+def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lambda=None,
+                    round_limit=ROUTEAWARE_ROUNDS):
+    path=ROUTEAWARE_RESULTS if result_path is None else result_path
+    all_rows=read_rows(path)
+    previous=[r for r in all_rows if r['layout_id']==name and r['method']==method]
     if any(r['stage']=='final' for r in previous):
         return next(r for r in reversed(previous) if r['stage']=='final')
     started=time.perf_counter()
     space=gnn.parent_assignment_space(parents,CONFIG)
-    seen,blockers,records=routeaware_history(name,parents,space)
+    seen,blockers,records=routeaware_history(name,parents,space,extra_rows=all_rows if result_path is not None else ())
     embeddings=model.encode_static(space.graph)
     model.route_aware=method=='GNN-RouteAware'
+    model.load_first_lambda=load_first_lambda
+    write=lambda rows:routeaware_write(rows,path=path)
     initial_rows=[r for r in previous if r['stage']=='initial']
     if initial_rows:
         initial_row=initial_rows[-1]
         initial=deadlock_plan(parents,initial_row['solution'],space)
     else:
         construction=time.perf_counter()
-        initial=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,embeddings=embeddings)
-        construction=time.perf_counter()-construction
+        screens=[r for r in previous if r['stage']=='screen' and r.get('solution')]
+        if screens:
+            initial=deadlock_plan(parents,screens[-1]['solution'],space)
+            construction=float(screens[-1]['construct_s'])
+        else:
+            initial=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,embeddings=embeddings)
+            construction=time.perf_counter()-construction
         if initial.solution is None:
             row=dict(stage='final',layout_id=name,method=method,seed=SEED,status='INFEASIBLE',
                      b32_calls=0,cache_hits=0,runtime_s=time.perf_counter()-started,diagnostic=initial.rejection_reason)
-            routeaware_write([row]);return row
+            write([row]);return row
         if method=='GNN-Original':
             old=next(r for r in read_rows(IMITATION_RESULTS) if r['layout_id']==name and r['method']=='GNN_IMITATION')
             old_plan=deadlock_plan(parents,json.loads(old['diagnostic'])['solution'],space)
@@ -4600,14 +4612,15 @@ def routeaware_case(name,parents,model,method):
         initial_row=routeaware_result_row(name,method,initial,schedule,blockers.get(key,()),
             historical=records.get(key),stage='initial',round=0,candidate_rank=0,b32_calls=int(called),
             cache_hits=int(not called),construct_s=construction,b32_s=elapsed if called else 0.,
-            runtime_s=time.perf_counter()-started)
+            runtime_s=time.perf_counter()-started+(construction if screens else 0.))
         detail=json.loads(initial_row['diagnostic'])
         detail.update(checkpoint=str(IMITATION_MODEL.relative_to(ROOT)),seed=SEED,
             scientific_parameters=CONFIG.scientific_mapping(),scope='FORMAL_SCOPE_V2',
-            reconstruction_rounds=ROUTEAWARE_ROUNDS,beam_width=2,initial_width=1,
+            reconstruction_rounds=round_limit,beam_width=2,initial_width=1,
+            load_first_lambda=load_first_lambda,maximum_reconstruction_attempts=2*round_limit,
             original_full_plan_reproduced=method=='GNN-Original')
         initial_row['diagnostic']=json.dumps(detail,ensure_ascii=False)
-        routeaware_write([initial_row]);previous.append(initial_row);records[key]=initial_row
+        write([initial_row]);previous.append(initial_row);records[key]=initial_row
         print('ROUTEAWARE_INITIAL',name,method,initial_row['status'],initial_row['cmax_s'],'new_B32',int(called),flush=True)
     initial_key=plan_key(initial.solution,initial.directions)
     current=initial;current_row=initial_row;current_schedule=seen[initial_key]
@@ -4626,18 +4639,22 @@ def routeaware_case(name,parents,model,method):
             if routeaware_improves(schedule,row,best_schedule,best_row):
                 best,best_row,best_schedule=result,row,schedule
     first_round=int(rounds[-1]['round'])+1 if rounds else 1
-    for round_index in range(first_round,ROUTEAWARE_ROUNDS+1):
+    for round_index in range(first_round,round_limit+1):
         round_started=time.perf_counter()
         origin_round=current_row['round']
         key=plan_key(current.solution,current.directions)
+        q=min(len(parents),max(6,min(12,round(.08*len(parents))+((round_index-1)//5)%3)))
         if current_schedule.feasible:
             partial,feedback=lns.select_routeaware_bottleneck(current.solution,current.directions,current_schedule,
-                blockers.get(key,()),CONFIG,q=min(len(parents),max(4,round(.1*len(parents)))),
-                seed=SEED+round_index,assignment_space=space)
+                blockers.get(key,()),CONFIG,
+                q=q if load_first_lambda is not None else min(len(parents),max(4,round(.1*len(parents)))),
+                seed=SEED+round_index,assignment_space=space,load_first=load_first_lambda is not None)
         elif current_schedule.status is ScheduleStatus.DEADLOCK:
             partial=lns.select_deadlock_blocker_parents(current.solution,current_schedule,CONFIG,
-                                                       neighbour_layers=1 if round_index%2 else 2)
-            feedback=dict(source='structured B32 DEADLOCK blockers')
+                **(dict(neighbour_layers=1,max_parents=max(4,q),seed=SEED+round_index)
+                   if load_first_lambda is not None else dict(neighbour_layers=1 if round_index%2 else 2)))
+            feedback=dict(source='bounded structured B32 DEADLOCK blockers' if load_first_lambda is not None else
+                          'structured B32 DEADLOCK blockers',max_parents=q if load_first_lambda is not None else None)
         else:
             partial=None;feedback=dict(source='no valid feasible/deadlock origin')
         construction=time.perf_counter()
@@ -4659,7 +4676,7 @@ def routeaware_case(name,parents,model,method):
             saved=next((r for r in previous if r['stage']=='candidate' and int(r['round'])==round_index
                         and int(r['candidate_rank'])==rank),None)
             if saved is None:
-                routeaware_write([row]);previous.append(row)
+                write([row]);previous.append(row)
             else:
                 row=saved
             records[candidate_key]=row
@@ -4681,14 +4698,19 @@ def routeaware_case(name,parents,model,method):
                  feedback=json.dumps(feedback))
         if not candidates:
             row['diagnostic']=json.dumps(dict(rejection=rebuilt.rejection_reason if rebuilt else 'no mapped feedback'))
-        routeaware_write([row]);previous.append(row)
-    row=dict(best_row if best is not None else current_row,stage='final',round=ROUTEAWARE_ROUNDS,
+        if load_first_lambda is not None:
+            # The initial/candidate row already holds the complete timeline.
+            # Retain the ordinary full-plan tuple for resume, without copying
+            # the same operations into every round checkpoint.
+            row.update(schedule='',wait_blockers='')
+        write([row]);previous.append(row)
+    row=dict(best_row if best is not None else current_row,stage='final',round=round_limit,
         runtime_s=sum(float(r.get('runtime_s') or 0) for r in previous if r['stage'] in ('initial','round')),
         construct_s=sum(float(r.get('construct_s') or 0) for r in previous if r['stage'] in ('initial','round')),
         b32_s=sum(float(r.get('b32_s') or 0) for r in previous if r['stage'] in ('initial','candidate')),
         b32_calls=sum(int(r.get('b32_calls') or 0) for r in previous if r['stage'] in ('initial','candidate')),
         cache_hits=sum(int(r.get('cache_hits') or 0) for r in previous if r['stage'] in ('initial','candidate')))
-    routeaware_write([row])
+    write([row])
     print('ROUTEAWARE_FINAL',json.dumps({k:row.get(k) for k in ('layout_id','method','status','cmax_s','move_s',
         'wait_s','runtime_s','b32_calls','cache_hits')}),flush=True)
     return row
@@ -4730,9 +4752,114 @@ def imitation_routeaware_pilot():
     return finals
 
 
+LOADFIRST_RESULTS=FINAL_RESULTS/'gnn_loadfirst_pilot.csv'
+LOADFIRST_LAMBDAS=(.25,.5,1.)
+LOADFIRST_ROUNDS=50  # Two full proposal slots per round: at most 100 repairs.
+
+
+def loadfirst_method(penalty):
+    return f'LoadFirst-GNN-lambda{penalty:g}'
+
+
+def loadfirst_references():
+    existing={(r['layout_id'],r['method']) for r in read_rows(LOADFIRST_RESULTS) if r['stage']=='reference'}
+    for old in read_rows(ROUTEAWARE_RESULTS):
+        if old['stage'] not in ('reference','final') or old['layout_id'] not in IMITATION_CASES:
+            continue
+        if (old['layout_id'],old['method']) in existing:
+            continue
+        row=dict(old,stage='reference',b32_calls=0,cache_hits=1)
+        detail=json.loads(row.get('diagnostic') or '{}')
+        detail['reused_from']='gnn_routeaware_pilot.csv; historical budget, no repeated B32'
+        row['diagnostic']=json.dumps(detail,ensure_ascii=False)
+        routeaware_write([row],path=LOADFIRST_RESULTS)
+        existing.add((old['layout_id'],old['method']))
+
+
+@torch.no_grad()
+def loadfirst_screen(model,layouts):
+    """Measure P/M before spending the B32 repair budget; save the initial plan."""
+    rows=read_rows(LOADFIRST_RESULTS)
+    done={(r['layout_id'],r['method']) for r in rows if r['stage']=='screen'}
+    refs={(r['layout_id'],r['method']):r for r in rows if r['stage']=='reference'}
+    for penalty in LOADFIRST_LAMBDAS:
+        model.load_first_lambda=penalty;model.route_aware=False
+        for name in IMITATION_CASES:
+            method=loadfirst_method(penalty)
+            if (name,method) in done:
+                continue
+            started=time.perf_counter();violations=[];steps=[]
+            def observe(state,selected,plans,scores):
+                processing=torch.stack([p.assignment_features[-8:-4]*2500. for p in plans])
+                moves=processing.new_tensor([[sum(arcs) for arcs in p.state.arc_costs] for p in plans])
+                values=gnn.loadfirst_proxy(processing,moves,penalty)
+                gap=float(values.max()-values.min())
+                tolerance=max(1.,.001*abs(float(values.min())))
+                if gap>tolerance+1e-3:
+                    violations.append((len(selected),gap,tolerance))
+                steps.append(dict(selected_parent_count=len(selected),candidate_count=len(plans),
+                    best_j=float(values.min()),chosen_j=float(values[int(scores.argmax())])))
+            result=gnn.construct_vnext_gnn(layouts[name],model,CONFIG,step_observer=observe)
+            elapsed=time.perf_counter()-started
+            if result.solution is None:
+                row=dict(stage='screen',layout_id=name,seed=SEED,method=method,status='CONSTRUCTION_FAILED',
+                    b32_calls=0,construct_s=elapsed,diagnostic=json.dumps(dict(rejection=result.rejection_reason)))
+            else:
+                state=lns.oriented_route_state(tuple(r.block_ids for r in result.solution.routes),result.directions,
+                    block_map(result.solution,CONFIG,scope=FORMAL_SCOPE_V2),CONFIG)
+                spread=max(state.loads)-min(state.loads)
+                row=dict(stage='screen',layout_id=name,parent_count=len(layouts[name]),seed=SEED,method=method,
+                    status='UNSCHEDULED',b32_calls=0,construct_s=elapsed,runtime_s=elapsed,
+                    **{f'processing_r{r}_s':p for r,p in enumerate(state.loads)},
+                    **{f'move_r{r}_s':sum(arcs) for r,arcs in enumerate(state.arc_costs)},
+                    **{f'robot_task_count_r{r}':len(route) for r,route in enumerate(state.routes)},
+                    max_processing_s=max(state.loads),processing_spread_s=spread,move_s=state.travel,
+                    solution=json.dumps(pack_directed_plan(result)),
+                    metrics_missing_reason='screen only: B32 has not been called; WAIT/C unknown',
+                    diagnostic=json.dumps(dict(load_first_lambda=penalty,steps=steps,j_band_violations=violations,
+                        spread_change_vs_routeaware=spread-float(refs[name,'GNN-RouteAware']['processing_spread_s']),
+                        move_change_vs_original=state.travel-float(refs[name,'GNN-Original']['move_s']),
+                        four_nonempty_routes=all(state.routes))))
+            routeaware_write([row],path=LOADFIRST_RESULTS)
+            print('LOADFIRST_SCREEN',name,penalty,row['status'],'Pmax',row.get('max_processing_s'),
+                'spread',row.get('processing_spread_s'),'MOVE',row.get('move_s'),'J_violations',len(violations),flush=True)
+    return [r for r in read_rows(LOADFIRST_RESULTS) if r['stage']=='screen']
+
+
+def imitation_loadfirst_pilot(*,screen_only=False):
+    configure_cpu();torch.manual_seed(SEED)
+    routeaware_write([],path=LOADFIRST_RESULTS)
+    loadfirst_references()
+    model=imitation_model(torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)['state_dict']).eval()
+    layouts=dict(ppo_layouts('validation'))
+    screens=loadfirst_screen(model,layouts)
+    if screen_only:
+        return screens
+    finals=[]
+    for penalty in LOADFIRST_LAMBDAS:
+        for name in IMITATION_CASES:
+            finals.append(routeaware_case(name,layouts[name],model,loadfirst_method(penalty),
+                result_path=LOADFIRST_RESULTS,load_first_lambda=penalty,round_limit=LOADFIRST_ROUNDS))
+    summary={}
+    for penalty in LOADFIRST_LAMBDAS:
+        good=[r for r in finals if r['method']==loadfirst_method(penalty) and r['status']=='FEASIBLE']
+        summary[penalty]=dict(feasible=len(good),mean_feasible_cmax_s=sum(float(r['cmax_s']) for r in good)/len(good)
+            if good else None)
+    selected=min(LOADFIRST_LAMBDAS,key=lambda p:(-summary[p]['feasible'],
+        summary[p]['mean_feasible_cmax_s'] if summary[p]['mean_feasible_cmax_s'] is not None else math.inf,p))
+    if not any(r['stage']=='selection' for r in read_rows(LOADFIRST_RESULTS)):
+        routeaware_write([dict(stage='selection',layout_id='',seed=SEED,method='LoadFirst-GNN',b32_calls=0,
+            diagnostic=json.dumps(dict(selected_lambda=selected,summary=summary,
+                rule='maximum feasible cases, then minimum mean feasible Cmax, then smaller lambda')))],path=LOADFIRST_RESULTS)
+        routeaware_write([dict(r,stage='selected_final') for r in finals if r['method']==loadfirst_method(selected)],
+            path=LOADFIRST_RESULTS)
+    print('LOADFIRST_SELECTION',json.dumps(dict(selected_lambda=selected,summary=summary)),flush=True)
+    return finals
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -4746,7 +4873,9 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'imitation-routeaware-pilot':imitation_routeaware_pilot()
+    if args.stage == 'imitation-loadfirst-screen':imitation_loadfirst_pilot(screen_only=True)
+    elif args.stage == 'imitation-loadfirst-pilot':imitation_loadfirst_pilot()
+    elif args.stage == 'imitation-routeaware-pilot':imitation_routeaware_pilot()
     elif args.stage == 'imitation-deadlock-pilot':imitation_deadlock_pilot(resume_unresolved=args.resume_unresolved)
     elif args.stage == 'imitation-teachers':imitation_teachers(args.workers)
     elif args.stage == 'imitation-train':imitation_train()

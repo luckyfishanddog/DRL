@@ -422,7 +422,8 @@ def _remove_parent_set(
     )
 
 
-def select_deadlock_blocker_parents(current, schedule, config, *, neighbour_layers=1):
+def select_deadlock_blocker_parents(current, schedule, config, *, neighbour_layers=1,
+                                    max_parents=None, seed=0):
     """Close direct terminal blocker tasks and one (at most two) route layers.
 
     Uses structured DEADLOCK evidence, including both MOVE endpoints. No WAIT
@@ -436,6 +437,39 @@ def select_deadlock_blocker_parents(current, schedule, config, *, neighbour_laye
     blocks = block_map(current, config)
     known = {p.parent_id for p in current.parents}
     evidence = schedule.deadlock_blockages
+    if max_parents is not None:
+        if max_parents<4:
+            raise ValueError('bounded deadlock selection needs room for both MOVE endpoints')
+        pairs=[]
+        for event in evidence:
+            blocked=set(event.blocked_parent_ids)&known
+            for operation,parents in zip(event.blocker_operations,event.blocker_parent_ids):
+                direct=set(parents)&known
+                if operation is not None and blocked and direct:
+                    pairs.append((event,operation,blocked|direct))
+        if not pairs:
+            return None
+        pairs.sort(key=lambda item:(-item[0].ready_time,item[0].robot_id,item[1].operation_id))
+        event,operation,removed=pairs[seed%len(pairs)]
+        removed=set(removed)
+        # Keep atomic blocked/blocker pairs, including source/destination of
+        # MOVE. Focus one actual blocked robot rather than union every robot's
+        # entire committed prefix. No cycle test is required.
+        for other,_,core in pairs:
+            if other.robot_id==event.robot_id and len(removed|core)<=max_parents-2:
+                removed.update(core)
+        neighbours=[]
+        for route in current.routes:
+            for position,block in enumerate(route.block_ids):
+                if blocks[block].parent_id in removed:
+                    for index in (position-1,position+1):
+                        if 0<=index<len(route.block_ids):
+                            neighbours.append(blocks[route.block_ids[index]].parent_id)
+        for parent in dict.fromkeys(neighbours):
+            if len(removed)>=max_parents:
+                break
+            removed.add(parent)
+        return _remove_parent_set(current,removed)
     blocking = {parent for event in evidence for parents in event.blocker_parent_ids
                 for parent in parents if parent in known}
     if not blocking:
@@ -466,8 +500,19 @@ def schedule_feedback_summary(current, schedule, blockers, config):
     processing, move, robot_wait = [0.] * 4, [0.] * 4, [0.] * 4
     parent_costs = {p.parent_id: [0.] * 4 for p in current.parents}
     parent_wait, parent_blocked, parent_move = {}, {}, {}
+    parent_processing={p.parent_id:[0.]*4 for p in current.parents}
+    critical=max(range(4),key=lambda r:(schedule.robot_completion[r],-r))
+    parent_critical_wait,parent_critical_blocked={},{}
     block_processing, block_move, block_wait = (dict.fromkeys(blocks, 0.) for _ in range(3))
     mapped_wait = {event.waiting.operation_id: event.delayed_block_id for event in blockers}
+    operation_by_id={op.operation_id:op for op in schedule.operations}
+
+    def arc_source(block_id,robot):
+        route=current.routes[robot].block_ids
+        if block_id in route:
+            position=route.index(block_id)
+            return route[position-1] if position else None
+        return None
 
     def block_for(op):
         block_id = mapped_wait.get(op.operation_id, op.block_id)
@@ -492,6 +537,8 @@ def schedule_feedback_summary(current, schedule, blockers, config):
             if parent is not None:
                 parent_wait[parent] = parent_wait.get(parent, 0.) + op.duration
                 block_wait[block_id] += op.duration
+                if op.robot_id==critical:
+                    parent_critical_wait[parent]=parent_critical_wait.get(parent,0.)+op.duration
         elif op.kind is OperationKind.MOVE:
             move[op.robot_id] += op.duration
             if parent is not None:
@@ -501,26 +548,42 @@ def schedule_feedback_summary(current, schedule, blockers, config):
             processing[op.robot_id] += op.duration
             if parent is not None:
                 block_processing[block_id] += op.duration
+                parent_processing[parent][op.robot_id]+=op.duration
         if parent is not None:
             parent_costs[parent][op.robot_id] += op.duration
     for event in blockers:
         by_parent = {}
-        for _, block_id, intervals in event.blocker_intervals:
+        for operation_id, block_id, intervals in event.blocker_intervals:
             if block_id in blocks:
                 by_parent.setdefault(blocks[block_id].parent_id, []).extend(intervals)
+            operation=operation_by_id.get(operation_id)
+            if event.waiting.robot_id==critical and operation is not None and operation.kind is OperationKind.MOVE:
+                source=arc_source(block_id,operation.robot_id)
+                if source in blocks:
+                    parent_critical_blocked[blocks[source].parent_id]=max(
+                        parent_critical_blocked.get(blocks[source].parent_id,0.),sum(hi-lo for lo,hi in intervals))
+        if event.waiting.robot_id==critical and event.delayed_operation.kind is OperationKind.MOVE:
+            source=arc_source(event.delayed_block_id,critical)
+            if source in blocks:
+                parent_critical_wait[blocks[source].parent_id]=max(
+                    parent_critical_wait.get(blocks[source].parent_id,0.),event.waiting.duration)
         for parent, intervals in by_parent.items():
             end, covered = -math.inf, 0.
             for lo, hi in sorted(intervals):
                 covered += max(0., hi - max(lo, end))
                 end = max(end, hi)
             parent_blocked[parent] = parent_blocked.get(parent, 0.) + covered
+            if event.waiting.robot_id==critical:
+                parent_critical_blocked[parent]=parent_critical_blocked.get(parent,0.)+covered
     maximum = max(max(schedule.robot_completion), config.numeric_epsilon)
     peak_load = max(max(processing), config.numeric_epsilon)
     criticality = [schedule.robot_completion[r] / maximum * (.5 + .5 * processing[r] / peak_load)
                    for r in range(4)]
     scores = {parent: sum(cost * criticality[r] for r, cost in enumerate(costs))
                        + parent_blocked.get(parent, 0.) for parent, costs in parent_costs.items()}
-    return dict(completion=schedule.robot_completion, robot_wait=tuple(robot_wait),
+    return dict(completion=schedule.robot_completion, robot_wait=tuple(robot_wait),critical_robot=critical,
+                parent_processing={p:tuple(costs) for p,costs in parent_processing.items()},
+                parent_critical_wait=parent_critical_wait,parent_critical_blocked=parent_critical_blocked,
                 parent_wait=parent_wait, parent_blocked=parent_blocked, scores=scores,
                 processing=tuple(processing), move=tuple(move), parent_move=parent_move,
                 parent_costs={parent: tuple(costs) for parent, costs in parent_costs.items()},
@@ -528,7 +591,7 @@ def schedule_feedback_summary(current, schedule, blockers, config):
 
 
 def select_routeaware_bottleneck(current, directions, schedule, blockers, config, *, q, seed,
-                                 assignment_space=None):
+                                 assignment_space=None, load_first=False):
     """Use the real critical/WAIT parents plus a costly directed route arc.
 
     Historical cached schedules without operations have no measured completion
@@ -549,6 +612,34 @@ def select_routeaware_bottleneck(current, directions, schedule, blockers, config
         feedback=schedule_feedback_summary(current,schedule,blockers,config)
         critical=max(range(4),key=lambda r:(schedule.robot_completion[r],-r))
         critical_parents={_parent_id(b) for b in current.routes[critical].block_ids}
+        if load_first:
+            contribution=feedback['parent_processing']
+            ranked=sorted(critical_parents,key=lambda p:(-contribution[p][critical],p))
+            anchors.append(ranked[seed%min(3,len(ranked))])
+            peak=max(range(4),key=lambda r:(feedback['processing'][r],-r))
+            peak_parents={_parent_id(b) for b in current.routes[peak].block_ids}
+            ranked_peak=sorted(peak_parents,key=lambda p:(-contribution[p][peak],p))
+            anchors.append(ranked_peak[(seed//3)%min(3,len(ranked_peak))])
+            important=[arc for arc in arcs if arc[1] in (critical,peak)] or arcs
+            if important:
+                _,robot,index=important[seed%min(3,len(important))]
+                route=state.routes[robot]
+                anchors.extend(_parent_id(route[i]) for i in (index,index+1))
+            waits=feedback['parent_critical_wait']
+            blocking=feedback['parent_critical_blocked']
+            if waits:
+                anchors.append(min(waits,key=lambda p:(-waits[p],p)))
+            if blocking:
+                anchors.append(min(blocking,key=lambda p:(-blocking[p],p)))
+            fallback=select_feedback_bottleneck(current,feedback,q=q,seed=seed,
+                                                assignment_space=assignment_space,load_first=True)
+            selected=list(dict.fromkeys((*anchors,*fallback.removed_parent_ids)))[:q]
+            if len(selected)<q:
+                selected.extend(p for p in sorted(contribution) if p not in selected)
+                selected=selected[:q]
+            return _remove_parent_set(current,selected),dict(source='LoadFirst B32 P/M/critical WAIT',
+                critical_robot=critical,processing_peak_robot=peak,
+                anchors=list(dict.fromkeys(anchors)),feedback=feedback)
         anchors.append(min(critical_parents,key=lambda p:(-feedback['parent_costs'][p][critical],p)))
         waits=sorted((p for p,w in feedback['parent_wait'].items() if w>config.numeric_epsilon),
                      key=lambda p:(-feedback['parent_wait'][p],p))
@@ -581,7 +672,7 @@ def select_routeaware_bottleneck(current, directions, schedule, blockers, config
         feedback=feedback)
 
 
-def select_feedback_bottleneck(current, feedback, *, q, seed, assignment_space=None):
+def select_feedback_bottleneck(current, feedback, *, q, seed, assignment_space=None, load_first=False):
     """Remove about 70% from the real critical robot, closing whole parents.
 
     Legal mode/owner alternatives take priority on the critical robot. Other
@@ -608,7 +699,9 @@ def select_feedback_bottleneck(current, feedback, *, q, seed, assignment_space=N
                 flexible.add(action.parent_id)
             if action.robots != assigned[action.parent_id]:
                 exchangeable.add(action.parent_id)
-    costs = feedback['parent_costs']
+    costs = feedback['parent_processing'] if load_first else feedback['parent_costs']
+    if load_first:
+        scores={p:costs[p][critical] for p in costs}
     moves = feedback['parent_move']
 
     def rank(pool, *, on_critical):
@@ -616,6 +709,8 @@ def select_feedback_bottleneck(current, feedback, *, q, seed, assignment_space=N
         for parent in sorted(pool):
             weight = (costs[parent][critical] + scores[parent] if on_critical
                       else scores[parent] + moves.get(parent, 0.))
+            if load_first:
+                weight=costs[parent][critical] if on_critical else sum(costs[parent])
             priority = parent in flexible if on_critical else parent in exchangeable
             ranked.append((not priority, -math.log(max(rng.random(), 1e-15)) / max(weight, 1e-9), parent))
         return [parent for _, _, parent in sorted(ranked)]

@@ -1865,6 +1865,24 @@ class CoarseToFineGNN(_JointAssignmentGNN):
         return self.policy(coarse_rows).squeeze(1) + self.insertion_logits(fine_rows, use_coordination=use_coordination)
 
 
+def loadfirst_proxy(processing, move, penalty):
+    """Per-robot P+MOVE with a soft processing spread penalty, in seconds."""
+    return (processing+move).amax(-1)+penalty*(processing.amax(-1)-processing.amin(-1))
+
+
+def loadfirst_near_indices(values, learned, *, limit):
+    """Let the existing GNN rank only within 0.1% (at least 1s) of best J.
+
+    This tolerance applies to the requested combined scalar, not to Pmax.
+    Every retained option is near the same minimum; no chained tie bands.
+    """
+    if not len(values) or limit<=0:
+        return ()
+    tolerance=max(1.,.001*abs(float(values.min())))
+    eligible=torch.where(values<=values.min()+tolerance)[0].tolist()
+    return tuple(sorted(eligible,key=lambda i:(-float(learned[i]),float(values[i]),i))[:limit])
+
+
 def bounded_route_pareto(objectives, scores, *, limit, groups=None):
     """Bounded Pareto retention, then the unchanged learned score.
 
@@ -1938,8 +1956,11 @@ def route_assignment_objectives(space, indices, features, state, blocks, config)
 
 
 def shortlist_assignments(space, indices, logits, *, owner_alternatives=False, processing=None,
-                          route_objectives=None):
+                          route_objectives=None, loadfirst_values=None):
     """Retain learned scores, with slots for distinct parents and mode families."""
+    if loadfirst_values is not None:
+        return tuple(int(indices[i]) for i in loadfirst_near_indices(loadfirst_values,logits,
+                                                                    limit=COARSE_ASSIGNMENT_LIMIT))
     if route_objectives is not None:
         groups=[(space.actions[i].parent_id,space.actions[i].robots,space.actions[i].pattern.kind)
                 for i in indices.tolist()]
@@ -2578,6 +2599,7 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
     balancing = getattr(model, 'imitation_balance', False)
     route_aware = getattr(model, 'route_aware', False)
+    load_first = getattr(model, 'load_first_lambda', None)
     if balancing:
         keep = coverage_preserving_assignments(space, indices, state, pending)
         indices, features = indices[keep], features[keep]
@@ -2591,7 +2613,13 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     # The coarse stage uses the workload forecast. Reranking adds the actual
     # change in route MOVE and the spatial risk after committing both children.
     positions = {index: i for i, index in enumerate(indices.tolist())}
-    shortlist = (shortlist_assignments(space,indices,logits,route_objectives=
+    loadfirst_values=None
+    if load_first is not None and assignment_indices is None:
+        coarse=route_assignment_objectives(space,indices,features,state,blocks,config)
+        loadfirst_values=coarse[:,0]+load_first*coarse[:,2]
+    shortlist = (shortlist_assignments(space,indices,logits,loadfirst_values=loadfirst_values)
+                 if load_first is not None and assignment_indices is None else
+                 shortlist_assignments(space,indices,logits,route_objectives=
                     route_assignment_objectives(space,indices,features,state,blocks,config))
                  if route_aware and assignment_indices is None else
                  shortlist_assignments(space, indices, logits, owner_alternatives=True,
@@ -2647,7 +2675,12 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                     fine = .65 * model.insertion_logits(embeddings, ix, inputs)
                     if not balancing:
                         fine = fine - move_delta / 32. - 1.5 * risk_by_option
-                    if route_aware:
+                    if load_first is not None:
+                        processing=features[positions[index],-8:-4]*2500.
+                        moves=inputs.new_tensor([[sum(arcs) for arcs in after.arc_costs] for after,_ in variants])
+                        values=loadfirst_proxy(processing.expand_as(moves),moves,load_first)
+                        retained=loadfirst_near_indices(values,fine,limit=2)
+                    elif route_aware:
                         processing=features[positions[index],-8:-4]*2500.
                         moves=inputs.new_tensor([[sum(arcs) for arcs in after.arc_costs] for after,_ in variants])
                         costs=torch.stack(((processing+moves).amax(1),moves.sum(1),
@@ -2678,6 +2711,13 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     plans = tuple(plans[i] for i in legal)
     if not plans:
         return plans, logits[:0]
+    if load_first is not None:
+        scores=imitation_joint_scores(space,embeddings,model,plans)
+        processing=torch.stack([p.assignment_features[-8:-4]*2500. for p in plans])
+        moves=processing.new_tensor([[sum(arcs) for arcs in p.state.arc_costs] for p in plans])
+        values=loadfirst_proxy(processing,moves,load_first)
+        retained=loadfirst_near_indices(values,scores,limit=16)
+        return tuple(plans[i] for i in retained),scores[list(retained)]
     if route_aware:
         scores=imitation_joint_scores(space,embeddings,model,plans)
         costs=[];groups=[]
@@ -2722,6 +2762,7 @@ class _VNextPartialState:
     score: float = 0.
     actions: tuple = ()
     decisions: tuple = ()
+    proxy: float | None = None
 
 
 def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, state, selected,
@@ -2740,6 +2781,7 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
              for pattern in selected.values() for b in space.children[pattern]}
     state = oriented_route_state(((),) * 4, ((),) * 4, blocks, config) if state is None else state
     beam = [_VNextPartialState(state, selected, blocks, nodes, frozenset(space.parent_ids) - selected.keys())]
+    load_first=getattr(model,'load_first_lambda',None)
     while any(partial.pending for partial in beam):
         expanded, failures = [], []
         for partial in beam:
@@ -2773,11 +2815,20 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
                     {**partial.blocks, **{b.block_id: b for b in children}},
                     {**partial.nodes, **{b.block_id: space.block_nodes[assignment.pattern, b.block_id] for b in children}},
                     partial.pending - {assignment.parent_id}, partial.score + float(log_probs[index]),
-                    (*partial.actions, *plan.actions), decisions))
+                    (*partial.actions, *plan.actions), decisions,
+                    float(loadfirst_proxy(plan.assignment_features[-8:-4]*2500.,
+                        plan.assignment_features.new_tensor([sum(arcs) for arcs in plan.state.arc_costs]),load_first))
+                        if load_first is not None else None))
         if not expanded:
             return JointCompletionResult(None, None, beam[0].actions, time.perf_counter() - started,
                                          rejection_reason=' | '.join(failures))
         beam = []
+        if load_first is not None:
+            # Cumulative learned log probabilities cannot revive a distant-J
+            # branch when the two global partial beams are merged.
+            minimum=min(p.proxy for p in expanded)
+            tolerance=max(1.,.001*abs(minimum))
+            expanded=[p for p in expanded if p.proxy<=minimum+tolerance]
         for partial in sorted(expanded, key=lambda p: -p.score):
             if any(partial.selected == kept.selected and partial.state.routes == kept.state.routes
                    and partial.state.directions == kept.state.directions for kept in beam):
@@ -2788,7 +2839,7 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
     completed, failures = [], []
     for partial in beam:
         try:
-            if (getattr(model,'route_aware',False) or
+            if (getattr(model,'load_first_lambda',None) is not None or getattr(model,'route_aware',False) or
                 getattr(model,'imitation_balance',False) and space.four_robot_cover_possible) and not all(partial.state.routes):
                 raise ValueError('LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
             solution = canonicalize(parents, partial.selected.values(), dict(enumerate(partial.state.routes)),
@@ -2874,7 +2925,7 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
         if decision_observer is not None:
             decision_observer(assignment, plan.actions, state)
     solution = canonicalize(parents, selected.values(), dict(enumerate(state.routes)), config, scope=FORMAL_SCOPE_V2)
-    if (getattr(model,'route_aware',False) or
+    if (getattr(model,'load_first_lambda',None) is not None or getattr(model,'route_aware',False) or
         getattr(model,'imitation_balance',False) and space.four_robot_cover_possible) and not all(state.routes):
         return JointCompletionResult(None,None,tuple(actions),time.perf_counter()-started,
                                      rejection_reason='LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
@@ -2892,7 +2943,7 @@ def construct_vnext_gnn(parents, model, config, *, decision_observer=None, space
     """Construct greedily (width one), or return up to two global joint beam plans."""
     from .lns import joint_block_candidates, oriented_route_state
 
-    if getattr(model,'route_aware',False):
+    if getattr(model,'load_first_lambda',None) is not None or getattr(model,'route_aware',False):
         space=parent_assignment_space(parents,config) if space is None else space
         if not space.four_robot_cover_possible:
             return JointCompletionResult(None,None,(),0.,rejection_reason='NO_LEGAL_FOUR_ROBOT_COVER')

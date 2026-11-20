@@ -4851,3 +4851,109 @@ def test_routeaware_history_skips_old_text_notes_and_reuses_known_plan_without_t
     monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('historical plan repeated'))
     assert e.evaluate_once(result,seen,blocker_cache=blockers)[1] is False
 
+
+def test_loadfirst_scalar_uses_each_robot_move_and_keeps_higher_p_lower_q():
+    e,c,_,_,_=_imitation_fixture()
+    processing=torch.tensor([[100.,90.,90.,90.],[100.,90.,90.,90.]])
+    moves=torch.tensor([[0.,40.,0.,0.],[25.,5.,5.,5.]])
+    assert torch.equal(moves.sum(1),torch.tensor([40.,40.]))
+    assert torch.equal(c.loadfirst_proxy(processing,moves,.5),torch.tensor([135.,130.]))
+    processing=torch.tensor([[100.,100.,100.,100.],[103.,99.,99.,99.]])
+    moves=torch.tensor([[60.,0.,0.,0.],[7.,0.,0.,0.]])
+    values=c.loadfirst_proxy(processing,moves,.5)
+    assert c.loadfirst_near_indices(values,torch.tensor([1e8,0.]),limit=8)==(1,)
+
+
+def test_loadfirst_learned_score_cannot_revive_a_distant_j_candidate():
+    e,c,_,_,_=_imitation_fixture()
+    values=torch.tensor([5000.,5004.,5100.])
+    chosen=c.loadfirst_near_indices(values,torch.tensor([0.,1.,1e8]),limit=16)
+    assert chosen==(1,0) and 2 not in chosen
+
+
+@pytest.mark.parametrize('penalty',[.25,.5,1.])
+def test_loadfirst_bypasses_pareto_and_keeps_features_joint_directions_and_coverage(monkeypatch,penalty):
+    e,c,parents,model,record=_imitation_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    empty=e.lns.oriented_route_state(((),)*4,((),)*4,{},CONFIG)
+    embeddings=model.encode_static(space.graph)
+    before=model.assignment_features(space,embeddings,empty,{},set(space.parent_ids),CONFIG)
+    model.route_aware=True;model.load_first_lambda=penalty
+    monkeypatch.setattr(c,'bounded_route_pareto',lambda *a,**k:pytest.fail('LoadFirst called Pareto'))
+    after=model.assignment_features(space,embeddings,empty,{},set(space.parent_ids),CONFIG)
+    assert torch.equal(before[1],after[1])
+    def observe(state,selected,plans,scores):
+        p=torch.stack([plan.assignment_features[-8:-4]*2500. for plan in plans])
+        m=p.new_tensor([[sum(arcs) for arcs in plan.state.arc_costs] for plan in plans])
+        values=c.loadfirst_proxy(p,m,penalty)
+        assert float(values.max()-values.min())<=max(1.,.001*float(values.min()))+1e-3
+        assert all(action.direction in (0,1) for plan in plans for action in plan.actions)
+    result=c.construct_vnext_gnn(parents,model,CONFIG,beam_width=2,step_observer=observe)
+    assert result.solution is not None and all(r.block_ids for r in result.solution.routes)
+    rejected=c.construct_vnext_gnn((ParentWeld('vertical',(2.,4.),(2.,8.)),),model,CONFIG)
+    assert rejected.solution is None and rejected.rejection_reason=='NO_LEGAL_FOUR_ROBOT_COVER'
+
+
+def test_loadfirst_wait_priority_requires_critical_robot_or_its_real_blocker():
+    from mrta_reference.model import Operation
+    from mrta_reference.scheduler import ScheduleWaitBlockers
+    e,c,parents,model,record=_imitation_fixture()
+    current=e.unpack_directed_plan(parents,record['plan'],c.parent_assignment_space(parents,CONFIG))
+    def op(name,robot,kind,duration):
+        return Operation(name,robot,kind,0.,duration,(0.,0.),(0.,0.),0,parents[robot].parent_id+'::whole')
+    pa,pb,pc=op('pa',0,OperationKind.WELD,40.),op('pb',1,OperationKind.WELD,30.),op('pc',2,OperationKind.WELD,5.)
+    critical_wait=op('cw',0,OperationKind.WAIT,5.)
+    unrelated_wait=op('uw',2,OperationKind.WAIT,100.)
+    events=(ScheduleWaitBlockers(critical_wait,pa,'a::whole',(('pb','b::whole',((0.,5.),)),)),
+            ScheduleWaitBlockers(unrelated_wait,pc,'c::whole',(('pd','d::whole',((0.,100.),)),)))
+    schedule=ScheduleResult(ScheduleStatus.FEASIBLE,(pa,pb,pc,critical_wait,unrelated_wait),200.,(200.,100.,150.,70.))
+    feedback=e.lns.schedule_feedback_summary(current.solution,schedule,events,CONFIG)
+    assert feedback['parent_critical_wait']=={'a':5.} and feedback['parent_critical_blocked']=={'b':5.}
+    assert feedback['parent_wait']['c']==100. and feedback['parent_processing']['c'][2]==5.
+    partial,info=e.lns.select_routeaware_bottleneck(current.solution,current.directions,schedule,events,
+        CONFIG,q=2,seed=1,load_first=True)
+    assert set(partial.removed_parent_ids)=={'a','b'}
+    assert 'c' not in info['anchors'] and 'd' not in info['anchors']
+
+
+def test_loadfirst_reconstruction_slots_are_bounded_and_cached_full_plans_never_reschedule(monkeypatch):
+    e,c,parents,model,record=_imitation_fixture()
+    current=e.unpack_directed_plan(parents,record['plan'],c.parent_assignment_space(parents,CONFIG))
+    blocks=block_map(current.solution,CONFIG)
+    operations=tuple(op for r,route in enumerate(current.solution.routes) for op in e.build_operation_templates(
+        e.RobotRoute(r,tuple(blocks[b] for b in route.block_ids),current.directions[r]),CONFIG))
+    completion=tuple(max(op.end_time for op in operations if op.robot_id==r) for r in range(4))
+    schedule=ScheduleResult(ScheduleStatus.FEASIBLE,operations,max(completion),completion,directions=current.directions)
+    key=e.plan_key(current.solution,current.directions);written=[];repairs=[]
+    monkeypatch.setattr(e,'read_rows',lambda path:list(written))
+    monkeypatch.setattr(e,'routeaware_write',lambda rows,**kwargs:written.extend(dict(r) for r in rows))
+    monkeypatch.setattr(e,'routeaware_history',lambda *a,**kw:({key:schedule},{key:()},{}))
+    monkeypatch.setattr(c,'construct_vnext_gnn',lambda *a,**kw:current)
+    def repair(*a,**kw):
+        repairs.append(1)
+        return replace(current,candidates=(current,current))
+    monkeypatch.setattr(e,'deadlock_reconstruct',repair)
+    monkeypatch.setattr(e,'b32',lambda *a,**kw:pytest.fail('cached plan scheduled twice'))
+    final=e.routeaware_case('fixture',parents,model,'LoadFirst-GNN-lambda0.5',result_path=e.LOADFIRST_RESULTS,
+        load_first_lambda=.5,round_limit=50)
+    assert len(repairs)==50 and sum(r['stage']=='candidate' for r in written)==100
+    assert final['b32_calls']==0 and final['cache_hits']==101
+    before=len(written)
+    assert e.routeaware_case('fixture',parents,None,'LoadFirst-GNN-lambda0.5',result_path=e.LOADFIRST_RESULTS)==final
+    assert len(written)==before
+
+
+def test_loadfirst_failed_cover_screen_reports_reason_without_loading_empty_plan_or_b32(monkeypatch):
+    e,c,_,model,_=_imitation_fixture()
+    parents=(ParentWeld('vertical',(2.,4.),(2.,8.)),)
+    method=e.loadfirst_method(.5);written=[]
+    screen=dict(stage='screen',layout_id='fixture',method=method,status='CONSTRUCTION_FAILED',
+                solution='',construct_s=0.)
+    monkeypatch.setattr(e,'read_rows',lambda path:[screen])
+    monkeypatch.setattr(e,'routeaware_history',lambda *a,**kw:({},{},{}))
+    monkeypatch.setattr(e,'routeaware_write',lambda rows,**kw:written.extend(rows))
+    monkeypatch.setattr(e,'b32',lambda *a,**kw:pytest.fail('uncoverable instance sent to B32'))
+    row=e.routeaware_case('fixture',parents,model,method,result_path=e.LOADFIRST_RESULTS,load_first_lambda=.5)
+    assert row['status']=='INFEASIBLE' and row['b32_calls']==0
+    assert row['diagnostic']=='NO_LEGAL_FOUR_ROBOT_COVER' and written==[row]
+

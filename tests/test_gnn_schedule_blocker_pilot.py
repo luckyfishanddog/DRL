@@ -179,6 +179,28 @@ def test_deadlock_parent_selection_closes_split_siblings_and_direct_neighbours()
     assert select_deadlock_blocker_parents(solution,replace(schedule,deadlock_blockages=(unknown,)),config) is None
 
 
+def test_bounded_deadlock_selection_keeps_direct_move_pair_without_union_of_long_prefixes():
+    from mrta_search.lns import select_deadlock_blocker_parents
+    config=ScientificConfig()
+    parents=tuple(ParentWeld(f'p{i:02d}',(1.+i%6,9. if i<12 else 2.),(1.5+i%6,9. if i<12 else 2.))
+                  for i in range(24))
+    patterns=tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents)
+    routes={r:tuple(f'p{i:02d}::whole' for i in range(r*6,(r+1)*6)) for r in range(4)}
+    solution=canonicalize(parents,patterns,routes,config,scope=FORMAL_SCOPE_V2)
+    blocked=Operation('blocked',0,OperationKind.MOVE,0.,1.,(1.,9.),(2.,9.),0)
+    blockers=tuple(Operation(f'b{i}',1,OperationKind.MOVE,float(i),float(i+1),(1.,9.),(2.,9.),i) for i in range(5))
+    pairs=tuple((f'p{i+6:02d}',f'p{i+7:02d}') for i in range(5))
+    evidence=DeadlockBlockage(0,0,0.,blocked,('p00::whole','p01::whole'),('p00','p01'),
+        tuple(op.operation_id for op in blockers),blockers,
+        tuple(tuple(p+'::whole' for p in pair) for pair in pairs),pairs)
+    schedule=ScheduleResult(ScheduleStatus.DEADLOCK,wait_for_graph=((0,(1,)),),deadlock_blockages=(evidence,))
+    broad=select_deadlock_blocker_parents(solution,schedule,config)
+    narrow=select_deadlock_blocker_parents(solution,schedule,config,max_parents=6,seed=0)
+    assert len(broad.removed_parent_ids)>6 and len(narrow.removed_parent_ids)<=6
+    assert {'p00','p01','p06','p07'}<=set(narrow.removed_parent_ids)
+    assert schedule.wait_for_graph==((0,(1,)),)  # An acyclic graph still requires repair.
+
+
 def test_deadlock_gnn_continuation_keeps_untouched_owners_order_and_directions(monkeypatch):
     import torch
     from test_gnn_construct_vns import _imitation_fixture
