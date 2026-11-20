@@ -385,6 +385,7 @@ def hga_route_vnd_experiment():
 def read_rows(path):
     if not path.exists():
         return []
+    csv.field_size_limit(2**31-1)
     with path.open(encoding='utf-8', newline='') as stream:
         return list(csv.DictReader(stream))
 
@@ -3316,9 +3317,367 @@ def child_feedback_experiment(workers):
     return saved
 
 
+PPO_DATA = DATA/'scale1000'
+PPO_MODELS = ROOT/'models/gnn_ppo_scale'
+PPO_RESULTS = FINAL_RESULTS/'gnn_ppo_scale.csv'
+PPO_SEED = 20261119
+PPO_OPTIONS = dict(epochs=3,rollout_batch=4,update_epochs=4,learning_rate=1e-4,
+    gamma=1.,gae_lambda=.95,clip=.2,value_coefficient=.5,entropy_coefficient=.01,max_gradient_norm=.5)
+PPO_FIELDS = ('stage','size','epoch','index','layout_id','parent_count','seed','method','status',
+    'cmax_s','runtime_s','max_processing_s','move_s','wait_s','b32_calls','steps','reward',
+    'loss','gradient_norm','diagnostic','source')
+
+
+def ppo_write(rows):
+    """One existing CSV; an ordinary byte lock permits concurrent training/baseline jobs."""
+    import msvcrt
+    with PPO_RESULTS.open('a+',encoding='utf-8',newline='') as stream:
+        stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_LOCK,1)
+        try:
+            stream.seek(0,2)
+            writer=csv.DictWriter(stream,fieldnames=PPO_FIELDS)
+            if stream.tell()==0:writer.writeheader()
+            for row in rows:writer.writerow(dict(source='GNN_PPO_SCALE_V1',**row))
+            stream.flush()
+        finally:
+            stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_UNLCK,1)
+
+
+def ppo_layouts(split):
+    rows=[json.loads(s) for s in (PPO_DATA/f'{split}.jsonl').read_text(encoding='utf-8').splitlines()]
+    return [(r['layout_id'],tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end']))
+            for p in r['parents'])) for r in rows]
+
+
+def ppo_model(weights=None):
+    torch.manual_seed(PPO_SEED)
+    actor=feedback_model() if weights is None else None
+    model=gnn.PPOJointInsertionGNN(64,4)
+    if weights is None:
+        missing,extra=model.load_state_dict(actor.state_dict(),strict=False)
+        if set(missing)!={f'value_head.{layer}.{part}' for layer in (0,2) for part in ('weight','bias')} or extra:
+            raise ValueError('initial actor parameters do not match the existing joint GNN')
+    else:model.load_state_dict(weights)
+    return model
+
+
+def ppo_distribution(scores,mask):
+    if not mask.any() or not torch.isfinite(scores[mask]).all():
+        raise ArithmeticError('invalid masked joint policy scores')
+    return torch.distributions.Categorical(logits=scores.masked_fill(~mask,-math.inf))
+
+
+def ppo_gae(values,reward,*,gamma=1.,gae_lambda=.95):
+    advantage=torch.zeros_like(values);last=values.new_zeros(())
+    for i in range(len(values)-1,-1,-1):
+        following=values[i+1] if i+1<len(values) else values.new_zeros(())
+        delta=(reward if i==len(values)-1 else 0.)+gamma*following-values[i]
+        last=delta+gamma*gae_lambda*last
+        advantage[i]=last
+    return advantage,advantage+values
+
+
+def ppo_rollout(model,layout,seed):
+    started=time.perf_counter();name,parents=layout
+    space=gnn.parent_assignment_space(parents,CONFIG)
+    trace=[];pending_state={}
+    with torch.no_grad():
+        embeddings=model.encode_static(space.graph)
+        def observe_state(state,selected,plans,scores):
+            features=model.partial_value_features(space,state,selected)
+            pending_state.update(features=features,value=float(model.state_value(space,embeddings,features)),
+                scores=scores.detach().clone(),routes=state.routes,directions=state.directions,
+                action_keys=tuple((p.assignment_index,tuple((a.block_id,a.robot,a.position,a.direction,
+                    a.neighbour_changes) for a in p.actions)) for p in plans))
+        def observe_policy(inputs,choice):
+            mask=torch.ones(len(pending_state['scores']),dtype=torch.bool)
+            distribution=ppo_distribution(pending_state['scores'],mask)
+            trace.append(dict(inputs={k:v.detach().clone() for k,v in inputs.items()},choice=choice,mask=mask,
+                old_log_probability=float(distribution.log_prob(torch.tensor(choice))),
+                old_probabilities=distribution.probs.detach().clone(),**pending_state))
+        try:
+            result=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,embeddings=embeddings,
+                rng=Random(seed),step_observer=observe_state,policy_observer=observe_policy)
+        except ArithmeticError as error:
+            return dict(space=space,trace=trace,reward=None,row=dict(layout_id=name,parent_count=len(parents),
+                seed=seed,status='NUMERIC_FAILURE',runtime_s=time.perf_counter()-started,b32_calls=0,
+                steps=len(trace),diagnostic=str(error)))
+        schedule,called=evaluate_once(result,{})
+    reward=feedback_reward(schedule,max(1.,sum(CONFIG.process_time(p.length) for p in parents)/4.))
+    status=schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED'
+    row=dict(layout_id=name,parent_count=len(parents),seed=seed,status=status,
+        cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
+        runtime_s=time.perf_counter()-started,b32_calls=int(called),steps=len(trace),reward=reward,
+        diagnostic=result.rejection_reason or (' | '.join(schedule.diagnostics) if schedule is not None and not schedule.feasible else ''),
+        **final_metrics(schedule))
+    if reward is not None and trace:
+        values=torch.tensor([t['value'] for t in trace])
+        advantage,returns=ppo_gae(values,reward,gamma=PPO_OPTIONS['gamma'],gae_lambda=PPO_OPTIONS['gae_lambda'])
+        for t,a,target in zip(trace,advantage,returns):t.update(advantage=a,return_value=target)
+    return dict(space=space,trace=trace,reward=reward,row=row)
+
+
+def ppo_update(model,episodes,optimizer):
+    valid=[e for e in episodes if e['reward'] is not None and e['trace']]
+    if not valid:return dict(updates=0,loss=None,gradient_norm=None)
+    for episode in valid:
+        trace=episode['trace']
+        episode['batch_inputs']={k:torch.cat([t['inputs'][k] for t in trace]) for k in trace[0]['inputs']}
+        episode['candidate_counts']=[len(t['mask']) for t in trace]
+    # Replay the same candidate tensors before any update, including the full normalizer.
+    replay_error=0.
+    with torch.no_grad():
+        for episode in valid:
+            embeddings=model.encode_static(episode['space'].graph)
+            scores=model.feedback_scores(episode['space'],embeddings,episode['batch_inputs'])
+            for step,scores in zip(episode['trace'],scores.split(episode['candidate_counts'])):
+                d=ppo_distribution(scores,step['mask'])
+                replay_error=max(replay_error,float((d.probs-step['old_probabilities']).abs().max()))
+    if replay_error>2e-6:raise RuntimeError(f'joint policy replay probability mismatch: {replay_error}')
+    all_advantages=torch.stack([t['advantage'] for e in valid for t in e['trace']])
+    center,spread=all_advantages.mean(),all_advantages.std(unbiased=False).clamp_min(1e-8)
+    measures=[]
+    for _ in range(PPO_OPTIONS['update_epochs']):
+        for episode in valid:
+            optimizer.zero_grad(set_to_none=True)
+            space=episode['space'];embeddings=model.encode_static(space.graph)
+            actor_losses=[];targets=[];entropies=[];ratios=[]
+            scores=model.feedback_scores(space,embeddings,episode['batch_inputs'])
+            for step,scores in zip(episode['trace'],scores.split(episode['candidate_counts'])):
+                distribution=ppo_distribution(scores,step['mask'])
+                log_probability=distribution.log_prob(torch.tensor(step['choice']))
+                ratio=torch.exp(log_probability-step['old_log_probability'])
+                advantage=(step['advantage']-center)/spread
+                actor_losses.append(-torch.minimum(ratio*advantage,
+                    ratio.clamp(1.-PPO_OPTIONS['clip'],1.+PPO_OPTIONS['clip'])*advantage))
+                entropies.append(distribution.entropy());ratios.append(ratio)
+                targets.append(step['return_value'])
+            actor_loss=torch.stack(actor_losses).mean()
+            values=model.state_value(space,embeddings,torch.stack([t['features'] for t in episode['trace']]))
+            value_loss=F.mse_loss(values,torch.stack(targets))
+            entropy=torch.stack(entropies).mean()
+            loss=actor_loss+PPO_OPTIONS['value_coefficient']*value_loss-PPO_OPTIONS['entropy_coefficient']*entropy
+            if not torch.isfinite(loss):raise ArithmeticError('nonfinite PPO loss; not a B32 DEADLOCK')
+            loss.backward()
+            norm=torch.nn.utils.clip_grad_norm_(model.parameters(),PPO_OPTIONS['max_gradient_norm'])
+            if not torch.isfinite(norm):raise ArithmeticError('nonfinite PPO gradient; not a B32 DEADLOCK')
+            optimizer.step()
+            measures.append((float(loss.detach()),float(norm),float(actor_loss.detach()),
+                float(value_loss.detach()),float(entropy.detach()),
+                float((torch.stack(ratios).detach()-1.).abs().gt(PPO_OPTIONS['clip']).float().mean())))
+    means=[sum(m[i] for m in measures)/len(measures) for i in range(6)]
+    return dict(zip(('loss','gradient_norm','actor_loss','value_loss','entropy','clip_fraction'),means),
+                updates=len(measures),replay_probability_max_error=replay_error)
+
+
+def ppo_rollout_job(job):
+    configure_cpu()
+    serialized,layout,seed=job
+    model=ppo_model(pickle.loads(serialized)).eval()
+    # A single byte payload avoids one multiprocessing handle per trace tensor.
+    return pickle.dumps(ppo_rollout(model,layout,seed),protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def ppo_train_size(size,workers=4):
+    configure_cpu()
+    started=time.perf_counter();layouts=ppo_layouts('train')[:size]
+    if len(layouts)!=size:raise ValueError('the requested nested TRAIN prefix is not available')
+    path=PPO_MODELS/f'ppo_{size}.pt';PPO_MODELS.mkdir(parents=True,exist_ok=True)
+    model=ppo_model().train()
+    optimizer=torch.optim.AdamW(model.parameters(),lr=PPO_OPTIONS['learning_rate'],weight_decay=1e-5)
+    saved=dict(size=size,seed=PPO_SEED,settings=dict(PPO_OPTIONS),completed_episodes=0,history=[],
+        initial_state_dict=copy.deepcopy(model.state_dict()),training_complete=False,elapsed_s=0.,
+        initialization='models/gnn_weld_layout.pt:models.GNN_VNEXT_WORKLOAD',training_dataset=str(PPO_DATA/'train.jsonl'))
+    if path.exists():
+        saved=torch.load(path,map_location='cpu',weights_only=True)
+        if saved['settings']!=PPO_OPTIONS or saved['size']!=size:raise ValueError('existing PPO run has different settings')
+        model.load_state_dict(saved['state_dict']);optimizer.load_state_dict(saved['optimizer_state_dict'])
+    existing={(r['size'],r['epoch'],r['index']) for r in read_rows(PPO_RESULTS) if r['stage']=='train'}
+    ppo_write([r for r in saved['history'] if (str(r['size']),str(r['epoch']),str(r['index'])) not in existing])
+    if saved['training_complete']:return saved['history']
+    order=[]
+    for epoch in range(1,PPO_OPTIONS['epochs']+1):
+        indices=list(range(size));Random(PPO_SEED+epoch).shuffle(indices)
+        order.extend((epoch,i) for i in indices)
+    previous_elapsed=saved['elapsed_s']
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        while saved['completed_episodes']<len(order):
+            first=saved['completed_episodes'];batch=[]
+            active=order[first:first+PPO_OPTIONS['rollout_batch']]
+            serialized=pickle.dumps(model.state_dict(),protocol=pickle.HIGHEST_PROTOCOL)
+            jobs=[(serialized,layouts[index],PPO_SEED+epoch*1000000+index) for epoch,index in active]
+            for (epoch,index),payload in zip(active,pool.map(ppo_rollout_job,jobs)):
+                episode=pickle.loads(payload)
+                episode['row'].update(stage='train',size=size,epoch=epoch,index=index,method='GNN_PPO')
+                batch.append(episode)
+            update=ppo_update(model,batch,optimizer)
+            for episode in batch:
+                row=episode['row'];row.update(loss=update['loss'],gradient_norm=update['gradient_norm'])
+                row['diagnostic']=json.dumps(dict(outcome=row['diagnostic'],ppo=update),ensure_ascii=False)
+                saved['history'].append(row)
+            saved.update(completed_episodes=first+len(batch),elapsed_s=previous_elapsed+time.perf_counter()-started,
+                state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),
+                training_complete=first+len(batch)==len(order))
+            torch.save(saved,path)
+            ppo_write([e['row'] for e in batch])
+            print('PPO_TRAIN_PROGRESS',json.dumps(dict(size=size,completed=saved['completed_episodes'],total=len(order),
+                elapsed_s=saved['elapsed_s'],last_status=batch[-1]['row']['status'],**update)),flush=True)
+    return saved['history']
+
+
+def ppo_train(workers):
+    for size in (120,500,1000):ppo_train_size(size,workers)
+
+
+def ppo_representatives():
+    layouts=ppo_layouts('validation')
+    if len(layouts)!=100:raise ValueError('select the 20 cases after the full 100 VALIDATION layouts are generated')
+    ordered=sorted(layouts,key=lambda row:(len(row[1]),row[0]))
+    selected=[ordered[5*i+2] for i in range(20)]
+    rows=[r for r in read_rows(PPO_RESULTS) if r['stage']=='selection']
+    if rows:
+        if [r['layout_id'] for r in rows]!=[name for name,_ in selected]:
+            raise ValueError('saved representative cases differ from the original parent-count strata')
+    else:
+        if any(r['stage'] in ('validation','baseline') for r in read_rows(PPO_RESULTS)):
+            raise ValueError('representative cases must be recorded before viewing validation results')
+        ppo_write([dict(stage='selection',size=0,epoch=0,index=i,layout_id=name,parent_count=len(parents),
+            seed=SEED,method='PARENT_COUNT_STRATUM',diagnostic='middle case in sorted stratum of five')
+            for i,(name,parents) in enumerate(selected)])
+    return selected
+
+
+def ppo_baseline_job(job):
+    configure_cpu()
+    layout,method=job
+    row=baseline_job((layout,method,SEED))
+    output={k:row[k] for k in ('layout_id','seed','method','status','cmax_s','runtime_s','move_s','wait_s','b32_calls') if k in row}
+    loads=[row.get(f'processing_r{r}_s') for r in range(4)]
+    output.update(stage='baseline',size=0,parent_count=len(layout[1]),
+        max_processing_s=max(loads) if all(p is not None for p in loads) else None,
+        diagnostic=json.dumps(row,ensure_ascii=False))
+    return output
+
+
+def ppo_baselines(workers):
+    layouts=ppo_representatives()
+    done={(r['layout_id'],r['method']) for r in read_rows(PPO_RESULTS) if r['stage']=='baseline'}
+    jobs=[(layout,method) for method in ('HGA','WAG+VNS') for layout in layouts if (layout[0],method) not in done]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for future in as_completed([pool.submit(ppo_baseline_job,job) for job in jobs]):
+            row=future.result();ppo_write([row]);print('PPO_BASELINE_RESULT',json.dumps(row),flush=True)
+
+
+def ppo_inference_job(job):
+    configure_cpu();size,layout=job
+    started=time.perf_counter()
+    if size:
+        saved=torch.load(PPO_MODELS/f'ppo_{size}.pt',map_location='cpu',weights_only=True)
+        if not saved['training_complete']:raise ValueError('PPO training is incomplete')
+        model=ppo_model(saved['state_dict']).eval()
+    else:model=ppo_model().eval()
+    model_loaded=time.perf_counter()
+    name,parents=layout;space=gnn.parent_assignment_space(parents,CONFIG)
+    seen={};calls=deadlocks=numeric=0;result=schedule=None;failures=[]
+    with torch.no_grad():
+        embeddings=model.encode_static(space.graph)
+        for attempt in range(3):
+            try:
+                result=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,embeddings=embeddings,
+                    rng=None if attempt==0 else Random(SEED+attempt))
+            except ArithmeticError as error:
+                numeric+=1;failures.append(str(error));break
+            schedule,called=evaluate_once(result,seen);calls+=int(called)
+            if schedule is not None:
+                numeric+=schedule.status is ScheduleStatus.NUMERIC_FAILURE
+                deadlocks+=schedule.status is ScheduleStatus.DEADLOCK
+                if schedule.feasible or schedule.status is ScheduleStatus.NUMERIC_FAILURE:break
+    status=('NUMERIC_FAILURE' if numeric else schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED')
+    return dict(stage='validation',size=size,epoch=PPO_OPTIONS['epochs'] if size else 0,layout_id=name,
+        parent_count=len(parents),seed=SEED,method='GNN_PPO' if size else 'GNN_INITIAL',status=status,
+        cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
+        runtime_s=time.perf_counter()-started,b32_calls=calls,
+        diagnostic=json.dumps(dict(model_loading_s=model_loaded-started,attempts=attempt+1,
+            deadlocks=deadlocks,numeric_failures=numeric,failures=failures,
+            schedule_diagnostic=list(schedule.diagnostics) if schedule is not None else None,
+            solution=(dict(patterns=[p.pattern_id for p in result.solution.patterns],
+                routes=[list(r.block_ids) for r in result.solution.routes],directions=result.directions)
+                if result is not None and result.solution is not None else None)),ensure_ascii=False),**final_metrics(schedule))
+
+
+def ppo_validation(workers,size=None):
+    ppo_representatives()
+    layouts=ppo_layouts('validation')
+    sizes=(size,) if size is not None else (0,120,500,1000)
+    done={(int(r['size']),r['layout_id']) for r in read_rows(PPO_RESULTS) if r['stage']=='validation'}
+    jobs=[(n,layout) for n in sizes for layout in layouts if (n,layout[0]) not in done]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for future in as_completed([pool.submit(ppo_inference_job,job) for job in jobs]):
+            row=future.result();ppo_write([row]);print('PPO_VALIDATION_RESULT',json.dumps({k:v for k,v in row.items() if k!='diagnostic'}),flush=True)
+
+
+def ppo_summary():
+    rows=read_rows(PPO_RESULTS);output={}
+    for size in (0,120,500,1000):
+        selected=[r for r in rows if r['stage']=='validation' and int(r['size'])==size]
+        if not selected:continue
+        good=[r for r in selected if r['status']=='FEASIBLE']
+        info=feedback_summary(selected)
+        for key in ('max_processing_s','move_s','wait_s'):
+            info['median_'+key]=median(float(r[key]) for r in good) if good else None
+        for other in (0,120,500):
+            ref=[r for r in rows if r['stage']=='validation' and int(r['size'])==other]
+            if other!=size and ref:
+                info[f'paired_to_{other}']=feedback_paired(selected,ref)
+                lookup={(r['layout_id'],r['seed']):r for r in ref}
+                changes=[100*(float(r['max_processing_s'])/float(lookup[r['layout_id'],r['seed']]['max_processing_s'])-1)
+                    for r in good if (r['layout_id'],r['seed']) in lookup
+                    and lookup[r['layout_id'],r['seed']]['status']=='FEASIBLE']
+                info[f'paired_to_{other}']['median_pmax_change_pct']=median(changes) if changes else None
+        for method in ('WAG+VNS','HGA'):
+            ref=[r for r in rows if r['stage']=='baseline' and r['method']==method]
+            if ref:info[method]=dict(summary=feedback_summary(ref),paired=feedback_paired(selected,ref))
+        output[size]=info
+    chosen=[r for r in rows if r['stage']=='validation' and int(r['size'])==1000]
+    representative_ids={r['layout_id'] for r in rows if r['stage']=='selection'}
+    subset=[r for r in chosen if r['layout_id'] in representative_ids]
+    compared={m:[r for r in rows if r['stage']=='baseline' and r['method']==m] for m in ('WAG+VNS','HGA')}
+    complete=len(chosen)==100 and len(subset)==20 and all(len(v)==20 for v in compared.values())
+    quality=complete and all(
+        sum(r['status']=='FEASIBLE' for r in subset)>=sum(r['status']=='FEASIBLE' for r in ref)
+        and sum(r['status']=='FEASIBLE' for r in chosen)*len(ref)>=sum(r['status']=='FEASIBLE' for r in ref)*len(chosen)
+        and feedback_paired(subset,ref)['common']>0
+        and feedback_paired(subset,ref)['median_change_pct']<0
+        and feedback_paired(subset,ref)['wins']>feedback_paired(subset,ref)['losses']
+        for ref in compared.values())
+    # Predeclared before any new validation outcomes: material Pmax improvement
+    # means a paired median reduction of at least 1% versus both initial and 120.
+    processing=complete and all(output[1000].get(f'paired_to_{n}',{}).get('median_pmax_change_pct') is not None
+        and output[1000][f'paired_to_{n}']['median_pmax_change_pct']<=-1. for n in (0,120))
+    efficient=complete and median(float(r['runtime_s']) for r in subset)<=median(float(r['runtime_s']) for r in compared['WAG+VNS'])
+    output['test_decision']=dict(complete=complete,quality_passed=quality,
+        processing_passed=processing,time_passed=efficient,passed=complete and quality and processing and efficient)
+    print('PPO_SCALE_SUMMARY',json.dumps(output,ensure_ascii=False),flush=True)
+    return output
+
+
+def ppo_smoke():
+    configure_cpu();model=ppo_model().train()
+    lookup=dict(ppo_layouts('train'))
+    episodes=[ppo_rollout(model,(name,lookup[name]),PPO_SEED+i) for i,name in enumerate(('train_15','train_34'))]
+    optimizer=torch.optim.AdamW(model.parameters(),lr=PPO_OPTIONS['learning_rate'])
+    update=ppo_update(model,episodes,optimizer)
+    for episode in episodes:
+        row=episode['row'];row.update(stage='smoke',size=0,epoch=0,method='GNN_PPO',
+            loss=update['loss'],gradient_norm=update['gradient_norm'],diagnostic=json.dumps(update))
+        ppo_write([row])
+    print('PPO_SMOKE',json.dumps(update),flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary'))
+    parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
@@ -3330,7 +3689,12 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'child-feedback':
+    if args.stage == 'ppo-scale-smoke':ppo_smoke()
+    elif args.stage == 'ppo-scale-train':ppo_train(args.workers)
+    elif args.stage == 'ppo-scale-baselines':ppo_baselines(args.workers)
+    elif args.stage == 'ppo-scale-validation':ppo_validation(args.workers,args.size)
+    elif args.stage == 'ppo-scale-summary':ppo_summary()
+    elif args.stage == 'child-feedback':
         saved=child_feedback_experiment(args.workers)
         if not CHILD_MODEL.exists() and saved['training_complete']:
             with CHILD_MODEL.open('xb') as stream:

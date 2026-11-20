@@ -2134,6 +2134,38 @@ class VNextGNN(_JointAssignmentGNN):
         return torch.cat((rows, torch.stack(extras)), dim=1)
 
 
+class PPOJointInsertionGNN(VNextGNN):
+    """Existing joint actor plus one partial-state critic on the same GAT."""
+    def __init__(self, hidden_dim=64, heads=4):
+        super().__init__(hidden_dim, heads, workload_lookahead=True,
+                         joint_actions=True, schedule_feedback=True)
+        self.value_head = nn.Sequential(nn.Linear(2*hidden_dim+13, hidden_dim),
+                                        nn.Tanh(), nn.Linear(hidden_dim, 1))
+        nn.init.zeros_(self.value_head[-1].weight)
+        nn.init.zeros_(self.value_head[-1].bias)
+
+    def encode_static(self, graph):
+        # Same two GAT layers/parameters, using the existing equivalent scatter kernel.
+        h = nn.functional.elu(_vnd_attention(self.layer1, graph.node_features,
+                                            graph.edge_index, graph.edge_type))
+        return (_vnd_attention(self.layer2,h,graph.edge_index,graph.edge_type)
+                + self.geometry_skip(graph.node_features))
+
+    @staticmethod
+    def partial_value_features(space, state, selected):
+        n = max(1,len(space.parent_ids))
+        return torch.tensor([*(p/2500. for p in state.loads),
+            *(sum(arcs)/2500. for arcs in state.arc_costs),
+            *(len(route)/n for route in state.routes),1.-len(selected)/n],dtype=torch.float32)
+
+    def state_value(self, space, embeddings, features):
+        offset = space.graph.robot_offset
+        pooled = torch.cat((embeddings[:offset].mean(0),embeddings[offset:].mean(0)))
+        if features.ndim == 1:
+            return self.value_head(torch.cat((pooled,features))).squeeze()
+        return self.value_head(torch.cat((pooled.expand(len(features),-1),features),dim=1)).squeeze(-1)
+
+
 def _sample_directed_positions(states, robot, endpoints, weld_seconds, config, times):
     """Sample MOVE/SETUP/WELD/POST geometry at a fixed grid, without pair sweeps."""
     xy = torch.tensor([[endpoints[b, d] for b, d in zip(s.routes[robot], s.directions[robot])]

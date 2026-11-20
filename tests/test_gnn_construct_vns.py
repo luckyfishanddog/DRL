@@ -4486,3 +4486,124 @@ def test_eg_train_split_is_layout_disjoint_and_true_cmax_drives_preferences():
     loss.backward()
     assert scores.grad[1]<0 and scores.grad[0]>0
 
+
+def test_ppo_scale_initial_actor_is_exact_and_critic_shares_two_gat_layers():
+    import run_gnn_weld_layout as e
+    from mrta_ranker.model import SparseGATLayer
+    e.configure_cpu()
+    model=e.ppo_model();actor=e.feedback_model()
+    assert sum(isinstance(m,SparseGATLayer) for m in model.modules())==2
+    assert all(torch.equal(v,model.state_dict()[k]) for k,v in actor.state_dict().items())
+    _,c,parents,_=_feedback_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    assert torch.allclose(model.encode_static(space.graph),actor.encode_static(space.graph),atol=2e-6)
+    assert model.policy[0].out_features==64 and model.layer1.heads==model.layer2.heads==4
+    assert torch.equal(model.value_head[-1].weight,torch.zeros_like(model.value_head[-1].weight))
+
+
+def test_ppo_scale_terminal_gae_and_legal_action_mask_are_exact():
+    import run_gnn_weld_layout as e
+    advantage,returns=e.ppo_gae(torch.tensor([.5,.4,.2]),-1.)
+    assert advantage.tolist()==pytest.approx([-1.373,-1.34,-1.2])
+    assert returns.tolist()==pytest.approx([-.873,-.94,-1.])
+    scores=torch.tensor([1.,2.,999.],requires_grad=True)
+    d=e.ppo_distribution(scores,torch.tensor([True,True,False]))
+    assert d.probs.tolist()==pytest.approx([.26894142,.73105858,0.])
+    assert torch.isfinite(d.entropy())
+    with pytest.raises(ArithmeticError):e.ppo_distribution(scores,torch.zeros(3,dtype=torch.bool))
+
+
+def _ppo_scale_fixture(monkeypatch):
+    import run_gnn_weld_layout as e
+    from mrta_search import gnn_constructor as c
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    e.configure_cpu();torch.manual_seed(71)
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(9.,9.),(10.,9.)),
+             ParentWeld('c',(2.,3.),(3.,3.)),ParentWeld('d',(13.,3.),(14.,3.)))
+    model=c.PPOJointInsertionGNN(16,4)
+    def evaluated(result,seen):
+        assert result.solution is not None
+        return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.,directions=result.directions),True
+    monkeypatch.setattr(e,'evaluate_once',evaluated)
+    return e,c,model,('fixture',parents)
+
+
+def test_ppo_scale_replays_same_complete_joint_distribution_and_updates_shared_actor_critic(monkeypatch):
+    e,c,model,layout=_ppo_scale_fixture(monkeypatch)
+    before={k:v.clone() for k,v in model.state_dict().items()}
+    episodes=[e.ppo_rollout(model,layout,seed) for seed in (7,8)]
+    import pickle
+    episodes=[pickle.loads(pickle.dumps(episode)) for episode in episodes]
+    for episode in episodes:
+        assert episode['reward'] is not None and episode['row']['b32_calls']==1
+        assert len(episode['trace'])==len(layout[1])
+        embeddings=model.encode_static(episode['space'].graph)
+        for step in episode['trace']:
+            scores=model.feedback_scores(episode['space'],embeddings,step['inputs'])
+            d=e.ppo_distribution(scores,step['mask'])
+            assert torch.allclose(d.probs,step['old_probabilities'],atol=2e-6)
+            assert float(d.log_prob(torch.tensor(step['choice'])))==pytest.approx(step['old_log_probability'],abs=2e-6)
+            assert len(step['action_keys'])==len(scores) and step['mask'].all()
+    optimizer=torch.optim.AdamW(model.parameters(),lr=1e-3)
+    statistics=e.ppo_update(model,episodes,optimizer)
+    assert statistics['updates']==8 and statistics['replay_probability_max_error']<2e-6
+    assert statistics['gradient_norm']>0 and math.isfinite(statistics['loss'])
+    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('layer1.'))
+    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('policy.'))
+    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('insertion_head.'))
+    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('value_head.'))
+
+
+def test_ppo_scale_detects_wrong_candidate_normalizer_before_update(monkeypatch):
+    e,c,model,layout=_ppo_scale_fixture(monkeypatch)
+    episode=e.ppo_rollout(model,layout,3)
+    episode['trace'][0]['old_probabilities'][0]+=.01
+    with pytest.raises(RuntimeError,match='probability mismatch'):
+        e.ppo_update(model,[episode],torch.optim.AdamW(model.parameters()))
+
+
+def test_ppo_scale_numeric_failure_is_skipped_and_deadlock_is_distinct(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    e,c,model,layout=_ppo_scale_fixture(monkeypatch)
+    monkeypatch.setattr(e,'evaluate_once',lambda *a:(ScheduleResult(ScheduleStatus.NUMERIC_FAILURE),True))
+    numerical=e.ppo_rollout(model,layout,2)
+    assert numerical['row']['status']=='NUMERIC_FAILURE' and numerical['reward'] is None
+    assert e.ppo_update(model,[numerical],torch.optim.AdamW(model.parameters()))['updates']==0
+    monkeypatch.setattr(e,'evaluate_once',lambda *a:(ScheduleResult(ScheduleStatus.DEADLOCK),True))
+    deadlock=e.ppo_rollout(model,layout,2)
+    assert deadlock['row']['status']=='DEADLOCK' and deadlock['reward']==-5.
+
+
+def test_ppo_scale_twenty_representatives_are_stratified_before_any_outcome(monkeypatch):
+    import run_gnn_weld_layout as e
+    rows=[];layouts=[(f'v_{i:03}',[None]*(40+i)) for i in range(100)]
+    monkeypatch.setattr(e,'ppo_layouts',lambda split:layouts)
+    monkeypatch.setattr(e,'read_rows',lambda path:rows)
+    monkeypatch.setattr(e,'ppo_write',lambda new:rows.extend(new))
+    selected=e.ppo_representatives()
+    assert [int(name.split('_')[1]) for name,_ in selected]==list(range(2,100,5))
+    assert len(rows)==20 and all(r['stage']=='selection' for r in rows)
+    assert e.ppo_representatives()==selected
+    rows.clear();rows.append(dict(stage='validation'))
+    with pytest.raises(ValueError,match='before viewing'):e.ppo_representatives()
+
+
+def test_ppo_scale_summary_does_not_allow_test_for_incomplete_or_worse_validation(monkeypatch):
+    import run_gnn_weld_layout as e
+    monkeypatch.setattr(e,'read_rows',lambda path:[])
+    assert not e.ppo_summary()['test_decision']['passed']
+    rows=[]
+    for i in range(100):
+        for size,score,pmax in ((0,120.,100.),(120,110.,99.),(500,108.,98.),(1000,107.,97.)):
+            rows.append(dict(stage='validation',size=str(size),layout_id=f'v{i}',seed='7',status='FEASIBLE',
+                cmax_s=str(score),max_processing_s=str(pmax),move_s='10',wait_s='0',runtime_s='1',b32_calls='1'))
+        if i<20:
+            rows.append(dict(stage='selection',layout_id=f'v{i}'))
+            for method in ('WAG+VNS','HGA'):
+                rows.append(dict(stage='baseline',method=method,layout_id=f'v{i}',seed='7',status='FEASIBLE',
+                    cmax_s='100',runtime_s='10',b32_calls='1'))
+    monkeypatch.setattr(e,'read_rows',lambda path:rows)
+    result=e.ppo_summary()['test_decision']
+    assert result['complete'] and result['processing_passed'] and result['time_passed']
+    assert not result['quality_passed'] and not result['passed']
+

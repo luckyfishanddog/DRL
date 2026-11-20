@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 import json
 from dataclasses import dataclass
 from itertools import combinations, product
@@ -510,6 +511,138 @@ def export_expanded_dataset(parts: list[LayoutPart], workbook: Path, output_dir:
         print('EXPANDED_DATASET', json.dumps(summary, ensure_ascii=False), flush=True)
 
 
+def _scale_worker_init(parts, workbook):
+    global _scale_parts, _scale_welds, _scale_workbook
+    _scale_parts = parts
+    _scale_welds = {p.ident: dataset_weld_paths(p) for p in parts}
+    _scale_workbook = workbook
+
+
+def _scale_record(job):
+    split, seed = job
+    library = [p for p in _scale_parts if held_out(p.ident) == (split == 'test')]
+    placements = pack_platform(library, seed, SPACING)
+    return dataset_record(placements, _scale_welds, '', seed, SPACING, _scale_workbook)
+
+
+def check_scale_dataset(output_dir, parts):
+    """Read the actual JSONL and check original geometry, isolation and duplicates."""
+    source = PROJECT_DIR.parent/'data/weld_layout'
+    history = {}
+    for name in ('train', 'validation', 'test', 'train_expanded', 'validation_fresh'):
+        for line in (source/f'{name}.jsonl').read_text(encoding='utf-8').splitlines():
+            row = json.loads(line)
+            if row['layout_id'] in history and history[row['layout_id']] != row:
+                raise ValueError('inconsistent historical layout primary key')
+            history[row['layout_id']] = row
+    geometries = [layout_geometry(r) for r in history.values()]
+    library = {p.ident:p for p in parts}
+    welds = {p.ident:dataset_weld_paths(p) for p in parts}
+    current, intentional = [], 0
+    for split in ('train', 'validation', 'test'):
+        rows = [json.loads(line) for line in (output_dir/f'{split}.jsonl').read_text(encoding='utf-8').splitlines()]
+        counts, utilization, lengths, models = [], [], [], Counter()
+        for row in rows:
+            if row['platform_size_xy_m'] != [20.,12.] or row['spacing_m'] != SPACING:
+                raise ValueError('platform or clearance changed')
+            placements = []
+            for part in row['parts']:
+                if held_out(part['model_id']) != (split == 'test'):
+                    raise ValueError('held-out model leaked across splits')
+                x,y,right,top = part['bounds_xyxy_m']
+                placement = Placement(library[part['model_id']],x,y,part['rotation_deg']//90)
+                if (not np.allclose(placement.bounds,(x,y,right,top),atol=1e-8,rtol=0)
+                        or min(x,y) < -1e-8 or right > 20.+1e-8 or top > 12.+1e-8):
+                    raise ValueError('invalid original part bounding box')
+                placements.append(placement)
+                models[part['model_id']] += 1
+            if minimum_clearance(placements) < SPACING-1e-8:
+                raise ValueError('part clearance below 0.3m')
+            rebuilt = dataset_record(placements,welds,row['layout_id'],row['geometry_seed'],SPACING,
+                                     PROJECT_DIR/'C_layout_geometry.xlsx')
+            if rebuilt['parents'] != row['parents']:
+                raise ValueError('stored welds differ from original extraction/rotation')
+            if any(hypot(p['end'][0]-p['start'][0],p['end'][1]-p['start'][1]) < .05-1e-10 for p in row['parents']):
+                raise ValueError('parent weld below the existing 50mm filter')
+            geometry = layout_geometry(row)
+            if any(same_layout(geometry,other) for other in current):
+                raise ValueError('duplicate geometry within the new 1200-layout dataset')
+            current.append(geometry)
+            if row['layout_id'] in history and row == history[row['layout_id']]:
+                if split == 'test':raise ValueError('historical TEST reused as new TEST')
+                intentional += 1
+            elif any(same_layout(geometry,other) for other in geometries):
+                raise ValueError('newly generated geometry duplicates historical data')
+            counts.append(len(row['parents'])); utilization.append(row['rectangle_utilization'])
+            lengths.append(row['total_weld_length_xy_m'])
+        summary = dict(split=split,layouts=len(rows),parents=sum(counts),parent_range=[min(counts),max(counts)],
+            part_range=[min(len(r['parts']) for r in rows),max(len(r['parts']) for r in rows)],
+            weld_length_m_range=[min(lengths),max(lengths)],
+            rectangle_utilization_quantiles=np.quantile(utilization,[0,.25,.5,.75,1]).tolist(),
+            model_usage=dict(sorted(models.items())),duplicate_layouts=0)
+        print('SCALE_DATA_CHECK',json.dumps(summary,ensure_ascii=False),flush=True)
+    print('SCALE_DATA_UNION',json.dumps(dict(historical_layouts=len(history),new_layouts=len(current),
+        intentionally_reused_train_validation_prefix=intentional,new_geometry_duplicates=0)),flush=True)
+
+
+def export_scale_dataset(parts, workbook, output_dir, targets=(1000,100,100), workers=4):
+    """Extend the original generator; keep its 1024 trials and geometric equality."""
+    source = PROJECT_DIR.parent/'data/weld_layout'
+    history = {}
+    for name in ('train','validation','test','train_expanded','validation_fresh'):
+        for line in (source/f'{name}.jsonl').read_text(encoding='utf-8').splitlines():
+            row=json.loads(line);history[row['layout_id']]=row
+    prefix = {name:[json.loads(s) for s in (source/f'{filename}.jsonl').read_text(encoding='utf-8').splitlines()]
+              for name,filename in (('train','train_expanded'),('validation','validation_fresh'))}
+    prefix['test']=[]
+    output_dir.mkdir(parents=True,exist_ok=True)
+    geometries=[layout_geometry(r) for r in history.values()]
+    used_seeds={r['geometry_seed'] for r in history.values()}
+    datasets={}
+    for name,target in zip(('train','validation','test'),targets):
+        if target < len(prefix[name]):raise ValueError('target smaller than the permitted historical prefix')
+        path=output_dir/f'{name}.jsonl'
+        if path.exists():
+            rows=[json.loads(s) for s in path.read_text(encoding='utf-8').splitlines()]
+        else:
+            rows=list(prefix[name])
+            with path.open('x',encoding='utf-8',newline='\n') as stream:
+                stream.write(''.join(json.dumps(r,ensure_ascii=False,allow_nan=False)+'\n' for r in rows))
+        if rows[:len(prefix[name])] != prefix[name] or len(rows)>target:
+            raise ValueError('scale output prefix/count differs from the requested dataset')
+        for row in rows[len(prefix[name]):]:
+            geometry=layout_geometry(row)
+            if any(same_layout(geometry,g) for g in geometries):raise ValueError('duplicate existing scale layout')
+            geometries.append(geometry);used_seeds.add(row['geometry_seed'])
+        datasets[name]=rows
+    seed=max(*used_seeds,2026111900)+1
+    duplicates=0
+    with ProcessPoolExecutor(max_workers=workers,initializer=_scale_worker_init,initargs=(parts,workbook)) as pool:
+        for name,target in zip(('train','validation','test'),targets):
+            rows=datasets[name]
+            with (output_dir/f'{name}.jsonl').open('a',encoding='utf-8',newline='\n') as stream:
+                failed=0
+                while len(rows)<target:
+                    jobs=[]
+                    for _ in range(min(workers*2,target-len(rows))):
+                        while seed in used_seeds:seed+=1
+                        jobs.append((name,seed));used_seeds.add(seed);seed+=1
+                    for record in pool.map(_scale_record,jobs):
+                        geometry=layout_geometry(record)
+                        if any(same_layout(geometry,g) for g in geometries):
+                            duplicates+=1;failed+=1
+                            if failed>=128:raise ValueError(f'{name}: 128 successive duplicate layouts; held_out unchanged')
+                            continue
+                        failed=0
+                        record['layout_id']=f'scale_{name}_{len(rows)+1:04d}'
+                        rows.append(record);geometries.append(geometry)
+                        stream.write(json.dumps(record,ensure_ascii=False,allow_nan=False)+'\n');stream.flush()
+                    if len(rows)%20<workers*2 or len(rows)==target:
+                        print('SCALE_DATA_PROGRESS',name,len(rows),'/',target,'duplicates',duplicates,flush=True)
+    check_scale_dataset(output_dir,parts)
+    print('SCALE_DATA_SKIPPED_DUPLICATES',duplicates,flush=True)
+
+
 def label_position(box: Box, paths: list[np.ndarray], ident: str, points_per_meter: float):
     x0, y0, x1, y1 = box
     width, height = x1 - x0, y1 - y0
@@ -599,7 +732,10 @@ def main() -> None:
     parser.add_argument("workbook", type=Path, nargs="?", default=PROJECT_DIR / "C_layout_geometry.xlsx")
     parser.add_argument("--seed", type=int, action="append", help="随机种子，可重复指定")
     parser.add_argument("--spacing", type=float, action="append", help=f"件间净距（m），可重复指定，默认 {SPACING:g}")
-    parser.add_argument("--split", choices=("all", "expanded", *DATASET_SEEDS), help="导出 JSONL；expanded 仅新增扩充训练和独立验证")
+    parser.add_argument("--split", choices=("all", "expanded", "scale1000", *DATASET_SEEDS), help="导出 JSONL")
+    parser.add_argument('--scale-counts',type=int,nargs=3,default=(1000,100,100),metavar=('TRAIN','VALIDATION','TEST'))
+    parser.add_argument('--workers',type=int,default=4)
+    parser.add_argument('--check-only',action='store_true')
     parser.add_argument("--output-dir", type=Path, help="指定 PNG 或 JSONL 的输出目录")
     args = parser.parse_args()
     if args.split == "all" and args.seed:
@@ -613,6 +749,12 @@ def main() -> None:
             raise ValueError("工作簿中没有小组立")
         if args.split:
             output_dir = args.output_dir or PROJECT_DIR.parent / "data" / "weld_layout"
+            if args.split == 'scale1000':
+                if args.seed or args.spacing:parser.error('scale1000 retains fixed 0.3m clearance and separate seeds')
+                output_dir=args.output_dir or output_dir/'scale1000'
+                if args.check_only:check_scale_dataset(output_dir,parts)
+                else:export_scale_dataset(parts,args.workbook,output_dir,tuple(args.scale_counts),args.workers)
+                return
             if args.split == 'expanded':
                 if args.seed or args.spacing:
                     parser.error('expanded 使用固定的新种子及原 0.3m 间距')
