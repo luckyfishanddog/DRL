@@ -5255,3 +5255,64 @@ def test_conflict_compensation_completes_real_cross_robot_ownership(kind):
     unchanged=set(before)-{move['block_id'] for move in actual}
     assert all(after[block]==before[block] for block in unchanged)
 
+
+def test_cycle_transfer_uses_route_cycle_bottleneck_and_all_legal_receivers(monkeypatch):
+    import run_gnn_weld_layout as e
+    _,current,space,model=_load_compensation_fixture('relocate')
+    embeddings=model.encode_static(space.graph)
+    real=e.cycle_route_state
+    state=real(current)
+    arcs=((1000.,),tuple(),(0.,),(0.,))
+    monkeypatch.setattr(e,'cycle_route_state',lambda plan:replace(state,arc_costs=arcs))
+    groups=e.cycle_transfer_groups(current,space,embeddings,model,kind='relocate',training=True)
+    assert groups and {g['source_robot'] for g in groups}=={0}
+    monkeypatch.undo()
+    groups=e.cycle_transfer_groups(current,space,embeddings,model,kind='relocate',training=True)
+    cycles=e.cycle_values(e.cycle_route_state(current))[0]
+    heavy_robot=max(range(4),key=lambda r:(cycles[r],-r))
+    expected=set()
+    for block_id in current.solution.routes[heavy_robot].block_ids:
+        expected.update(t.move.key.destination_robot_id for t in e.lns.child_transfer_candidates(
+            current.solution,current.directions,block_id,CONFIG))
+    actual={move['destination'] for group in groups for move in group['moves']}
+    assert actual==expected
+
+
+def test_cycle_swap_is_two_sided_and_safe_lb_load_filter_is_exact():
+    import run_gnn_weld_layout as e
+    _,current,space,model=_load_compensation_fixture('swap')
+    embeddings=model.encode_static(space.graph)
+    groups=e.cycle_transfer_groups(current,space,embeddings,model,kind='swap',training=True)
+    assert groups
+    for group in groups:
+        left,right=group['moves']
+        assert left['source']==right['destination'] and left['destination']==right['source']
+        for candidate in group['candidates']:
+            actual=e.conflict_actual_transfers(candidate['plan'],dict(moves=group['moves']),current)
+            assert len(actual)==2
+            state=candidate['plan'].oriented_state
+            assert candidate['lb']==pytest.approx(e.lns.oriented_route_lower_bound(state))
+    limits=dict(pmax_limit_s=1000.,spread_limit_s=1000.)
+    selected=e.cycle_transfer_groups(current,space,embeddings,model,kind='swap',training=False,limits=limits)
+    incumbent=e.cycle_values(e.cycle_route_state(current))[1]
+    assert all(c['lb']<incumbent and c['peak']<=1000 and c['spread']<=1000
+               for group in selected for c in group['candidates'])
+    strict=e.cycle_transfer_groups(current,space,embeddings,model,kind='relocate',training=False,
+        limits=dict(pmax_limit_s=1.,spread_limit_s=1.))
+    assert strict==[]
+
+
+def test_cycle_ranking_loss_backpropagates_to_existing_joint_actor():
+    import run_gnn_weld_layout as e
+    _,current,space,model=_load_compensation_fixture('relocate')
+    embeddings=model.encode_static(space.graph)
+    groups=e.cycle_transfer_groups(current,space,embeddings,model,kind='relocate',training=True)
+    losses=[e.cycle_group_loss(space,embeddings,model,group) for group in groups]
+    loss,pairs,_=next(value for value in losses if value[0] is not None)
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    assert pairs>0 and math.isfinite(float(loss))
+    assert model.joint_weights.grad is not None
+    assert any(float(p.grad.abs().sum())>0 for p in (model.policy[0].weight,model.insertion_head[0].weight,
+                                                     model.joint_weights))
+

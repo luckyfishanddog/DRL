@@ -24,7 +24,7 @@ from torch.nn import functional as F
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
-from mrta_reference.geometry import optimize_directions, oriented_endpoints
+from mrta_reference.geometry import optimize_directions, oriented_endpoints, robot_is_eligible
 from mrta_reference.model import DeadlockBlockage, Operation, OperationKind, ParentWeld, RobotRoute, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind
 from mrta_reference.scheduler import ScheduleWaitBlockers, build_operation_templates, earliest_safe_start, selected_schedule_wait_blockers
 from mrta_reference.scope import FORMAL_SCOPE_V2
@@ -5242,6 +5242,492 @@ def conflict_core_partial(current, schedule, model, space, embeddings, *, seed, 
         evidence_source=schedule.deadlock_evidence_source)
 
 
+CYCLE_MODEL = ROOT/'models/gnn_weld_layout_cycle_transfer.pt'
+CYCLE_RESULTS = FINAL_RESULTS/'gnn_cycle_transfer_pilot.csv'
+CYCLE_METHOD = 'GNN-Cycle-Transfer-LNS'
+CYCLE_FIELDS = (*CONFLICT_LOAD_FIELDS, 'cycle_lb_s')
+CYCLE_EPS = 1e-7
+
+
+def cycle_route_state(plan):
+    return lns.oriented_route_state(tuple(r.block_ids for r in plan.solution.routes), plan.directions,
+        block_map(plan.solution, CONFIG, scope=FORMAL_SCOPE_V2), CONFIG)
+
+
+def cycle_values(state):
+    cycles = tuple(p+sum(arcs) for p, arcs in zip(state.loads, state.arc_costs))
+    return cycles, max(cycles), max(state.loads), max(state.loads)-min(state.loads)
+
+
+def cycle_joint_plan(space, embeddings, model, current, transfer, feedback=None):
+    """Express an existing legal child insertion as the ordinary VNext joint action."""
+    parent = transfer.action.block_id.split('::', 1)[0]
+    before = {a.parent_id: a for a in gnn.parent_assignment_targets(current, CONFIG)}[parent]
+    after_owners = gnn.assignment_targets(transfer.solution)
+    robots = tuple(after_owners[b.block_id] for b in space.children[before.pattern])
+    target = gnn.ParentAssignment(parent, before.pattern, robots)
+    target_index = space.action_index[target]
+    blocks = block_map(current, CONFIG, scope=FORMAL_SCOPE_V2)
+    patterns = {p.parent_id: p for p in current.patterns}
+    nodes = {b.block_id: space.block_nodes[patterns[b.parent_id], b.block_id] for b in blocks.values()}
+    pending = {parent}
+    indices, features = model.assignment_features(space, embeddings, transfer.partial, blocks, pending, CONFIG)
+    positions = {index: i for i, index in enumerate(indices.tolist())}
+    position = positions[target_index]
+    graph = replace(space.graph, block_index=nodes)
+    ix, inputs = gnn.vnext_insertion_inputs(graph, transfer.partial,
+        ((transfer.state, transfer.action),), blocks, CONFIG)
+    moves = features.new_tensor([sum(arcs) for arcs in transfer.state.arc_costs])
+    assignment = features[position]
+    peak = float(assignment[-8:-4].max())
+    nominal = max(p+m for p, m in zip(transfer.state.loads, moves.tolist()))/2500.
+    lo = [min((min(blocks[b].start[0], blocks[b].end[0]) for b in route), default=math.inf)
+          for route in transfer.state.routes]
+    hi = [max((max(blocks[b].start[0], blocks[b].end[0]) for b in route), default=-math.inf)
+          for route in transfer.state.routes]
+    overlap = sum(max(0., hi[r]+CONFIG.interference_dx-lo[r+1]) for r in (0, 2))/20.
+    feedback = feedback or {}
+    risk = (feedback.get('parent_wait', {}).get(parent, 0.) +
+            feedback.get('parent_blocked', {}).get(parent, 0.))/2500.
+    outcome = features.new_tensor((peak, peak-float(assignment[-8:-4].min()), nominal,
+        (transfer.state.travel-transfer.partial.travel)/45., overlap, risk))
+    return gnn.VNextJointAction(target_index, transfer.state, (transfer.action,), assignment,
+                                outcome, (inputs[0].detach(),), (ix[0].detach(),))
+
+
+@torch.no_grad()
+def cycle_score_candidates(space, embeddings, model, candidates):
+    flat = [plan for candidate in candidates for plan in candidate['joint_plans']]
+    if not flat:
+        return
+    scores = gnn.imitation_joint_scores(space, embeddings, model, flat)
+    offset = 0
+    for candidate in candidates:
+        count = len(candidate['joint_plans'])
+        candidate['gnn_score'] = float(scores[offset:offset+count].sum())/count
+        offset += count
+
+
+def cycle_candidate_group(kind, moves, candidates, source, destination):
+    for candidate in candidates:
+        candidate.update(kind=kind, moves=moves, source_robot=source, destination_robot=destination)
+    return dict(kind=kind, source_robot=source, destination_robot=destination,
+                moves=moves, candidates=candidates)
+
+
+def cycle_transfer_groups(current, space, embeddings, model, *, kind, feedback=None,
+                           training=False, limits=None, max_blocks=None, max_partners=None,
+                           max_swaps=12):
+    """Enumerate bottleneck tasks/receivers, then score legal joint insertions."""
+    solution = current.solution
+    state = cycle_route_state(current)
+    cycles, incumbent_lb, _, _ = cycle_values(state)
+    heavy = max(range(4), key=lambda r: (cycles[r], -r))
+    groups = []
+    working_blocks = block_map(solution, CONFIG, scope=FORMAL_SCOPE_V2)
+    patterns = {p.parent_id: p for p in solution.patterns}
+    source_blocks = [b for b in state.routes[heavy]
+        if patterns[b.split('::', 1)[0]].kind is not SplitKind.X_SPLIT]
+    source_blocks.sort(key=lambda b: (-CONFIG.process_time(working_blocks[b].length), b))
+    if max_blocks is not None:
+        source_blocks = source_blocks[:max_blocks]
+
+    def allowed_candidate(lb, peak, spread):
+        return lb < incumbent_lb-CYCLE_EPS and (limits is None or
+            peak <= limits['pmax_limit_s']+CYCLE_EPS and spread <= limits['spread_limit_s']+CYCLE_EPS)
+
+    if kind == 'relocate':
+        for block_id in source_blocks:
+            parent = block_id.split('::', 1)[0]
+            destinations = sorted({t.move.key.destination_robot_id for t in lns.child_transfer_candidates(
+                solution, current.directions, block_id, CONFIG)})
+            for destination in destinations:
+                moves = [dict(parent_id=parent, block_id=block_id, source=heavy, destination=destination)]
+                candidates = []
+                for transfer in lns.child_transfer_candidates(solution, current.directions, block_id, CONFIG,
+                                                               destination_robot=destination):
+                    _, lb, peak, spread = cycle_values(transfer.state)
+                    if not training and not allowed_candidate(lb, peak, spread):
+                        continue
+                    candidates.append(dict(plan=gnn.JointCompletionResult(transfer.solution,
+                        transfer.state.directions, (transfer.action,), 0., oriented_state=transfer.state),
+                        lb=lb, peak=peak, spread=spread,
+                        joint_plans=(cycle_joint_plan(space, embeddings, model, solution, transfer, feedback),)))
+                cycle_score_candidates(space, embeddings, model, candidates)
+                candidates.sort(key=lambda c: (-c['gnn_score'], c['lb']))
+                selected = candidates if training else candidates[:4]
+                if selected:
+                    groups.append(cycle_candidate_group(kind, moves, selected, heavy, destination))
+    elif kind == 'swap':
+        # Fixed-position exchange gives an exact route-cycle ordering over every
+        # bottleneck-task/receiver-task pair. The leading pairs then retain every
+        # legal GNN insertion/direction variant. No pair is selected by a rule
+        # score; the GNN jointly orders the expanded complete candidates.
+        direct = []
+        owners = {b: (r, i) for r, route in enumerate(state.routes) for i, b in enumerate(route)}
+        bits = {b: d for route, vector in zip(state.routes, state.directions)
+                for b, d in zip(route, vector)}
+        for block_id in source_blocks:
+            parent = block_id.split('::', 1)[0]
+            for destination in range(4):
+                if destination == heavy:
+                    continue
+                for other_id in state.routes[destination]:
+                    other_parent = other_id.split('::', 1)[0]
+                    if other_parent == parent or patterns[other_parent].kind is SplitKind.X_SPLIT:
+                        continue
+                    if not (robot_is_eligible(working_blocks[block_id], destination, CONFIG)
+                            and robot_is_eligible(working_blocks[other_id], heavy, CONFIG)):
+                        continue
+                    routes = [list(route) for route in state.routes]
+                    source_pos = owners[block_id][1]
+                    other_pos = owners[other_id][1]
+                    routes[heavy][source_pos], routes[destination][other_pos] = other_id, block_id
+                    vectors = [list(vector) for vector in state.directions]
+                    vectors[heavy][source_pos], vectors[destination][other_pos] = bits[other_id], bits[block_id]
+                    direct_state = lns.oriented_route_state(routes, vectors, working_blocks, CONFIG)
+                    _, lb, peak, spread = cycle_values(direct_state)
+                    if not training and not allowed_candidate(lb, peak, spread):
+                        continue
+                    direct.append((lb, block_id, other_id, destination, other_parent))
+        direct.sort(key=lambda item: (item[0], item[1], item[2]))
+        for lb, block_id, other_id, destination, other_parent in direct[:max_swaps]:
+            parent = block_id.split('::', 1)[0]
+            first_moves = [dict(parent_id=parent, block_id=block_id, source=heavy, destination=destination)]
+            first = []
+            for transfer in lns.child_transfer_candidates(solution, current.directions, block_id, CONFIG,
+                                                           destination_robot=destination):
+                first.append(dict(plan=gnn.JointCompletionResult(transfer.solution, transfer.state.directions,
+                    (transfer.action,), 0., oriented_state=transfer.state), lb=lb,
+                    joint_plans=(cycle_joint_plan(space, embeddings, model, solution, transfer, feedback),)))
+            cycle_score_candidates(space, embeddings, model, first)
+            first.sort(key=lambda c: (-c['gnn_score'], c['plan'].oriented_state.travel))
+            for left in first[:2]:
+                moves = [*first_moves, dict(parent_id=other_parent, block_id=other_id,
+                                            source=destination, destination=heavy)]
+                second = []
+                for transfer in lns.child_transfer_candidates(left['plan'].solution, left['plan'].directions,
+                    other_id, CONFIG, destination_robot=heavy):
+                    _, final_lb, peak, spread = cycle_values(transfer.state)
+                    if not training and not allowed_candidate(final_lb, peak, spread):
+                        continue
+                    second.append(dict(plan=gnn.JointCompletionResult(transfer.solution,
+                        transfer.state.directions, (*left['plan'].actions, transfer.action), 0.,
+                        oriented_state=transfer.state), lb=final_lb, peak=peak, spread=spread,
+                        joint_plans=(*left['joint_plans'], cycle_joint_plan(space, embeddings, model,
+                            left['plan'].solution, transfer, feedback))))
+                cycle_score_candidates(space, embeddings, model, second)
+                second.sort(key=lambda c: (-c['gnn_score'], c['lb']))
+                selected = second if training else second[:2]
+                if selected:
+                    groups.append(cycle_candidate_group(kind, moves, selected, heavy, destination))
+    else:
+        raise ValueError('cycle transfer kind must be relocate or swap')
+    if training:
+        for group in groups:
+            group['candidates'].sort(key=lambda c: (c['lb'], -c['gnn_score']))
+            group['candidates'] = group['candidates'][:6]
+    return groups
+
+
+def cycle_group_loss(space, embeddings, model, group):
+    scores = []
+    for candidate in group['candidates']:
+        inputs = gnn.vnext_policy_inputs(space, candidate['joint_plans'], model)
+        steps = gnn.imitation_joint_scores(space, embeddings, model, inputs)
+        scores.append(steps.mean())
+    if not scores:
+        return None, 0, 0
+    scores = torch.stack(scores)
+    cycles = [c['lb'] for c in group['candidates']]
+    reference = max(max(cycles, default=0.), 1.)
+    losses, weights, correct, pairs = [], [], 0, 0
+    for i in range(len(cycles)):
+        for j in range(i+1, len(cycles)):
+            if abs(cycles[i]-cycles[j]) <= 1e-6:
+                continue
+            good, bad = (i, j) if cycles[i] < cycles[j] else (j, i)
+            weight = abs(cycles[i]-cycles[j])/reference
+            losses.append(F.softplus(scores[bad]-scores[good]))
+            weights.append(weight)
+            correct += int(scores[good] > scores[bad])
+            pairs += 1
+    if not pairs:
+        return None, 0, 0
+    weights = scores.new_tensor(weights)
+    loss = (torch.stack(losses)*weights).sum()/weights.sum().clamp_min(1e-12)
+    return loss, pairs, correct
+
+
+def imitation_cycle_train():
+    """TRAIN-only directed-cycle ranking on the unchanged joint actor."""
+    configure_cpu()
+    torch.manual_seed(SEED)
+    source = torch.load(IMITATION_MODEL, map_location='cpu', weights_only=True)
+    saved = torch.load(CYCLE_MODEL, map_location='cpu', weights_only=True) if CYCLE_MODEL.exists() else {}
+    if saved.get('training_complete'):
+        print('CYCLE_TRAIN_ALREADY_COMPLETE', saved.get('completed_epoch'), flush=True)
+        return saved
+    initial = saved.get('initial_state_dict', copy.deepcopy(source['state_dict']))
+    weights = saved.get('last_state_dict', initial)
+    model = imitation_model(weights).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    if saved.get('optimizer_state_dict'):
+        optimizer.load_state_dict(saved['optimizer_state_dict'])
+    teachers = imitation_best_teachers(imitation_saved())
+    training = dict(ppo_layouts('train'))
+    # A fixed size-stratified set of existing TRAIN instances, not a new dataset
+    # and never VALIDATION/TEST. It bounds ranking collection without changing
+    # the available legal receivers or using B32 labels.
+    teacher_names=sorted(teachers,key=lambda n:(len(training[n]),n))
+    teacher_names=[teacher_names[round(i*(len(teacher_names)-1)/19)] for i in range(20)]
+    prepared = []
+    with torch.no_grad():
+        for name in teacher_names:
+            record=teachers[name]
+            space = gnn.parent_assignment_space(training[name], CONFIG)
+            current = unpack_directed_plan(training[name], record['plan'], space)
+            embeddings = model.encode_static(space.graph)
+            groups = []
+            for kind in ('relocate', 'swap'):
+                groups.extend(cycle_transfer_groups(current, space, embeddings, model,
+                    kind=kind, training=True, max_blocks=4, max_partners=3))
+            sizes = [cycle_group_loss(space, embeddings, model, group)[1] for group in groups]
+            kept = [group for group, pairs in zip(groups, sizes) if pairs]
+            pairs = sum(sizes)
+            prepared.append((name, space, kept))
+            print('CYCLE_TRAIN_GROUPS', name, len(kept), 'pairs', pairs, flush=True)
+    if not any(groups for _, _, groups in prepared):
+        raise ValueError('no usable directed-cycle ranking preference in TRAIN')
+    history = list(saved.get('history', ()))
+    for epoch in range(saved.get('completed_epoch', 0)+1, 4):
+        started = time.perf_counter()
+        rng = Random(SEED+epoch)
+        order = list(range(len(prepared)))
+        rng.shuffle(order)
+        epoch_loss, epoch_pairs, epoch_correct, updates = [], 0, 0, 0
+        for index in order:
+            name, space, groups = prepared[index]
+            optimizer.zero_grad(set_to_none=True)
+            embeddings = model.encode_static(space.graph)
+            values = [cycle_group_loss(space, embeddings, model, group) for group in groups]
+            losses = [value[0] for value in values if value[0] is not None]
+            if not losses:
+                continue
+            loss = torch.stack(losses).mean()
+            loss.backward()
+            gradient = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.))
+            if not math.isfinite(float(loss.detach())) or not math.isfinite(gradient):
+                raise ArithmeticError('nonfinite directed-cycle ranking optimization')
+            optimizer.step()
+            epoch_loss.append(float(loss.detach()))
+            epoch_pairs += sum(value[1] for value in values)
+            epoch_correct += sum(value[2] for value in values)
+            updates += 1
+        history.append(dict(epoch=epoch, loss=sum(epoch_loss)/max(1, len(epoch_loss)),
+                            ranking_accuracy=epoch_correct/max(1, epoch_pairs),
+                            pairs=epoch_pairs, updates=updates, learning_rate=1e-4,
+                            runtime_s=time.perf_counter()-started))
+        saved.update(initial_state_dict=initial, state_dict=copy.deepcopy(model.state_dict()),
+                     last_state_dict=copy.deepcopy(model.state_dict()), optimizer_state_dict=optimizer.state_dict(),
+                     completed_epoch=epoch, training_complete=epoch == 3, history=history,
+                     training_split='TRAIN_ONLY', teacher_layouts=[name for name, _, _ in prepared],
+                     cycle_metric='max directed processing+MOVE; no WAIT; no B32 labels',
+                     network='unchanged VNextGNN assignment/joint/insertion scoring')
+        torch.save(saved, CYCLE_MODEL)
+        print('CYCLE_TRAIN_EPOCH', json.dumps(history[-1]), flush=True)
+    return saved
+
+
+def cycle_write(rows):
+    with CYCLE_RESULTS.open('a' if CYCLE_RESULTS.exists() else 'w', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=CYCLE_FIELDS)
+        if stream.tell() == 0:
+            writer.writeheader()
+        writer.writerows({key: row.get(key) for key in CYCLE_FIELDS} for row in rows)
+
+
+def cycle_origin_feedback(current, schedule, events):
+    if schedule.feasible and schedule.operations:
+        summary = lns.schedule_feedback_summary(current.solution, schedule, events, CONFIG)
+        return dict(parent_wait=summary['parent_wait'], parent_blocked=summary['parent_blocked'])
+    parent_blocked = Counter()
+    for event in schedule.deadlock_blockages:
+        for parent in event.blocked_parent_ids:
+            parent_blocked[parent] += 1
+        for parents in event.blocker_parent_ids:
+            for parent in parents:
+                parent_blocked[parent] += 1
+    return dict(parent_wait={}, parent_blocked=dict(parent_blocked))
+
+
+@torch.no_grad()
+def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, max_attempts=500):
+    saved = [r for r in read_rows(CYCLE_RESULTS) if r['layout_id'] == name and int(r['seed']) == seed]
+    final = next((r for r in reversed(saved) if r['stage'] == 'final'), None)
+    if final is not None:
+        return final
+    started = time.perf_counter()
+    limits = conflict_load_limits(name, references)
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    history = [*read_rows(CONFLICT_LOAD_RESULTS), *read_rows(CONFLICT_RESULTS), *read_rows(CYCLE_RESULTS)]
+    seen, blockers, records = routeaware_history(name, parents, space, extra_rows=history)
+    embeddings = model.encode_static(space.graph)
+    warm = next(r for r in read_rows(CONFLICT_LOAD_RESULTS)
+                if r['layout_id'] == name and r['stage'] == 'final' and int(r['seed']) == seed)
+    original = deadlock_plan(parents, warm['solution'], space)
+    calls = sum(int(r.get('b32_calls') or 0) for r in saved if r['stage'] in ('initial', 'candidate'))
+    hits = 0
+    attempts = sum(r['stage'] == 'round' for r in saved)
+    visited, all_entries, failures = set(), [], Counter()
+    saved_ids = {r['candidate_id']: r for r in saved if r['stage'] in ('initial', 'candidate')}
+    exhausted = set()
+
+    def evaluate(plan, candidate_id, *, origin=None, removed=(), feedback=None, construction=None,
+                 stage='candidate', operator='cycle-transfer'):
+        nonlocal calls, hits
+        key = plan_key(plan.solution, plan.directions)
+        if key in visited or key not in seen and calls >= budget:
+            return None
+        visited.add(key)
+        transfers = conflict_actual_transfers(plan, dict(moves=(feedback or {}).get('moves', ())),
+                                              None if origin is None else origin[0])
+        if origin is not None and not transfers:
+            failures['requested ownership not completed'] += 1
+            return None
+        _, lb, _, _ = cycle_values(cycle_route_state(plan))
+        evaluation = time.perf_counter()
+        schedule, called = evaluate_once(plan, seen, blocker_cache=blockers)
+        elapsed = time.perf_counter()-evaluation
+        calls += int(called)
+        hits += int(not called)
+        modes, owners = ({}, {}) if origin is None else conflict_changes(origin[0], plan, removed)
+        row = routeaware_result_row(name, CYCLE_METHOD, plan, schedule, blockers.get(key, ()),
+            historical=records.get(key), stage=stage, candidate_id=candidate_id,
+            origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
+            removed_parent_ids=json.dumps(removed), feedback=json.dumps(feedback or {}),
+            construct_s=plan.inference_seconds, b32_s=elapsed if called else 0.,
+            runtime_s=plan.inference_seconds+elapsed, b32_calls=int(called), cache_hits=int(not called),
+            gnn_score=(construction or {}).get('gnn_score'), load_limits=json.dumps(limits),
+            mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
+            rebuild_actions=json.dumps((construction or {}).get('actions', [])),
+            successful_repair=int(origin is not None and origin[1].status is ScheduleStatus.DEADLOCK and schedule.feasible),
+            transfer_count=int(bool(transfers)), transfer_details=json.dumps(transfers), cycle_lb_s=lb)
+        row.update(seed=seed, load_allowed=int(conflict_load_allowed(row, limits)))
+        previous = saved_ids.get(candidate_id)
+        if previous is None:
+            cycle_write([row])
+        else:
+            if json.loads(previous['solution']) != json.loads(row['solution']):
+                raise ValueError('resumed cycle proposal differs from saved proposal')
+            row = previous
+        records[key] = row
+        entry = (plan, schedule, row)
+        all_entries.append(entry)
+        print('CYCLE_CANDIDATE', name, candidate_id, schedule.status.value, schedule.cmax,
+              'LB', round(lb, 3), 'B32', calls, 'load_ok', row['load_allowed'], flush=True)
+        return entry
+
+    initial = evaluate(original, 'warm-start', stage='initial', operator='saved-load-compensation-best')
+    if initial is None:
+        raise ValueError(f'{name}: unable to restore the previous feasible incumbent')
+    # Restore already evaluated cycle candidates after a process interruption.
+    for previous in saved:
+        if previous['stage'] != 'candidate' or previous['solution'] in (None, ''):
+            continue
+        plan = deadlock_plan(parents, previous['solution'], space)
+        key = plan_key(plan.solution, plan.directions)
+        if key in visited or key not in seen:
+            continue
+        schedule = seen[key]
+        entry = (plan, schedule, previous)
+        visited.add(key)
+        all_entries.append(entry)
+    pool = conflict_pool([], [initial])
+    while calls < budget and attempts < max_attempts:
+        origin = pool[(attempts % len(pool))]
+        attempts += 1
+        kind = 'relocate' if attempts % 2 else 'swap'
+        current, schedule, row = origin
+        origin_key = plan_key(current.solution, current.directions)
+        if (origin_key, kind) in exhausted:
+            cycle_write([dict(stage='round', layout_id=name, seed=seed, method=CYCLE_METHOD,
+                round=attempts, b32_calls=0, cache_hits=0, runtime_s=time.perf_counter()-started,
+                diagnostic=json.dumps(dict(skip='deterministic origin/kind already exhausted')))])
+            continue
+        feedback = cycle_origin_feedback(current, schedule, blockers.get(origin_key, ()))
+        groups = cycle_transfer_groups(current, space, embeddings, model, kind=kind,
+            feedback=feedback, training=False, limits=limits, max_blocks=None, max_swaps=16)
+        candidates = [dict(group=group, **candidate) for group in groups for candidate in group['candidates']]
+        admissible = [e for e in all_entries if int(e[2]['load_allowed']) and e[1].feasible]
+        incumbent_cmax = min((e[1].cmax for e in admissible), default=math.inf)
+        candidates = [c for c in candidates if c['lb'] < incumbent_cmax-CYCLE_EPS
+                      and plan_key(c['plan'].solution,c['plan'].directions) not in visited]
+        candidates.sort(key=lambda c: (-c['gnn_score'], c['lb']))
+        new = []
+        for index, candidate in enumerate(candidates[:2]):
+            if calls >= budget:
+                break
+            group = candidate['group']
+            moves = group['moves']
+            removed = tuple(dict.fromkeys(move['parent_id'] for move in moves))
+            construction = dict(gnn_score=candidate['gnn_score'],
+                actions=[dict(block_id=a.block_id, robot=a.robot, position=a.position, direction=a.direction,
+                              neighbour_changes=a.neighbour_changes) for a in candidate['plan'].actions])
+            detail = dict(compensation=kind, moves=moves, source_robot=group['source_robot'],
+                          destination_robot=group['destination_robot'], candidate_lb_s=candidate['lb'],
+                          incumbent_cmax_s=incumbent_cmax, cycle_feedback=feedback)
+            entry = evaluate(candidate['plan'], f'attempt{attempts}-{index}', origin=origin, removed=removed,
+                feedback=detail, construction=construction, operator='cycle-'+kind)
+            if entry is not None:
+                new.append(entry)
+        if not new:
+            exhausted.add((origin_key, kind))
+        pool = conflict_pool(pool, new)
+        cycle_write([dict(stage='round', layout_id=name, seed=seed, method=CYCLE_METHOD, round=attempts,
+            pool_ids=json.dumps([e[2]['candidate_id'] for e in pool]), b32_calls=0, cache_hits=0,
+            runtime_s=time.perf_counter()-started, diagnostic=json.dumps(dict(kind=kind,
+                candidates_after_lb=len(candidates), failures=failures)))])
+    admissible = [e for e in all_entries if int(e[2]['load_allowed'])]
+    good = [e for e in admissible if e[1].feasible]
+    best = min(good, key=lambda e: e[1].cmax) if good else max(admissible or all_entries, key=conflict_deadlock_progress)
+    modes, owners = conflict_changes(original, best[0], space.parent_ids)
+    baseline_hga = next(float(r['cmax_s']) for r in references
+                        if r['layout_id'] == name and r['method'] == 'HGA' and r['status'] == 'FEASIBLE')
+    evaluated = [r for r in read_rows(CYCLE_RESULTS) if r['layout_id'] == name and int(r['seed']) == seed
+                 and r['stage'] in ('initial', 'candidate')]
+    minimum_lb = min(float(r['cycle_lb_s']) for r in evaluated)
+    final = dict(best[2], stage='final', runtime_s=time.perf_counter()-started, b32_calls=calls,
+        cache_hits=hits, origin_id=best[2]['candidate_id'], mode_changes=json.dumps(modes),
+        assignment_changes=json.dumps(owners), diagnostic=json.dumps(dict(
+            stop='B32 budget exhausted' if calls >= budget else '500 attempts/legal origin candidates exhausted',
+            attempts=attempts, unique_visited=len(visited), failures=failures,
+            feasible_candidates=sum(e[1].feasible for e in all_entries), admissible_feasible=len(good),
+            successful_transfers=sum(int(e[2].get('transfer_count') or 0) for e in all_entries),
+            minimum_cycle_lb_s=minimum_lb, lb_below_hga=minimum_lb < baseline_hga-CYCLE_EPS,
+            evaluation='directed P+MOVE screening; original FORMAL_SCOPE_V2 B32; no priority_schedule', seed=seed)))
+    cycle_write([final])
+    print('CYCLE_FINAL', json.dumps({key: final.get(key) for key in
+        ('layout_id', 'status', 'cmax_s', 'cycle_lb_s', 'b32_calls', 'runtime_s')}), flush=True)
+    return final
+
+
+def imitation_cycle_transfer_pilot():
+    saved = imitation_cycle_train()
+    references = read_rows(IMITATION_RESULTS)
+    layouts = dict(ppo_layouts('validation'))
+    model = imitation_model(saved['state_dict']).eval()
+    model.requires_grad_(False)
+    model.load_first_lambda = None
+    model.route_aware = False
+    finals = [cycle_transfer_case(name, layouts[name], SEED, model, references) for name in IMITATION_CASES]
+    feasible = sum(r['status'] == 'FEASIBLE' and int(r['load_allowed']) for r in finals)
+    print('CYCLE_PHASE1_SUMMARY', json.dumps(dict(feasible=feasible, cases=6,
+        b32_calls=sum(int(r['b32_calls']) for r in finals),
+        lb_below_hga=sum(bool(json.loads(r['diagnostic']).get('lb_below_hga')) for r in finals))), flush=True)
+    return finals
+
+
 def conflict_compensation(current, space, removed, protected, *, q, kind, seed):
     """Select one legal Relocate or two-sided Swap inside the existing core."""
     solution = current.solution
@@ -5724,7 +6210,7 @@ def imitation_conflict_load_pilot():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -5738,7 +6224,8 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'imitation-conflict-load-pilot':imitation_conflict_load_pilot()
+    if args.stage == 'imitation-cycle-transfer-pilot':imitation_cycle_transfer_pilot()
+    elif args.stage == 'imitation-conflict-load-pilot':imitation_conflict_load_pilot()
     elif args.stage == 'imitation-conflict-core-pilot':imitation_conflict_core_pilot()
     elif args.stage in ('imitation-priority-vnd','imitation-deadlock-pilot'):priority_pilot()
     elif args.stage == 'imitation-priority-diagnosis':priority_history_diagnosis()
