@@ -5069,3 +5069,112 @@ def test_priority_vnd_budget_completed_resume_and_no_forbidden_evaluation(monkey
     resumed=e.priority_vnd_case('fixture',20261110,plan,None,cache,budget=9)
     assert resumed['stage']=='final' and (len(calls),len(written))==before
 
+
+def test_conflict_joint_reconstruction_can_change_mode_and_owner_without_touching_other_tasks():
+    e,c,parents,model,record=_imitation_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    current=e.unpack_directed_plan(parents,record['plan'],space)
+    embeddings=model.encode_static(space.graph)
+    alternate=next(a for a in space.actions if a.parent_id=='a' and a.pattern.kind is SplitKind.X_SPLIT)
+    limits=dict(temporary_pmax_limit_s=10000.)
+    rebuilt,detail=e.conflict_construct(parents,model,space,embeddings,limits,current=current,
+        removed=('a',),forced=(alternate,))
+    assert rebuilt is not None,detail
+    assert next(p for p in rebuilt.solution.patterns if p.parent_id=='a').kind is SplitKind.X_SPLIT
+    assert all(route.block_ids for route in rebuilt.solution.routes)
+    before={b:(r,d) for r,route in enumerate(current.solution.routes) for b,d in zip(route.block_ids,current.directions[r])}
+    after={b:(r,d) for r,route in enumerate(rebuilt.solution.routes) for b,d in zip(route.block_ids,rebuilt.directions[r])}
+    assert all(after[b]==before[b] for b in before if not b.startswith('a::'))
+    assert after['a::0'][0]==0 and after['a::1'][0]==1
+    assert detail['actions'] and math.isfinite(detail['gnn_score'])
+    # The region initializer cannot keep these two prescribed X owners. Its
+    # invalid hint is skipped, while legal WAG groups remain available.
+    hints=e.conflict_initial_hints(parents,rebuilt,space)
+    assert all(action in space.action_index for _,group in hints for action in group)
+    assert 'GNN-modes-WAG-group0' in {label for label,_ in hints}
+
+
+def test_conflict_core_uses_b32_move_endpoints_without_wait_for_cycle():
+    from mrta_reference.model import DeadlockBlockage,Operation
+    e,c,parents,model,record=_imitation_fixture()
+    space=c.parent_assignment_space(parents,CONFIG)
+    current=e.unpack_directed_plan(parents,record['plan'],space)
+    move=Operation('move',0,OperationKind.MOVE,10.,11.,(1.,9.),(16.,9.),0,None)
+    blocker=Operation('blocker',1,OperationKind.WELD,1.,20.,(16.,9.),(18.,9.),0,'b::whole')
+    event=DeadlockBlockage(0,1,10.,move,('a::whole','b::whole'),('a','b'),('blocker',),
+                           (blocker,),(('b::whole',),),(('b',),))
+    schedule=ScheduleResult(ScheduleStatus.DEADLOCK,wait_for_graph=((0,(1,)),),deadlock_blockages=(event,))
+    partial,feedback=e.conflict_core_partial(current,schedule,model,space,model.encode_static(space.graph),seed=0,q=2)
+    assert set(partial.removed_parent_ids)=={'a','b'}
+    assert feedback['blocked_robot']==0 and feedback['blocked_MOVE_endpoints']==('a::whole','b::whole')
+    assert feedback['blocker_parents']==('b',) and feedback['source']=='structured B32 DEADLOCK'
+    assert e.conflict_core_partial(current,replace(schedule,deadlock_blockages=()),model,space,
+                                  model.encode_static(space.graph),seed=0,q=2)[0] is None
+
+
+def test_conflict_pool_keeps_worse_deadlock_intermediate_and_orders_feasible_by_real_cmax():
+    e,plan=_priority_plan_fixture()
+    worse=replace(plan,directions=tuple(tuple(1-b for b in bits) for bits in plan.directions))
+    d1=(plan,ScheduleResult(ScheduleStatus.DEADLOCK),dict(candidate_id='old'))
+    d2=(worse,ScheduleResult(ScheduleStatus.DEADLOCK),dict(candidate_id='new'))
+    assert d2 in e.conflict_pool([d1],[d2])
+    f1=(plan,ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.),dict(candidate_id='f1'))
+    f2=(worse,ScheduleResult(ScheduleStatus.FEASIBLE,cmax=90.),dict(candidate_id='f2'))
+    assert e.conflict_pool([f1],[f2])[0] is f2
+    assert e.conflict_pool([d1],[f2])[0] is f2
+
+
+def test_conflict_load_limits_reference_all_three_actual_methods_and_allow_temporary_slack():
+    import run_gnn_weld_layout as e
+    refs=[dict(layout_id='fixture',method=method,**{f'processing_r{i}_s':p for i,p in enumerate(loads)})
+          for method,loads in [('HGA',(100.,98.,99.,97.)),('WAG+VNS',(102.,99.,96.,97.)),
+                               ('GNN_IMITATION',(101.,100.,99.,100.))]]
+    limits=e.conflict_load_limits('fixture',refs)
+    assert limits['pmax_limit_s']==pytest.approx(107.1)
+    assert limits['spread_limit_s']==pytest.approx(10.1)
+    assert limits['temporary_pmax_limit_s']>limits['pmax_limit_s']
+    assert e.conflict_load_allowed(dict(max_processing_s=107.,processing_spread_s=10.),limits)
+    assert not e.conflict_load_allowed(dict(max_processing_s=107.,processing_spread_s=11.),limits)
+    with pytest.raises(ValueError,match='missing actual'):
+        e.conflict_load_limits('fixture',refs[:2])
+
+
+def test_conflict_case_counts_initial_b32_in_budget_reuses_complete_plans_and_completed_run(monkeypatch):
+    e,plan=_priority_plan_fixture();written=[];calls=[]
+    space=e.gnn.parent_assignment_space(plan.solution.parents,CONFIG)
+    model=e.imitation_model().eval()
+    dead=ScheduleResult(ScheduleStatus.DEADLOCK)
+    metrics=e.routeaware_metrics(plan,dead)
+    references=[dict(layout_id='fixture',method=method,
+        **{f'processing_r{r}_s':metrics[f'processing_r{r}_s'] for r in range(4)},
+        diagnostic=e.json.dumps(dict(solution=e.pack_directed_plan(plan))))
+        for method in ('HGA','WAG+VNS','GNN_IMITATION')]
+    def rows(path):
+        return [{k:str(v) if v is not None else '' for k,v in row.items()} for row in written] if path==e.CONFLICT_RESULTS else []
+    monkeypatch.setattr(e,'read_rows',rows)
+    monkeypatch.setattr(e,'conflict_write',lambda rows:written.extend(dict(r) for r in rows))
+    key=e.plan_key(plan.solution,plan.directions)
+    monkeypatch.setattr(e,'routeaware_history',lambda *a,**kw:({key:dead},{},{}))
+    monkeypatch.setattr(e,'conflict_initial_hints',lambda *a:())
+    partial=e.lns._remove_parent_set(plan.solution,('r0p0',))
+    monkeypatch.setattr(e,'conflict_core_partial',lambda *a,**kw:(partial,{}))
+    variants=[]
+    for pos in range(3):
+        bits=[list(b) for b in plan.directions];bits[0][pos]^=1
+        variants.append(replace(plan,directions=tuple(tuple(b) for b in bits)))
+    sequence=iter((variants[0],variants[0],variants[1],variants[2]))
+    monkeypatch.setattr(e,'conflict_construct',lambda *a,**kw:(next(sequence),dict(gnn_score=0.,actions=[])))
+    def evaluate(result,**kwargs):
+        actual=e.plan_key(result.solution,result.directions)
+        assert actual not in calls and actual!=key
+        calls.append(actual)
+        return dead
+    monkeypatch.setattr(e,'b32',evaluate)
+    monkeypatch.setattr(e,'priority_schedule',lambda *a,**kw:pytest.fail('priority_schedule used for conflict repair'))
+    final=e.conflict_core_case('fixture',plan.solution.parents,20261110,model,references,budget=3)
+    assert final['b32_calls']==3 and len(calls)==3
+    assert len([r for r in written if r['stage'] in ('initial','candidate')])==4
+    before=len(written)
+    assert e.conflict_core_case('fixture',plan.solution.parents,20261110,None,None,budget=3)['stage']=='final'
+    assert len(written)==before and len(calls)==3
+

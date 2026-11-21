@@ -5153,9 +5153,371 @@ def priority_pilot():
     return finals
 
 
+CONFLICT_RESULTS = FINAL_RESULTS/'gnn_conflict_core_pilot.csv'
+CONFLICT_METHOD = 'GNN-Conflict-Core-LNS'
+CONFLICT_FIELDS = (*ROUTEAWARE_FIELDS, 'candidate_id', 'origin_id', 'operator', 'gnn_score',
+    'load_allowed', 'load_limits', 'mode_changes', 'assignment_changes', 'rebuild_actions',
+    'successful_repair', 'pool_ids')
+
+
+def conflict_write(rows):
+    with CONFLICT_RESULTS.open('a' if CONFLICT_RESULTS.exists() else 'w', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=CONFLICT_FIELDS)
+        if stream.tell() == 0:
+            writer.writeheader()
+        writer.writerows({k: row.get(k) for k in CONFLICT_FIELDS} for row in rows)
+
+
+def conflict_load_limits(name, references):
+    """Case-specific processing protection, independent of the frozen initial genes."""
+    vectors = {r['method']: [float(r[f'processing_r{i}_s']) for i in range(4)]
+               for r in references if r['layout_id'] == name
+               and r['method'] in ('HGA', 'WAG+VNS', 'GNN_IMITATION')}
+    if len(vectors) != 3:
+        raise ValueError(f'{name}: missing actual HGA/WAG/GNN processing references')
+    peaks = [max(p) for p in vectors.values()]
+    return dict(pmax_limit_s=1.05*max(peaks),
+                spread_limit_s=max(max(max(p)-min(p) for p in vectors.values()), .10*median(peaks)),
+                temporary_pmax_limit_s=1.20*1.05*max(peaks), reference_processing=vectors,
+                rule='final peak <= 1.05*largest reference peak; spread <= max(reference spreads, 10% median peak)')
+
+
+def conflict_load_allowed(row, limits):
+    return (float(row['max_processing_s']) <= limits['pmax_limit_s']+1e-7
+            and float(row['processing_spread_s']) <= limits['spread_limit_s']+1e-7)
+
+
+def conflict_core_partial(current, schedule, model, space, embeddings, *, seed, q):
+    """Rank actual blocked/direct-blocker cores with the existing assignment GNN."""
+    pairs = []
+    known = set(space.parent_ids)
+    for event in schedule.deadlock_blockages:
+        for operation, parents in zip(event.blocker_operations, event.blocker_parent_ids):
+            core = (set(event.blocked_parent_ids) | set(parents)) & known
+            if operation is not None and set(parents)&known and set(event.blocked_parent_ids)&known:
+                pairs.append((event, operation, core))
+    if not pairs:
+        return None, dict(source='B32 DEADLOCK', reason='no mapped direct blocker core')
+    union = set().union(*(core for _, _, core in pairs))
+    partial = lns._remove_parent_set(current.solution, union)
+    patterns = {p.parent_id: p for p in current.solution.patterns if p.parent_id not in union}
+    blocks = {b.block_id: b for p in patterns.values() for b in space.children[p]}
+    old_bits = {b: d for route, bits in zip(current.solution.routes, current.directions)
+                for b, d in zip(route.block_ids, bits)}
+    state = lns.oriented_route_state(partial.routes, tuple(tuple(old_bits[b] for b in route)
+                                           for route in partial.routes), blocks, CONFIG)
+    indices, logits = model.assignment_logits(space, embeddings, state, blocks, union, CONFIG)
+    priorities = {p: -math.inf for p in union}
+    for index, score in zip(indices.tolist(), logits.tolist()):
+        parent = space.actions[index].parent_id
+        priorities[parent] = max(priorities[parent], score)
+    pairs.sort(key=lambda item: (-sum(priorities[p] for p in item[2])/len(item[2]),
+                                 item[0].robot_id, item[1].operation_id))
+    # Rotate among GNN-ranked real cores. This also handles acyclic wait-for graphs.
+    event, operation, core = pairs[seed % len(pairs)]
+    removed = set(core)
+    blocks = block_map(current.solution, CONFIG, scope=FORMAL_SCOPE_V2)
+    neighbors = []
+    for route in current.solution.routes:
+        for pos, block in enumerate(route.block_ids):
+            if blocks[block].parent_id in core:
+                for offset in (-1, 1, -2, 2):
+                    if 0 <= pos+offset < len(route.block_ids):
+                        neighbors.append(blocks[route.block_ids[pos+offset]].parent_id)
+    for parent in dict.fromkeys(neighbors):
+        if len(removed) >= max(q, len(core)):
+            break
+        removed.add(parent)
+    return lns._remove_parent_set(current.solution, removed), dict(source='structured B32 DEADLOCK',
+        blocked_robot=event.robot_id, blocked_operation=asdict(event.blocked_operation),
+        blocked_parents=event.blocked_parent_ids, blocked_MOVE_endpoints=event.blocked_block_ids,
+        blocker_operation=asdict(operation), blocker_parents=next(parents for op, parents in
+            zip(event.blocker_operations, event.blocker_parent_ids) if op is operation),
+        core=sorted(core), gnn_core_priority={p: priorities[p] for p in core},
+        evidence_source=schedule.deadlock_evidence_source)
+
+
+@torch.no_grad()
+def conflict_construct(parents, model, space, embeddings, limits, *, rng=None, current=None,
+                       removed=(), forced=None):
+    """Continue the old joint actor over all legal modes and owners of removed parents."""
+    started = time.perf_counter()
+    pending = set(space.parent_ids) if current is None else set(removed)
+    selected = {} if current is None else {p.parent_id: p for p in current.solution.patterns
+                                          if p.parent_id not in pending}
+    blocks = {b.block_id: b for p in selected.values() for b in space.children[p]}
+    nodes = {b.block_id: space.block_nodes[p, b.block_id] for p in selected.values() for b in space.children[p]}
+    routes = ((),)*4 if current is None else lns._remove_parent_set(current.solution, pending).routes
+    fixed = {} if current is None else {b: d for route, bits in zip(current.solution.routes, current.directions)
+                                       for b, d in zip(route.block_ids, bits) if b in blocks}
+    bits = tuple(tuple(fixed[b] for b in route) for route in routes)
+    state = lns.oriented_route_state(routes, bits, blocks, CONFIG)
+    actions, learned = [], []
+    forced_indices = None if forced is None else tuple(space.action_index[a] for a in forced)
+    while pending:
+        plans, scores = gnn.vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, CONFIG,
+            conflict_core=True, fixed_directions=fixed, assignment_indices=forced_indices)
+        keep = [i for i, plan in enumerate(plans)
+                if max(plan.state.loads) <= limits['temporary_pmax_limit_s']+1e-7
+                and float(plan.assignment_features[-8:-4].max())*2500 <= limits['temporary_pmax_limit_s']+1e-3]
+        if not keep:
+            return None, dict(reason='no joint action within temporary peak limit', pending=sorted(pending))
+        keep.sort(key=lambda i: -float(scores[i]))
+        index = keep[0]
+        if rng is not None and len(keep) > 1:
+            top = keep[:12]
+            values = scores[top]
+            scale = max(1., float(values.std(unbiased=False)))
+            index = rng.choices(top, weights=((values-values.max())/scale).softmax(0).tolist())[0]
+        plan = plans[index]
+        assignment = space.actions[plan.assignment_index]
+        learned.append(float(scores[index]))
+        state = plan.state
+        for block in space.children[assignment.pattern]:
+            blocks[block.block_id] = block
+            nodes[block.block_id] = space.block_nodes[assignment.pattern, block.block_id]
+        selected[assignment.parent_id] = assignment.pattern
+        pending.remove(assignment.parent_id)
+        actions.extend(plan.actions)
+    try:
+        if not all(state.routes):
+            raise ValueError('LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
+        solution = canonicalize(parents, selected.values(), dict(enumerate(state.routes)), CONFIG, scope=FORMAL_SCOPE_V2)
+        if tuple(r.block_ids for r in solution.routes) != state.routes or set(solution.patterns) != set(selected.values()):
+            raise ValueError('canonicalization changed the directed joint construction')
+        # Retained tasks keep mode, owner, relative order and direction.
+        for robot, route in enumerate(routes):
+            kept = set(route)
+            if tuple(b for b in state.routes[robot] if b in kept) != route:
+                raise ValueError('reconstruction changed retained route order')
+            actual = dict(zip(state.routes[robot], state.directions[robot]))
+            if any(actual[b] != fixed[b] for b in route):
+                raise ValueError('reconstruction changed retained directions')
+    except ValueError as error:
+        return None, dict(reason=str(error))
+    result = gnn.JointCompletionResult(solution, state.directions, tuple(actions), time.perf_counter()-started,
+                                      oriented_state=state)
+    return result, dict(gnn_score=sum(learned)/max(1, len(learned)), actions=[asdict(a) for a in actions])
+
+
+def conflict_initial_hints(parents, original, space):
+    """Only unsearched region/WAG assignment groups; never their final answers."""
+    from mrta_baselines.wag_vns import generate_wag_assignments
+    catalog = {p: tuple(pattern for pattern in space.children if pattern.parent_id == p) for p in space.parent_ids}
+    minimal = native_hga.initial_patterns(parents, CONFIG, catalog=catalog)
+    hints = []
+    for label, patterns in (('minimal-modes', minimal), ('GNN-modes', original.solution.patterns)):
+        try:
+            region = native_hga.initialize_hga_region_seed(parents, CONFIG, patterns=patterns, scope=FORMAL_SCOPE_V2)
+        except ValueError:
+            # That initializer predates prescribed X-child owners. Discard its
+            # illegal hint; the WAG generator below already respects them. Do
+            # not modify either official baseline or relax canonicalization.
+            region = None
+        if region is not None:
+            hints.append((label+'-region', gnn.parent_assignment_targets(region, CONFIG)))
+        for index, assignment in enumerate(generate_wag_assignments(parents, patterns, CONFIG, max_variants=2,
+                                                                   scope=FORMAL_SCOPE_V2)):
+            hints.append((f'{label}-WAG-group{index}', gnn.parent_assignment_targets(assignment, CONFIG)))
+    return hints
+
+
+def conflict_deadlock_progress(entry):
+    """Observed dispatch cursor fractions, used only to retain DEADLOCK diversity."""
+    plan, schedule, _ = entry
+    lengths = [max(1, 4*len(route.block_ids)-1) for route in plan.solution.routes]
+    fractions = [event.next_template_index/lengths[event.robot_id] for event in schedule.deadlock_blockages]
+    return min(fractions, default=0.), sum(fractions)/max(1, len(fractions))
+
+
+def conflict_pool(entries, latest, *, width=6):
+    by_key = {plan_key(e[0].solution, e[0].directions): e for e in (*entries, *latest)}
+    ranked = sorted(by_key.values(), key=lambda e: (0, e[1].cmax) if e[1].feasible else
+                    (1, *(-x for x in conflict_deadlock_progress(e))))
+    chosen = ranked[:1]
+    # Reserve a slot for a fresh intermediate even when its dispatch progress
+    # is worse. Keep the best feasible separately, and allow changed cores.
+    if latest and latest[-1] not in chosen:
+        chosen.append(latest[-1])
+    signatures = set()
+    for entry in (*ranked, *latest):
+        if entry in chosen:
+            continue
+        plan, schedule, _ = entry
+        signature = (plan.solution.patterns, tuple((e.robot_id, e.blocked_parent_ids, e.blocker_parent_ids)
+                                                   for e in schedule.deadlock_blockages))
+        if signature not in signatures:
+            chosen.append(entry)
+            signatures.add(signature)
+        if len(chosen) >= width:
+            break
+    return chosen[:width]
+
+
+def conflict_changes(before, after, removed):
+    old = {p.parent_id: p.pattern_id for p in before.solution.patterns}
+    modes = {p.parent_id: dict(before=old[p.parent_id], after=p.pattern_id) for p in after.solution.patterns
+             if old[p.parent_id] != p.pattern_id}
+    def owners(plan):
+        return {p: [(b, r) for r, route in enumerate(plan.solution.routes) for b in route.block_ids
+                    if b.split('::')[0] == p] for p in removed}
+    a, b = owners(before), owners(after)
+    return modes, {p: dict(before=a[p], after=b[p]) for p in removed if a[p] != b[p]}
+
+
+@torch.no_grad()
+def conflict_core_case(name, parents, seed, model, references, *, budget=100):
+    saved = [r for r in read_rows(CONFLICT_RESULTS) if r['layout_id'] == name and int(r['seed']) == seed]
+    final = next((r for r in reversed(saved) if r['stage'] == 'final'), None)
+    if final is not None:
+        return final
+    started = time.perf_counter()
+    limits = conflict_load_limits(name, references)
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    history = [*read_rows(LOADFIRST_RESULTS), *read_rows(CONFLICT_RESULTS)]
+    seen, blockers, records = routeaware_history(name, parents, space, extra_rows=history)
+    embeddings = model.encode_static(space.graph)
+    old = next(r for r in references if r['layout_id'] == name and r['method'] == 'GNN_IMITATION')
+    original = deadlock_plan(parents, json.loads(old['diagnostic'])['solution'], space)
+    calls = sum(int(r.get('b32_calls') or 0) for r in saved if r['stage'] in ('initial', 'candidate'))
+    hits = 0
+    visited, all_entries, failures = set(), [], Counter()
+    saved_ids = {r['candidate_id']: r for r in saved if r['stage'] in ('initial', 'candidate')}
+
+    def evaluate(plan, candidate_id, *, origin=None, removed=(), feedback=None, construction=None, stage='candidate', operator='core-rebuild'):
+        nonlocal calls, hits
+        key = plan_key(plan.solution, plan.directions)
+        if key in visited or (key not in seen and calls >= budget):
+            return None
+        visited.add(key)
+        evaluation = time.perf_counter()
+        schedule, called = evaluate_once(plan, seen, blocker_cache=blockers)
+        elapsed = time.perf_counter()-evaluation
+        calls += int(called)
+        hits += int(not called)
+        modes, owners = ({}, {}) if origin is None else conflict_changes(origin[0], plan, removed)
+        row = routeaware_result_row(name, CONFLICT_METHOD, plan, schedule, blockers.get(key, ()),
+            historical=records.get(key), stage=stage, candidate_id=candidate_id,
+            origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
+            removed_parent_ids=json.dumps(removed), feedback=json.dumps(feedback or {}),
+            construct_s=plan.inference_seconds, b32_s=elapsed if called else 0.,
+            runtime_s=plan.inference_seconds+elapsed, b32_calls=int(called), cache_hits=int(not called),
+            gnn_score=(construction or {}).get('gnn_score'), load_limits=json.dumps(limits),
+            mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
+            rebuild_actions=json.dumps((construction or {}).get('actions', [])),
+            successful_repair=int(origin is not None and origin[1].status is ScheduleStatus.DEADLOCK and schedule.feasible))
+        row['seed'] = seed
+        row['load_allowed'] = int(conflict_load_allowed(row, limits))
+        previous = saved_ids.get(candidate_id)
+        if previous is None:
+            conflict_write([row])
+        else:
+            if json.loads(previous['solution']) != json.loads(row['solution']):
+                raise ValueError('resumed seeded proposal differs from saved proposal')
+            row = previous
+        records[key] = row
+        entry = (plan, schedule, row)
+        all_entries.append(entry)
+        print('CONFLICT_CANDIDATE', name, seed, candidate_id, schedule.status.value, schedule.cmax,
+              'Pmax', round(float(row['max_processing_s']), 3), 'load_ok', row['load_allowed'],
+              'B32', calls, 'modes', len(modes), 'core', len(removed), flush=True)
+        return entry
+
+    initial = evaluate(original, 'initial0', stage='initial', operator='saved-GNN-initial')
+    candidates = [initial] if initial else []
+    proposal, detail = conflict_construct(parents, model, space, embeddings, limits)
+    if proposal is not None:
+        entry = evaluate(proposal, 'initial1', stage='initial', operator='joint-GNN', construction=detail)
+        if entry: candidates.append(entry)
+    else:
+        failures[detail['reason']] += 1
+    for index, (label, hints) in enumerate(conflict_initial_hints(parents, original, space), start=2):
+        proposal, detail = conflict_construct(parents, model, space, embeddings, limits,
+                                              rng=Random(seed+index), forced=hints)
+        if proposal is not None:
+            entry = evaluate(proposal, f'initial{index}', stage='initial', operator=label, construction=detail)
+            if entry: candidates.append(entry)
+        else:
+            failures[detail['reason']] += 1
+    # At most eight initial plans. Their GNN construction scores choose the
+    # initial search origins; B32 feasibility/Cmax ranks the retained pool.
+    candidates.sort(key=lambda e: -float(e[2].get('gnn_score') or -1e9))
+    pool = conflict_pool([], candidates)
+    rounds = 0
+    while calls < budget and rounds < 40:
+        rounds += 1
+        origin = pool[(rounds-1) % len(pool)]
+        current, schedule, row = origin
+        q = min(len(parents), 12, max(4, round(.08*len(parents)))+2*((rounds-1)%3))
+        new = []
+        for rank in range(4):
+            if calls >= budget:
+                break
+            pick_seed = seed+rounds*7+rank
+            if schedule.status is ScheduleStatus.DEADLOCK:
+                partial, feedback = conflict_core_partial(current, schedule, model, space, embeddings, seed=pick_seed, q=q)
+            elif schedule.feasible:
+                partial, feedback = lns.select_routeaware_bottleneck(current.solution, current.directions, schedule,
+                    blockers.get(plan_key(current.solution, current.directions), ()), CONFIG, q=q, seed=pick_seed,
+                    assignment_space=space)
+            else:
+                partial, feedback = None, dict(reason='no structured B32 feedback')
+            if partial is None:
+                failures[feedback.get('reason', 'empty feedback core')] += 1
+                continue
+            proposal, detail = conflict_construct(parents, model, space, embeddings, limits,
+                rng=None if rank == 0 else Random(pick_seed), current=current, removed=partial.removed_parent_ids)
+            if proposal is None:
+                failures[detail['reason']] += 1
+                continue
+            entry = evaluate(proposal, f'round{rounds}-{rank}', origin=origin,
+                removed=partial.removed_parent_ids, feedback=feedback, construction=detail)
+            if entry: new.append(entry)
+            else: failures['duplicate complete plan'] += 1
+        pool = conflict_pool(pool, new)
+        conflict_write([dict(stage='round', layout_id=name, seed=seed, method=CONFLICT_METHOD, round=rounds,
+            pool_ids=json.dumps([e[2]['candidate_id'] for e in pool]), b32_calls=0, cache_hits=0,
+            runtime_s=time.perf_counter()-started, diagnostic=json.dumps(dict(failures=failures)))])
+    admissible = [e for e in all_entries if conflict_load_allowed(e[2], limits)]
+    good = [e for e in admissible if e[1].feasible]
+    best = min(good, key=lambda e: e[1].cmax) if good else max(admissible or all_entries, key=conflict_deadlock_progress)
+    modes, owners = conflict_changes(original, best[0], space.parent_ids)
+    final = dict(best[2], stage='final', runtime_s=time.perf_counter()-started, b32_calls=calls, cache_hits=hits,
+        origin_id=best[2]['candidate_id'], mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
+        diagnostic=json.dumps(dict(stop='B32 budget exhausted' if calls >= budget else '40 bounded candidate-pool rounds exhausted',
+            rounds=rounds, unique_visited=len(visited), failures=failures, initial_candidate='initial0',
+            feasible_candidates=sum(e[1].feasible for e in all_entries), admissible_feasible=len(good),
+            successful_local_repairs=[e[2]['candidate_id'] for e in all_entries if int(e[2]['successful_repair'])],
+            evaluation='original FORMAL_SCOPE_V2 B32; no priority_schedule', seed=seed)))
+    conflict_write([final])
+    print('CONFLICT_FINAL', json.dumps({k: final.get(k) for k in
+        ('layout_id', 'seed', 'status', 'cmax_s', 'max_processing_s', 'processing_spread_s', 'b32_calls', 'runtime_s')}), flush=True)
+    return final
+
+
+def imitation_conflict_core_pilot():
+    configure_cpu()
+    conflict_write([])
+    references = read_rows(IMITATION_RESULTS)
+    layouts = dict(ppo_layouts('validation'))
+    model = imitation_model(torch.load(IMITATION_MODEL, map_location='cpu', weights_only=True)['state_dict']).eval()
+    model.requires_grad_(False)
+    # No LoadFirst/Pareto branch or new learned parameters in this experiment.
+    model.load_first_lambda = None
+    model.route_aware = False
+    finals = [conflict_core_case(name, layouts[name], SEED, model, references) for name in IMITATION_CASES]
+    feasible = sum(r['status'] == 'FEASIBLE' and int(r['load_allowed']) for r in finals)
+    print('CONFLICT_PHASE1_SUMMARY', json.dumps(dict(feasible=feasible, cases=6,
+        target_met=feasible >= 5, b32_calls=sum(int(r['b32_calls']) for r in finals))), flush=True)
+    if feasible >= 5:
+        for seed in TEST_SEEDS[1:]:
+            finals.extend(conflict_core_case(name, layouts[name], seed, model, references) for name in IMITATION_CASES)
+    return finals
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -5169,7 +5531,8 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage in ('imitation-priority-vnd','imitation-deadlock-pilot'):priority_pilot()
+    if args.stage == 'imitation-conflict-core-pilot':imitation_conflict_core_pilot()
+    elif args.stage in ('imitation-priority-vnd','imitation-deadlock-pilot'):priority_pilot()
     elif args.stage == 'imitation-priority-diagnosis':priority_history_diagnosis()
     elif args.stage == 'imitation-loadfirst-screen':imitation_loadfirst_pilot(screen_only=True)
     elif args.stage == 'imitation-loadfirst-pilot':imitation_loadfirst_pilot()

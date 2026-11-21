@@ -2592,7 +2592,7 @@ def vnext_value_candidate_indices(space, plans, scores):
 
 def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config, *,
                         assignment_indices=None, preserve_prefix=False, feedback=None, prefer_start_recovery=True,
-                        fixed_directions=None):
+                        fixed_directions=None, conflict_core=False):
     """Rank directed insertions of eight assignments, or twelve with feedback."""
     from .lns import joint_block_candidates, prefer_joint_legal_starts
 
@@ -2617,7 +2617,13 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     if load_first is not None and assignment_indices is None:
         coarse=route_assignment_objectives(space,indices,features,state,blocks,config)
         loadfirst_values=coarse[:,0]+load_first*coarse[:,2]
-    shortlist = (shortlist_assignments(space,indices,logits,loadfirst_values=loadfirst_values)
+    # Conflict repair keeps the checkpoint and feature semantics, but must not
+    # freeze the original 1% processing band before a joint exchange completes.
+    # Exact coverage and the formal mode/owner catalog still apply. The caller
+    # bounds temporary loads and checks final loads against case references.
+    shortlist = (feedback_shortlist(space, indices, logits)
+                 if conflict_core and assignment_indices is None else
+                 shortlist_assignments(space,indices,logits,loadfirst_values=loadfirst_values)
                  if load_first is not None and assignment_indices is None else
                  shortlist_assignments(space,indices,logits,route_objectives=
                     route_assignment_objectives(space,indices,features,state,blocks,config))
@@ -2628,6 +2634,8 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                  shortlist_assignments(space, indices, logits + features[:, -4:-2] @ model.joint_weights[:2],
                                        owner_alternatives=True) if assignment_indices is None
                  else tuple(index for index in assignment_indices if index in positions))
+    if conflict_core and assignment_indices is not None:
+        shortlist = tuple(sorted(shortlist, key=lambda i: -float(logits[positions[i]])))[:12]
     before_move = features.new_tensor([sum(arcs) for arcs in state.arc_costs])
     x_low = [min((min(blocks[b].start[0], blocks[b].end[0]) for b in route), default=math.inf)
              for route in state.routes]
@@ -2687,7 +2695,7 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                                            inputs[:,-8],inputs[:,-7],inputs[:,-4]),1)
                         retained=bounded_route_pareto(costs,fine,limit=2)
                     else:
-                        keep = 2 if len(children) == 2 and child_index == 0 else 1
+                        keep = 2 if conflict_core or len(children) == 2 and child_index == 0 else 1
                         retained = torch.argsort(fine, descending=True, stable=True)[:keep].tolist()
                 for i in retained:
                     after, action = variants[i]
@@ -2711,6 +2719,19 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     plans = tuple(plans[i] for i in legal)
     if not plans:
         return plans, logits[:0]
+    if conflict_core:
+        # The existing assignment, joint and directed insertion heads select
+        # modes, owners, positions and bits together. Retain alternatives for
+        # sampling; do not apply LoadFirst/Pareto or a monotone route proxy.
+        scores = imitation_joint_scores(space, embeddings, model, plans)
+        order = torch.argsort(scores, descending=True, stable=True).tolist()
+        retained, assignments = [], set()
+        for i in order:
+            if plans[i].assignment_index not in assignments:
+                retained.append(i)
+                assignments.add(plans[i].assignment_index)
+        retained = tuple(dict.fromkeys((*retained, *order)))[:24]
+        return tuple(plans[i] for i in retained), scores[list(retained)]
     if load_first is not None:
         scores=imitation_joint_scores(space,embeddings,model,plans)
         processing=torch.stack([p.assignment_features[-8:-4]*2500. for p in plans])

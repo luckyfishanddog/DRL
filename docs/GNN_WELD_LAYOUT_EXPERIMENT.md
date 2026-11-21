@@ -2309,3 +2309,490 @@ Set-Location 'D:\pybullet_test\MRTA_GA\DRL'
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py imitation-deadlock-pilot
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -m pytest -p no:cacheprovider tests/test_hga_baseline.py tests/test_wag_baseline.py tests/test_gnn_construct_vns.py -q --disable-warnings
 ```
+
+
+## 2026-11-20：GNN 冲突核心联合重构（真实 B32，固定种子六例）
+
+第一阶段完成 **5/6** 负载合格且 B32 可行，5/6目标达到。
+复用原 models/gnn_weld_layout_imitation.pt，无训练/新网络/物理参数或正式 HGA/WAG 修改。解释器为 D:/pybullet_test/.venv/Scripts/python.exe，工作目录为 DRL。唯一新增文件是用户明确批准的 results/new_dataset_final/gnn_conflict_core_pilot.csv；旧模型、CSV、本报告原有内容全部保留。
+
+### 实现与固定设置
+
+1. 在原 vnext_joint_actions(..., conflict_core=True) 复用原分配、联合、插入评分，允许合法 WHOLE/X_SPLIT/Y_SPLIT 和归属重选。X 子任务指定机器人、资格和16状态四机覆盖DP保留，仅本分支绕过原1%加工筛选；没有 LoadFirst、Pareto 或新的头。
+2. 初始化上限8个槽：保存的GNN初始方案、联合GNN贪心、最少拆分/GNN模式下的未搜索HGA区域与WAG两个分配组。提示只给模式/归属，路线插入和方向由GNN完成；不读取对照最终答案。非法、未完成、重复方案不补B32。HGA区域初始化不支持部分指定X归属时跳过其非法提示，WAG合法组仍保留。
+3. 核心直接读取B32 deadlock_blockages：blocked机器人/操作/父任务、直接blocker及MOVE两端任务。GNN分配头排序真实核心后有限轮换，加必要前后邻居，不以有向环为条件。未使用priority_schedule判定或替代B32反馈。
+4. 每轮4个完整重构槽，贪心加固定随机流。破坏约8%父任务并有限轮换扩大，最多12个。未移除任务保持模式、归属、相对顺序和方向。6项池保留最佳可行、不同模式/核心及一个新中间态，允许暂时更差负载和DEADLOCK进展；没有单调路线周期接受。
+5. 最终Pmax上限=三种参考(HGA/WAG/GNN)实际峰值最大值的1.05倍；极差上限=max(三者最大实测极差, 三者峰值中位数的10%)。临时峰值允许最终上限的1.20倍。固定规则不锁定LoadFirst初始加工负载，没有调lambda。
+6. 每例每种子最多100次新增完整B32，包含初始化。普通完整(patterns,routes,directions)缓存跨旧B32记录和本轮复用，同方案不重复调度。最终只在负载合格的B32可行方案间取最小真实Cmax。
+
+修改位置：
+
+| 文件 | 入口/行 |
+|---|---|
+| scripts/run_gnn_weld_layout.py | conflict_load_limits:5171 |
+| scripts/run_gnn_weld_layout.py | conflict_core_partial:5190 |
+| scripts/run_gnn_weld_layout.py | conflict_construct:5241 |
+| scripts/run_gnn_weld_layout.py | conflict_initial_hints:5303 |
+| scripts/run_gnn_weld_layout.py | conflict_pool:5333 |
+| scripts/run_gnn_weld_layout.py | conflict_core_case:5369 |
+| scripts/run_gnn_weld_layout.py | imitation_conflict_core_pilot:5498 |
+| src/mrta_search/gnn_constructor.py | vnext_joint_actions:2593 |
+| tests/test_gnn_construct_vns.py | 文件末尾的模式、归属、无环核心、候选池、负载、预算与缓存回归 |
+
+### 六例 Cmax 与实际调用
+
+种子20261110，全部为VALIDATION开发案例。对照取原gnn_imitation_balance_pilot.csv保存的同种子正式完整对照B32 cmax_s，不取上一节native Cmax。WAG500/HGA200000与本轮预算不同，本表仅作实际质量参照。
+
+| 案例 | 原GNN B32 | 最终B32 | HGA B32 | WAG B32 | 对HGA | 对WAG | 初始数 | 新B32/缓存 | 耗时(s) |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| 0031 | DEADLOCK | 4538.883 | 4231.883 | 4276.973 | +7.254% | +6.124% | 6 | 100/1 | 110.039 |
+| 0095 | DEADLOCK | 6632.261 | 6418.986 | 6463.569 | +3.323% | +2.610% | 8 | 100/1 | 452.649 |
+| 0067 | 5575.105 | 5516.058 | 5325.854 | 5347.376 | +3.571% | +3.154% | 7 | 100/2 | 170.726 |
+| 0076 | DEADLOCK | DEADLOCK | 5898.146 | 6073.092 | — | — | 6 | 100/1 | 247.753 |
+| 0084 | DEADLOCK | 6974.092 | 6655.491 | 6832.780 | +4.787% | +2.068% | 8 | 100/1 | 317.643 |
+| 0100 | DEADLOCK | 6266.946 | 5691.336 | 6065.607 | +10.114% | +3.319% | 7 | 100/1 | 172.434 |
+
+0067在1次新增B32后因区域初始化的X归属兼容问题中断，修复后复用保存的初始记录，累计预算仍为100。该例耗时为重新进入到完成的实测段，前一中断段只有逐候选构造/B32时间，未造精确总墙钟时间。其余为每例完整实测段，不含进程模型加载。
+
+### 四机器人完整分布与负载限制
+
+向量按R0/R1/R2/R3，单位秒。DEADLOCK完整WAIT/Cmax/完成时间为空，部分WAIT单列。历史缓存缺失完整时间线的字段也为空，不为补齐记录重复B32。
+
+| 案例 | 阶段 | P | MOVE | 完整WAIT | 完成时间 | 部分WAIT | Pmax | 极差 |
+|---|---|---|---|---|---|---:|---:|---:|
+| 0031 | 初始 | 4131.803/4148.859/4162.708/4142.468 | 49.023/353.862/405.842/211.837 | —/—/—/— | —/—/—/— | 52.683 | 4162.708 | 30.905 |
+| 0031 | 最终 | 4045.726/4258.194/3951.764/4330.155 | 127.184/137.028/176.832/208.728 | 0.000/0.000/0.000/0.000 | 4172.910/4395.222/4128.597/4538.883 | — | 4330.155 | 378.390 |
+| 0095 | 初始 | 5948.750/5902.636/6321.978/6391.924 | 104.695/359.726/324.306/300.100 | —/—/—/— | —/—/—/— | 11.447 | 6391.924 | 489.288 |
+| 0095 | 最终 | 6130.278/5761.988/6355.751/6317.272 | 96.373/337.243/276.511/300.496 | 0.000/0.000/0.000/0.000 | 6226.652/6099.231/6632.261/6617.767 | — | 6355.751 | 593.763 |
+| 0067 | 初始 | 5266.424/5294.017/5214.716/5239.016 | 246.690/281.088/167.860/227.780 | —/—/—/— | —/—/—/— | — | 5294.017 | 79.300 |
+| 0067 | 最终 | 5266.424/5247.721/5326.899/5123.131 | 218.854/232.201/81.723/297.825 | 30.779/0.000/0.000/0.000 | 5516.058/5479.922/5408.622/5420.956 | — | 5326.899 | 203.768 |
+| 0076 | 初始 | 5945.755/5941.635/5561.885/5650.248 | 260.871/353.739/299.629/454.715 | —/—/—/— | —/—/—/— | 0.000 | 5945.755 | 383.870 |
+| 0076 | 最终 | 5945.755/5941.635/5561.885/5650.248 | 260.871/353.739/299.629/454.715 | —/—/—/— | —/—/—/— | 0.000 | 5945.755 | 383.870 |
+| 0084 | 初始 | 6646.822/6651.132/5950.796/5886.859 | 408.934/320.830/244.108/300.083 | —/—/—/— | —/—/—/— | 0.000 | 6651.132 | 764.273 |
+| 0084 | 最终 | 6631.898/6666.057/5799.679/6037.976 | 283.722/308.036/221.489/262.801 | 0.000/0.000/27.823/0.000 | 6915.620/6974.092/6048.991/6300.777 | — | 6666.057 | 866.378 |
+| 0100 | 初始 | 5712.371/5674.904/5574.028/5508.585 | 212.884/224.445/193.789/353.472 | —/—/—/— | —/—/—/— | 241.593 | 5712.371 | 203.786 |
+| 0100 | 最终 | 5076.759/5491.411/5865.879/5885.839 | 47.215/264.555/126.336/381.108 | 0.000/0.000/205.698/0.000 | 5123.975/5755.966/6197.913/6266.946 | — | 5885.839 | 809.079 |
+
+| 案例 | 最终Pmax上限 | 最终极差上限 | WHOLE/X/Y 初始→最终 | 模式变化父任务数 |
+|---|---:|---:|---|---:|
+| 0031 | 4407.848 | 418.331 | 61/0/2 → 61/0/2 | 1 |
+| 0095 | 6711.520 | 635.575 | 115/0/7 → 115/0/7 | 1 |
+| 0067 | 5559.644 | 529.402 | 71/2/5 → 72/1/5 | 2 |
+| 0076 | 6293.411 | 594.575 | 103/1/4 → 103/1/4 | 0 |
+| 0084 | 7062.869 | 926.863 | 125/0/4 → 125/0/4 | 0 |
+| 0100 | 6338.889 | 857.849 | 82/1/6 → 85/0/4 | 6 |
+
+### 实际冲突核心与修复过程
+
+
+#### 0031
+
+完整方案101个，新增B32 100次；局部DEADLOCK→FEASIBLE 6次，其中负载合格1次，最终来源round14-2。
+
+- 初始R0阻塞于 R0:B3:SETUP (SETUP)，blocked父任务['P03-W01-S01']；直接blocker父任务[['P09-W04-S01', 'P03-W04-S01'], ['P03-W04-S01'], ['P03-W04-S01'], ['P03-W04-S01'], ['P03-W04-S01', 'P16-W01-S01']]；blocked操作关联块/MOVE两端['P03-W01-S01::whole']。
+- 初始R3阻塞于 R3:B5:POST (POST)，blocked父任务['P18-W02-S01']；直接blocker父任务[['P12-W01-S01', 'P09-W02-S01'], ['P09-W02-S01'], ['P09-W02-S01'], ['P09-W02-S01'], ['P09-W02-S01', 'P10-W02-S01'], ['P10-W02-S01'], ['P10-W02-S01'], ['P10-W02-S01'], ['P10-W02-S01', 'P07-W01-S01'], ['P07-W01-S01'], ['P07-W01-S01'], ['P07-W01-S01'], ['P07-W01-S01', 'P15-W01-S01']]；blocked操作关联块/MOVE两端['P18-W02-S01::whole']。
+
+最终方案实际祖先链，包含临时负载不合格或DEADLOCK中间态：
+
+| 步骤 | 来源 | B32状态/Cmax | 负载合格 | 移除父任务数 | 本步模式变化 |
+|---|---|---|---|---:|---|
+| initial3 | minimal-modes-WAG-group0 | FEASIBLE 5485.736 | 0 | 0 | 无 |
+| round5-3 | initial3 | FEASIBLE 4732.696 | 0 | 7 | P13-W05-S01: Y_SPLIT:BY_OUTER_LOWER → Y_SPLIT:MIDPOINT |
+| round9-0 | round5-3 | FEASIBLE 4615.318 | 0 | 9 | P09-W04-S01: Y_SPLIT:BY_OUTER_UPPER → Y_SPLIT:BY_CENTER |
+| round13-3 | round9-0 | DEADLOCK — | 0 | 5 | 无 |
+| round14-2 | round13-3 | FEASIBLE 4538.883 | 1 | 7 | 无 |
+
+每次成功修复的索引；每步全部父任务、blocked/blocker、前后归属、插入位置和方向见同一CSV的feedback、assignment_changes、rebuild_actions及solution字段：
+
+| 成功候选 | DEADLOCK来源 | Cmax | 负载合格 | 移除父任务数 | 模式变化数 |
+|---|---|---:|---|---:|---:|
+| round8-0 | round7-3 | 4845.534 | 0 | 7 | 1 |
+| round8-2 | round7-3 | 4852.310 | 0 | 7 | 1 |
+| round8-3 | round7-3 | 4885.767 | 0 | 7 | 2 |
+| round14-1 | round13-3 | 5391.849 | 0 | 7 | 1 |
+| round14-2 | round13-3 | 4538.883 | 1 | 7 | 0 |
+| round14-3 | round13-3 | 4550.560 | 0 | 7 | 0 |
+
+构造失败/重复计数：{"no joint action within temporary peak limit": 2, "duplicate complete plan": 1}。
+
+
+#### 0095
+
+完整方案101个，新增B32 100次；局部DEADLOCK→FEASIBLE 1次，其中负载合格0次，最终来源round9-0。
+
+- 初始R1阻塞于 R1:B38:MOVE (MOVE)，blocked父任务['P17-W04-S01', 'P10-W03-S01']；直接blocker父任务[['P08-W02-S01'], ['P08-W02-S01']]；blocked操作关联块/MOVE两端['P17-W04-S01::whole', 'P10-W03-S01::whole']。
+- 初始R2阻塞于 R2:B3:SETUP (SETUP)，blocked父任务['P03-W01-S01']；直接blocker父任务[['P20-W01-S01', 'P15-W04-S01'], ['P15-W04-S01'], ['P15-W04-S01'], ['P15-W04-S01'], ['P15-W04-S01', 'P15-W09-S01'], ['P15-W09-S01'], ['P15-W09-S01'], ['P15-W09-S01'], ['P15-W09-S01', 'P15-W01-S01'], ['P15-W01-S01'], ['P15-W01-S01'], ['P15-W01-S01'], ['P15-W01-S01', 'P15-W02-S01'], ['P15-W02-S01'], ['P15-W02-S01'], ['P15-W02-S01'], ['P15-W02-S01', 'P15-W10-S01'], ['P15-W10-S01'], ['P15-W10-S01'], ['P15-W10-S01'], ['P15-W10-S01', 'P16-W08-S01'], ['P16-W08-S01'], ['P16-W08-S01'], ['P16-W08-S01'], ['P16-W08-S01', 'P16-W06-S01'], ['P16-W06-S01'], ['P16-W06-S01'], ['P16-W06-S01'], ['P16-W06-S01', 'P16-W07-S01'], ['P16-W07-S01'], ['P16-W07-S01'], ['P16-W07-S01'], ['P16-W07-S01', 'P17-W05-S01'], ['P17-W05-S01'], ['P17-W05-S01'], ['P17-W05-S01'], ['P17-W05-S01', 'P17-W06-S01'], ['P17-W06-S01'], ['P17-W06-S01'], ['P17-W06-S01'], ['P17-W06-S01', 'P16-W05-S01'], ['P16-W05-S01'], ['P16-W05-S01'], ['P16-W05-S01'], ['P16-W05-S01', 'P16-W01-S01'], ['P16-W01-S01'], ['P16-W01-S01'], ['P16-W01-S01'], ['P16-W01-S01', 'P16-W02-S01'], ['P16-W02-S01'], ['P16-W02-S01'], ['P16-W02-S01'], ['P16-W02-S01', 'P17-W07-S01'], ['P17-W07-S01'], ['P17-W07-S01'], ['P17-W07-S01'], ['P17-W07-S01', 'P16-W04-S01'], ['P16-W04-S01'], ['P16-W04-S01'], ['P16-W04-S01'], ['P16-W04-S01', 'P15-W07-S01'], ['P15-W07-S01'], ['P15-W07-S01'], ['P15-W07-S01'], ['P15-W07-S01', 'P15-W08-S01'], ['P15-W08-S01'], ['P15-W08-S01'], ['P15-W08-S01'], ['P15-W08-S01', 'P15-W06-S01'], ['P15-W06-S01'], ['P15-W06-S01'], ['P15-W06-S01'], ['P15-W06-S01', 'P16-W03-S01'], ['P16-W03-S01'], ['P16-W03-S01'], ['P16-W03-S01'], ['P16-W03-S01', 'P17-W08-S01'], ['P17-W08-S01'], ['P17-W08-S01'], ['P17-W08-S01'], ['P17-W08-S01', 'P09-W02-S01'], ['P09-W02-S01'], ['P09-W02-S01'], ['P09-W02-S01'], ['P09-W02-S01', 'P03-W02-S01'], ['P03-W02-S01'], ['P03-W02-S01']]；blocked操作关联块/MOVE两端['P03-W01-S01::whole']。
+
+最终方案实际祖先链，包含临时负载不合格或DEADLOCK中间态：
+
+| 步骤 | 来源 | B32状态/Cmax | 负载合格 | 移除父任务数 | 本步模式变化 |
+|---|---|---|---|---:|---|
+| initial3 | minimal-modes-WAG-group0 | FEASIBLE 6898.237 | 1 | 0 | 无 |
+| round3-0 | initial3 | FEASIBLE 6635.651 | 1 | 12 | 无 |
+| round9-0 | round3-0 | FEASIBLE 6632.261 | 1 | 12 | 无 |
+
+每次成功修复的索引；每步全部父任务、blocked/blocker、前后归属、插入位置和方向见同一CSV的feedback、assignment_changes、rebuild_actions及solution字段：
+
+| 成功候选 | DEADLOCK来源 | Cmax | 负载合格 | 移除父任务数 | 模式变化数 |
+|---|---|---:|---|---:|---:|
+| round20-1 | round19-3 | 7148.543 | 0 | 12 | 1 |
+
+构造失败/重复计数：{}。
+
+
+#### 0067
+
+完整方案101个，新增B32 100次；局部DEADLOCK→FEASIBLE 4次，其中负载合格3次，最终来源round23-2。
+
+
+最终方案实际祖先链，包含临时负载不合格或DEADLOCK中间态：
+
+| 步骤 | 来源 | B32状态/Cmax | 负载合格 | 移除父任务数 | 本步模式变化 |
+|---|---|---|---|---:|---|
+| initial0 | saved-GNN-initial | FEASIBLE 5575.105 | 1 | 0 | 无 |
+| round1-3 | initial0 | FEASIBLE 5772.464 | 0 | 6 | P06-W02-S01: X_SPLIT:LOWER:BX_OUTER_UPPER → WHOLE；P13-W04-S01: Y_SPLIT:BY_OUTER_UPPER → Y_SPLIT:BY_OUTER_LOWER |
+| round2-3 | round1-3 | FEASIBLE 5762.121 | 0 | 8 | P13-W04-S01: Y_SPLIT:BY_OUTER_LOWER → Y_SPLIT:BY_OUTER_UPPER |
+| round6-2 | round2-3 | FEASIBLE 5668.188 | 1 | 10 | 无 |
+| round12-0 | round6-2 | FEASIBLE 5588.193 | 1 | 10 | 无 |
+| round16-3 | round12-0 | FEASIBLE 5516.070 | 1 | 6 | P18-W05-S01: Y_SPLIT:BY_CENTER → Y_SPLIT:BY_OUTER_UPPER |
+| round19-0 | round16-3 | FEASIBLE 5542.564 | 1 | 6 | 无 |
+| round23-2 | round19-0 | FEASIBLE 5516.058 | 1 | 8 | 无 |
+
+每次成功修复的索引；每步全部父任务、blocked/blocker、前后归属、插入位置和方向见同一CSV的feedback、assignment_changes、rebuild_actions及solution字段：
+
+| 成功候选 | DEADLOCK来源 | Cmax | 负载合格 | 移除父任务数 | 模式变化数 |
+|---|---|---:|---|---:|---:|
+| round14-0 | round13-3 | 5547.550 | 1 | 8 | 0 |
+| round14-1 | round13-3 | 5759.502 | 1 | 8 | 0 |
+| round14-2 | round13-3 | 5547.550 | 1 | 8 | 0 |
+| round14-3 | round13-3 | 5759.502 | 0 | 8 | 1 |
+
+构造失败/重复计数：{}。
+
+
+#### 0076
+
+完整方案101个，新增B32 100次；局部DEADLOCK→FEASIBLE 9次，其中负载合格0次，最终来源initial0。
+
+- 初始R0阻塞于 R0:B11:WELD (WELD)，blocked父任务['P04-W02-S01']；直接blocker父任务[['P21-W01-S01', 'P10-W04-S01'], ['P10-W04-S01'], ['P10-W04-S01'], ['P10-W04-S01'], ['P10-W04-S01', 'P10-W03-S01'], ['P10-W03-S01'], ['P10-W03-S01'], ['P10-W03-S01'], ['P10-W03-S01', 'P11-W01-S01'], ['P11-W01-S01'], ['P11-W01-S01'], ['P11-W01-S01'], ['P11-W01-S01', 'P06-W02-S01'], ['P06-W02-S01'], ['P06-W02-S01'], ['P06-W02-S01'], ['P06-W02-S01', 'P18-W08-S01'], ['P18-W08-S01'], ['P18-W08-S01'], ['P18-W08-S01'], ['P18-W08-S01', 'P15-W01-S01'], ['P15-W01-S01'], ['P15-W01-S01'], ['P15-W01-S01'], ['P15-W01-S01', 'P09-W12-S01'], ['P09-W12-S01'], ['P09-W12-S01'], ['P09-W12-S01'], ['P09-W12-S01', 'P09-W10-S01'], ['P09-W10-S01'], ['P09-W10-S01'], ['P09-W10-S01'], ['P09-W10-S01', 'P09-W03-S01'], ['P09-W03-S01'], ['P09-W03-S01'], ['P09-W03-S01'], ['P09-W03-S01', 'P05-W09-S01'], ['P05-W09-S01'], ['P05-W09-S01'], ['P05-W09-S01'], ['P05-W09-S01', 'P05-W07-S01'], ['P05-W07-S01'], ['P05-W07-S01'], ['P05-W07-S01'], ['P05-W07-S01', 'P05-W02-S01'], ['P05-W02-S01'], ['P05-W02-S01'], ['P05-W02-S01'], ['P05-W02-S01', 'P05-W10-S01'], ['P05-W10-S01'], ['P05-W10-S01'], ['P05-W10-S01'], ['P05-W10-S01', 'P05-W11-S01'], ['P05-W11-S01'], ['P05-W11-S01'], ['P05-W11-S01'], ['P05-W11-S01', 'P05-W12-S01'], ['P05-W12-S01'], ['P05-W12-S01'], ['P05-W12-S01'], ['P05-W12-S01', 'P05-W01-S01'], ['P05-W01-S01'], ['P05-W01-S01'], ['P05-W01-S01'], ['P05-W01-S01', 'P03-W01-S01'], ['P03-W01-S01'], ['P03-W01-S01'], ['P03-W01-S01'], ['P03-W01-S01', 'P05-W08-S01'], ['P05-W08-S01'], ['P05-W08-S01'], ['P05-W08-S01'], ['P05-W08-S01', 'P05-W03-S01'], ['P05-W03-S01'], ['P05-W03-S01'], ['P05-W03-S01'], ['P12-W01-S01'], ['P12-W01-S01'], ['P12-W01-S01', 'P21-W02-S01'], ['P21-W02-S01'], ['P21-W02-S01'], ['P21-W02-S01'], ['P21-W02-S01', 'P18-W09-S01'], ['P18-W09-S01'], ['P18-W09-S01'], ['P18-W09-S01'], ['P18-W09-S01', 'P18-W01-S01'], ['P18-W01-S01'], ['P18-W01-S01'], ['P18-W01-S01'], ['P18-W01-S01', 'P18-W06-S01'], ['P18-W06-S01'], ['P18-W06-S01'], ['P18-W06-S01'], ['P18-W06-S01', 'P12-W02-S01'], ['P12-W02-S01'], ['P12-W02-S01'], ['P12-W02-S01']]；blocked操作关联块/MOVE两端['P04-W02-S01::whole']。
+- 初始R2阻塞于 R2:B3:MOVE (MOVE)，blocked父任务['P20-W01-S01', 'P16-W02-S01']；直接blocker父任务[['P02-W02-S01', 'P02-W01-S01'], ['P02-W01-S01'], ['P02-W01-S01'], ['P02-W01-S01'], ['P02-W01-S01', 'P10-W07-S01'], ['P10-W07-S01'], ['P10-W07-S01'], ['P10-W07-S01'], ['P10-W07-S01', 'P10-W06-S01'], ['P10-W06-S01'], ['P10-W06-S01'], ['P10-W06-S01'], ['P10-W06-S01', 'P02-W03-S01'], ['P02-W03-S01'], ['P02-W03-S01'], ['P02-W03-S01'], ['P02-W03-S01', 'P02-W05-S01'], ['P02-W05-S01'], ['P02-W05-S01'], ['P02-W05-S01'], ['P02-W05-S01', 'P20-W02-S01'], ['P20-W02-S01'], ['P20-W02-S01'], ['P20-W02-S01'], ['P20-W02-S01', 'P10-W08-S01'], ['P10-W08-S01'], ['P10-W08-S01'], ['P10-W08-S01'], ['P10-W08-S01', 'P10-W05-S01'], ['P10-W05-S01'], ['P10-W05-S01'], ['P10-W05-S01'], ['P10-W05-S01', 'P20-W05-S01'], ['P20-W05-S01'], ['P20-W05-S01'], ['P20-W05-S01'], ['P20-W05-S01', 'P20-W03-S01'], ['P20-W03-S01'], ['P20-W03-S01'], ['P20-W03-S01'], ['P20-W03-S01', 'P20-W06-S01'], ['P20-W06-S01'], ['P20-W06-S01'], ['P20-W06-S01'], ['P20-W06-S01', 'P18-W07-S01'], ['P18-W07-S01'], ['P18-W07-S01'], ['P17-W03-S01'], ['P17-W03-S01', 'P18-W02-S01'], ['P18-W02-S01'], ['P18-W02-S01'], ['P18-W02-S01'], ['P18-W02-S01', 'P25-W02-S01'], ['P25-W02-S01'], ['P25-W02-S01'], ['P25-W02-S01'], ['P25-W02-S01', 'P07-W04-S01'], ['P07-W04-S01'], ['P07-W04-S01'], ['P07-W04-S01'], ['P07-W04-S01', 'P23-W02-S01'], ['P23-W02-S01'], ['P23-W02-S01'], ['P23-W02-S01'], ['P23-W02-S01', 'P14-W01-S01'], ['P14-W01-S01'], ['P14-W01-S01'], ['P14-W01-S01'], ['P14-W01-S01', 'P02-W02-S01'], ['P02-W02-S01'], ['P02-W02-S01'], ['P02-W02-S01']]；blocked操作关联块/MOVE两端['P20-W01-S01::whole', 'P16-W02-S01::whole']。
+- 初始R3阻塞于 R3:B21:POST (POST)，blocked父任务['P18-W07-S01']；直接blocker父任务[['P21-W01-S01', 'P10-W04-S01']]；blocked操作关联块/MOVE两端['P18-W07-S01::whole']。
+
+最终方案实际祖先链，包含临时负载不合格或DEADLOCK中间态：
+
+| 步骤 | 来源 | B32状态/Cmax | 负载合格 | 移除父任务数 | 本步模式变化 |
+|---|---|---|---|---:|---|
+| initial0 | saved-GNN-initial | DEADLOCK — | 1 | 0 | 无 |
+
+每次成功修复的索引；每步全部父任务、blocked/blocker、前后归属、插入位置和方向见同一CSV的feedback、assignment_changes、rebuild_actions及solution字段：
+
+| 成功候选 | DEADLOCK来源 | Cmax | 负载合格 | 移除父任务数 | 模式变化数 |
+|---|---|---:|---|---:|---:|
+| round1-2 | initial4 | 7016.896 | 0 | 8 | 0 |
+| round1-3 | initial4 | 7003.088 | 0 | 8 | 0 |
+| round4-0 | initial4 | 6985.151 | 0 | 7 | 0 |
+| round4-1 | initial4 | 6955.189 | 0 | 9 | 1 |
+| round4-2 | initial4 | 7036.613 | 0 | 9 | 0 |
+| round4-3 | initial4 | 7117.085 | 0 | 8 | 0 |
+| round6-1 | initial4 | 7010.334 | 0 | 8 | 0 |
+| round6-2 | initial4 | 6993.888 | 0 | 8 | 0 |
+| round6-3 | initial4 | 7196.389 | 0 | 8 | 1 |
+
+失败的具体边界：出现81个B32可行完整方案，但没有同时满足最终负载。最接近负载范围的round22-2：Cmax 9390.280、Pmax 6295.816、极差 1157.205；上限 6293.411/594.575。
+
+具体搜索阻碍：本轮各轮池内负载合格起点数为 [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]；95/95 个局部候选来自负载不合格起点。当前候选池优先物理可行Cmax，没有为负载合格死锁保留专门位置，暂时超载的可行方案会挤掉可继续修复的均衡方案；这是本实现的候选保留短板，而非B32证明负载范围无解。
+实际模式转移计数 {('WHOLE', 'X_SPLIT'): 6, ('WHOLE', 'Y_SPLIT'): 7, ('X_SPLIT', 'WHOLE'): 7, ('Y_SPLIT', 'WHOLE'): 7}，因此不能再归因于固定模式。小核心重构和原GNN的有限动作保留，仍未形成把避冲突迁移与补偿负载迁移一起选中的稳定路径；未扩大预算、训练或放松物理约束掩盖该负结果。
+
+该例最终方案直接来自多样化初始化，不能算作局部冲突核心修复的贡献。
+
+构造失败/重复计数：{"no joint action within temporary peak limit": 1, "duplicate complete plan": 1, "canonicalization changed the directed joint construction": 1}。
+
+
+#### 0084
+
+完整方案101个，新增B32 100次；局部DEADLOCK→FEASIBLE 1次，其中负载合格0次，最终来源initial5。
+
+- 初始R1阻塞于 R1:B14:WELD (WELD)，blocked父任务['P18-W11-S01']；直接blocker父任务[['P15-W01-S01'], ['P15-W01-S01'], ['P15-W01-S01', 'P14-W05-S01']]；blocked操作关联块/MOVE两端['P18-W11-S01::whole']。
+- 初始R3阻塞于 R3:B23:MOVE (MOVE)，blocked父任务['P22-W02-S01', 'P09-W05-S01']；直接blocker父任务[['P09-W04-S01', 'P12-W02-S01'], ['P12-W02-S01'], ['P12-W02-S01'], ['P12-W02-S01'], ['P12-W02-S01', 'P13-W04-S01'], ['P13-W04-S01'], ['P13-W04-S01'], ['P13-W04-S01'], ['P13-W04-S01', 'P13-W03-S01'], ['P13-W03-S01'], ['P13-W03-S01'], ['P13-W03-S01'], ['P13-W03-S01', 'P04-W02-S01'], ['P04-W02-S01'], ['P04-W02-S01'], ['P04-W02-S01']]；blocked操作关联块/MOVE两端['P22-W02-S01::whole', 'P09-W05-S01::whole']。
+
+最终方案实际祖先链，包含临时负载不合格或DEADLOCK中间态：
+
+| 步骤 | 来源 | B32状态/Cmax | 负载合格 | 移除父任务数 | 本步模式变化 |
+|---|---|---|---|---:|---|
+| initial5 | GNN-modes-region | FEASIBLE 6974.092 | 1 | 0 | 无 |
+
+每次成功修复的索引；每步全部父任务、blocked/blocker、前后归属、插入位置和方向见同一CSV的feedback、assignment_changes、rebuild_actions及solution字段：
+
+| 成功候选 | DEADLOCK来源 | Cmax | 负载合格 | 移除父任务数 | 模式变化数 |
+|---|---|---:|---|---:|---:|
+| round2-1 | round1-3 | 7273.129 | 0 | 10 | 1 |
+
+该例最终方案直接来自多样化初始化，不能算作局部冲突核心修复的贡献。
+
+构造失败/重复计数：{}。
+
+
+#### 0100
+
+完整方案101个，新增B32 100次；局部DEADLOCK→FEASIBLE 0次，其中负载合格0次，最终来源initial4。
+
+- 初始R1阻塞于 R1:B20:POST (POST)，blocked父任务['P10-W04-S01']；直接blocker父任务[['P14-W01-S01', 'P08-W09-S01'], ['P08-W09-S01'], ['P08-W09-S01'], ['P08-W09-S01'], ['P08-W09-S01', 'P10-W06-S01'], ['P10-W06-S01'], ['P10-W06-S01'], ['P10-W06-S01'], ['P10-W06-S01', 'P10-W08-S01'], ['P10-W08-S01'], ['P10-W08-S01'], ['P10-W08-S01'], ['P10-W08-S01', 'P08-W03-S01'], ['P08-W03-S01'], ['P08-W03-S01'], ['P08-W03-S01'], ['P08-W03-S01', 'P10-W07-S01'], ['P10-W07-S01'], ['P10-W07-S01'], ['P10-W07-S01'], ['P10-W07-S01', 'P06-W02-S01']]；blocked操作关联块/MOVE两端['P10-W04-S01::whole']。
+- 初始R2阻塞于 R2:B0:POST (POST)，blocked父任务['P13-W01-S01']；直接blocker父任务[['P17-W08-S01', 'P15-W12-S01'], ['P15-W12-S01'], ['P15-W12-S01'], ['P15-W12-S01'], ['P15-W12-S01', 'P15-W11-S01'], ['P15-W11-S01'], ['P15-W11-S01'], ['P15-W11-S01'], ['P15-W11-S01', 'P15-W10-S01']]；blocked操作关联块/MOVE两端['P13-W01-S01::whole']。
+
+最终方案实际祖先链，包含临时负载不合格或DEADLOCK中间态：
+
+| 步骤 | 来源 | B32状态/Cmax | 负载合格 | 移除父任务数 | 本步模式变化 |
+|---|---|---|---|---:|---|
+| initial4 | minimal-modes-WAG-group1 | FEASIBLE 6266.946 | 1 | 0 | 无 |
+
+该例最终方案直接来自多样化初始化，不能算作局部冲突核心修复的贡献。
+
+构造失败/重复计数：{}。
+
+初始化已能得到负载合格B32可行方案 4/6；局部重构后最终为5/6。应分别报告初始化与冲突核心的贡献。
+
+### 六例完整初始与最终分配、顺序和方向
+
+每条路线按实际执行顺序，方向位[d=0/1]沿用原模型定义。父模式差异完整保存在final行mode_changes。
+
+<details><summary>0031 四机器人初始与最终路线</summary>
+
+初始 initial0
+
+```text
+R0 (7): P06-W02-S01::whole[d=1] -> P06-W01-S01::whole[d=1] -> P03-W03-S01::whole[d=1] -> P03-W01-S01::whole[d=1] -> P04-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=0] -> P02-W02-S01::whole[d=1]
+R1 (16): P09-W04-S01::0[d=0] -> P03-W04-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P01-W02-S01::whole[d=1] -> P01-W05-S01::whole[d=1] -> P01-W03-S01::whole[d=1] -> P01-W06-S01::whole[d=1] -> P01-W04-S01::whole[d=1] -> P19-W02-S01::whole[d=1] -> P09-W01-S01::whole[d=1] -> P01-W01-S01::whole[d=0] -> P16-W02-S01::whole[d=1] -> P13-W05-S01::1[d=1] -> P04-W01-S01::whole[d=1]
+R2 (24): P13-W05-S01::0[d=1] -> P08-W01-S01::whole[d=1] -> P11-W01-S01::whole[d=0] -> P11-W03-S01::whole[d=1] -> P12-W01-S01::whole[d=1] -> P09-W02-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P07-W01-S01::whole[d=1] -> P15-W01-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P09-W03-S01::whole[d=1] -> P17-W02-S01::whole[d=1] -> P17-W01-S01::whole[d=1] -> P15-W03-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P13-W04-S01::whole[d=1] -> P13-W03-S01::whole[d=1] -> P11-W02-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P05-W02-S01::whole[d=0] -> P05-W03-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P05-W04-S01::whole[d=1]
+R3 (18): P07-W04-S01::whole[d=1] -> P07-W03-S01::whole[d=0] -> P07-W02-S01::whole[d=1] -> P07-W05-S01::whole[d=1] -> P07-W06-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P18-W01-S01::whole[d=1] -> P15-W02-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P09-W04-S01::1[d=1] -> P12-W03-S01::whole[d=0] -> P12-W02-S01::whole[d=1] -> P12-W04-S01::whole[d=0] -> P14-W01-S01::whole[d=1] -> P13-W02-S01::whole[d=0] -> P15-W04-S01::whole[d=1] -> P11-W04-S01::whole[d=1]
+```
+
+最终 round14-2
+
+```text
+R0 (11): P03-W04-S01::whole[d=1] -> P13-W05-S01::1[d=1] -> P03-W03-S01::whole[d=1] -> P03-W01-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P06-W02-S01::whole[d=1] -> P16-W02-S01::whole[d=0] -> P02-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=0] -> P06-W01-S01::whole[d=1] -> P16-W01-S01::whole[d=1]
+R1 (13): P04-W02-S01::whole[d=1] -> P04-W01-S01::whole[d=1] -> P09-W02-S01::whole[d=1] -> P09-W04-S01::0[d=1] -> P09-W01-S01::whole[d=0] -> P19-W02-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P01-W04-S01::whole[d=0] -> P01-W02-S01::whole[d=1] -> P01-W03-S01::whole[d=0] -> P01-W05-S01::whole[d=1] -> P01-W06-S01::whole[d=0] -> P01-W01-S01::whole[d=1]
+R2 (15): P05-W04-S01::whole[d=0] -> P05-W03-S01::whole[d=1] -> P14-W01-S01::whole[d=0] -> P11-W01-S01::whole[d=1] -> P11-W03-S01::whole[d=1] -> P11-W04-S01::whole[d=1] -> P13-W02-S01::whole[d=1] -> P11-W02-S01::whole[d=1] -> P13-W04-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P13-W05-S01::0[d=1] -> P13-W03-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P08-W01-S01::whole[d=1]
+R3 (26): P10-W04-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P15-W01-S01::whole[d=0] -> P15-W02-S01::whole[d=1] -> P15-W04-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P07-W05-S01::whole[d=1] -> P07-W06-S01::whole[d=1] -> P10-W01-S01::whole[d=0] -> P18-W01-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P17-W02-S01::whole[d=1] -> P17-W01-S01::whole[d=1] -> P15-W03-S01::whole[d=1] -> P12-W04-S01::whole[d=1] -> P12-W01-S01::whole[d=0] -> P12-W03-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P09-W04-S01::1[d=1] -> P09-W03-S01::whole[d=1] -> P07-W01-S01::whole[d=1] -> P07-W02-S01::whole[d=0] -> P07-W03-S01::whole[d=1] -> P07-W04-S01::whole[d=0]
+```
+
+</details>
+
+<details><summary>0095 四机器人初始与最终路线</summary>
+
+初始 initial0
+
+```text
+R0 (9): P01-W01-S01::whole[d=1] -> P10-W05-S01::1[d=1] -> P14-W08-S01::1[d=1] -> P10-W02-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P01-W02-S01::whole[d=0] -> P08-W01-S01::whole[d=0] -> P08-W02-S01::whole[d=1]
+R1 (43): P11-W01-S01::0[d=1] -> P13-W08-S01::whole[d=1] -> P13-W09-S01::whole[d=1] -> P13-W07-S01::whole[d=1] -> P04-W03-S01::whole[d=1] -> P04-W02-S01::whole[d=1] -> P04-W05-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P24-W01-S01::whole[d=1] -> P23-W02-S01::whole[d=1] -> P25-W01-S01::whole[d=1] -> P25-W02-S01::whole[d=1] -> P07-W08-S01::whole[d=1] -> P07-W10-S01::whole[d=1] -> P07-W09-S01::whole[d=1] -> P12-W01-S01::whole[d=1] -> P23-W01-S01::whole[d=1] -> P24-W02-S01::whole[d=1] -> P07-W07-S01::whole[d=1] -> P07-W05-S01::1[d=1] -> P07-W06-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P13-W05-S01::whole[d=0] -> P13-W06-S01::whole[d=1] -> P13-W04-S01::whole[d=1] -> P13-W02-S01::whole[d=0] -> P13-W03-S01::whole[d=1] -> P13-W10-S01::whole[d=0] -> P13-W11-S01::whole[d=1] -> P19-W02-S01::whole[d=1] -> P13-W12-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P04-W06-S01::whole[d=1] -> P04-W04-S01::whole[d=1] -> P04-W01-S01::whole[d=1] -> P16-W08-S01::1[d=1] -> P17-W02-S01::whole[d=0] -> P17-W04-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P14-W07-S01::1[d=1] -> P17-W03-S01::whole[d=0] -> P17-W01-S01::whole[d=1] -> P16-W07-S01::1[d=1]
+R2 (33): P06-W01-S01::whole[d=1] -> P06-W02-S01::whole[d=0] -> P14-W01-S01::whole[d=0] -> P03-W01-S01::whole[d=1] -> P09-W01-S01::whole[d=1] -> P02-W01-S01::whole[d=1] -> P05-W05-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P15-W03-S01::whole[d=1] -> P14-W04-S01::whole[d=0] -> P22-W01-S01::whole[d=1] -> P21-W02-S01::whole[d=1] -> P21-W01-S01::whole[d=1] -> P18-W05-S01::whole[d=1] -> P18-W01-S01::whole[d=1] -> P18-W06-S01::whole[d=0] -> P18-W04-S01::whole[d=1] -> P18-W07-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P18-W08-S01::whole[d=0] -> P18-W12-S01::whole[d=1] -> P18-W09-S01::whole[d=1] -> P18-W11-S01::whole[d=0] -> P18-W10-S01::whole[d=1] -> P18-W03-S01::whole[d=1] -> P22-W02-S01::whole[d=1] -> P14-W05-S01::whole[d=1] -> P14-W07-S01::0[d=1] -> P14-W06-S01::whole[d=1] -> P14-W02-S01::whole[d=1] -> P14-W03-S01::whole[d=1] -> P14-W08-S01::0[d=1] -> P10-W05-S01::0[d=1]
+R3 (44): P15-W05-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P07-W03-S01::whole[d=1] -> P07-W04-S01::whole[d=1] -> P07-W05-S01::0[d=1] -> P07-W01-S01::whole[d=1] -> P05-W06-S01::whole[d=0] -> P05-W04-S01::whole[d=1] -> P05-W09-S01::whole[d=0] -> P02-W03-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P05-W07-S01::whole[d=1] -> P05-W11-S01::whole[d=1] -> P05-W12-S01::whole[d=0] -> P05-W10-S01::whole[d=1] -> P05-W03-S01::whole[d=1] -> P07-W02-S01::whole[d=1] -> P05-W08-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P15-W04-S01::whole[d=1] -> P15-W09-S01::whole[d=1] -> P15-W01-S01::whole[d=1] -> P15-W02-S01::whole[d=1] -> P15-W10-S01::whole[d=1] -> P16-W08-S01::0[d=1] -> P16-W06-S01::whole[d=1] -> P16-W07-S01::0[d=1] -> P17-W05-S01::whole[d=1] -> P17-W06-S01::whole[d=1] -> P16-W05-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P16-W02-S01::whole[d=1] -> P17-W07-S01::whole[d=1] -> P16-W04-S01::whole[d=1] -> P15-W07-S01::whole[d=1] -> P15-W08-S01::whole[d=1] -> P15-W06-S01::whole[d=1] -> P16-W03-S01::whole[d=0] -> P17-W08-S01::whole[d=1] -> P09-W02-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P02-W04-S01::whole[d=1] -> P11-W01-S01::1[d=1]
+```
+
+最终 round9-0
+
+```text
+R0 (9): P10-W05-S01::1[d=1] -> P10-W03-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P08-W02-S01::whole[d=1] -> P01-W02-S01::whole[d=1] -> P08-W01-S01::whole[d=1] -> P01-W01-S01::whole[d=1]
+R1 (43): P16-W07-S01::1[d=0] -> P16-W08-S01::1[d=1] -> P17-W04-S01::whole[d=1] -> P17-W02-S01::whole[d=1] -> P17-W03-S01::whole[d=1] -> P14-W07-S01::1[d=1] -> P17-W01-S01::whole[d=1] -> P14-W08-S01::1[d=1] -> P13-W10-S01::whole[d=1] -> P13-W12-S01::whole[d=0] -> P19-W02-S01::whole[d=1] -> P13-W09-S01::whole[d=0] -> P13-W08-S01::whole[d=1] -> P13-W11-S01::whole[d=1] -> P13-W03-S01::whole[d=1] -> P13-W02-S01::whole[d=0] -> P11-W01-S01::0[d=1] -> P13-W06-S01::whole[d=1] -> P07-W05-S01::1[d=1] -> P07-W09-S01::whole[d=1] -> P07-W10-S01::whole[d=0] -> P07-W06-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P13-W04-S01::whole[d=0] -> P13-W07-S01::whole[d=1] -> P04-W01-S01::whole[d=1] -> P04-W06-S01::whole[d=1] -> P04-W04-S01::whole[d=1] -> P12-W01-S01::whole[d=1] -> P23-W01-S01::whole[d=1] -> P25-W02-S01::whole[d=1] -> P23-W02-S01::whole[d=1] -> P24-W01-S01::whole[d=1] -> P25-W01-S01::whole[d=1] -> P24-W02-S01::whole[d=1] -> P07-W08-S01::whole[d=1] -> P07-W07-S01::whole[d=1] -> P13-W05-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P04-W02-S01::whole[d=1] -> P04-W05-S01::whole[d=1] -> P04-W03-S01::whole[d=1] -> P19-W01-S01::whole[d=0]
+R2 (30): P10-W05-S01::0[d=1] -> P18-W01-S01::whole[d=1] -> P18-W12-S01::whole[d=0] -> P18-W07-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P18-W03-S01::whole[d=0] -> P18-W11-S01::whole[d=1] -> P18-W10-S01::whole[d=0] -> P18-W08-S01::whole[d=0] -> P18-W09-S01::whole[d=1] -> P18-W06-S01::whole[d=1] -> P22-W01-S01::whole[d=1] -> P14-W07-S01::0[d=1] -> P14-W06-S01::whole[d=1] -> P21-W01-S01::whole[d=1] -> P22-W02-S01::whole[d=1] -> P14-W08-S01::0[d=1] -> P14-W02-S01::whole[d=1] -> P17-W07-S01::whole[d=1] -> P17-W06-S01::whole[d=1] -> P14-W04-S01::whole[d=0] -> P14-W05-S01::whole[d=1] -> P17-W05-S01::whole[d=1] -> P14-W01-S01::whole[d=1] -> P06-W01-S01::whole[d=1] -> P21-W02-S01::whole[d=1] -> P18-W05-S01::whole[d=0] -> P18-W04-S01::whole[d=1] -> P14-W03-S01::whole[d=1] -> P06-W02-S01::whole[d=1]
+R3 (47): P16-W07-S01::0[d=0] -> P16-W06-S01::whole[d=1] -> P16-W08-S01::0[d=1] -> P16-W05-S01::whole[d=1] -> P15-W09-S01::whole[d=1] -> P15-W10-S01::whole[d=1] -> P15-W08-S01::whole[d=1] -> P16-W04-S01::whole[d=0] -> P16-W02-S01::whole[d=1] -> P17-W08-S01::whole[d=1] -> P16-W03-S01::whole[d=1] -> P05-W11-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=1] -> P05-W09-S01::whole[d=1] -> P05-W07-S01::whole[d=0] -> P05-W08-S01::whole[d=1] -> P05-W10-S01::whole[d=1] -> P05-W03-S01::whole[d=1] -> P07-W04-S01::whole[d=1] -> P07-W03-S01::whole[d=1] -> P07-W02-S01::whole[d=1] -> P07-W05-S01::0[d=1] -> P07-W01-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P11-W01-S01::1[d=1] -> P15-W04-S01::whole[d=1] -> P15-W03-S01::whole[d=1] -> P15-W05-S01::whole[d=1] -> P15-W01-S01::whole[d=1] -> P15-W02-S01::whole[d=1] -> P15-W07-S01::whole[d=1] -> P15-W06-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P09-W02-S01::whole[d=1] -> P09-W01-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P02-W04-S01::whole[d=1] -> P05-W06-S01::whole[d=1] -> P05-W05-S01::whole[d=1] -> P05-W04-S01::whole[d=0] -> P05-W01-S01::whole[d=1] -> P05-W12-S01::whole[d=0] -> P02-W03-S01::whole[d=1] -> P03-W01-S01::whole[d=1]
+```
+
+</details>
+
+<details><summary>0067 四机器人初始与最终路线</summary>
+
+初始 initial0
+
+```text
+R0 (20): P16-W07-S01::whole[d=1] -> P16-W04-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P16-W05-S01::whole[d=1] -> P17-W01-S01::whole[d=1] -> P09-W01-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P19-W03-S01::whole[d=1] -> P13-W03-S01::whole[d=1] -> P13-W04-S01::0[d=1] -> P13-W01-S01::whole[d=1] -> P13-W02-S01::whole[d=0] -> P19-W02-S01::whole[d=1] -> P15-W01-S01::whole[d=0] -> P15-W02-S01::whole[d=1] -> P16-W06-S01::whole[d=1] -> P16-W08-S01::whole[d=1] -> P09-W02-S01::0[d=1] -> P19-W04-S01::whole[d=1] -> P12-W01-S01::whole[d=1]
+R1 (29): P21-W01-S01::1[d=1] -> P07-W03-S01::whole[d=1] -> P07-W02-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P07-W01-S01::whole[d=1] -> P02-W04-S01::whole[d=1] -> P02-W03-S01::whole[d=1] -> P01-W06-S01::whole[d=1] -> P01-W03-S01::whole[d=1] -> P01-W02-S01::whole[d=1] -> P01-W01-S01::whole[d=1] -> P01-W05-S01::whole[d=1] -> P01-W04-S01::whole[d=1] -> P18-W04-S01::1[d=1] -> P18-W02-S01::whole[d=1] -> P16-W03-S01::whole[d=1] -> P16-W02-S01::whole[d=1] -> P25-W01-S01::whole[d=1] -> P25-W02-S01::whole[d=1] -> P18-W05-S01::1[d=1] -> P18-W03-S01::1[d=1] -> P07-W04-S01::whole[d=1] -> P18-W07-S01::whole[d=1] -> P18-W06-S01::whole[d=1] -> P26-W01-S01::whole[d=1] -> P18-W08-S01::whole[d=1] -> P26-W02-S01::whole[d=1] -> P14-W01-S01::whole[d=1] -> P09-W02-S01::1[d=1]
+R2 (10): P04-W01-S01::whole[d=0] -> P06-W01-S01::whole[d=1] -> P13-W04-S01::1[d=1] -> P06-W02-S01::0[d=1] -> P24-W02-S01::whole[d=1] -> P23-W01-S01::whole[d=1] -> P24-W01-S01::whole[d=1] -> P18-W01-S01::whole[d=1] -> P23-W02-S01::whole[d=1] -> P04-W02-S01::whole[d=1]
+R3 (26): P21-W01-S01::0[d=1] -> P22-W02-S01::whole[d=1] -> P22-W01-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P18-W03-S01::0[d=1] -> P18-W04-S01::0[d=0] -> P18-W05-S01::0[d=1] -> P11-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=1] -> P03-W03-S01::whole[d=0] -> P03-W05-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P08-W01-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P06-W02-S01::1[d=1] -> P10-W02-S01::whole[d=1] -> P11-W04-S01::whole[d=1] -> P11-W05-S01::whole[d=1] -> P11-W01-S01::whole[d=1] -> P11-W03-S01::whole[d=1] -> P03-W04-S01::whole[d=0] -> P08-W02-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P03-W01-S01::whole[d=1]
+```
+
+最终 round23-2
+
+```text
+R0 (20): P16-W05-S01::whole[d=1] -> P16-W08-S01::whole[d=1] -> P16-W06-S01::whole[d=1] -> P16-W07-S01::whole[d=1] -> P16-W04-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P09-W01-S01::whole[d=1] -> P19-W03-S01::whole[d=1] -> P19-W04-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P13-W03-S01::whole[d=1] -> P13-W02-S01::whole[d=0] -> P13-W04-S01::0[d=1] -> P19-W02-S01::whole[d=1] -> P12-W01-S01::whole[d=1] -> P15-W01-S01::whole[d=0] -> P17-W01-S01::whole[d=1] -> P15-W02-S01::whole[d=1] -> P09-W02-S01::0[d=1]
+R1 (29): P07-W03-S01::whole[d=1] -> P07-W02-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P21-W01-S01::1[d=1] -> P07-W01-S01::whole[d=1] -> P02-W04-S01::whole[d=1] -> P02-W03-S01::whole[d=1] -> P07-W04-S01::whole[d=1] -> P01-W05-S01::whole[d=1] -> P01-W06-S01::whole[d=1] -> P01-W04-S01::whole[d=1] -> P01-W03-S01::whole[d=1] -> P01-W01-S01::whole[d=1] -> P01-W02-S01::whole[d=1] -> P09-W02-S01::1[d=1] -> P18-W04-S01::1[d=1] -> P18-W02-S01::whole[d=1] -> P16-W03-S01::whole[d=1] -> P16-W02-S01::whole[d=1] -> P18-W03-S01::1[d=1] -> P25-W01-S01::whole[d=1] -> P25-W02-S01::whole[d=1] -> P18-W06-S01::whole[d=1] -> P18-W07-S01::whole[d=1] -> P26-W01-S01::whole[d=1] -> P18-W08-S01::whole[d=1] -> P18-W05-S01::1[d=1] -> P26-W02-S01::whole[d=1] -> P14-W01-S01::whole[d=1]
+R2 (6): P04-W02-S01::whole[d=1] -> P13-W04-S01::1[d=1] -> P04-W01-S01::whole[d=0] -> P06-W01-S01::whole[d=1] -> P06-W02-S01::whole[d=0] -> P24-W02-S01::whole[d=1]
+R3 (29): P22-W02-S01::whole[d=1] -> P22-W01-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P18-W04-S01::0[d=0] -> P18-W05-S01::0[d=1] -> P23-W02-S01::whole[d=1] -> P18-W03-S01::0[d=1] -> P23-W01-S01::whole[d=1] -> P24-W01-S01::whole[d=1] -> P18-W01-S01::whole[d=1] -> P21-W01-S01::0[d=1] -> P11-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=1] -> P03-W03-S01::whole[d=1] -> P03-W05-S01::whole[d=1] -> P08-W01-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P11-W05-S01::whole[d=1] -> P11-W04-S01::whole[d=1] -> P11-W01-S01::whole[d=1] -> P11-W03-S01::whole[d=1] -> P03-W04-S01::whole[d=0] -> P08-W02-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P03-W01-S01::whole[d=1]
+```
+
+</details>
+
+<details><summary>0076 四机器人初始与最终路线</summary>
+
+初始 initial0
+
+```text
+R0 (26): P18-W05-S01::whole[d=1] -> P06-W03-S01::whole[d=1] -> P09-W04-S01::whole[d=1] -> P09-W02-S01::whole[d=1] -> P11-W02-S01::whole[d=1] -> P09-W01-S01::whole[d=0] -> P09-W05-S01::whole[d=1] -> P08-W01-S01::whole[d=1] -> P08-W02-S01::whole[d=1] -> P06-W04-S01::0[d=1] -> P10-W01-S01::whole[d=1] -> P04-W02-S01::whole[d=0] -> P01-W01-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P13-W02-S01::whole[d=1] -> P06-W01-S01::whole[d=0] -> P05-W06-S01::whole[d=1] -> P05-W05-S01::whole[d=0] -> P05-W04-S01::whole[d=1] -> P09-W11-S01::whole[d=1] -> P09-W07-S01::whole[d=1] -> P09-W09-S01::whole[d=0] -> P09-W08-S01::whole[d=1] -> P09-W06-S01::whole[d=1] -> P06-W05-S01::whole[d=1]
+R1 (30): P01-W02-S01::whole[d=1] -> P15-W02-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P04-W01-S01::whole[d=0] -> P12-W01-S01::whole[d=1] -> P21-W02-S01::whole[d=1] -> P18-W09-S01::whole[d=0] -> P18-W01-S01::whole[d=1] -> P18-W06-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P21-W01-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P11-W01-S01::1[d=1] -> P06-W02-S01::0[d=1] -> P18-W08-S01::whole[d=1] -> P15-W01-S01::whole[d=1] -> P09-W12-S01::whole[d=1] -> P09-W10-S01::whole[d=0] -> P09-W03-S01::whole[d=1] -> P05-W09-S01::whole[d=0] -> P05-W07-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P05-W10-S01::whole[d=1] -> P05-W11-S01::whole[d=0] -> P05-W12-S01::whole[d=1] -> P05-W01-S01::whole[d=0] -> P03-W01-S01::whole[d=1] -> P05-W08-S01::whole[d=1] -> P05-W03-S01::whole[d=1]
+R2 (23): P02-W06-S01::whole[d=1] -> P20-W04-S01::0[d=1] -> P20-W01-S01::whole[d=1] -> P16-W02-S01::whole[d=0] -> P23-W01-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P07-W07-S01::whole[d=1] -> P07-W04-S01::0[d=1] -> P07-W03-S01::whole[d=1] -> P07-W02-S01::whole[d=1] -> P07-W01-S01::whole[d=1] -> P07-W09-S01::whole[d=1] -> P07-W06-S01::whole[d=1] -> P11-W01-S01::0[d=1] -> P14-W02-S01::whole[d=1] -> P07-W08-S01::whole[d=0] -> P06-W04-S01::1[d=1] -> P06-W02-S01::1[d=1] -> P07-W10-S01::whole[d=1] -> P07-W05-S01::whole[d=1] -> P02-W04-S01::whole[d=1] -> P22-W01-S01::whole[d=1] -> P16-W01-S01::whole[d=1]
+R3 (34): P12-W05-S01::whole[d=1] -> P17-W02-S01::whole[d=1] -> P17-W01-S01::whole[d=0] -> P17-W03-S01::whole[d=1] -> P18-W02-S01::whole[d=0] -> P25-W02-S01::whole[d=1] -> P07-W04-S01::1[d=1] -> P23-W02-S01::whole[d=1] -> P14-W01-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=1] -> P10-W07-S01::whole[d=1] -> P10-W06-S01::whole[d=1] -> P02-W03-S01::whole[d=1] -> P02-W05-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P10-W08-S01::whole[d=1] -> P10-W05-S01::whole[d=1] -> P20-W05-S01::whole[d=1] -> P20-W03-S01::whole[d=1] -> P20-W06-S01::whole[d=1] -> P18-W07-S01::whole[d=1] -> P18-W03-S01::whole[d=1] -> P18-W10-S01::whole[d=0] -> P18-W04-S01::whole[d=1] -> P17-W04-S01::whole[d=1] -> P12-W04-S01::whole[d=0] -> P12-W03-S01::whole[d=1] -> P12-W07-S01::whole[d=0] -> P24-W01-S01::whole[d=1] -> P12-W08-S01::whole[d=1] -> P12-W06-S01::whole[d=1] -> P25-W01-S01::whole[d=1] -> P20-W04-S01::1[d=1]
+```
+
+最终 initial0
+
+```text
+R0 (26): P18-W05-S01::whole[d=1] -> P06-W03-S01::whole[d=1] -> P09-W04-S01::whole[d=1] -> P09-W02-S01::whole[d=1] -> P11-W02-S01::whole[d=1] -> P09-W01-S01::whole[d=0] -> P09-W05-S01::whole[d=1] -> P08-W01-S01::whole[d=1] -> P08-W02-S01::whole[d=1] -> P06-W04-S01::0[d=1] -> P10-W01-S01::whole[d=1] -> P04-W02-S01::whole[d=0] -> P01-W01-S01::whole[d=1] -> P03-W02-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P13-W02-S01::whole[d=1] -> P06-W01-S01::whole[d=0] -> P05-W06-S01::whole[d=1] -> P05-W05-S01::whole[d=0] -> P05-W04-S01::whole[d=1] -> P09-W11-S01::whole[d=1] -> P09-W07-S01::whole[d=1] -> P09-W09-S01::whole[d=0] -> P09-W08-S01::whole[d=1] -> P09-W06-S01::whole[d=1] -> P06-W05-S01::whole[d=1]
+R1 (30): P01-W02-S01::whole[d=1] -> P15-W02-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P04-W01-S01::whole[d=0] -> P12-W01-S01::whole[d=1] -> P21-W02-S01::whole[d=1] -> P18-W09-S01::whole[d=0] -> P18-W01-S01::whole[d=1] -> P18-W06-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P21-W01-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P11-W01-S01::1[d=1] -> P06-W02-S01::0[d=1] -> P18-W08-S01::whole[d=1] -> P15-W01-S01::whole[d=1] -> P09-W12-S01::whole[d=1] -> P09-W10-S01::whole[d=0] -> P09-W03-S01::whole[d=1] -> P05-W09-S01::whole[d=0] -> P05-W07-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P05-W10-S01::whole[d=1] -> P05-W11-S01::whole[d=0] -> P05-W12-S01::whole[d=1] -> P05-W01-S01::whole[d=0] -> P03-W01-S01::whole[d=1] -> P05-W08-S01::whole[d=1] -> P05-W03-S01::whole[d=1]
+R2 (23): P02-W06-S01::whole[d=1] -> P20-W04-S01::0[d=1] -> P20-W01-S01::whole[d=1] -> P16-W02-S01::whole[d=0] -> P23-W01-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P07-W07-S01::whole[d=1] -> P07-W04-S01::0[d=1] -> P07-W03-S01::whole[d=1] -> P07-W02-S01::whole[d=1] -> P07-W01-S01::whole[d=1] -> P07-W09-S01::whole[d=1] -> P07-W06-S01::whole[d=1] -> P11-W01-S01::0[d=1] -> P14-W02-S01::whole[d=1] -> P07-W08-S01::whole[d=0] -> P06-W04-S01::1[d=1] -> P06-W02-S01::1[d=1] -> P07-W10-S01::whole[d=1] -> P07-W05-S01::whole[d=1] -> P02-W04-S01::whole[d=1] -> P22-W01-S01::whole[d=1] -> P16-W01-S01::whole[d=1]
+R3 (34): P12-W05-S01::whole[d=1] -> P17-W02-S01::whole[d=1] -> P17-W01-S01::whole[d=0] -> P17-W03-S01::whole[d=1] -> P18-W02-S01::whole[d=0] -> P25-W02-S01::whole[d=1] -> P07-W04-S01::1[d=1] -> P23-W02-S01::whole[d=1] -> P14-W01-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=1] -> P10-W07-S01::whole[d=1] -> P10-W06-S01::whole[d=1] -> P02-W03-S01::whole[d=1] -> P02-W05-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P10-W08-S01::whole[d=1] -> P10-W05-S01::whole[d=1] -> P20-W05-S01::whole[d=1] -> P20-W03-S01::whole[d=1] -> P20-W06-S01::whole[d=1] -> P18-W07-S01::whole[d=1] -> P18-W03-S01::whole[d=1] -> P18-W10-S01::whole[d=0] -> P18-W04-S01::whole[d=1] -> P17-W04-S01::whole[d=1] -> P12-W04-S01::whole[d=0] -> P12-W03-S01::whole[d=1] -> P12-W07-S01::whole[d=0] -> P24-W01-S01::whole[d=1] -> P12-W08-S01::whole[d=1] -> P12-W06-S01::whole[d=1] -> P25-W01-S01::whole[d=1] -> P20-W04-S01::1[d=1]
+```
+
+</details>
+
+<details><summary>0084 四机器人初始与最终路线</summary>
+
+初始 initial0
+
+```text
+R0 (30): P09-W01-S01::whole[d=1] -> P09-W02-S01::whole[d=0] -> P09-W04-S01::0[d=1] -> P09-W03-S01::whole[d=1] -> P15-W01-S01::whole[d=1] -> P14-W05-S01::whole[d=0] -> P14-W02-S01::whole[d=0] -> P07-W01-S01::1[d=0] -> P08-W04-S01::whole[d=1] -> P08-W02-S01::whole[d=1] -> P11-W01-S01::whole[d=0] -> P11-W02-S01::whole[d=1] -> P11-W03-S01::whole[d=1] -> P08-W03-S01::whole[d=0] -> P08-W10-S01::whole[d=1] -> P08-W08-S01::whole[d=0] -> P08-W11-S01::whole[d=1] -> P08-W07-S01::whole[d=0] -> P08-W09-S01::whole[d=1] -> P08-W12-S01::whole[d=1] -> P11-W04-S01::whole[d=1] -> P14-W01-S01::whole[d=1] -> P14-W03-S01::whole[d=1] -> P03-W03-S01::0[d=1] -> P16-W04-S01::whole[d=1] -> P08-W05-S01::whole[d=0] -> P08-W06-S01::whole[d=1] -> P08-W01-S01::whole[d=1] -> P14-W04-S01::whole[d=1] -> P15-W02-S01::whole[d=1]
+R1 (51): P02-W01-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P18-W07-S01::whole[d=1] -> P18-W10-S01::whole[d=0] -> P18-W03-S01::whole[d=1] -> P26-W02-S01::whole[d=1] -> P23-W12-S01::whole[d=1] -> P23-W11-S01::whole[d=1] -> P18-W06-S01::whole[d=1] -> P18-W05-S01::whole[d=0] -> P18-W01-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P18-W09-S01::whole[d=0] -> P18-W08-S01::whole[d=1] -> P18-W11-S01::whole[d=1] -> P18-W12-S01::whole[d=1] -> P23-W10-S01::whole[d=1] -> P23-W08-S01::whole[d=1] -> P23-W09-S01::whole[d=0] -> P23-W07-S01::whole[d=1] -> P23-W02-S01::whole[d=1] -> P23-W06-S01::whole[d=0] -> P23-W01-S01::whole[d=1] -> P23-W04-S01::whole[d=1] -> P23-W05-S01::whole[d=1] -> P17-W08-S01::whole[d=0] -> P16-W01-S01::whole[d=1] -> P16-W05-S01::whole[d=1] -> P16-W02-S01::whole[d=1] -> P14-W06-S01::whole[d=1] -> P17-W11-S01::whole[d=1] -> P17-W09-S01::whole[d=0] -> P17-W02-S01::whole[d=1] -> P17-W12-S01::whole[d=0] -> P17-W10-S01::whole[d=1] -> P17-W07-S01::whole[d=1] -> P16-W06-S01::whole[d=1] -> P17-W06-S01::whole[d=1] -> P16-W03-S01::whole[d=1] -> P17-W03-S01::whole[d=0] -> P17-W01-S01::whole[d=1] -> P17-W05-S01::whole[d=0] -> P17-W04-S01::whole[d=1] -> P23-W03-S01::whole[d=1] -> P26-W01-S01::whole[d=1] -> P18-W04-S01::whole[d=1] -> P02-W05-S01::whole[d=1] -> P02-W06-S01::whole[d=1] -> P02-W03-S01::whole[d=0] -> P03-W01-S01::0[d=1] -> P02-W04-S01::whole[d=1]
+R2 (18): P04-W01-S01::whole[d=0] -> P07-W01-S01::0[d=1] -> P13-W01-S01::whole[d=0] -> P12-W04-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P24-W01-S01::whole[d=1] -> P22-W01-S01::whole[d=1] -> P13-W02-S01::whole[d=1] -> P13-W05-S01::whole[d=1] -> P01-W02-S01::whole[d=1] -> P25-W02-S01::whole[d=1] -> P25-W01-S01::whole[d=1] -> P01-W01-S01::whole[d=1] -> P09-W04-S01::1[d=1] -> P12-W02-S01::whole[d=1] -> P13-W04-S01::whole[d=1] -> P13-W03-S01::whole[d=1] -> P04-W02-S01::whole[d=1]
+R3 (34): P03-W04-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P10-W05-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P05-W10-S01::whole[d=1] -> P05-W07-S01::whole[d=0] -> P06-W02-S01::whole[d=1] -> P06-W01-S01::whole[d=1] -> P05-W08-S01::whole[d=1] -> P05-W06-S01::whole[d=1] -> P05-W05-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P05-W04-S01::whole[d=0] -> P05-W09-S01::whole[d=1] -> P05-W03-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P12-W05-S01::whole[d=1] -> P12-W01-S01::whole[d=1] -> P21-W01-S01::whole[d=0] -> P22-W02-S01::whole[d=1] -> P09-W05-S01::whole[d=1] -> P09-W06-S01::whole[d=1] -> P24-W02-S01::whole[d=1] -> P12-W03-S01::whole[d=1] -> P03-W01-S01::1[d=1] -> P03-W03-S01::1[d=1] -> P03-W05-S01::whole[d=1] -> P10-W08-S01::whole[d=1] -> P10-W06-S01::whole[d=1] -> P10-W07-S01::whole[d=1] -> P03-W02-S01::whole[d=1]
+```
+
+最终 initial5
+
+```text
+R0 (31): P15-W02-S01::whole[d=0] -> P09-W03-S01::whole[d=0] -> P09-W01-S01::whole[d=0] -> P08-W07-S01::whole[d=1] -> P11-W04-S01::whole[d=1] -> P14-W05-S01::whole[d=1] -> P14-W03-S01::whole[d=1] -> P16-W05-S01::whole[d=1] -> P14-W06-S01::whole[d=1] -> P16-W02-S01::whole[d=1] -> P14-W01-S01::whole[d=1] -> P11-W02-S01::whole[d=1] -> P11-W01-S01::whole[d=1] -> P11-W03-S01::whole[d=1] -> P08-W02-S01::whole[d=0] -> P08-W12-S01::whole[d=1] -> P08-W04-S01::whole[d=1] -> P07-W01-S01::1[d=1] -> P09-W04-S01::0[d=0] -> P09-W02-S01::whole[d=1] -> P08-W06-S01::whole[d=1] -> P08-W05-S01::whole[d=0] -> P08-W01-S01::whole[d=1] -> P08-W08-S01::whole[d=0] -> P08-W09-S01::whole[d=1] -> P08-W10-S01::whole[d=1] -> P08-W11-S01::whole[d=0] -> P08-W03-S01::whole[d=1] -> P14-W02-S01::whole[d=1] -> P14-W04-S01::whole[d=0] -> P15-W01-S01::whole[d=0]
+R1 (50): P02-W06-S01::whole[d=0] -> P02-W02-S01::whole[d=1] -> P18-W08-S01::whole[d=1] -> P18-W11-S01::whole[d=0] -> P18-W12-S01::whole[d=1] -> P02-W01-S01::whole[d=0] -> P18-W05-S01::whole[d=1] -> P18-W01-S01::whole[d=1] -> P23-W05-S01::whole[d=1] -> P23-W06-S01::whole[d=1] -> P23-W01-S01::whole[d=0] -> P23-W09-S01::whole[d=1] -> P23-W03-S01::whole[d=1] -> P17-W05-S01::whole[d=0] -> P16-W06-S01::whole[d=1] -> P16-W03-S01::whole[d=1] -> P17-W01-S01::whole[d=1] -> P17-W04-S01::whole[d=1] -> P23-W10-S01::whole[d=1] -> P23-W12-S01::whole[d=0] -> P23-W11-S01::whole[d=1] -> P23-W02-S01::whole[d=1] -> P23-W08-S01::whole[d=0] -> P23-W07-S01::whole[d=1] -> P17-W06-S01::whole[d=1] -> P16-W04-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P17-W02-S01::whole[d=1] -> P17-W07-S01::whole[d=0] -> P17-W08-S01::whole[d=1] -> P17-W10-S01::whole[d=0] -> P17-W11-S01::whole[d=1] -> P17-W12-S01::whole[d=0] -> P17-W09-S01::whole[d=1] -> P17-W03-S01::whole[d=1] -> P23-W04-S01::whole[d=1] -> P18-W06-S01::whole[d=0] -> P18-W04-S01::whole[d=1] -> P18-W07-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P02-W05-S01::whole[d=1] -> P03-W01-S01::0[d=0] -> P03-W03-S01::0[d=0] -> P02-W03-S01::whole[d=0] -> P18-W10-S01::whole[d=1] -> P18-W03-S01::whole[d=1] -> P26-W02-S01::whole[d=1] -> P26-W01-S01::whole[d=1] -> P18-W09-S01::whole[d=1] -> P02-W04-S01::whole[d=1]
+R2 (20): P04-W02-S01::whole[d=0] -> P13-W03-S01::whole[d=1] -> P25-W01-S01::whole[d=1] -> P01-W01-S01::whole[d=1] -> P25-W02-S01::whole[d=0] -> P01-W02-S01::whole[d=1] -> P13-W04-S01::whole[d=0] -> P13-W02-S01::whole[d=1] -> P24-W01-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P22-W02-S01::whole[d=0] -> P24-W02-S01::whole[d=1] -> P22-W01-S01::whole[d=1] -> P09-W06-S01::whole[d=1] -> P09-W05-S01::whole[d=1] -> P13-W05-S01::whole[d=1] -> P13-W01-S01::whole[d=1] -> P09-W04-S01::1[d=1] -> P07-W01-S01::0[d=1] -> P04-W01-S01::whole[d=1]
+R3 (32): P10-W05-S01::whole[d=1] -> P05-W04-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P05-W03-S01::whole[d=1] -> P05-W02-S01::whole[d=1] -> P05-W10-S01::whole[d=1] -> P05-W09-S01::whole[d=1] -> P03-W04-S01::whole[d=1] -> P03-W03-S01::1[d=1] -> P03-W05-S01::whole[d=1] -> P03-W01-S01::1[d=1] -> P03-W02-S01::whole[d=0] -> P06-W02-S01::whole[d=1] -> P10-W08-S01::whole[d=1] -> P10-W07-S01::whole[d=1] -> P10-W06-S01::whole[d=1] -> P06-W01-S01::whole[d=1] -> P05-W07-S01::whole[d=1] -> P05-W06-S01::whole[d=1] -> P05-W08-S01::whole[d=1] -> P05-W05-S01::whole[d=1] -> P12-W04-S01::whole[d=1] -> P12-W05-S01::whole[d=1] -> P21-W01-S01::whole[d=1] -> P12-W01-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P12-W03-S01::whole[d=1] -> P10-W04-S01::whole[d=0] -> P20-W01-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P19-W01-S01::whole[d=0]
+```
+
+</details>
+
+<details><summary>0100 四机器人初始与最终路线</summary>
+
+初始 initial0
+
+```text
+R0 (11): P02-W01-S01::whole[d=1] -> P02-W02-S01::whole[d=0] -> P06-W01-S01::0[d=0] -> P14-W01-S01::whole[d=1] -> P08-W09-S01::whole[d=1] -> P10-W06-S01::whole[d=0] -> P10-W08-S01::0[d=1] -> P08-W03-S01::whole[d=1] -> P10-W07-S01::whole[d=1] -> P06-W02-S01::whole[d=1] -> P13-W02-S01::0[d=1]
+R1 (31): P05-W03-S01::whole[d=1] -> P10-W03-S01::whole[d=1] -> P01-W02-S01::whole[d=1] -> P08-W10-S01::whole[d=1] -> P08-W11-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P10-W02-S01::whole[d=1] -> P01-W01-S01::whole[d=1] -> P08-W12-S01::whole[d=1] -> P08-W07-S01::whole[d=1] -> P08-W08-S01::whole[d=0] -> P08-W01-S01::whole[d=1] -> P08-W04-S01::whole[d=0] -> P08-W05-S01::whole[d=1] -> P08-W06-S01::whole[d=1] -> P16-W02-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P08-W02-S01::whole[d=1] -> P09-W03-S01::whole[d=0] -> P10-W05-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P09-W05-S01::whole[d=1] -> P09-W04-S01::0[d=0] -> P09-W02-S01::0[d=1] -> P09-W01-S01::whole[d=1] -> P05-W05-S01::whole[d=1] -> P05-W04-S01::0[d=0] -> P05-W02-S01::0[d=1] -> P05-W01-S01::whole[d=1] -> P14-W02-S01::whole[d=1] -> P06-W01-S01::1[d=1]
+R2 (15): P13-W01-S01::whole[d=0] -> P07-W02-S01::whole[d=0] -> P07-W01-S01::whole[d=1] -> P17-W05-S01::whole[d=1] -> P15-W08-S01::whole[d=1] -> P15-W01-S01::whole[d=1] -> P17-W01-S01::whole[d=1] -> P18-W04-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P17-W06-S01::whole[d=0] -> P17-W04-S01::whole[d=1] -> P15-W09-S01::whole[d=1] -> P15-W02-S01::whole[d=1] -> P15-W03-S01::whole[d=1] -> P13-W02-S01::1[d=1]
+R3 (39): P03-W01-S01::whole[d=1] -> P21-W02-S01::whole[d=1] -> P17-W07-S01::whole[d=1] -> P17-W02-S01::whole[d=1] -> P17-W08-S01::whole[d=0] -> P15-W12-S01::whole[d=1] -> P15-W11-S01::whole[d=0] -> P15-W10-S01::whole[d=1] -> P15-W06-S01::whole[d=0] -> P15-W07-S01::whole[d=1] -> P15-W04-S01::whole[d=1] -> P17-W12-S01::whole[d=0] -> P17-W11-S01::whole[d=1] -> P15-W05-S01::whole[d=1] -> P17-W09-S01::whole[d=1] -> P17-W03-S01::whole[d=0] -> P17-W10-S01::whole[d=1] -> P18-W01-S01::whole[d=1] -> P18-W03-S01::whole[d=1] -> P22-W02-S01::whole[d=0] -> P22-W01-S01::whole[d=1] -> P21-W01-S01::whole[d=1] -> P05-W02-S01::1[d=1] -> P04-W01-S01::whole[d=1] -> P09-W02-S01::1[d=1] -> P09-W04-S01::1[d=1] -> P04-W02-S01::whole[d=1] -> P04-W03-S01::whole[d=1] -> P11-W01-S01::whole[d=1] -> P19-W02-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P10-W08-S01::1[d=1] -> P12-W01-S01::whole[d=1] -> P05-W04-S01::1[d=1] -> P11-W02-S01::whole[d=1] -> P04-W04-S01::whole[d=1]
+```
+
+最终 initial4
+
+```text
+R0 (5): P05-W05-S01::whole[d=1] -> P06-W01-S01::whole[d=1] -> P02-W02-S01::whole[d=1] -> P06-W02-S01::whole[d=1] -> P02-W01-S01::whole[d=1]
+R1 (35): P09-W02-S01::0[d=0] -> P09-W05-S01::whole[d=1] -> P05-W03-S01::whole[d=1] -> P14-W01-S01::whole[d=1] -> P16-W01-S01::whole[d=1] -> P08-W06-S01::whole[d=0] -> P08-W01-S01::whole[d=1] -> P08-W05-S01::whole[d=1] -> P10-W06-S01::whole[d=0] -> P10-W05-S01::whole[d=1] -> P09-W04-S01::0[d=1] -> P09-W03-S01::whole[d=1] -> P10-W03-S01::whole[d=0] -> P10-W08-S01::whole[d=1] -> P10-W07-S01::whole[d=1] -> P10-W04-S01::whole[d=1] -> P01-W02-S01::whole[d=1] -> P01-W01-S01::whole[d=1] -> P08-W10-S01::whole[d=1] -> P08-W03-S01::whole[d=0] -> P08-W09-S01::whole[d=1] -> P08-W08-S01::whole[d=0] -> P08-W11-S01::whole[d=1] -> P08-W12-S01::whole[d=0] -> P08-W07-S01::whole[d=1] -> P08-W02-S01::whole[d=1] -> P10-W01-S01::whole[d=1] -> P10-W02-S01::whole[d=0] -> P09-W01-S01::whole[d=1] -> P08-W04-S01::whole[d=1] -> P14-W02-S01::whole[d=1] -> P05-W01-S01::whole[d=1] -> P16-W02-S01::whole[d=1] -> P05-W04-S01::0[d=0] -> P05-W02-S01::0[d=1]
+R2 (13): P13-W01-S01::whole[d=1] -> P13-W02-S01::whole[d=1] -> P07-W01-S01::whole[d=1] -> P15-W12-S01::whole[d=1] -> P15-W10-S01::whole[d=0] -> P15-W11-S01::whole[d=1] -> P15-W03-S01::whole[d=0] -> P15-W07-S01::whole[d=1] -> P15-W01-S01::whole[d=0] -> P15-W02-S01::whole[d=0] -> P15-W09-S01::whole[d=1] -> P15-W08-S01::whole[d=0] -> P07-W02-S01::whole[d=0]
+R3 (40): P09-W02-S01::1[d=0] -> P19-W02-S01::whole[d=1] -> P04-W04-S01::whole[d=1] -> P20-W01-S01::whole[d=1] -> P12-W02-S01::whole[d=1] -> P12-W01-S01::whole[d=1] -> P20-W02-S01::whole[d=1] -> P19-W01-S01::whole[d=1] -> P04-W01-S01::whole[d=0] -> P04-W02-S01::whole[d=1] -> P04-W03-S01::whole[d=1] -> P09-W04-S01::1[d=0] -> P11-W01-S01::whole[d=1] -> P11-W02-S01::whole[d=1] -> P03-W01-S01::whole[d=1] -> P21-W02-S01::whole[d=1] -> P21-W01-S01::whole[d=1] -> P18-W01-S01::whole[d=1] -> P18-W02-S01::whole[d=1] -> P18-W04-S01::whole[d=1] -> P17-W08-S01::whole[d=1] -> P15-W06-S01::whole[d=0] -> P15-W05-S01::whole[d=1] -> P17-W11-S01::whole[d=0] -> P17-W12-S01::whole[d=1] -> P17-W09-S01::whole[d=0] -> P17-W03-S01::whole[d=1] -> P15-W04-S01::whole[d=1] -> P17-W10-S01::whole[d=0] -> P17-W02-S01::whole[d=1] -> P17-W04-S01::whole[d=1] -> P17-W06-S01::whole[d=0] -> P17-W05-S01::whole[d=1] -> P17-W07-S01::whole[d=1] -> P17-W01-S01::whole[d=1] -> P22-W02-S01::whole[d=0] -> P22-W01-S01::whole[d=1] -> P18-W03-S01::whole[d=1] -> P05-W04-S01::1[d=0] -> P05-W02-S01::1[d=1]
+```
+
+</details>
+
+### 结论、核对和复现
+
+- 对HGA共同可行5对：0胜，Cmax变化中位+4.787%（正为更慢）。
+- 对WAG+VNS共同可行5对：0胜，Cmax变化中位+3.154%（正为更慢）。
+- 相对原GNN初始，加工峰值下降1/6、极差下降0/6；不能把负载不合格的物理可行候选算成联合目标成功，也不能宣称整体加工负载已改善。
+- 普通逐行核对通过：{'complete_records': 606, 'full_feasible_timelines': 380, 'local_reconstructions': 564}。新完整B32身份无重复，预算、四机非空、资格、方向、未移除任务保持、P/M/W与C一致、最终负载与最小真实Cmax选择一致。没有新评价器/独立认证或额外B32。
+- 相关回归419项通过；区域X提示兼容修复后冲突相关6项再次通过。历史priority/native入口保留，本轮只走imitation-conflict-core-pilot的真实B32路径。
+
+```powershell
+Set-Location 'D:\pybullet_test\MRTA_GA\DRL'
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py imitation-conflict-core-pilot
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -m pytest -p no:cacheprovider tests/test_gnn_construct_vns.py tests/test_scheduler_equivalence.py tests/test_interference_scheduler.py tests/test_gnn_schedule_blocker_pilot.py tests/test_model_geometry.py -q --disable-warnings
+```
+
+完成记录重入直接返回final，不再构造/B32；CSV仅initial/candidate是逐次评价，round是候选池记录，final调用数为汇总，不重复累加。
+
+
+### 第一轮局部修复的真实加工变化
+
+以下只统计真实 DEADLOCK→FEASIBLE 且最终负载合格的局部操作，与单纯由多样化初始化产生可行方案区分。
+
+| 案例/操作 | DEADLOCK来源 | Pmax 前→后 | 极差 前→后 | MOVE总和 前→后 | B32 Cmax |
+|---|---|---|---|---|---:|
+| 0031/round14-2 | round13-3 | 4406.759 → 4330.155 | 509.598 → 378.390 | 606.544 → 649.772 | 4538.883 |
+| 0067/round14-0 | round13-3 | 5326.899 → 5390.602 | 203.768 → 331.175 | 925.798 → 910.975 | 5547.550 |
+| 0067/round14-1 | round13-3 | 5326.899 → 5443.779 | 203.768 → 321.204 | 925.798 → 997.431 | 5759.502 |
+| 0067/round14-2 | round13-3 | 5326.899 → 5390.602 | 203.768 → 331.175 | 925.798 → 934.283 | 5547.550 |
+
+0031本步的真实反馈是：R0的P02-W02-S01 POST被R1的P13-W05-S01::1 POST直接阻塞，证据来自last recovery deadlock。破坏上述任务及必要邻居共7个父任务；GNN将P13-W05-S01::1从R1迁到R0，保持其另一子任务在R2，其余主要是联合顺序/方向重插。该步模式未改变，先前祖先链已调整Y拆分点。Pmax与极差同时下降，但总MOVE上升，说明不能以总MOVE下降代替真实修复目标。
+
+该次GNN重构的全部动作如下；位置为每次插入当时的0基路线索引，最终顺序以完整solution为准。
+
+| 顺序 | 子焊缝 | 机器人 | 插入位置 | 方向 | 邻居方向变化 |
+|---:|---|---|---:|---:|---|
+| 1 | P19-W02-S01::whole | R1 | 5 | 1 | [] |
+| 2 | P06-W02-S01::whole | R0 | 3 | 1 | [] |
+| 3 | P03-W02-S01::whole | R0 | 3 | 1 | [] |
+| 4 | P02-W02-S01::whole | R0 | 6 | 1 | [] |
+| 5 | P02-W01-S01::whole | R0 | 7 | 0 | [] |
+| 6 | P13-W05-S01::0 | R2 | 10 | 1 | [] |
+| 7 | P13-W05-S01::1 | R0 | 1 | 1 | [] |
+| 8 | P06-W01-S01::whole | R0 | 9 | 1 | [] |
+
+这是一个同时改善物理可行性和加工分布的具体局部成功；六例整体相对原GNN的加工峰值/极差仍未形成一致改善，不能由单例外推。
+
+
+### 2026-11-21：六例三种子复现完成
+
+首轮达到5/6后才执行种子20261111、20261112，全部18组已完成。最终负载合格且B32可行 **15/18**，新增完整B32合计 **1800** 次；每组均不超过100。没有扩展案例或TEST。
+
+| 案例 | seed20261110 Cmax | seed20261111 Cmax | seed20261112 Cmax | 合格可行率 |
+|---|---:|---:|---:|---|
+| 0031 | 4538.883 | 4603.291 | 4612.666 | 3/3 |
+| 0095 | 6632.261 | 6629.267 | 6590.085 | 3/3 |
+| 0067 | 5516.058 | 5523.399 | 5550.909 | 3/3 |
+| 0076 | DEADLOCK | DEADLOCK | DEADLOCK | 0/3 |
+| 0084 | 6974.092 | 7042.325 | 11106.628 | 3/3 |
+| 0100 | 6266.946 | 6716.726 | 6198.797 | 3/3 |
+
+| 种子 | 合格B32可行 | 新B32 | 完成段时间总和(s) |
+|---|---|---:|---:|
+| 20261110 | 5/6 | 600 | 1471.242 |
+| 20261111 | 5/6 | 600 | 1503.167 |
+| 20261112 | 5/6 | 600 | 1400.867 |
+
+runtime_s从已完成记录查找之后开始计时，涵盖后续历史缓存读回、图编码、初始化/重构、实际B32及逐候选记录；不含进程模型加载、最前一次完成记录查找和事后核对。表中为这些逐组实测段之和，0067第一种子的中断计时限制同前文。另两种子缺少对应正式HGA/WAG同种子结果，只报告复现稳定性，不伪造18组对照胜负。首轮对HGA/WAG的共同可行Cmax变化中位仍为+4.787%/+3.154%，0/5胜。
+
+另两种子的四机器人真实分布，按R0/R1/R2/R3。非可行完整WAIT/完成时间留空；历史缓存时间线缺失仍不补造。
+
+| 案例 | 种子 | P | MOVE | 完整WAIT | 完成时间 | 部分WAIT | 新B32 | 时间(s) |
+|---|---|---|---|---|---|---:|---:|---:|
+| 0031 | 20261111 | 4045.726/4234.937/3951.764/4353.412 | 218.450/138.116/197.592/249.879 | 0.000/32.474/0.000/0.000 | 4264.175/4405.527/4149.356/4603.291 | — | 100 | 123.637 |
+| 0095 | 20261111 | 6089.399/5858.284/6396.630/6270.975 | 88.603/317.010/232.637/348.013 | 0.000/0.000/0.000/0.000 | 6178.001/6175.294/6629.267/6618.989 | — | 100 | 506.910 |
+| 0067 | 20261111 | 5266.424/5262.895/5326.899/5107.956 | 256.975/259.867/70.734/292.783 | 0.000/0.000/0.000/0.000 | 5523.399/5522.762/5397.632/5400.738 | — | 100 | 174.056 |
+| 0076 | 20261111 | 5831.536/5948.076/5418.507/5851.404 | 269.037/202.460/232.699/310.952 | —/—/—/— | —/—/—/— | 41.585 | 100 | 197.236 |
+| 0084 | 20261111 | 6631.898/6721.980/5799.679/5932.053 | 203.580/320.345/264.902/291.903 | 108.359/0.000/0.000/0.000 | 6943.836/7042.325/6064.581/6223.956 | — | 100 | 359.454 |
+| 0100 | 20261111 | 5769.167/5568.109/5631.620/5450.992 | 167.648/261.714/217.149/440.346 | 0.000/0.000/867.957/0.000 | 5936.814/5829.823/6716.726/5891.339 | — | 100 | 141.874 |
+| 0031 | 20261112 | 4045.726/4234.937/3951.764/4353.412 | 115.063/73.926/172.708/259.254 | 141.958/0.000/0.000/0.000 | 4302.747/4308.863/4124.473/4612.666 | — | 100 | 114.608 |
+| 0095 | 20261112 | 6130.278/5808.284/6355.751/6270.975 | 113.726/362.083/234.334/305.432 | 0.000/0.000/0.000/0.000 | 6244.005/6170.367/6590.085/6576.408 | — | 100 | 322.309 |
+| 0067 | 20261112 | 5312.720/5294.017/5122.124/5285.313 | 206.999/247.794/183.933/265.596 | 0.000/0.000/0.000/0.000 | 5519.720/5541.810/5306.057/5550.909 | — | 100 | 179.397 |
+| 0076 | 20261112 | 5946.351/5833.261/5418.507/5851.404 | 290.765/160.295/241.951/313.894 | —/—/—/— | —/—/—/— | 0.000 | 100 | 218.602 |
+| 0084 | 20261112 | 6631.898/6721.980/5799.679/5932.053 | 315.952/307.915/229.902/271.750 | 4158.779/0.000/0.000/0.000 | 11106.628/7029.895/6029.581/6203.802 | — | 100 | 402.716 |
+| 0100 | 20261112 | 5717.540/5650.087/5516.805/5535.455 | 141.592/248.951/164.946/329.727 | 0.000/0.000/517.046/0.000 | 5859.132/5899.038/6198.797/5865.183 | — | 100 | 163.235 |
+
+18组中，多样化初始化已有合格可行解 10/18，局部搜索后 15/18。真正DEADLOCK→FEASIBLE且Pmax与极差同时下降的局部候选共 2 个；这支持存在局部联合改善，但不等于18组整体加工分布一致改善。
+
+- 0076/20261110：81个B32可行候选均未进入负载合格最终集；95/95个局部候选来自负载不合格起点，25/25轮池内没有负载合格起点。
+- 0076/20261111：73个B32可行候选均未进入负载合格最终集；96/96个局部候选来自负载不合格起点，20/24轮池内没有负载合格起点。
+- 0076/20261112：86个B32可行候选均未进入负载合格最终集；93/104个局部候选来自负载不合格起点，14/27轮池内没有负载合格起点。
+
+当前明确的后续改动应限制在同一候选池：保留最佳负载合格可行起点和均衡死锁起点，避免失衡可行中间态淘汰这两类起点，并把真实blocker迁移与补偿负载迁移一起纳入同轮小核心。本文结果属于当前固定实现，没有事后放松负载、换lambda、追加网络或扩大预算重跑。
+
+全部18组初/终分配、模式变化、四机指标、全部成功修复操作与B32时间线均保存于同一个CSV。该轮到六例三种子为止，不继续扩大实验。
+
+全量普通核对通过：1870个完整记录、1744次局部重构、1151条保存完整可行时间线；1800次新增B32方案均唯一，最终选择均为负载合格集合中的最小真实Cmax。18组已完成记录重新进入验证为0构造、0新增B32、0新增行，CSV大小与修改时间不变。
+
+
+### 三种子暴露的 Cmax 停滞证据
+
+最终负载合格候选被保存在全量记录中，所以最终选择正确；但它们未必继续参与搜索。以下是候选池选择层面的具体失败，不是网络容量或B32无环诊断不足。
+
+| 案例/种子 | 最终合格候选 | Cmax | 关键机器人完整WAIT | 出现在池中的轮数 | 作为后续起点次数 | 更快但负载不合格Cmax | 其加工极差/允许极差 |
+|---|---|---:|---|---:|---:|---:|---|
+| 0084/20261112 | round1-1 | 11106.628 | R0: 4158.779 | 2/24 | 0 | 7095.547 | 1226.928/926.863 |
+| 0100/20261111 | round11-3 | 6716.726 | R2: 867.957 | 4/24 | 0 | 6069.357 | 1205.278/857.849 |
+
+0084第三种子的合格候选R0等待4158.779秒，却从未作为后续重构起点；搜索持续围绕更快、但最终负载不合格的状态展开。0100第二种子也出现同样现象。当前池按所有物理可行方案的Cmax排序并有限保留多样性，没有单独保护最佳负载合格可行方案，导致“允许暂时差负载”缺少稳定回归合格解的路径。
+
+因此本轮证明了合法模式/归属可变和真实冲突核心可以修复部分死锁，也存在同时降低Pmax与极差的具体局部成功；但尚不能证明整体负载与工期优于原GNN或正式对照。下一步应修正同一候选池的起点保留与补偿迁移联动，不需要增加网络、重新训练或再套完整HGA/WAG。本轮18组结果保持原样，未将事后建议混入实验。
