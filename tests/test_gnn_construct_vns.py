@@ -5294,9 +5294,14 @@ def test_cycle_swap_is_two_sided_and_safe_lb_load_filter_is_exact():
             assert candidate['lb']==pytest.approx(e.lns.oriented_route_lower_bound(state))
     limits=dict(pmax_limit_s=1000.,spread_limit_s=1000.)
     selected=e.cycle_transfer_groups(current,space,embeddings,model,kind='swap',training=False,limits=limits)
-    incumbent=e.cycle_values(e.cycle_route_state(current))[1]
-    assert all(c['lb']<incumbent and c['peak']<=1000 and c['spread']<=1000
+    # No measured B32 Cmax is available, so the LB-versus-LB filter must not be
+    # applied; only the formal load constraints may reject a legal candidate.
+    assert all(c['peak']<=1000 and c['spread']<=1000
                for group in selected for c in group['candidates'])
+    incumbent=e.cycle_values(e.cycle_route_state(current))[1]
+    measured=e.cycle_transfer_groups(current,space,embeddings,model,kind='swap',training=False,
+        limits=dict(limits,incumbent_cmax_s=incumbent))
+    assert all(c['lb']<incumbent for group in measured for c in group['candidates'])
     strict=e.cycle_transfer_groups(current,space,embeddings,model,kind='relocate',training=False,
         limits=dict(pmax_limit_s=1.,spread_limit_s=1.))
     assert strict==[]
@@ -5315,4 +5320,138 @@ def test_cycle_ranking_loss_backpropagates_to_existing_joint_actor():
     assert model.joint_weights.grad is not None
     assert any(float(p.grad.abs().sum())>0 for p in (model.policy[0].weight,model.insertion_head[0].weight,
                                                      model.joint_weights))
+
+
+def test_joint3_measured_feedback_enters_the_same_outcome_vector():
+    from mrta_search import gnn_constructor as c
+    plain=c.VNextGNN(16,4,workload_lookahead=True,joint_actions=True)
+    measured=c.VNextGNN(16,4,workload_lookahead=True,joint_actions=True,feedback_outcomes=True)
+    assert plain.joint_weights.numel()==6 and measured.joint_weights.numel()==10
+    assert measured.joint_weights[6:].tolist()==[0.,0.,0.,0.]
+    values=(1.,2.,3.,4.,5.,6.)
+    assert c.vnext_outcome(plain,values).numel()==6
+    outcome=c.vnext_outcome(measured,values)
+    assert outcome.numel()==10 and outcome[6:].tolist()==[0.,0.,0.,0.]
+
+
+def test_joint3_safe_prune_never_rejects_by_lb_alone():
+    import run_gnn_weld_layout as e
+    assert e.joint3_safe_prune(100.,100.) is True
+    assert e.joint3_safe_prune(100.001,100.) is True
+    assert e.joint3_safe_prune(99.999,100.) is False
+    assert e.joint3_safe_prune(1e9,math.inf) is False
+
+
+def test_joint3_provenance_forbids_teacher_warm_start_and_fallback_sources(monkeypatch):
+    import run_gnn_weld_layout as e
+    audit=e.joint3_provenance()
+    assert audit['violations']=={}
+    assert audit['initialization']=='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD'
+    assert all(audit['feedback_shared'].values())
+    for name in ('IMITATION_MODEL','CYCLE_MODEL','CONFLICT_LOAD_RESULTS','IMITATION_RESULTS',
+                 'imitation_saved','imitation_best_teachers','conflict_initial_hints',
+                 'conflict_construct','conflict_core_case','cycle_transfer_case','native_hga'):
+        assert name in audit['forbidden_sources']
+
+    def audited_violation():
+        return e.CYCLE_MODEL
+
+    monkeypatch.setattr(e,'joint3_core',audited_violation)
+    with pytest.raises(ValueError):
+        e.joint3_provenance()
+
+
+def test_joint3_feedback_features_measure_waits_and_the_candidate_cycle():
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import ParentWeld, SplitKind
+    from mrta_reference.solution import block_map, canonicalize
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search import lns
+    parents=tuple(ParentWeld(name,(x,y),(x+4.,y)) for name,x,y in
+                  [('a',2.,9.),('b',14.,9.),('c',2.,5.),('d',14.,5.)])
+    patterns=tuple(SplitPattern(parent.parent_id,SplitKind.WHOLE) for parent in parents)
+    origin_solution=canonicalize(parents,patterns,{0:('a::whole','c::whole'),1:('b::whole',),
+                                                  2:(),3:('d::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    moved_solution=canonicalize(parents,patterns,{0:('a::whole',),1:('b::whole',),
+                                                  2:('c::whole',),3:('d::whole',)},CONFIG,scope=FORMAL_SCOPE_V2)
+    origin_bits=((0,0),(0,),(),(0,))
+    moved_bits=((0,),(0,),(0,),(0,))
+    current=type('Plan',(),{'solution':origin_solution})()
+    work=CONFIG.process_time(4.)
+    feedback=dict(critical_robot=0,parent_wait={'c':50.},parent_blocked={},
+                  parent_processing={'c':[work,0.,0.,0.]})
+    moved_state=lns.oriented_route_state(tuple(r.block_ids for r in moved_solution.routes),moved_bits,
+                                         block_map(moved_solution,CONFIG),CONFIG)
+    moved=e.joint3_feedback_features(current,moved_solution,moved_state,feedback,('c',))
+    kept_state=lns.oriented_route_state(tuple(r.block_ids for r in origin_solution.routes),origin_bits,
+                                        block_map(origin_solution,CONFIG),CONFIG)
+    kept=e.joint3_feedback_features(current,origin_solution,kept_state,feedback,('c',))
+    assert moved[0]==pytest.approx(work/2500.)
+    assert kept[0]==pytest.approx(0.)
+    assert moved[1]==pytest.approx(0.) and kept[1]==pytest.approx(0.)
+    assert moved[2]==pytest.approx((moved_state.loads[0]+sum(moved_state.arc_costs[0]))/2500.)
+    assert all(math.isfinite(value) for value in (*moved,*kept))
+
+
+def test_joint3_pool_protects_load_qualified_and_load_margin_states():
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import ParentWeld, ScheduleResult, ScheduleStatus, SplitKind
+    parents=(ParentWeld('a',(2.,9.),(6.,9.)),ParentWeld('b',(14.,9.),(18.,9.)),
+             ParentWeld('c',(2.,5.),(6.,5.)),ParentWeld('d',(14.,5.),(18.,5.)))
+    patterns=tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents)
+    routes={0:('a::whole',),1:('b::whole',),2:('c::whole',),3:('d::whole',)}
+    solution=canonicalize(parents,patterns,routes,CONFIG,scope=FORMAL_SCOPE_V2)
+    def entry(cmax,peak,qualify,directions):
+        plan=type('Plan',(),{'solution':solution,'directions':directions})()
+        schedule=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=cmax,robot_completion=(cmax,0.,0.,0.))
+        row=dict(max_processing_s=peak,processing_spread_s=0.,load_allowed=int(qualify),
+                 load_limits='{"pmax_limit_s": 1.0}')
+        return (plan,schedule,row)
+    # The plan key includes directions, so distinct direction vectors stay distinct.
+    pool=e.joint3_pool([], [entry(100.,10.,True,((0,),(0,),(0,),(0,))),
+                            entry(200.,20.,True,((1,),(0,),(0,),(0,))),
+                            entry(300.,30.,False,((0,),(1,),(0,),(0,)))], width=3)
+    assert {round(value[1].cmax) for value in pool}=={100.,200.,300.}
+
+
+def test_joint3_reconstruct_keeps_legal_distinct_complete_plans_from_the_joint_actor():
+    import run_gnn_weld_layout as e
+    e.configure_cpu()
+    torch.manual_seed(e.SEED)
+    layouts=dict(e.load_layouts('validation'))
+    name=e.JOINT3_LAYOUTS[0]
+    parents=layouts[name]
+    model=e.joint3_model().eval()
+    model.requires_grad_(False)
+    space=e.gnn.parent_assignment_space(parents,e.CONFIG)
+    embeddings=model.encode_static(space.graph)
+    initial=e.build_joint(parents,model,space=space,embeddings=embeddings)
+    assert initial.solution is not None
+    seen,blockers={},{}
+    schedule,called=e.evaluate_once(initial,seen,blocker_cache=blockers)
+    assert called==1
+    key=e.plan_key(initial.solution,initial.directions)
+    limits=e.joint3_load_limits(name,e.joint3_references(),max(e.cycle_route_state(initial).loads))
+    core,_=e.joint3_core(initial,schedule,model,space,embeddings,blockers.get(key,()),seed=e.SEED,
+                         q=e.JOINT3_CORE)
+    removed=tuple(core.removed_parent_ids)
+    assert 3<=len(removed)<=len(space.parent_ids)
+    feedback=e.joint3_feedback(initial,schedule,blockers.get(key,()),removed)
+    candidates,detail=e.joint3_reconstruct(parents,model,space,embeddings,initial,removed,limits,feedback,
+                                           width=e.JOINT3_BEAM)
+    assert candidates and detail['legal']==len(candidates)
+    keys={e.plan_key(c['plan'].solution,c['plan'].directions) for c in candidates}
+    assert len(keys)==len(candidates)
+    scores=[c['score'] for c in candidates]
+    assert scores==sorted(scores,reverse=True)
+    retained={p.parent_id:p for p in initial.solution.patterns if p.parent_id not in set(removed)}
+    for candidate in candidates:
+        patterns={p.parent_id:p for p in candidate['plan'].solution.patterns}
+        assert set(patterns)==set(space.parent_ids)
+        for parent,pattern in retained.items():
+            assert patterns[parent].pattern_id==pattern.pattern_id
+        assert len(candidate['feedback_features'])==4
+        assert len(candidate['joint_plans'])==len(removed)
+        for plan in candidate['joint_plans']:
+            assert plan.outcome.numel()==model.joint_weights.numel()
 

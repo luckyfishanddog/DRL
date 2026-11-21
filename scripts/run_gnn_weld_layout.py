@@ -5333,8 +5333,15 @@ def cycle_transfer_groups(current, space, embeddings, model, *, kind, feedback=N
         source_blocks = source_blocks[:max_blocks]
 
     def allowed_candidate(lb, peak, spread):
-        return lb < incumbent_lb-CYCLE_EPS and (limits is None or
-            peak <= limits['pmax_limit_s']+CYCLE_EPS and spread <= limits['spread_limit_s']+CYCLE_EPS)
+        # Safe pruning only: an exact directed route-cycle lower bound that already
+        # reaches the best measured B32 Cmax cannot improve that Cmax.  A candidate
+        # is never rejected merely because its LB does not fall below the current
+        # LB, because WAIT can shrink while the directed P+MOVE cycle does not.
+        if limits is not None and limits.get('incumbent_cmax_s') is not None \
+                and lb >= float(limits['incumbent_cmax_s'])-CYCLE_EPS:
+            return False
+        return limits is None or (peak <= limits['pmax_limit_s']+CYCLE_EPS
+                                  and spread <= limits['spread_limit_s']+CYCLE_EPS)
 
     if kind == 'relocate':
         for block_id in source_blocks:
@@ -5390,7 +5397,9 @@ def cycle_transfer_groups(current, space, embeddings, model, *, kind, feedback=N
                     if not training and not allowed_candidate(lb, peak, spread):
                         continue
                     direct.append((lb, block_id, other_id, destination, other_parent))
-        direct.sort(key=lambda item: (item[0], item[1], item[2]))
+        # No fixed-position LB pre-ranking: the enumeration order stays structural
+        # and max_swaps is only an explicit bound on how many pairs are expanded,
+        # not an LB filter applied before the GNN scores the legal candidates.
         for lb, block_id, other_id, destination, other_parent in direct[:max_swaps]:
             parent = block_id.split('::', 1)[0]
             first_moves = [dict(parent_id=parent, block_id=block_id, source=heavy, destination=destination)]
@@ -5657,7 +5666,8 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
             continue
         feedback = cycle_origin_feedback(current, schedule, blockers.get(origin_key, ()))
         groups = cycle_transfer_groups(current, space, embeddings, model, kind=kind,
-            feedback=feedback, training=False, limits=limits, max_blocks=None, max_swaps=16)
+            feedback=feedback, training=False, limits=dict(limits, incumbent_cmax_s=incumbent_cmax),
+            max_blocks=None, max_swaps=16)
         candidates = [dict(group=group, **candidate) for group in groups for candidate in group['candidates']]
         admissible = [e for e in all_entries if int(e[2]['load_allowed']) and e[1].feasible]
         incumbent_cmax = min((e[1].cmax for e in admissible), default=math.inf)
@@ -6208,9 +6218,947 @@ def imitation_conflict_load_pilot():
     return finals
 
 
+# ---------------------------------------------------------------------------
+# Independent GNN main algorithm: B32-feedback-driven three-parent joint
+# reconstruction.  Initialisation is the original GNN_VNEXT_WORKLOAD actor only;
+# no imitation/cycle checkpoint, no HGA/WAG teacher, hint, warm start or fallback.
+# The single move operator removes a measured core and lets the same joint actor
+# choose modes, owners, insertion order/positions and directions together.
+# ---------------------------------------------------------------------------
+JOINT3_LAYOUTS = tuple(f'validation_{index:02d}' for index in range(1, 11))
+JOINT3_MODEL = ROOT/'models/gnn_weld_layout_joint3.pt'
+JOINT3_RESULTS = FINAL_RESULTS/'gnn_joint3_rebuild.csv'
+JOINT3_TRAINING_RESULTS = FINAL_RESULTS/'gnn_joint3_training.csv'
+JOINT3_METHOD = 'GNN-Joint3-B32-Feedback'
+JOINT3_CORE = 3
+JOINT3_BEAM = 3
+JOINT3_TRAIN_BEAM = 4
+JOINT3_BUDGET = 100
+JOINT3_ATTEMPTS = 500
+JOINT3_STALE = 128
+JOINT3_SEEDS = TEST_SEEDS
+JOINT3_EPOCHS = 3
+JOINT3_LEARNING_RATE = 1e-4
+JOINT3_TRAIN_LAYOUTS = 20
+JOINT3_TRAIN_CORES = 4
+JOINT3_EPS = CYCLE_EPS
+JOINT3_HGA_REFERENCE = FINAL_RESULTS/'hga_results_optimized.csv'
+JOINT3_WAG_REFERENCE = FINAL_RESULTS/'wag_vns_results_optimized.csv'
+JOINT3_HGA_SOURCE = HGA_ROUTE_SOURCE
+JOINT3_WAG_SOURCE = BASELINE_SOURCES['WAG+VNS']
+JOINT3_FIELDS = (*CONFLICT_LOAD_FIELDS, 'beam_width', 'core_size', 'route_lb_s', 'incumbent_cmax_s',
+                 'feedback_features', 'load_allowed_three_ref', 'load_limits_three_ref', 'run_id')
+JOINT3_TRAINING_FIELDS = ('stage', 'layout_id', 'parent_count', 'seed', 'method', 'epoch', 'loss',
+    'ranking_accuracy', 'pairs', 'updates', 'gradient_norm', 'learning_rate', 'candidates', 'b32_calls',
+    'construct_s', 'b32_s', 'runtime_s', 'diagnostic')
+JOINT3_FORBIDDEN_SOURCES = frozenset((
+    'IMITATION_MODEL', 'CYCLE_MODEL', 'EXPANDED_MODEL', 'IMITATION_RESULTS', 'CYCLE_RESULTS',
+    'CONFLICT_RESULTS', 'CONFLICT_LOAD_RESULTS', 'LOADFIRST_RESULTS', 'ROUTEAWARE_RESULTS', 'PPO_RESULTS',
+    'imitation_saved', 'imitation_best_teachers', 'imitation_cycle_train', 'imitation_train',
+    'imitation_model', 'imitation_replay', 'imitation_evaluate', 'conflict_initial_hints',
+    'conflict_compensation', 'conflict_construct', 'conflict_core_case', 'cycle_transfer_case',
+    'routeaware_history', 'baseline_run', 'native_hga', 'generate_wag_assignments'))
+
+
+def joint3_model(weights=None):
+    """Original workload Actor plus four zero-initialised measured-feedback slots."""
+    model = gnn.VNextGNN(workload_lookahead=True, joint_actions=True, feedback_outcomes=True)
+    model.imitation_balance = False
+    model.load_first_lambda = None
+    model.route_aware = False
+    if weights is None:
+        source = torch.load(MODEL, map_location='cpu', weights_only=True)
+        missing, extra = model.load_state_dict(source['models']['GNN_VNEXT_WORKLOAD']['state_dict'], strict=False)
+        if missing != ['joint_weights'] or extra:
+            raise ValueError('joint3 must start from the original GNN_VNEXT_WORKLOAD actor only')
+        return model
+    model.load_state_dict(weights)
+    return model
+
+
+def joint3_called_names(function):
+    import ast, inspect, textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    names |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    return names
+
+
+def joint3_provenance():
+    """Static and checkpoint audit of the model and every plan source."""
+    functions = (joint3_model, joint3_feedback, joint3_feedback_features, joint3_load_limits,
+                 joint3_training_limits, joint3_references, joint3_core, joint3_reconstruct,
+                 joint3_case, joint3_train, joint3_validation)
+    violations = {}
+    for function in functions:
+        hits = sorted(joint3_called_names(function) & JOINT3_FORBIDDEN_SOURCES)
+        if hits:
+            violations[function.__name__] = hits
+    if violations:
+        raise ValueError(f'joint3 audit found forbidden teacher/fallback sources: {violations}')
+    reconstruct = joint3_called_names(joint3_reconstruct)
+    case = joint3_called_names(joint3_case)
+    train = joint3_called_names(joint3_train)
+    shared = dict(reconstruct_uses_feedback_features='joint3_feedback_features' in reconstruct,
+                  inference_uses_same_feedback='joint3_feedback' in case and 'joint3_reconstruct' in case,
+                  training_uses_same_feedback='joint3_feedback' in train and 'joint3_reconstruct' in train)
+    if not all(shared.values()):
+        raise ValueError(f'joint3 B32 feedback is not shared by training and inference: {shared}')
+    source = torch.load(MODEL, map_location='cpu', weights_only=True)
+    state = source['models']['GNN_VNEXT_WORKLOAD']['state_dict']
+    return dict(algorithm=JOINT3_METHOD, initialization='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD',
+        initialization_parameters=len(state), new_model=str(JOINT3_MODEL.relative_to(ROOT)),
+        own_records=str(JOINT3_RESULTS.relative_to(ROOT)), forbidden_sources=sorted(JOINT3_FORBIDDEN_SOURCES),
+        violations=violations, feedback_shared=shared,
+        core='lns.select_routeaware_bottleneck (FEASIBLE) | conflict_core_partial (DEADLOCK)',
+        reconstruction='gnn.vnext_joint_actions joint beam; mode+owner+position+order+direction together',
+        labels='real B32 feasibility/Cmax; no HGA/WAG teacher and no HGA/WAG candidate source',
+        load_rule='frozen HGA/WAG 1.05x ceiling; three-reference variant reported only')
+
+
+def joint3_references():
+    """Frozen HGA/WAG+VNS rows: only the fixed load ceiling and the final pairing."""
+    references = {}
+    for method, path, source in (('HGA', JOINT3_HGA_REFERENCE, JOINT3_HGA_SOURCE),
+                                 ('WAG+VNS', JOINT3_WAG_REFERENCE, JOINT3_WAG_SOURCE)):
+        for row in read_rows(path):
+            if row.get('source') != source or row.get('status') != 'FEASIBLE':
+                continue
+            if row.get('layout_id') not in JOINT3_LAYOUTS:
+                continue
+            if not all(row.get(f'processing_r{robot}_s') not in (None, '') for robot in range(4)):
+                continue
+            values = [float(row[f'processing_r{robot}_s']) for robot in range(4)]
+            record = dict(method=method, layout_id=row['layout_id'], seed=int(row['seed']),
+                          cmax_s=float(row['cmax_s']), runtime_s=float(row.get('runtime_s') or 0.),
+                          processing=values, peak=max(values), spread=max(values)-min(values))
+            key = (row['layout_id'], method)
+            # Duplicate rows of the same official frozen source keep the best Cmax.
+            if key not in references or record['cmax_s'] < references[key]['cmax_s']:
+                references[key] = record
+    # validation_07 has no feasible frozen WAG+VNS row for any seed; that method
+    # then contributes a feasibility result only and cannot supply a load ceiling.
+    if not any((layout, 'HGA') in references for layout in JOINT3_LAYOUTS):
+        raise ValueError('the frozen HGA reference is missing')
+    return references
+
+
+def joint3_load_limits(name, references, gnn_peak, gnn_spread=None):
+    """The fixed formal ceiling; the three-reference variant is recorded, never used to accept."""
+    methods = [method for method in ('HGA', 'WAG+VNS') if (name, method) in references]
+    peaks, spreads, vectors = [], [], {}
+    for method in methods:
+        record = references[(name, method)]
+        peaks.append(record['peak'])
+        spreads.append(record['spread'])
+        vectors[method] = record['processing']
+    base = max(peaks)
+    three = max(base, float(gnn_peak))
+    gnn_spread = 0. if gnn_spread is None else float(gnn_spread)
+    return dict(pmax_limit_s=1.05*base, spread_limit_s=max(max(spreads), .10*median(peaks)),
+        temporary_pmax_limit_s=1.20*1.05*base, reference_processing=vectors,
+        reference_peaks={method: references[(name, method)]['peak'] for method in methods},
+        rule='final peak <= 1.05*largest feasible frozen HGA/WAG peak; '
+             'spread <= max(frozen spreads, 10% median peak)',
+        three_reference=dict(pmax_limit_s=1.05*three,
+            spread_limit_s=max(max(spreads), gnn_spread, .10*median((*peaks, float(gnn_peak)))),
+            temporary_pmax_limit_s=1.20*1.05*three, gnn_peak=float(gnn_peak), gnn_spread=gnn_spread,
+            rule='same formula with this experiment original GNN construction as third reference; reported only'))
+
+
+def joint3_training_limits(state):
+    """TRAIN-only relative protection, the earlier formal Pmax<=1.01*initial variant."""
+    peak = max(state.loads)
+    return dict(pmax_limit_s=1.01*peak, spread_limit_s=max(state.loads)-min(state.loads)+20.,
+                temporary_pmax_limit_s=1.20*1.01*peak)
+
+
+def joint3_feedback(current, schedule, events, removed):
+    """Measured B32 evidence, identical in training and inference."""
+    removed = set(removed)
+    if schedule.feasible and schedule.operations:
+        summary = lns.schedule_feedback_summary(current.solution, schedule, events, CONFIG)
+        return dict(source='B32 feasible WAIT/blocked intervals',
+            critical_robot=int(summary['critical_robot']),
+            parent_wait={p: float(w) for p, w in summary['parent_wait'].items()
+                         if w > CONFIG.numeric_epsilon},
+            parent_blocked={p: float(w) for p, w in summary['parent_blocked'].items()
+                            if w > CONFIG.numeric_epsilon},
+            parent_critical_wait={p: float(w) for p, w in summary['parent_critical_wait'].items()
+                                  if w > CONFIG.numeric_epsilon},
+            parent_critical_blocked={p: float(w) for p, w in summary['parent_critical_blocked'].items()
+                                     if w > CONFIG.numeric_epsilon},
+            parent_processing={p: [float(x) for x in summary['parent_processing'][p]]
+                               for p in removed if p in summary['parent_processing']})
+    blocked = Counter()
+    for event in schedule.deadlock_blockages:
+        for parent in event.blocked_parent_ids:
+            blocked[parent] += 1
+        for parents in event.blocker_parent_ids:
+            blocked.update(parents)
+    # Processing is geometry, not a B32 label, so the same parent work vector is
+    # available on a DEADLOCK origin and keeps the blocked-work interaction real.
+    blocks = block_map(current.solution, CONFIG, scope=FORMAL_SCOPE_V2)
+    processing = {parent: [0.]*4 for parent in removed}
+    for robot, route in enumerate(current.solution.routes):
+        for block in route.block_ids:
+            parent = block.split('::', 1)[0]
+            if parent in processing:
+                processing[parent][robot] += CONFIG.process_time(blocks[block].length)
+    return dict(source='B32 DEADLOCK blocked/blocker evidence', critical_robot=None, parent_wait={},
+                parent_blocked=dict(blocked), parent_critical_wait={}, parent_critical_blocked={},
+                parent_processing=processing)
+
+
+def joint3_feedback_features(current, solution, state, feedback, removed):
+    """Candidate-specific B32 feedback interactions, never all-zero during training."""
+    removed = set(removed)
+    critical = feedback.get('critical_robot')
+    if critical is None:
+        cycles = [load + sum(arcs) for load, arcs in zip(state.loads, state.arc_costs)]
+        critical = max(range(4), key=lambda robot: (cycles[robot], -robot))
+    blocks = block_map(solution, CONFIG, scope=FORMAL_SCOPE_V2)
+    owners = {block: robot for robot, route in enumerate(state.routes) for block in route}
+    before = {block: robot for robot, route in enumerate(current.solution.routes) for block in route.block_ids}
+    processing = {parent: [0.]*4 for parent in removed}
+    for block, robot in owners.items():
+        parent = block.split('::', 1)[0]
+        if parent in processing:
+            processing[parent][robot] += CONFIG.process_time(blocks[block].length)
+    origin = feedback.get('parent_processing') or {}
+
+    def moved(parents):
+        total = 0.
+        for parent in parents:
+            if parent not in removed or parent not in origin:
+                continue
+            total += max(0., float(origin[parent][critical]) - processing[parent][critical])
+        return total / 2500.
+
+    waits = [parent for parent in feedback.get('parent_wait', {}) if parent in removed]
+    blocked = [parent for parent in feedback.get('parent_blocked', {}) if parent in removed]
+    cycle = (state.loads[critical] + sum(state.arc_costs[critical])) / 2500.
+    changed = sum(1 for block, robot in owners.items() if robot == critical
+                  and block.split('::', 1)[0] in removed and before.get(block) != critical) / 4.
+    return [moved(waits), moved(blocked), cycle, changed]
+
+
+def joint3_core(current, schedule, model, space, embeddings, blockers, *, seed, q):
+    """FEASIBLE: route-aware bottleneck; DEADLOCK: every measured blocked/blocker parent."""
+    if schedule.status is ScheduleStatus.DEADLOCK:
+        partial, feedback = conflict_core_partial(current, schedule, model, space, embeddings, seed=seed, q=q)
+        return partial, dict(feedback, operator='conflict_core_partial')
+    if schedule.feasible:
+        partial, feedback = lns.select_routeaware_bottleneck(current.solution, current.directions, schedule,
+            blockers, CONFIG, q=q, seed=seed, assignment_space=space)
+        return partial, dict(feedback, operator='select_routeaware_bottleneck')
+    return None, dict(reason='B32 returned neither FEASIBLE nor DEADLOCK')
+
+
+def joint3_route_lb(plan):
+    """Exact directed route-cycle lower bound max_r(P_r+MOVE_r) for a complete plan."""
+    return cycle_values(cycle_route_state(plan))[1]
+
+
+def joint3_safe_prune(lb, incumbent_cmax):
+    """Safe pruning: only an exact route-cycle LB that already reaches the measured Cmax."""
+    return math.isfinite(incumbent_cmax) and lb >= incumbent_cmax-JOINT3_EPS
+
+
+@torch.no_grad()
+def joint3_reconstruct(parents, model, space, embeddings, current, removed, limits, feedback, *,
+                       width=JOINT3_BEAM):
+    """Bounded joint beam over whole removed parents; no rule fixes a migration target."""
+    started = time.perf_counter()
+    pending = set(removed)
+    selected = {p.parent_id: p for p in current.solution.patterns if p.parent_id not in pending}
+    blocks = {b.block_id: b for p in selected.values() for b in space.children[p]}
+    nodes = {b.block_id: space.block_nodes[p, b.block_id] for p in selected.values() for b in space.children[p]}
+    routes = lns._remove_parent_set(current.solution, pending).routes
+    fixed = {b: d for route, bits in zip(current.solution.routes, current.directions)
+             for b, d in zip(route.block_ids, bits) if b in blocks}
+    state = lns.oriented_route_state(routes, tuple(tuple(fixed[b] for b in route) for route in routes),
+                                     blocks, CONFIG)
+    origin_assignment = {action.parent_id: action
+                         for action in gnn.parent_assignment_targets(current.solution, CONFIG)}
+    beam = [dict(state=state, blocks=dict(blocks), nodes=dict(nodes), selected=dict(selected), actions=(),
+                 plans=(), logits=(), pending=set(pending))]
+    truncated = 0
+    for _ in range(len(removed)):
+        expanded = []
+        for node in beam:
+            plans, scores = gnn.vnext_joint_actions(space, embeddings, model, node['state'], node['blocks'],
+                node['nodes'], node['pending'], CONFIG, conflict_core=True)
+            seen_structures = set()
+            for plan, score in zip(plans, scores.tolist()):
+                assignment = space.actions[plan.assignment_index]
+                if assignment.parent_id not in node['pending'] or not math.isfinite(score):
+                    continue
+                if max(plan.state.loads) > limits['temporary_pmax_limit_s']+JOINT3_EPS:
+                    continue
+                if float(plan.assignment_features[-8:-4].max())*2500 > limits['temporary_pmax_limit_s']+1e-3:
+                    continue
+                # Keep one representative per (parent, legal mode, robot ownership):
+                # direction-only duplicates are not a distinct joint structure.
+                structure = (assignment.parent_id, assignment.pattern.pattern_id, assignment.robots)
+                if structure in seen_structures:
+                    continue
+                seen_structures.add(structure)
+                before = origin_assignment[assignment.parent_id]
+                # Beam diversity: a rebuild that changes a parent mode or its robot
+                # ownership is kept ahead of a rebuild that restores the origin, so
+                # the limited beam is not three copies of the incumbent plan.
+                changed = int(assignment.pattern.pattern_id != before.pattern.pattern_id
+                              or assignment.robots != before.robots)
+                children = space.children[assignment.pattern]
+                expanded.append(dict(state=plan.state, changes=node.get('changes', 0)+changed,
+                    blocks={**node['blocks'], **{b.block_id: b for b in children}},
+                    nodes={**node['nodes'], **{b.block_id: space.block_nodes[assignment.pattern, b.block_id]
+                                               for b in children}},
+                    selected={**node['selected'], assignment.parent_id: assignment.pattern},
+                    actions=(*node['actions'], *plan.actions), plans=(*node['plans'], plan),
+                    logits=(*node['logits'], score), pending=node['pending']-{assignment.parent_id}))
+        if not expanded:
+            return [], dict(reason='no legal joint insertion inside the temporary peak limit',
+                            removed=list(removed), truncated=truncated)
+        unique = {}
+        for node in expanded:
+            key = (node['state'].routes, node['state'].directions)
+            best = unique.get(key)
+            if best is None or sum(node['logits']) > sum(best['logits']):
+                unique[key] = node
+        ranked = sorted(unique.values(), key=lambda node: (
+            -node.get('changes', 0), -sum(node['logits'])/max(1, len(node['logits'])), node['state'].travel))
+        truncated += max(0, len(ranked)-max(1, width))
+        # Keep changed structures first but always retain one unchanged completion:
+        # that keeps a legal rebuild in the beam even if every mode/owner change of
+        # this core is rejected by canonicalization.
+        changed = [node for node in ranked if node.get('changes', 0) > 0]
+        unchanged = [node for node in ranked if not node.get('changes', 0)]
+        size = max(1, width)
+        beam = (changed[:max(1, size-1)] + unchanged[:1])[:size] or unchanged[:size] or changed[:size]
+        ordered = ranked
+    results, seen_plans, rejected = [], set(), Counter()
+    for node in ordered[:2*max(1, width)]:
+        try:
+            if not all(node['state'].routes):
+                raise ValueError('LEGAL_FOUR_ROBOT_COVER_NOT_COMPLETED')
+            solution = canonicalize(parents, node['selected'].values(), dict(enumerate(node['state'].routes)),
+                                    CONFIG, scope=FORMAL_SCOPE_V2)
+            if tuple(r.block_ids for r in solution.routes) != node['state'].routes or \
+                    set(solution.patterns) != set(node['selected'].values()):
+                raise ValueError('canonicalization changed the directed joint construction')
+            for robot, route in enumerate(routes):
+                kept = set(route)
+                if tuple(b for b in node['state'].routes[robot] if b in kept) != route:
+                    raise ValueError('reconstruction changed retained route order')
+            # The native joint insertion decides a new child's direction together with
+            # the directions of its immediate neighbours.  That is allowed only inside
+            # the reconstructed core's new neighbourhood; no retained parent elsewhere
+            # may be re-optimised, and there is no separate direction pass.
+            touched = set()
+            for parent in removed:
+                touched.update(block.block_id for block in space.children[node['selected'][parent]])
+            allowed = set(touched)
+            for route in node['state'].routes:
+                for index, block in enumerate(route):
+                    if block in touched:
+                        for offset in (-1, 1):
+                            if 0 <= index+offset < len(route):
+                                allowed.add(route[index+offset])
+            actual = {block: direction for route, bits in zip(node['state'].routes, node['state'].directions)
+                      for block, direction in zip(route, bits)}
+            outside = {block for block in fixed if block in actual and actual[block] != fixed[block]} - allowed
+            if outside:
+                raise ValueError('direction change outside the reconstructed core neighbourhood')
+        except ValueError as error:
+            rejected[str(error)] += 1
+            truncated += 1
+            continue
+        key = (solution.patterns, solution.routes, node['state'].directions)
+        if key in seen_plans:
+            truncated += 1
+            continue
+        seen_plans.add(key)
+        extra = joint3_feedback_features(current, solution, node['state'], feedback, removed)
+        patched = tuple(plan._replace(outcome=torch.cat(
+            (plan.outcome[:6], plan.outcome.new_tensor(extra))))
+            for plan in node['plans'])
+        score = float(gnn.imitation_joint_scores(space, embeddings, model, patched).mean())
+        result = gnn.JointCompletionResult(solution, node['state'].directions, node['actions'],
+                                           time.perf_counter()-started, oriented_state=node['state'])
+        results.append(dict(plan=result, score=score, joint_plans=patched, feedback_features=extra,
+            actions=[dict(block_id=a.block_id, robot=a.robot, position=a.position, direction=a.direction,
+                          neighbour_changes=list(a.neighbour_changes)) for plan in node['plans'] for a in plan.actions],
+            lb=joint3_route_lb(result)))
+    results.sort(key=lambda item: (-item['score'], item['lb'], item['plan'].solution.patterns))
+    return results, dict(reason='ok' if results else 'no legal joint completion', removed=sorted(removed),
+                         truncated=truncated, legal=len(results), rejected=dict(rejected))
+
+
+def joint3_pool(entries, latest, *, width=6):
+    """Retain distinct real states: load-qualified Cmax, load margin, best Cmax, deadlock progress."""
+    by_key = {}
+    for entry in (*entries, *latest):
+        if entry[1].status not in (ScheduleStatus.FEASIBLE, ScheduleStatus.DEADLOCK):
+            continue
+        by_key[plan_key(entry[0].solution, entry[0].directions)] = entry
+    feasible = [entry for entry in by_key.values() if entry[1].feasible]
+    feasible_ok = [entry for entry in feasible if int(entry[2].get('load_allowed') or 0)]
+    deadlocks = [entry for entry in by_key.values() if entry[1].status is ScheduleStatus.DEADLOCK]
+    latest_keys = [plan_key(entry[0].solution, entry[0].directions) for entry in reversed(latest)
+                   if plan_key(entry[0].solution, entry[0].directions) in by_key]
+    categories = [
+        sorted(feasible_ok, key=lambda entry: entry[1].cmax),
+        sorted(feasible_ok, key=lambda entry: (conflict_load_balance(entry)[0], entry[1].cmax)),
+        sorted(feasible, key=lambda entry: entry[1].cmax),
+        sorted(feasible, key=lambda entry: (conflict_load_balance(entry)[0], entry[1].cmax)),
+        sorted(deadlocks, key=lambda entry: tuple(-value for value in conflict_deadlock_progress(entry))),
+        [by_key[key] for key in latest_keys[:1]],
+    ]
+    cursors = [0]*len(categories)
+    chosen, keys = [], set()
+    while len(chosen) < width:
+        added = False
+        for index, category in enumerate(categories):
+            while cursors[index] < len(category):
+                entry = category[cursors[index]]
+                cursors[index] += 1
+                key = plan_key(entry[0].solution, entry[0].directions)
+                if key in keys:
+                    continue
+                chosen.append(entry)
+                keys.add(key)
+                added = True
+                break
+            if len(chosen) >= width:
+                break
+        if not added:
+            break
+    return chosen
+
+
+def joint3_write(rows):
+    """One existing CSV; an ordinary byte lock permits concurrent validation workers."""
+    import msvcrt
+    if not rows:
+        return
+    with JOINT3_RESULTS.open('a+', encoding='utf-8', newline='') as stream:
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            stream.seek(0, 2)
+            writer = csv.DictWriter(stream, fieldnames=JOINT3_FIELDS)
+            if stream.tell() == 0:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in JOINT3_FIELDS})
+            stream.flush()
+        finally:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def joint3_training_write(rows):
+    if not rows:
+        return
+    with JOINT3_TRAINING_RESULTS.open('a' if JOINT3_TRAINING_RESULTS.exists() else 'w',
+                                      encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=JOINT3_TRAINING_FIELDS)
+        if stream.tell() == 0:
+            writer.writeheader()
+        writer.writerows({key: row.get(key) for key in JOINT3_TRAINING_FIELDS} for row in rows)
+        stream.flush()
+
+
+@torch.no_grad()
+def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
+                max_attempts=JOINT3_ATTEMPTS, limits=None, write=True):
+    finished = [row for row in read_rows(JOINT3_RESULTS) if row.get('layout_id') == name
+                and row.get('method') == JOINT3_METHOD and row.get('stage') == 'final'
+                and int(row.get('seed') or 0) == seed]
+    if finished:
+        return finished[-1]
+    started = time.perf_counter()
+    space = gnn.parent_assignment_space(parents, CONFIG)
+    embeddings = model.encode_static(space.graph)
+    seen, blockers, visited, entries, pending_rows = {}, {}, set(), [], []
+    calls, attempts, stale = 0, 0, 0
+    run = f'{name}-{seed}-{int(started)}'
+    failures, core_sizes = Counter(), Counter()
+
+    def flush():
+        if write and pending_rows:
+            joint3_write(pending_rows)
+            pending_rows.clear()
+
+    initial = build_joint(parents, model, space=space, embeddings=embeddings)
+    if initial.solution is None:
+        final = dict(stage='final', layout_id=name, seed=seed, method=JOINT3_METHOD,
+            parent_count=len(parents), status='CONSTRUCTION_FAILED', cmax_s=None, load_allowed=0,
+            runtime_s=time.perf_counter()-started, b32_calls=0, candidate_id='final', run_id=run,
+            diagnostic=json.dumps(dict(reason=initial.rejection_reason, algorithm=JOINT3_METHOD)))
+        if write:
+            joint3_write([final])
+        return final
+    gnn_state = cycle_route_state(initial)
+    gnn_peak = max(gnn_state.loads)
+    gnn_spread = gnn_peak-min(gnn_state.loads)
+    limits = joint3_load_limits(name, references, gnn_peak, gnn_spread) if limits is None else limits
+
+    def incumbent_cmax():
+        values = [entry[1].cmax for entry in entries
+                  if entry[1].feasible and int(entry[2].get('load_allowed') or 0)]
+        return min(values, default=math.inf)
+
+    def evaluate(result, candidate_id, *, origin=None, removed=(), feedback=None, construction=None,
+                 stage='candidate', operator='joint3'):
+        nonlocal calls
+        key = plan_key(result.solution, result.directions)
+        if key in visited:
+            return None
+        visited.add(key)
+        lb = joint3_route_lb(result)
+        evaluation = time.perf_counter()
+        schedule, called = evaluate_once(result, seen, blocker_cache=blockers)
+        elapsed = time.perf_counter()-evaluation
+        calls += int(called)
+        if schedule is None or schedule.status not in (ScheduleStatus.FEASIBLE, ScheduleStatus.DEADLOCK):
+            return None
+        modes, owners = ({}, {}) if origin is None else conflict_changes(origin[0], result, removed)
+        row = routeaware_result_row(name, JOINT3_METHOD, result, schedule, blockers.get(key, ()),
+            stage=stage, candidate_id=candidate_id,
+            origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
+            removed_parent_ids=json.dumps(list(removed)), feedback=json.dumps(feedback or {}),
+            construct_s=result.inference_seconds, b32_s=elapsed if called else 0.,
+            runtime_s=time.perf_counter()-started, b32_calls=int(called),
+            gnn_score=(construction or {}).get('score'), load_limits=json.dumps(limits),
+            mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
+            rebuild_actions=json.dumps((construction or {}).get('actions', [])),
+            route_lb_s=lb, incumbent_cmax_s=incumbent_cmax(), beam_width=JOINT3_BEAM,
+            core_size=len(removed),
+            feedback_features=json.dumps((construction or {}).get('feedback_features')),
+            load_allowed_three_ref=None, load_limits_three_ref=json.dumps(limits['three_reference']),
+            successful_repair=int(origin is not None and origin[1].status is ScheduleStatus.DEADLOCK
+                                  and schedule.feasible),
+            transfer_count=0, transfer_details='[]', pool_ids='', run_id=run)
+        row.update(seed=seed, load_allowed=int(conflict_load_allowed(row, limits)),
+                   load_allowed_three_ref=int(conflict_load_allowed(row, limits['three_reference'])))
+        if stage != 'final':
+            row['schedule'] = None
+            row['wait_blockers'] = None
+        entry = (result, schedule, row)
+        entries.append(entry)
+        if write:
+            pending_rows.append(row)
+        return entry
+
+    initial_entry = evaluate(initial, 'initial0', stage='initial', operator='original-GNN-construction')
+    if initial_entry is None:
+        raise ValueError(f'{name}: the original GNN construction has no B32 schedule')
+    print('JOINT3_INITIAL', json.dumps(dict(layout_id=name, seed=seed, status=initial_entry[1].status.value,
+        cmax_s=initial_entry[1].cmax if initial_entry[1].feasible else None,
+        pmax_s=float(initial_entry[2]['max_processing_s']),
+        pmax_limit_s=limits['pmax_limit_s'], pmax_limit_three_ref_s=limits['three_reference']['pmax_limit_s'],
+        load_allowed=initial_entry[2]['load_allowed'],
+        load_allowed_three_ref=initial_entry[2]['load_allowed_three_ref'])), flush=True)
+    flush()
+    pool = joint3_pool([], [initial_entry])
+    expanded = set()
+    while calls < budget and attempts < max_attempts and stale < JOINT3_STALE:
+        attempts += 1
+        origin = pool[(attempts-1) % len(pool)]
+        current, schedule, origin_row = origin
+        origin_key = plan_key(current.solution, current.directions)
+        core, feedback = joint3_core(current, schedule, model, space, embeddings,
+            blockers.get(origin_key, ()), seed=seed+attempts*7919, q=JOINT3_CORE)
+        if core is None:
+            failures[feedback.get('reason', 'empty measured core')] += 1
+            stale += 1
+            continue
+        removed = tuple(core.removed_parent_ids)
+        expansion = (origin_key, tuple(sorted(removed)))
+        if expansion in expanded:
+            # This measured core of this state was already rebuilt; do not spend
+            # reconstruction time on a repeat, and do not relax any filter.
+            failures['measured core already expanded'] += 1
+            stale += 1
+            continue
+        expanded.add(expansion)
+        core_sizes[len(removed)] += 1
+        measured = joint3_feedback(current, schedule, blockers.get(origin_key, ()), removed)
+        candidates, detail = joint3_reconstruct(parents, model, space, embeddings, current, removed,
+                                                limits, measured, width=JOINT3_BEAM)
+        if not candidates:
+            failures[detail.get('reason', 'no joint beam completion')] += 1
+            stale += 1
+            continue
+        incumbent = incumbent_cmax()
+        # Safe pruning only: the exact route-cycle lower bound already reaches the
+        # best measured load-qualified B32 Cmax.  No LB-versus-LB filter is applied.
+        admissible = [candidate for candidate in candidates
+                      if not joint3_safe_prune(candidate['lb'], incumbent)
+                      and plan_key(candidate['plan'].solution, candidate['plan'].directions) not in visited]
+        admissible.sort(key=lambda candidate: (-candidate['score'], candidate['lb']))
+        new = []
+        for index, candidate in enumerate(admissible):
+            if calls >= budget:
+                break
+            entry = evaluate(candidate['plan'], f'{run}-r{attempts}-{index}', origin=origin, removed=removed,
+                feedback=dict(measured, candidate_lb_s=candidate['lb'], incumbent_cmax_s=incumbent,
+                              beam_truncated=detail['truncated'], beam_legal=detail['legal']),
+                construction=candidate,
+                operator='deadlock-core-rebuild' if schedule.status is ScheduleStatus.DEADLOCK
+                else 'bottleneck-core-rebuild')
+            if entry is not None:
+                new.append(entry)
+        if not new:
+            failures['beam candidates pruned or duplicate'] += 1
+            stale += 1
+        else:
+            stale = 0
+            entries.extend(new)
+            pool = joint3_pool(pool, new)
+        print('JOINT3_ROUND', json.dumps(dict(layout_id=name, seed=seed, round=attempts,
+            core=list(removed), core_size=len(removed), candidates=len(candidates),
+            admissible=len(admissible), b32_calls=calls, incumbent_s=None if not math.isfinite(incumbent) else incumbent,
+            pool=[entry[2]['candidate_id'] for entry in pool])), flush=True)
+        flush()
+    admissible = [entry for entry in entries
+                  if entry[1].feasible and int(entry[2].get('load_allowed') or 0)]
+    feasible_entries = [entry for entry in entries if entry[1].feasible]
+    # The formal final is the minimum real Cmax among load-qualified FEASIBLE
+    # candidates.  When no candidate reaches the ceiling, the reported fallback is
+    # the best non-qualified FEASIBLE plan, then the best measured DEADLOCK state;
+    # the load flag stays false, so this never relaxes the constraint.
+    best = (min(admissible, key=lambda entry: entry[1].cmax) if admissible else
+            min(feasible_entries, key=lambda entry: entry[1].cmax) if feasible_entries else
+            max(entries, key=conflict_deadlock_progress))
+    best_key = plan_key(best[0].solution, best[0].directions)
+    modes, owners = conflict_changes(initial, best[0], space.parent_ids)
+    final = routeaware_result_row(name, JOINT3_METHOD, best[0], best[1], blockers.get(best_key, ()),
+        stage='final', candidate_id='final', origin_id=best[2]['candidate_id'],
+        operator='joint3-final', removed_parent_ids=best[2]['removed_parent_ids'],
+        feedback=best[2]['feedback'], construct_s=best[0].inference_seconds, b32_s=0.,
+        runtime_s=time.perf_counter()-started, b32_calls=calls, gnn_score=best[2]['gnn_score'],
+        load_limits=json.dumps(limits), mode_changes=json.dumps(modes),
+        assignment_changes=json.dumps(owners), rebuild_actions=best[2]['rebuild_actions'],
+        route_lb_s=best[2]['route_lb_s'], incumbent_cmax_s=best[2]['incumbent_cmax_s'],
+        beam_width=JOINT3_BEAM, core_size=best[2]['core_size'],
+        feedback_features=best[2]['feedback_features'], load_allowed_three_ref=best[2]['load_allowed_three_ref'],
+        load_limits_three_ref=best[2]['load_limits_three_ref'], successful_repair=best[2]['successful_repair'],
+        transfer_count=0, transfer_details='[]', pool_ids='', run_id=run)
+    final.update(seed=seed, load_allowed=int(conflict_load_allowed(final, limits)),
+                 load_allowed_three_ref=int(conflict_load_allowed(final, limits['three_reference'])))
+    evaluated = len(entries)
+    deadlocks = sum(entry[1].status is ScheduleStatus.DEADLOCK for entry in entries)
+    feasible = sum(entry[1].feasible for entry in entries)
+    load_allowed = sum(int(entry[2].get('load_allowed') or 0) for entry in entries)
+    final['diagnostic'] = json.dumps(dict(algorithm=JOINT3_METHOD, run_id=run, budget=budget,
+        max_attempts=max_attempts, attempts=attempts,
+        stop='B32 budget exhausted' if calls >= budget else
+             'outer attempts exhausted' if attempts >= max_attempts else 'no new legal core candidate',
+        evaluated=evaluated, unique_plans=len(visited), b32_calls=calls,
+        deadlock_candidates=deadlocks, deadlock_rate=deadlocks/max(1, evaluated),
+        feasible_candidates=feasible, feasible_rate=feasible/max(1, evaluated),
+        load_allowed_candidates=load_allowed, load_allowed_rate=load_allowed/max(1, evaluated),
+        final_feasible=int(best[1].feasible), final_from_initial=best[0] is initial,
+        core_size_counts=dict(sorted(core_sizes.items())), failures=failures,
+        final_core=json.loads(final['removed_parent_ids']), final_feedback=json.loads(final['feedback']),
+        final_feedback_features=json.loads(final['feedback_features'] or 'null'),
+        final_max_p_plus_move_s=final['route_lb_s'], gnn_reference_peak_s=gnn_peak,
+        load_rule=limits['rule'], load_rule_three_ref=limits['three_reference']['rule'],
+        evaluation='original FORMAL_SCOPE_V2 B32; no priority_schedule; no HGA/WAG candidate source',
+        construction_source='original GNN_VNEXT_WORKLOAD'), ensure_ascii=False)
+    if write:
+        joint3_write([final])
+    print('JOINT3_FINAL', json.dumps({key: final.get(key) for key in
+        ('layout_id', 'seed', 'status', 'cmax_s', 'max_processing_s', 'load_allowed',
+         'load_allowed_three_ref', 'b32_calls', 'runtime_s')}), flush=True)
+    return final
+
+
+def joint3_group_loss(scores, ranks):
+    losses, weights, correct, pairs = [], [], 0, 0
+    for first in range(len(ranks)):
+        for second in range(first+1, len(ranks)):
+            a, b = ranks[first], ranks[second]
+            if a == b:
+                continue
+            good, bad = (first, second) if a < b else (second, first)
+            if a[0] != b[0]:
+                weight = .25
+            else:
+                weight = abs(a[1]-b[1])/max(1., min(a[1], b[1]))
+            losses.append(F.softplus(scores[bad]-scores[good]))
+            weights.append(max(weight, 1e-3))
+            correct += int(scores[good] > scores[bad])
+            pairs += 1
+    if not pairs:
+        return None, 0, 0
+    weights = scores.new_tensor(weights)
+    return (torch.stack(losses)*weights).sum()/weights.sum().clamp_min(1e-12), pairs, correct
+
+
+def joint3_train():
+    """TRAIN-only pairwise ranking on the existing joint head, labelled by real B32."""
+    configure_cpu()
+    torch.manual_seed(SEED)
+    if JOINT3_MODEL.exists():
+        complete = torch.load(JOINT3_MODEL, map_location='cpu', weights_only=True)
+        if complete.get('training_complete'):
+            print('JOINT3_TRAIN_ALREADY_COMPLETE', complete.get('completed_epoch'), flush=True)
+            return complete
+    model = joint3_model().train()
+    initial_state = copy.deepcopy(model.state_dict())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=JOINT3_LEARNING_RATE, weight_decay=1e-4)
+    references = joint3_references()
+    training = dict(ppo_layouts('train'))
+    ordered = sorted(training, key=lambda name: (len(training[name]), name))
+    names = [ordered[round(index*(len(ordered)-1)/(JOINT3_TRAIN_LAYOUTS-1))]
+             for index in range(JOINT3_TRAIN_LAYOUTS)]
+    training_started = time.perf_counter()
+    prepared, groups, calls = [], 0, 0
+    construct_s = b32_s = 0.
+    with torch.no_grad():
+        for name in names:
+            parents = training[name]
+            started = time.perf_counter()
+            space = gnn.parent_assignment_space(parents, CONFIG)
+            embeddings = model.encode_static(space.graph)
+            initial = build_joint(parents, model, space=space, embeddings=embeddings)
+            construct_s += time.perf_counter()-started
+            if initial.solution is None:
+                print('JOINT3_TRAIN_SKIP', name, initial.rejection_reason, flush=True)
+                continue
+            seen, blockers = {}, {}
+            evaluation = time.perf_counter()
+            schedule, called = evaluate_once(initial, seen, blocker_cache=blockers)
+            b32_s += time.perf_counter()-evaluation
+            calls += int(called)
+
+            def collect(origin, origin_schedule, stage, limit=JOINT3_TRAIN_CORES):
+                nonlocal calls, b32_s, groups
+                state = cycle_route_state(origin)
+                limits = joint3_training_limits(state)
+                key = plan_key(origin.solution, origin.directions)
+                cores = []
+                for index in range(12):
+                    core, _ = joint3_core(origin, origin_schedule, model, space, embeddings,
+                        blockers.get(key, ()), seed=SEED+index*7919+len(parents)+len(prepared), q=JOINT3_CORE)
+                    if core is None:
+                        continue
+                    removed = tuple(core.removed_parent_ids)
+                    if removed in cores:
+                        continue
+                    cores.append(removed)
+                    if len(cores) >= limit:
+                        break
+                labelled, best = [], None
+                for removed in cores:
+                    measured = joint3_feedback(origin, origin_schedule, blockers.get(key, ()), removed)
+                    candidates, _ = joint3_reconstruct(parents, model, space, embeddings, origin, removed,
+                                                       limits, measured, width=JOINT3_TRAIN_BEAM)
+                    for candidate in candidates:
+                        candidate_key = plan_key(candidate['plan'].solution, candidate['plan'].directions)
+                        if candidate_key in seen:
+                            continue
+                        evaluation = time.perf_counter()
+                        candidate_schedule, called = evaluate_once(candidate['plan'], seen, blocker_cache=blockers)
+                        b32_s += time.perf_counter()-evaluation
+                        calls += int(called)
+                        row = routeaware_result_row(name, JOINT3_METHOD, candidate['plan'], candidate_schedule,
+                            blockers.get(candidate_key, ()))
+                        row.update(load_allowed=int(conflict_load_allowed(row, limits)))
+                        cls = 0 if candidate_schedule.feasible and int(row['load_allowed']) else \
+                            1 if candidate_schedule.feasible else 2
+                        labelled.append(dict(plan=candidate['plan'], joint_plans=candidate['joint_plans'],
+                            rank=(cls, float(candidate_schedule.cmax) if candidate_schedule.feasible else 1e9),
+                            status=candidate_schedule.status.value, load_allowed=int(row['load_allowed']),
+                            feedback_features=candidate['feedback_features']))
+                        if candidate_schedule.feasible and (best is None or candidate_schedule.cmax < best[1].cmax):
+                            best = (candidate['plan'], candidate_schedule)
+                distinct = len({item['rank'] for item in labelled})
+                if distinct > 1:
+                    prepared.append((space, labelled))
+                    groups += 1
+                print('JOINT3_TRAIN_GROUP', json.dumps(dict(layout_id=name, stage=stage,
+                    parents=len(parents), cores=len(cores), candidates=len(labelled), classes=distinct,
+                    best_s=None if best is None else best[1].cmax,
+                    feedback_features=[item['feedback_features'] for item in labelled])), flush=True)
+                return best
+
+            best = collect(initial, schedule, 'initial',
+                           limit=8 if schedule.status is ScheduleStatus.DEADLOCK else JOINT3_TRAIN_CORES)
+            # A repaired FEASIBLE state is the informative ranking origin: its
+            # candidates differ in real Cmax and in the load class.
+            if best is not None:
+                collect(best[0], best[1], 'repaired')
+    if not prepared:
+        raise ValueError('no usable real-B32 ranking preference in TRAIN')
+    history = []
+    for epoch in range(1, JOINT3_EPOCHS+1):
+        started = time.perf_counter()
+        order = list(range(len(prepared)))
+        Random(SEED+epoch).shuffle(order)
+        epoch_loss, epoch_pairs, epoch_correct, updates, gradients = [], 0, 0, 0, []
+        for index in order:
+            space, labelled = prepared[index]
+            optimizer.zero_grad(set_to_none=True)
+            embeddings = model.encode_static(space.graph)
+            scores = torch.stack([gnn.imitation_joint_scores(space, embeddings, model,
+                item['joint_plans']).mean() for item in labelled])
+            loss, pairs, correct = joint3_group_loss(scores, [item['rank'] for item in labelled])
+            if loss is None:
+                continue
+            loss.backward()
+            gradient = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.))
+            if not math.isfinite(float(loss.detach())) or not math.isfinite(gradient):
+                raise ArithmeticError('nonfinite joint3 ranking optimization')
+            optimizer.step()
+            epoch_loss.append(float(loss.detach()))
+            epoch_pairs += pairs
+            epoch_correct += correct
+            updates += 1
+            gradients.append(gradient)
+        record = dict(stage='epoch', seed=SEED, method=JOINT3_METHOD, epoch=epoch,
+            loss=sum(epoch_loss)/max(1, len(epoch_loss)), ranking_accuracy=epoch_correct/max(1, epoch_pairs),
+            pairs=epoch_pairs, updates=updates, gradient_norm=max(gradients, default=0.),
+            learning_rate=JOINT3_LEARNING_RATE, candidates=sum(len(labelled) for _, labelled in prepared),
+            b32_calls=calls, construct_s=construct_s, b32_s=b32_s,
+            runtime_s=time.perf_counter()-training_started,
+            parent_count=len(names), diagnostic=json.dumps(dict(training_split='TRAIN_ONLY',
+                groups=groups, layouts=len(names), feedback_outcomes=True,
+                label='load-qualified FEASIBLE > FEASIBLE by real B32 Cmax > DEADLOCK')))
+        history.append(record)
+        joint3_training_write([record])
+        torch.save(dict(seed=SEED, initialization='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD',
+            state_dict=copy.deepcopy(model.state_dict()), initial_state_dict=initial_state,
+            optimizer_state_dict=optimizer.state_dict(), completed_epoch=epoch,
+            training_complete=epoch == JOINT3_EPOCHS, history=history, training_split='TRAIN_ONLY',
+            training_layouts=names, feedback_outcomes=True, b32_calls=calls,
+            construct_s=construct_s, b32_s=b32_s), JOINT3_MODEL)
+        print('JOINT3_TRAIN_EPOCH', json.dumps({key: record[key] for key in
+            ('epoch', 'loss', 'ranking_accuracy', 'pairs', 'updates', 'b32_calls', 'runtime_s')}), flush=True)
+    return torch.load(JOINT3_MODEL, map_location='cpu', weights_only=True)
+
+
+def joint3_job(payload):
+    configure_cpu()
+    name, parents, seed, weights = payload
+    model = joint3_model(weights).eval()
+    model.requires_grad_(False)
+    return joint3_case(name, parents, seed, model, joint3_references())
+
+
+def joint3_validation(workers=4, seeds=JOINT3_SEEDS):
+    if not JOINT3_MODEL.exists():
+        raise ValueError('train and save the joint3 actor before VALIDATION')
+    saved = torch.load(JOINT3_MODEL, map_location='cpu', weights_only=True)
+    if not saved.get('training_complete'):
+        raise ValueError('joint3 training is incomplete')
+    layouts = dict(load_layouts('validation'))
+    if set(layouts) != set(JOINT3_LAYOUTS):
+        raise ValueError('the official ten-layout VALIDATION split changed')
+    jobs = [(name, layouts[name], seed, saved['state_dict'])
+            for name in JOINT3_LAYOUTS for seed in seeds]
+    finals = []
+    if workers <= 1:
+        finals = [joint3_job(job) for job in jobs]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for future in as_completed([pool.submit(joint3_job, job) for job in jobs]):
+                finals.append(future.result())
+    summary = joint3_summary()
+    print('JOINT3_VALIDATION_SUMMARY', json.dumps(summary, ensure_ascii=False), flush=True)
+    return finals
+
+
+def joint3_summary():
+    """Thirty paired VALIDATION comparisons against the frozen HGA/WAG+VNS results."""
+    references = joint3_references()
+    finals = {(row['layout_id'], int(row['seed'])): row for row in read_rows(JOINT3_RESULTS)
+              if row.get('stage') == 'final' and row.get('method') == JOINT3_METHOD}
+    missing = [(name, seed) for name in JOINT3_LAYOUTS for seed in JOINT3_SEEDS
+               if (name, seed) not in finals]
+    result = dict(algorithm=JOINT3_METHOD, expected=len(JOINT3_LAYOUTS)*len(JOINT3_SEEDS),
+                  completed=len(JOINT3_LAYOUTS)*len(JOINT3_SEEDS)-len(missing), missing=missing)
+    wag_rows = read_rows(JOINT3_WAG_REFERENCE)
+    for tag, method in (('HGA', 'HGA'), ('WAG', 'WAG+VNS')):
+        deltas, wins, losses, ties, feasibility_wins, no_reference = [], 0, 0, 0, 0, 0
+        for name in JOINT3_LAYOUTS:
+            reference = references.get((name, method))
+            for seed in JOINT3_SEEDS:
+                row = finals.get((name, seed))
+                if row is None:
+                    continue
+                feasible = row['status'] == 'FEASIBLE' and row.get('cmax_s') not in (None, '')
+                if not feasible:
+                    losses += 1
+                    continue
+                if reference is None:
+                    # No feasible frozen row exists for this layout: a feasible final
+                    # is a feasibility result, never a fabricated Cmax pair.
+                    wins += 1
+                    feasibility_wins += 1
+                    no_reference += 1
+                    continue
+                if tag == 'WAG':
+                    deadlock_seed = [other for other in wag_rows if other['layout_id'] == name
+                                     and int(other['seed']) == seed
+                                     and other.get('source') == JOINT3_WAG_SOURCE
+                                     and other['status'] != 'FEASIBLE']
+                    if deadlock_seed:
+                        wins += 1
+                        feasibility_wins += 1
+                        continue
+                delta = (float(row['cmax_s'])-reference['cmax_s'])/reference['cmax_s']*100.
+                deltas.append(delta)
+                wins += int(delta < -1e-9)
+                losses += int(delta > 1e-9)
+                ties += int(abs(delta) <= 1e-9)
+        result[tag] = dict(pairs=len(deltas), median_pct=median(deltas) if deltas else None,
+                           wins=wins, losses=losses, ties=ties, feasibility_wins=feasibility_wins,
+                           pairs_without_frozen_reference=no_reference,
+                           reference_cmax_s={name: references[(name, method)]['cmax_s']
+                                             for name in JOINT3_LAYOUTS if (name, method) in references},
+                           reference_runtime_s=median([references[(name, method)]['runtime_s']
+                                                       for name in JOINT3_LAYOUTS
+                                                       if (name, method) in references]))
+    rows = [finals[(name, seed)] for name in JOINT3_LAYOUTS for seed in JOINT3_SEEDS
+            if (name, seed) in finals]
+    feasible = [row for row in rows if row['status'] == 'FEASIBLE']
+    load_ok = [row for row in feasible if int(row.get('load_allowed') or 0)]
+    load_ok_three = [row for row in feasible if int(row.get('load_allowed_three_ref') or 0)]
+    deadlocks = sum(1 for row in rows if row['status'] == 'DEADLOCK')
+    evaluated = sum(int(json.loads(row['diagnostic']).get('evaluated') or 0) for row in rows) \
+        if rows and rows[0].get('diagnostic', '').startswith('{') else None
+    candidate_deadlocks = sum(int(json.loads(row['diagnostic']).get('deadlock_candidates') or 0)
+                              for row in rows if row.get('diagnostic', '').startswith('{'))
+    candidate_total = sum(int(json.loads(row['diagnostic']).get('evaluated') or 0)
+                          for row in rows if row.get('diagnostic', '').startswith('{'))
+    result.update(feasible=len(feasible), deadlock_finals=deadlocks,
+                  load_allowed_strict=len(load_ok), load_allowed_three_reference=len(load_ok_three),
+                  final_feasible_rate=len(feasible)/max(1, len(rows)),
+                  candidate_deadlock_rate=candidate_deadlocks/max(1, candidate_total),
+                  median_runtime_s=median([float(row['runtime_s']) for row in rows]) if rows else None,
+                  median_b32_calls=median([int(row['b32_calls']) for row in rows]) if rows else None,
+                  duration_seconds={})
+    thresholds = dict(final_feasible_load_ok=len(load_ok) == 30,
+                      hga_median_below_zero=(result['HGA']['median_pct'] is not None
+                                             and result['HGA']['median_pct'] < 0),
+                      wag_median_below_zero=(result['WAG']['median_pct'] is not None
+                                             and result['WAG']['median_pct'] < 0),
+                      hga_wins_more=result['HGA']['wins'] > result['HGA']['losses'],
+                      wag_wins_more=result['WAG']['wins'] > result['WAG']['losses'])
+    result['criteria'] = thresholds
+    result['passed'] = all(thresholds.values())
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -6224,7 +7172,15 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'imitation-cycle-transfer-pilot':imitation_cycle_transfer_pilot()
+    if args.stage == 'joint3-audit':
+        print('JOINT3_AUDIT', json.dumps(joint3_provenance(), ensure_ascii=False), flush=True)
+    elif args.stage == 'joint3-train':
+        joint3_train()
+    elif args.stage == 'joint3-validation':
+        joint3_validation(args.workers)
+    elif args.stage == 'joint3-summary':
+        print('JOINT3_SUMMARY', json.dumps(joint3_summary(), ensure_ascii=False), flush=True)
+    elif args.stage == 'imitation-cycle-transfer-pilot':imitation_cycle_transfer_pilot()
     elif args.stage == 'imitation-conflict-load-pilot':imitation_conflict_load_pilot()
     elif args.stage == 'imitation-conflict-core-pilot':imitation_conflict_core_pilot()
     elif args.stage in ('imitation-priority-vnd','imitation-deadlock-pilot'):priority_pilot()

@@ -2164,6 +2164,18 @@ _VNEXT_LOCAL_COLUMNS = (8, 9, 10, 11, 16, 19, 20, 21, 22, 23, 24, 28)
 _VNEXT_FEATURE_DIM = len(_VNEXT_LOCAL_COLUMNS) + 8
 _VNEXT_TIME_SAMPLES = 12
 _VNEXT_JOINT_PRIOR = (-5., -1.5, -1., -1., -3., -1.5)
+# Measured B32 feedback enters the same outcome vector: work actually moved off
+# the critical robot for waiting/blocked parents, the candidate critical-robot
+# route cycle, and how many critical children changed hands.
+_VNEXT_FEEDBACK_OUTCOMES = 4
+
+
+def vnext_outcome(model, values):
+    """Append the measured-feedback slots when the actor was built with them."""
+    outcome = torch.as_tensor(values)
+    if getattr(model, 'feedback_outcomes', False):
+        outcome = torch.cat((outcome, outcome.new_zeros(_VNEXT_FEEDBACK_OUTCOMES)))
+    return outcome
 _VNEXT_VALUE_CHILD_DIM = 9 + _VNEXT_FEATURE_DIM
 _VNEXT_VALUE_EXTRA_DIM = 2 * _VNEXT_VALUE_CHILD_DIM + 16 + 1 + 8 + 1 + 6 + 1
 
@@ -2173,10 +2185,13 @@ class VNextGNN(_JointAssignmentGNN):
 
     def __init__(self, hidden_dim: int = 64, heads: int = 4, *, workload_lookahead: bool = False,
                  joint_actions: bool = False, cmax_value: bool = False, bounded_assignment: bool = False,
-                 schedule_feedback: bool = False, imitation_balance: bool = False):
+                 schedule_feedback: bool = False, imitation_balance: bool = False,
+                 feedback_outcomes: bool = False):
         super().__init__(hidden_dim, heads, workload_lookahead=workload_lookahead)
         if imitation_balance and (not workload_lookahead or not joint_actions or schedule_feedback or cmax_value):
             raise ValueError('imitation balancing uses the existing workload joint actor without extra heads')
+        if feedback_outcomes and not joint_actions:
+            raise ValueError('measured outcome features require the joint VNext actor')
         self.imitation_balance = imitation_balance
         self.schedule_feedback = schedule_feedback
         if schedule_feedback:
@@ -2187,7 +2202,13 @@ class VNextGNN(_JointAssignmentGNN):
         self.bounded_assignment = bounded_assignment
         if joint_actions and not workload_lookahead:
             raise ValueError('joint VNext actions require workload estimates')
-        self.joint_weights = nn.Parameter(torch.tensor(_VNEXT_JOINT_PRIOR)) if joint_actions else None
+        self.joint_weights = (nn.Parameter(torch.tensor(_VNEXT_JOINT_PRIOR
+                                                         + ((0.,) * _VNEXT_FEEDBACK_OUTCOMES)))
+                              if joint_actions and feedback_outcomes else
+                              nn.Parameter(torch.tensor(_VNEXT_JOINT_PRIOR)) if joint_actions else None)
+        # The four extra coefficients start at zero, so a model built with this
+        # switch scores exactly like the original actor until it is trained.
+        self.feedback_outcomes = bool(feedback_outcomes) and joint_actions
         self.insertion_head = nn.Sequential(nn.Linear(4 * hidden_dim + _VNEXT_FEATURE_DIM, hidden_dim),
                                             nn.ReLU(), nn.Linear(hidden_dim, 1))
         for name, size in (('assignment', self.policy[0].in_features), ('insertion', _VNEXT_FEATURE_DIM)):
@@ -2719,6 +2740,7 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
             nominal = max(p + m for p, m in zip(after.loads, moves.tolist())) / 2500.
             outcome = moves.new_tensor((peak, peak - float(expected.min()), nominal,
                                         (after.travel - state.travel) / 45., overlap, risk))
+            outcome = vnext_outcome(model, outcome)
             plans.append(VNextJointAction(index, after, actions, assignment_features, outcome, retained_inputs, retained_indices))
     legal = (tuple(range(len(plans))) if balancing and not prefer_start_recovery else
              legal_assignment_starts(plans, blocks, space, config))
