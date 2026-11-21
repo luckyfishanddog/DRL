@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
 from mrta_reference.geometry import optimize_directions, oriented_endpoints
-from mrta_reference.model import DeadlockBlockage, Operation, OperationKind, ParentWeld, RobotRoute, ScheduleResult, ScheduleStatus, ScientificConfig
+from mrta_reference.model import DeadlockBlockage, Operation, OperationKind, ParentWeld, RobotRoute, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind
 from mrta_reference.scheduler import ScheduleWaitBlockers, build_operation_templates, earliest_safe_start, selected_schedule_wait_blockers
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map, canonicalize
@@ -5154,18 +5154,23 @@ def priority_pilot():
 
 
 CONFLICT_RESULTS = FINAL_RESULTS/'gnn_conflict_core_pilot.csv'
+CONFLICT_LOAD_RESULTS = FINAL_RESULTS/'gnn_conflict_load_compensation_pilot.csv'
 CONFLICT_METHOD = 'GNN-Conflict-Core-LNS'
+CONFLICT_LOAD_METHOD = 'GNN-Conflict-Load-Compensation-LNS'
 CONFLICT_FIELDS = (*ROUTEAWARE_FIELDS, 'candidate_id', 'origin_id', 'operator', 'gnn_score',
     'load_allowed', 'load_limits', 'mode_changes', 'assignment_changes', 'rebuild_actions',
     'successful_repair', 'pool_ids')
+CONFLICT_LOAD_FIELDS = (*CONFLICT_FIELDS, 'transfer_count', 'transfer_details')
 
 
-def conflict_write(rows):
-    with CONFLICT_RESULTS.open('a' if CONFLICT_RESULTS.exists() else 'w', encoding='utf-8', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=CONFLICT_FIELDS)
+def conflict_write(rows, *, path=None):
+    path = CONFLICT_RESULTS if path is None else path
+    fields = CONFLICT_LOAD_FIELDS if path == CONFLICT_LOAD_RESULTS else CONFLICT_FIELDS
+    with path.open('a' if path.exists() else 'w', encoding='utf-8', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
         if stream.tell() == 0:
             writer.writeheader()
-        writer.writerows({k: row.get(k) for k in CONFLICT_FIELDS} for row in rows)
+        writer.writerows({k: row.get(k) for k in fields} for row in rows)
 
 
 def conflict_load_limits(name, references):
@@ -5237,9 +5242,120 @@ def conflict_core_partial(current, schedule, model, space, embeddings, *, seed, 
         evidence_source=schedule.deadlock_evidence_source)
 
 
+def conflict_compensation(current, space, removed, protected, *, q, kind, seed):
+    """Select one legal Relocate or two-sided Swap inside the existing core."""
+    solution = current.solution
+    current_actions = {a.parent_id: a for a in gnn.parent_assignment_targets(solution, CONFIG)}
+    state = lns.oriented_route_state(tuple(r.block_ids for r in solution.routes), current.directions,
+                                    block_map(solution, CONFIG, scope=FORMAL_SCOPE_V2), CONFIG)
+    loads = list(state.loads)
+    heavy = max(range(4), key=lambda r: (loads[r], -r))
+    processing = {p: tuple(float(x)*2500. for x in space.processing[space.action_index[a]])
+                  for p, a in current_actions.items()}
+
+    def alternative(parent, source, destination):
+        action = current_actions[parent]
+        if action.pattern.kind is SplitKind.X_SPLIT:
+            return None
+        changing = [i for i, robot in enumerate(action.robots) if robot == source]
+        if len(changing) != 1:
+            return None
+        robots = list(action.robots)
+        index = changing[0]
+        robots[index] = destination
+        candidate = gnn.ParentAssignment(parent, action.pattern, tuple(robots))
+        if candidate == action or candidate not in space.action_index:
+            return None
+        block = space.children[action.pattern][index]
+        work = float(space.processing[space.action_index[action], source])*2500.
+        return candidate, block.block_id, work
+
+    def score(targets):
+        updated = loads.copy()
+        for parent, action in targets.items():
+            for robot in range(4):
+                updated[robot] += (float(space.processing[space.action_index[action], robot])*2500.
+                                   - processing[parent][robot])
+        return updated, (max(updated), max(updated)-min(updated))
+
+    ranked = []
+    if kind == 'relocate':
+        for parent in sorted(current_actions):
+            work = processing[parent][heavy]
+            if work <= CONFIG.numeric_epsilon:
+                continue
+            for destination in range(4):
+                if destination == heavy or loads[destination] >= loads[heavy]:
+                    continue
+                change = alternative(parent, heavy, destination)
+                if change is None:
+                    continue
+                action, block, _ = change
+                targets = {parent: action}
+                updated, key = score(targets)
+                if key[0] < max(loads)-1e-7 or key[1] < max(loads)-min(loads)-1e-7:
+                    ranked.append(((*key, -work, parent, block, destination), targets,
+                                   [dict(parent_id=parent, block_id=block, source=heavy, destination=destination)],
+                                   heavy, destination, updated))
+    elif kind == 'swap':
+        for destination in range(4):
+            if destination == heavy or loads[destination] >= loads[heavy]:
+                continue
+            for left in sorted(current_actions):
+                if processing[left][heavy] <= CONFIG.numeric_epsilon:
+                    continue
+                first = alternative(left, heavy, destination)
+                if first is None:
+                    continue
+                for right in sorted(current_actions):
+                    if right == left or processing[right][destination] <= CONFIG.numeric_epsilon:
+                        continue
+                    second = alternative(right, destination, heavy)
+                    if second is None:
+                        continue
+                    targets = {left: first[0], right: second[0]}
+                    updated, key = score(targets)
+                    pair_gap = abs(updated[heavy]-updated[destination])
+                    if key[0] < max(loads)-1e-7 or key[1] < max(loads)-min(loads)-1e-7:
+                        ranked.append(((*key, pair_gap, left, right, destination), targets,
+                                       [dict(parent_id=left, block_id=first[1], source=heavy, destination=destination),
+                                        dict(parent_id=right, block_id=second[1], source=destination, destination=heavy)],
+                                       heavy, destination, updated))
+    else:
+        raise ValueError('compensation kind must be relocate or swap')
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    _, targets, moves, source, destination, updated = ranked[seed % min(3, len(ranked))]
+    required = set(protected) | set(targets)
+    limit = max(q, len(protected))
+    if len(required) > limit:
+        return None
+    ordered = list(dict.fromkeys(removed))
+    retained = [p for p in ordered if p in required]
+    retained.extend(p for p in ordered if p not in required)
+    removed = tuple(dict.fromkeys((*retained, *(p for p in targets if p not in retained))))[:limit]
+    if not required <= set(removed):
+        return None
+    return removed, targets, dict(compensation=kind, source_robot=source, destination_robot=destination,
+                                  processing_before=loads, processing_after=updated, moves=moves)
+
+
+def conflict_actual_transfers(plan, compensation, origin=None):
+    owners = gnn.assignment_targets(plan.solution)
+    before = None if origin is None else gnn.assignment_targets(origin.solution)
+    actual = []
+    for move in (compensation or {}).get('moves', ()):
+        source, destination = move['source'], move['destination']
+        if owners.get(move['block_id']) != destination or before is not None and before.get(move['block_id']) != source:
+            return []
+        actual.append(dict(move, actual_source=source, actual_destination=destination))
+    return actual
+
+
 @torch.no_grad()
 def conflict_construct(parents, model, space, embeddings, limits, *, rng=None, current=None,
-                       removed=(), forced=None):
+                       removed=(), forced=None, targets=None):
     """Continue the old joint actor over all legal modes and owners of removed parents."""
     started = time.perf_counter()
     pending = set(space.parent_ids) if current is None else set(removed)
@@ -5254,14 +5370,20 @@ def conflict_construct(parents, model, space, embeddings, limits, *, rng=None, c
     state = lns.oriented_route_state(routes, bits, blocks, CONFIG)
     actions, learned = [], []
     forced_indices = None if forced is None else tuple(space.action_index[a] for a in forced)
+    target_indices = {p: (space.action_index[a],) for p, a in (targets or {}).items()}
     while pending:
         plans, scores = gnn.vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, CONFIG,
-            conflict_core=True, fixed_directions=fixed, assignment_indices=forced_indices)
+            conflict_core=True, fixed_directions=fixed, assignment_indices=forced_indices,
+            assignment_targets=target_indices)
         keep = [i for i, plan in enumerate(plans)
                 if max(plan.state.loads) <= limits['temporary_pmax_limit_s']+1e-7
                 and float(plan.assignment_features[-8:-4].max())*2500 <= limits['temporary_pmax_limit_s']+1e-3]
         if not keep:
             return None, dict(reason='no joint action within temporary peak limit', pending=sorted(pending))
+        keep = [i for i in keep if space.actions[plans[i].assignment_index].parent_id not in target_indices
+                or plans[i].assignment_index in target_indices[space.actions[plans[i].assignment_index].parent_id]]
+        if not keep:
+            return None, dict(reason='directed compensation action has no legal joint insertion', pending=sorted(pending))
         keep.sort(key=lambda i: -float(scores[i]))
         index = keep[0]
         if rng is not None and len(keep) > 1:
@@ -5285,6 +5407,10 @@ def conflict_construct(parents, model, space, embeddings, limits, *, rng=None, c
         solution = canonicalize(parents, selected.values(), dict(enumerate(state.routes)), CONFIG, scope=FORMAL_SCOPE_V2)
         if tuple(r.block_ids for r in solution.routes) != state.routes or set(solution.patterns) != set(selected.values()):
             raise ValueError('canonicalization changed the directed joint construction')
+        if any(selected[parent] != action.pattern or
+               tuple(gnn.assignment_targets(solution)[b.block_id] for b in space.children[action.pattern]) != action.robots
+               for parent, action in (targets or {}).items()):
+            raise ValueError('canonical solution did not complete the directed compensation ownership')
         # Retained tasks keep mode, owner, relative order and direction.
         for robot, route in enumerate(routes):
             kept = set(route)
@@ -5297,7 +5423,9 @@ def conflict_construct(parents, model, space, embeddings, limits, *, rng=None, c
         return None, dict(reason=str(error))
     result = gnn.JointCompletionResult(solution, state.directions, tuple(actions), time.perf_counter()-started,
                                       oriented_state=state)
-    return result, dict(gnn_score=sum(learned)/max(1, len(learned)), actions=[asdict(a) for a in actions])
+    return result, dict(gnn_score=sum(learned)/max(1, len(learned)), actions=[asdict(a) for a in actions],
+                        directed_assignments=[dict(parent_id=p, pattern_id=a.pattern.pattern_id, robots=a.robots)
+                                              for p, a in (targets or {}).items()])
 
 
 def conflict_initial_hints(parents, original, space):
@@ -5330,28 +5458,63 @@ def conflict_deadlock_progress(entry):
     return min(fractions, default=0.), sum(fractions)/max(1, len(fractions))
 
 
+def conflict_load_balance(entry):
+    row = entry[2]
+    limits = json.loads(row.get('load_limits') or '{}')
+    peak, spread = float(row.get('max_processing_s') or 0.), float(row.get('processing_spread_s') or 0.)
+    peak_ratio = peak / max(limits.get('pmax_limit_s', 1.), 1e-12)
+    spread_ratio = spread / max(limits.get('spread_limit_s', 1.), 1e-12)
+    return max(peak_ratio, spread_ratio), max(0., peak_ratio-1.) + max(0., spread_ratio-1.)
+
+
 def conflict_pool(entries, latest, *, width=6):
-    by_key = {plan_key(e[0].solution, e[0].directions): e for e in (*entries, *latest)}
+    valid = [e for e in (*entries, *latest) if e[1].status in (ScheduleStatus.FEASIBLE, ScheduleStatus.DEADLOCK)]
+    by_key = {plan_key(e[0].solution, e[0].directions): e for e in valid}
+    latest_keys = [plan_key(e[0].solution, e[0].directions) for e in reversed(latest)
+                   if plan_key(e[0].solution, e[0].directions) in by_key]
+    feasible_ok = [e for e in by_key.values() if e[1].feasible and int(e[2].get('load_allowed') or 0)]
+    deadlock_ok = [e for e in by_key.values() if e[1].status is ScheduleStatus.DEADLOCK
+                   and int(e[2].get('load_allowed') or 0)]
+    deadlocks = [e for e in by_key.values() if e[1].status is ScheduleStatus.DEADLOCK]
+    feasible_bad = [e for e in by_key.values() if e[1].feasible and not int(e[2].get('load_allowed') or 0)]
     ranked = sorted(by_key.values(), key=lambda e: (0, e[1].cmax) if e[1].feasible else
                     (1, *(-x for x in conflict_deadlock_progress(e))))
-    chosen = ranked[:1]
-    # Reserve a slot for a fresh intermediate even when its dispatch progress
-    # is worse. Keep the best feasible separately, and allow changed cores.
-    if latest and latest[-1] not in chosen:
-        chosen.append(latest[-1])
-    signatures = set()
-    for entry in (*ranked, *latest):
-        if entry in chosen:
-            continue
+    priority = [
+        sorted(feasible_ok, key=lambda e: e[1].cmax),
+        sorted(feasible_ok, key=lambda e: (conflict_load_balance(e)[0], e[1].cmax)),
+        sorted(deadlock_ok, key=lambda e: tuple(-x for x in conflict_deadlock_progress(e))),
+        sorted(deadlocks, key=lambda e: (conflict_load_balance(e)[1], *(-x for x in conflict_deadlock_progress(e)))),
+        sorted(feasible_bad, key=lambda e: e[1].cmax),
+        [by_key[latest_keys[0]]] if latest_keys else [],
+    ]
+    chosen, keys, signatures = [], set(), set()
+
+    def signature(entry):
         plan, schedule, _ = entry
-        signature = (plan.solution.patterns, tuple((e.robot_id, e.blocked_parent_ids, e.blocker_parent_ids)
-                                                   for e in schedule.deadlock_blockages))
-        if signature not in signatures:
-            chosen.append(entry)
-            signatures.add(signature)
+        return (plan.solution.patterns, tuple((e.robot_id, e.blocked_parent_ids, e.blocker_parent_ids)
+                                              for e in schedule.deadlock_blockages))
+
+    def add(entry, *, diverse=False):
+        if entry is None or len(chosen) >= width:
+            return
+        key = plan_key(entry[0].solution, entry[0].directions)
+        if key in keys or diverse and signature(entry) in signatures:
+            return
+        chosen.append(entry)
+        keys.add(key)
+        signatures.add(signature(entry))
+
+    for category in priority:
+        for entry in category:
+            before = len(chosen)
+            add(entry)
+            if len(chosen) != before:
+                break
+    for entry in (*ranked, *(by_key[k] for k in latest_keys)):
+        add(entry, diverse=True)
         if len(chosen) >= width:
             break
-    return chosen[:width]
+    return chosen
 
 
 def conflict_changes(before, after, removed):
@@ -5366,15 +5529,21 @@ def conflict_changes(before, after, removed):
 
 
 @torch.no_grad()
-def conflict_core_case(name, parents, seed, model, references, *, budget=100):
-    saved = [r for r in read_rows(CONFLICT_RESULTS) if r['layout_id'] == name and int(r['seed']) == seed]
+def conflict_core_case(name, parents, seed, model, references, *, budget=100, result_path=CONFLICT_RESULTS,
+                       method=CONFLICT_METHOD, load_compensation=False):
+    def write(rows):
+        if result_path == CONFLICT_RESULTS:
+            conflict_write(rows)
+        else:
+            conflict_write(rows, path=result_path)
+    saved = [r for r in read_rows(result_path) if r['layout_id'] == name and int(r['seed']) == seed]
     final = next((r for r in reversed(saved) if r['stage'] == 'final'), None)
     if final is not None:
         return final
     started = time.perf_counter()
     limits = conflict_load_limits(name, references)
     space = gnn.parent_assignment_space(parents, CONFIG)
-    history = [*read_rows(LOADFIRST_RESULTS), *read_rows(CONFLICT_RESULTS)]
+    history = [*read_rows(LOADFIRST_RESULTS), *read_rows(CONFLICT_RESULTS), *read_rows(result_path)]
     seen, blockers, records = routeaware_history(name, parents, space, extra_rows=history)
     embeddings = model.encode_static(space.graph)
     old = next(r for r in references if r['layout_id'] == name and r['method'] == 'GNN_IMITATION')
@@ -5391,12 +5560,17 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100):
             return None
         visited.add(key)
         evaluation = time.perf_counter()
+        transfers = (conflict_actual_transfers(plan, feedback, None if origin is None else origin[0])
+                     if (feedback or {}).get('compensation') in ('relocate', 'swap') else [])
+        if (feedback or {}).get('compensation') in ('relocate', 'swap') and not transfers:
+            failures['compensation did not change the requested ownership'] += 1
+            return None
         schedule, called = evaluate_once(plan, seen, blocker_cache=blockers)
         elapsed = time.perf_counter()-evaluation
         calls += int(called)
         hits += int(not called)
         modes, owners = ({}, {}) if origin is None else conflict_changes(origin[0], plan, removed)
-        row = routeaware_result_row(name, CONFLICT_METHOD, plan, schedule, blockers.get(key, ()),
+        row = routeaware_result_row(name, method, plan, schedule, blockers.get(key, ()),
             historical=records.get(key), stage=stage, candidate_id=candidate_id,
             origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
             removed_parent_ids=json.dumps(removed), feedback=json.dumps(feedback or {}),
@@ -5405,12 +5579,13 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100):
             gnn_score=(construction or {}).get('gnn_score'), load_limits=json.dumps(limits),
             mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
             rebuild_actions=json.dumps((construction or {}).get('actions', [])),
-            successful_repair=int(origin is not None and origin[1].status is ScheduleStatus.DEADLOCK and schedule.feasible))
+            successful_repair=int(origin is not None and origin[1].status is ScheduleStatus.DEADLOCK and schedule.feasible),
+            transfer_count=int(bool(transfers)), transfer_details=json.dumps(transfers))
         row['seed'] = seed
         row['load_allowed'] = int(conflict_load_allowed(row, limits))
         previous = saved_ids.get(candidate_id)
         if previous is None:
-            conflict_write([row])
+            write([row])
         else:
             if json.loads(previous['solution']) != json.loads(row['solution']):
                 raise ValueError('resumed seeded proposal differs from saved proposal')
@@ -5450,7 +5625,7 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100):
         current, schedule, row = origin
         q = min(len(parents), 12, max(4, round(.08*len(parents)))+2*((rounds-1)%3))
         new = []
-        for rank in range(4):
+        for rank in range(3 if load_compensation else 4):
             if calls >= budget:
                 break
             pick_seed = seed+rounds*7+rank
@@ -5465,17 +5640,29 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100):
             if partial is None:
                 failures[feedback.get('reason', 'empty feedback core')] += 1
                 continue
+            removed, targets = partial.removed_parent_ids, None
+            if load_compensation and rank:
+                kind = 'relocate' if rank == 1 else 'swap'
+                compensated = conflict_compensation(current, space, removed,
+                    set(feedback.get('core', ())) if schedule.status is ScheduleStatus.DEADLOCK else set(),
+                    q=q, kind=kind, seed=pick_seed)
+                if compensated is None:
+                    failures['no improving legal '+kind] += 1
+                    continue
+                removed, targets, compensation = compensated
+                feedback = dict(feedback, **compensation)
             proposal, detail = conflict_construct(parents, model, space, embeddings, limits,
-                rng=None if rank == 0 else Random(pick_seed), current=current, removed=partial.removed_parent_ids)
+                rng=None if rank == 0 else Random(pick_seed), current=current, removed=removed, targets=targets)
             if proposal is None:
                 failures[detail['reason']] += 1
                 continue
-            entry = evaluate(proposal, f'round{rounds}-{rank}', origin=origin,
-                removed=partial.removed_parent_ids, feedback=feedback, construction=detail)
+            entry = evaluate(proposal, f'round{rounds}-{rank}', origin=origin, removed=removed,
+                feedback=feedback, construction=detail,
+                operator='core-rebuild' if not load_compensation or not rank else ('core-relocate' if rank == 1 else 'core-swap'))
             if entry: new.append(entry)
             else: failures['duplicate complete plan'] += 1
         pool = conflict_pool(pool, new)
-        conflict_write([dict(stage='round', layout_id=name, seed=seed, method=CONFLICT_METHOD, round=rounds,
+        write([dict(stage='round', layout_id=name, seed=seed, method=method, round=rounds,
             pool_ids=json.dumps([e[2]['candidate_id'] for e in pool]), b32_calls=0, cache_hits=0,
             runtime_s=time.perf_counter()-started, diagnostic=json.dumps(dict(failures=failures)))])
     admissible = [e for e in all_entries if conflict_load_allowed(e[2], limits)]
@@ -5488,8 +5675,9 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100):
             rounds=rounds, unique_visited=len(visited), failures=failures, initial_candidate='initial0',
             feasible_candidates=sum(e[1].feasible for e in all_entries), admissible_feasible=len(good),
             successful_local_repairs=[e[2]['candidate_id'] for e in all_entries if int(e[2]['successful_repair'])],
+            successful_transfers=sum(int(e[2].get('transfer_count') or 0) for e in all_entries),
             evaluation='original FORMAL_SCOPE_V2 B32; no priority_schedule', seed=seed)))
-    conflict_write([final])
+    write([final])
     print('CONFLICT_FINAL', json.dumps({k: final.get(k) for k in
         ('layout_id', 'seed', 'status', 'cmax_s', 'max_processing_s', 'processing_spread_s', 'b32_calls', 'runtime_s')}), flush=True)
     return final
@@ -5515,9 +5703,28 @@ def imitation_conflict_core_pilot():
     return finals
 
 
+def imitation_conflict_load_pilot():
+    configure_cpu()
+    conflict_write([], path=CONFLICT_LOAD_RESULTS)
+    references = read_rows(IMITATION_RESULTS)
+    layouts = dict(ppo_layouts('validation'))
+    model = imitation_model(torch.load(IMITATION_MODEL, map_location='cpu', weights_only=True)['state_dict']).eval()
+    model.requires_grad_(False)
+    model.load_first_lambda = None
+    model.route_aware = False
+    finals = [conflict_core_case(name, layouts[name], SEED, model, references,
+                                result_path=CONFLICT_LOAD_RESULTS, method=CONFLICT_LOAD_METHOD,
+                                load_compensation=True) for name in IMITATION_CASES]
+    feasible = sum(r['status'] == 'FEASIBLE' and int(r['load_allowed']) for r in finals)
+    print('CONFLICT_LOAD_PHASE1_SUMMARY', json.dumps(dict(feasible=feasible, cases=6,
+        b32_calls=sum(int(r['b32_calls']) for r in finals),
+        successful_transfers=sum(json.loads(r['diagnostic']).get('successful_transfers', 0) for r in finals))), flush=True)
+    return finals
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -5531,7 +5738,8 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'imitation-conflict-core-pilot':imitation_conflict_core_pilot()
+    if args.stage == 'imitation-conflict-load-pilot':imitation_conflict_load_pilot()
+    elif args.stage == 'imitation-conflict-core-pilot':imitation_conflict_core_pilot()
     elif args.stage in ('imitation-priority-vnd','imitation-deadlock-pilot'):priority_pilot()
     elif args.stage == 'imitation-priority-diagnosis':priority_history_diagnosis()
     elif args.stage == 'imitation-loadfirst-screen':imitation_loadfirst_pilot(screen_only=True)

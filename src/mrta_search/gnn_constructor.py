@@ -2592,7 +2592,7 @@ def vnext_value_candidate_indices(space, plans, scores):
 
 def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending, config, *,
                         assignment_indices=None, preserve_prefix=False, feedback=None, prefer_start_recovery=True,
-                        fixed_directions=None, conflict_core=False):
+                        fixed_directions=None, conflict_core=False, assignment_targets=None):
     """Rank directed insertions of eight assignments, or twelve with feedback."""
     from .lns import joint_block_candidates, prefer_joint_legal_starts
 
@@ -2636,6 +2636,12 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                  else tuple(index for index in assignment_indices if index in positions))
     if conflict_core and assignment_indices is not None:
         shortlist = tuple(sorted(shortlist, key=lambda i: -float(logits[positions[i]])))[:12]
+    targeted = tuple(index for parent in pending for index in (assignment_targets or {}).get(parent, ())
+                     if index in positions)
+    if conflict_core and targeted:
+        # Directed Relocate/Swap actions remain available even when their learned
+        # logits fall outside the ordinary twelve-assignment shortlist.
+        shortlist = tuple(dict.fromkeys((*targeted, *shortlist)))
     before_move = features.new_tensor([sum(arcs) for arcs in state.arc_costs])
     x_low = [min((min(blocks[b].start[0], blocks[b].end[0]) for b in route), default=math.inf)
              for route in state.routes]
@@ -2730,7 +2736,13 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
             if plans[i].assignment_index not in assignments:
                 retained.append(i)
                 assignments.add(plans[i].assignment_index)
-        retained = tuple(dict.fromkeys((*retained, *order)))[:24]
+        mandatory, counts = [], {}
+        for i in order:
+            assignment = plans[i].assignment_index
+            if assignment in targeted and counts.get(assignment, 0) < 4:
+                mandatory.append(i)
+                counts[assignment] = counts.get(assignment, 0) + 1
+        retained = tuple(dict.fromkeys((*mandatory, *retained, *order)))[:24]
         return tuple(plans[i] for i in retained), scores[list(retained)]
     if load_first is not None:
         scores=imitation_joint_scores(space,embeddings,model,plans)

@@ -5118,8 +5118,8 @@ def test_conflict_pool_keeps_worse_deadlock_intermediate_and_orders_feasible_by_
     d1=(plan,ScheduleResult(ScheduleStatus.DEADLOCK),dict(candidate_id='old'))
     d2=(worse,ScheduleResult(ScheduleStatus.DEADLOCK),dict(candidate_id='new'))
     assert d2 in e.conflict_pool([d1],[d2])
-    f1=(plan,ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.),dict(candidate_id='f1'))
-    f2=(worse,ScheduleResult(ScheduleStatus.FEASIBLE,cmax=90.),dict(candidate_id='f2'))
+    f1=(plan,ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.),dict(candidate_id='f1',load_allowed=1))
+    f2=(worse,ScheduleResult(ScheduleStatus.FEASIBLE,cmax=90.),dict(candidate_id='f2',load_allowed=1))
     assert e.conflict_pool([f1],[f2])[0] is f2
     assert e.conflict_pool([d1],[f2])[0] is f2
 
@@ -5177,4 +5177,81 @@ def test_conflict_case_counts_initial_b32_in_budget_reuses_complete_plans_and_co
     before=len(written)
     assert e.conflict_core_case('fixture',plan.solution.parents,20261110,None,None,budget=3)['stage']=='final'
     assert len(written)==before and len(calls)==3
+
+
+def test_conflict_pool_protects_load_allowed_origins_and_deduplicates_categories():
+    import run_gnn_weld_layout as e
+    _,plan=_priority_plan_fixture()
+
+    def variant(index):
+        bits=[list(values) for values in plan.directions]
+        robot=index%4
+        position=(index//4)%len(bits[robot])
+        bits[robot][position]^=1
+        return replace(plan,directions=tuple(tuple(values) for values in bits))
+
+    def entry(index,status,cmax=0.,allowed=0,peak=150.,spread=100.):
+        row=dict(candidate_id=f'c{index}',load_allowed=allowed,max_processing_s=peak,processing_spread_s=spread,
+                 load_limits=e.json.dumps(dict(pmax_limit_s=100.,spread_limit_s=50.)))
+        return variant(index),ScheduleResult(status,cmax=cmax if status is ScheduleStatus.FEASIBLE else None),row
+
+    fast=entry(0,ScheduleStatus.FEASIBLE,120.,1,100.,50.)
+    balanced=entry(1,ScheduleStatus.FEASIBLE,150.,1,90.,40.)
+    allowed_dead=entry(2,ScheduleStatus.DEADLOCK,allowed=1,peak=95.,spread=45.)
+    other_dead=entry(3,ScheduleStatus.DEADLOCK,allowed=0,peak=200.,spread=200.)
+    bad_fast=entry(4,ScheduleStatus.FEASIBLE,50.,0)
+    latest=entry(5,ScheduleStatus.FEASIBLE,60.,0)
+    pool=e.conflict_pool([fast,balanced,allowed_dead,other_dead,bad_fast],[latest])
+    assert len(pool)==6
+    assert pool[0] is fast and pool[1] is balanced
+    assert allowed_dead in pool and other_dead in pool and bad_fast in pool and latest in pool
+    keys=[e.plan_key(item[0].solution,item[0].directions) for item in pool]
+    assert len(set(keys))==len(keys)
+    # The balanced-Cmax duplicate must fall through to the next distinct plan.
+    assert e.conflict_pool([fast],[fast,balanced])[:2]==[fast,balanced]
+
+
+def _load_compensation_fixture(kind):
+    import run_gnn_weld_layout as e
+    from mrta_search import gnn_constructor as c
+    if kind=='relocate':
+        parents=(ParentWeld('a',(1.,9.),(3.,9.)),ParentWeld('e',(4.,9.),(6.,9.)),
+                 ParentWeld('b',(16.,9.),(17.,9.)),ParentWeld('c',(1.,2.),(2.,2.)),
+                 ParentWeld('d',(16.,2.),(17.,2.)))
+        routes={0:('a::whole','e::whole'),1:('b::whole',),2:('c::whole',),3:('d::whole',)}
+    else:
+        parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(4.,9.),(8.,9.)),
+                 ParentWeld('e',(14.,9.),(15.,9.)),ParentWeld('c',(1.,2.),(2.,2.)),
+                 ParentWeld('d',(16.,2.),(17.,2.)))
+        routes={0:('a::whole',),1:('b::whole','e::whole'),2:('c::whole',),3:('d::whole',)}
+    solution=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+                          routes,CONFIG,scope=FORMAL_SCOPE_V2)
+    current=c.JointCompletionResult(solution,tuple((0,)*len(route.block_ids) for route in solution.routes),(),0.)
+    space=c.parent_assignment_space(parents,CONFIG)
+    model=c.VNextGNN(16,4,workload_lookahead=True,joint_actions=True,imitation_balance=True).eval()
+    return e,current,space,model
+
+
+@pytest.mark.parametrize('kind', ['relocate','swap'])
+def test_conflict_compensation_completes_real_cross_robot_ownership(kind):
+    e,current,space,model=_load_compensation_fixture(kind)
+    compensated=e.conflict_compensation(current,space,(),set(),q=2,kind=kind,seed=0)
+    assert compensated is not None
+    removed,targets,feedback=compensated
+    assert len(targets)==(1 if kind=='relocate' else 2)
+    assert set(targets)<=set(removed) and len(removed)<=2
+    rebuilt,detail=e.conflict_construct(current.solution.parents,model,space,model.encode_static(space.graph),
+        dict(temporary_pmax_limit_s=10000.),current=current,removed=removed,targets=targets)
+    assert rebuilt is not None,detail
+    actual=e.conflict_actual_transfers(rebuilt,feedback)
+    assert len(actual)==len(targets)
+    before=e.gnn.assignment_targets(current.solution)
+    after=e.gnn.assignment_targets(rebuilt.solution)
+    for move in actual:
+        assert before[move['block_id']]==move['source']
+        assert after[move['block_id']]==move['destination']
+    # Compensation keeps each parent's existing pattern; only named children move.
+    assert rebuilt.solution.patterns==current.solution.patterns
+    unchanged=set(before)-{move['block_id'] for move in actual}
+    assert all(after[block]==before[block] for block in unchanged)
 

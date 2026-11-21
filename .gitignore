@@ -3,7 +3,3 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 /data/local/ppo_smokeset/
-results/new_dataset_final/gnn_loadfirst_pilot.csv
-results/new_dataset_final/gnn_conflict_core_pilot.csv
-results/new_dataset_final/gnn_loadfirst_pilot.csv
-results/new_dataset_final/gnn_conflict_core_pilot.csv
