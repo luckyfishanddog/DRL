@@ -6251,6 +6251,15 @@ JOINT3_FIELDS = (*CONFLICT_LOAD_FIELDS, 'beam_width', 'core_size', 'route_lb_s',
 JOINT3_TRAINING_FIELDS = ('stage', 'layout_id', 'parent_count', 'seed', 'method', 'epoch', 'loss',
     'ranking_accuracy', 'pairs', 'updates', 'gradient_norm', 'learning_rate', 'candidates', 'b32_calls',
     'construct_s', 'b32_s', 'runtime_s', 'diagnostic')
+# Load-keeping / deadlock-repair stage: same operator, no new network, no new scheduler.
+JOINT3B_METHOD = 'GNN-Joint3-LoadKeep-Repair'
+JOINT3B_RESULTS = FINAL_RESULTS/'gnn_joint3_loadkeep.csv'
+JOINT3B_TOLERANCE = 1.0
+JOINT3B_TRAIN_CASES = ('train_52', 'scale_train_0482', 'scale_train_0973',
+                       'scale_train_0214', 'scale_train_0617', 'scale_train_0268')
+JOINT3B_FIELDS = (*JOINT3_FIELDS, 'variant', 'phase', 'final_choice', 'r_c_pct',
+                  'alt_cmax_balanced_s', 'alt_cmax_best_s', 'alt_cmax_balance_s',
+                  'deadlock_origins', 'deadlock_repairs', 'cmax_tolerance_pct')
 JOINT3_FORBIDDEN_SOURCES = frozenset((
     'IMITATION_MODEL', 'CYCLE_MODEL', 'EXPANDED_MODEL', 'IMITATION_RESULTS', 'CYCLE_RESULTS',
     'CONFLICT_RESULTS', 'CONFLICT_LOAD_RESULTS', 'LOADFIRST_RESULTS', 'ROUTEAWARE_RESULTS', 'PPO_RESULTS',
@@ -6364,6 +6373,18 @@ def joint3_load_limits(name, references, gnn_peak, gnn_spread=None):
             spread_limit_s=max(max(spreads), gnn_spread, .10*median((*peaks, float(gnn_peak)))),
             temporary_pmax_limit_s=1.20*1.05*three, gnn_peak=float(gnn_peak), gnn_spread=gnn_spread,
             rule='same formula with this experiment original GNN construction as third reference; reported only'))
+
+
+def joint3_relative_limits(state):
+    """TRAIN-only relative guard (the training-label rule); used because TRAIN has no frozen reference."""
+    peak = max(state.loads)
+    spread = peak-min(state.loads)
+    rule = 'TRAIN-only relative guard: Pmax <= 1.01*initial Pmax; spread <= initial spread+20 s'
+    limits = dict(pmax_limit_s=1.01*peak, spread_limit_s=spread+20.,
+                  temporary_pmax_limit_s=1.20*1.01*peak, reference_processing={},
+                  reference_peaks={}, rule=rule)
+    limits['three_reference'] = dict(limits, rule=rule)
+    return limits
 
 
 def joint3_training_limits(state):
@@ -6638,6 +6659,220 @@ def joint3_pool(entries, latest, *, width=6):
     return chosen
 
 
+def joint3b_ratio(entry):
+    """Normalized load pressure max(Pmax/limit, spread/limit); <=1 means load-qualified."""
+    return conflict_load_balance(entry)[0]
+
+
+def joint3b_deadlock_signature(entry):
+    """Measured blocked-parent set of a DEADLOCK state, used only for core diversity."""
+    return frozenset(parent for event in entry[1].deadlock_blockages
+                     for parent in event.blocked_parent_ids)
+
+
+def joint3b_pool(entries, latest, *, width=6):
+    """Six protected states: a DEADLOCK can never displace a FEASIBLE state."""
+    by_key = {}
+    for entry in (*entries, *latest):
+        if entry[1].status not in (ScheduleStatus.FEASIBLE, ScheduleStatus.DEADLOCK):
+            continue
+        by_key[plan_key(entry[0].solution, entry[0].directions)] = entry
+    feasible = [entry for entry in by_key.values() if entry[1].feasible]
+    balanced = [entry for entry in feasible if int(entry[2].get('load_allowed') or 0)]
+    deadlocks = sorted((entry for entry in by_key.values()
+                        if entry[1].status is ScheduleStatus.DEADLOCK),
+                       key=lambda entry: tuple(-value for value in conflict_deadlock_progress(entry)))
+    first = deadlocks[0] if deadlocks else None
+    first_signature = joint3b_deadlock_signature(first) if first is not None else None
+    other = next((entry for entry in deadlocks
+                  if joint3b_deadlock_signature(entry) != first_signature), None)
+    latest_keys = [plan_key(entry[0].solution, entry[0].directions) for entry in reversed(latest)
+                   if plan_key(entry[0].solution, entry[0].directions) in by_key]
+    categories = [
+        sorted(balanced, key=lambda entry: entry[1].cmax),
+        sorted(feasible, key=lambda entry: entry[1].cmax),
+        sorted(feasible, key=lambda entry: (joint3b_ratio(entry), entry[1].cmax)),
+        [first] if first is not None else [],
+        [other] if other is not None else [],
+        [by_key[key] for key in latest_keys[:1]],
+    ]
+    fallback = [*sorted(feasible, key=lambda entry: entry[1].cmax), *deadlocks,
+                *sorted(by_key.values(), key=lambda entry: (0, entry[1].cmax) if entry[1].feasible
+                        else (1, *(-value for value in conflict_deadlock_progress(entry))))]
+    chosen, keys = [], set()
+
+    def add(entry):
+        if entry is None or len(chosen) >= width:
+            return False
+        key = plan_key(entry[0].solution, entry[0].directions)
+        if key in keys:
+            return False
+        chosen.append(entry)
+        keys.add(key)
+        return True
+
+    cursors = [0]*len(categories)
+    while len(chosen) < width:
+        added = False
+        for index, category in enumerate(categories):
+            while cursors[index] < len(category):
+                if add(category[cursors[index]]):
+                    added = True
+                cursors[index] += 1
+                if added or len(chosen) >= width:
+                    break
+            if len(chosen) >= width:
+                break
+        if not added:
+            break
+    for entry in fallback:
+        if len(chosen) >= width:
+            break
+        add(entry)
+    return chosen
+
+
+def joint3b_deadlock_choice(current, schedule, model, space, embeddings, *, seed, q):
+    """Rank real B32 blocked/blocker cores by measured coverage; the GNN only breaks ties."""
+    known = set(space.parent_ids)
+    all_blocks = block_map(current.solution, CONFIG, scope=FORMAL_SCOPE_V2)
+    records = []
+    for event in schedule.deadlock_blockages:
+        for operation, parents in zip(event.blocker_operations, event.blocker_parent_ids):
+            blocked = set(event.blocked_parent_ids) & known
+            blockers = set(parents) & known
+            if operation is None or not blocked or not blockers:
+                continue
+            records.append(dict(event=event, operation=operation, core=blocked | blockers,
+                                blocked=blocked, blockers=blockers))
+    if not records:
+        return None, dict(source='B32 DEADLOCK', reason='no mapped blocked/blocker parent core')
+    union = set().union(*(record['core'] for record in records))
+    partial = lns._remove_parent_set(current.solution, union)
+    kept = {p.parent_id: p for p in current.solution.patterns if p.parent_id not in union}
+    kept_blocks = {b.block_id: b for p in kept.values() for b in space.children[p]}
+    old_bits = {b: d for route, bits in zip(current.solution.routes, current.directions)
+                for b, d in zip(route.block_ids, bits)}
+    state = lns.oriented_route_state(partial.routes,
+        tuple(tuple(old_bits[b] for b in route) for route in partial.routes), kept_blocks, CONFIG)
+    indices, logits = model.assignment_logits(space, embeddings, state, kept_blocks, union, CONFIG)
+    priorities = {parent: -math.inf for parent in union}
+    for index, score in zip(indices.tolist(), logits.tolist()):
+        parent = space.actions[index].parent_id
+        priorities[parent] = max(priorities[parent], score)
+
+    def gnn_priority(record):
+        return sum(priorities[parent] for parent in record['core'])/len(record['core'])
+
+    records.sort(key=lambda record: (-len(record['core']), -len(record['blocked']),
+                                     -gnn_priority(record), record['event'].robot_id,
+                                     record['operation'].operation_id))
+    tier = [record for record in records
+            if (len(record['core']), len(record['blocked']))
+            == (len(records[0]['core']), len(records[0]['blocked']))]
+    chosen = tier[seed % len(tier)]
+    removed = set(chosen['core'])
+    # Necessary neighbours come only from the blocked MOVE endpoints, not from
+    # every core parent, so the reconstruction does not grow without evidence.
+    blocked_blocks = set(chosen['event'].blocked_block_ids)
+    neighbours = []
+    for route in current.solution.routes:
+        for position, block in enumerate(route.block_ids):
+            if block in blocked_blocks:
+                for offset in (-1, 1):
+                    if 0 <= position+offset < len(route.block_ids):
+                        neighbours.append(all_blocks[route.block_ids[position+offset]].parent_id)
+    for parent in dict.fromkeys(neighbours):
+        if len(removed) >= max(q, len(chosen['core'])):
+            break
+        removed.add(parent)
+    if not removed:
+        return None, dict(source='B32 DEADLOCK', reason='empty measured deadlock core')
+    return lns._remove_parent_set(current.solution, removed), dict(
+        source='structured B32 DEADLOCK (blocked/blocker coverage first)',
+        operator='joint3b_deadlock_core', blocked_robot=chosen['event'].robot_id,
+        blocked_operation=asdict(chosen['event'].blocked_operation),
+        blocked_parents=sorted(chosen['blocked']), blocker_parents=sorted(chosen['blockers']),
+        blocked_MOVE_endpoints=chosen['event'].blocked_block_ids,
+        blocker_operation=asdict(chosen['operation']), core=sorted(chosen['core']),
+        gnn_core_priority={parent: priorities[parent] for parent in chosen['core']},
+        evidence_coverage=len(chosen['core']), blocked_count=len(chosen['blocked']),
+        necessary_neighbours=sorted(removed-chosen['core']),
+        evidence_source=schedule.deadlock_evidence_source)
+
+
+def joint3b_core(current, schedule, model, space, embeddings, blockers, *, seed, q):
+    if schedule.status is ScheduleStatus.FEASIBLE:
+        partial, feedback = lns.select_routeaware_bottleneck(current.solution, current.directions, schedule,
+            blockers, CONFIG, q=q, seed=seed, assignment_space=space)
+        return partial, dict(feedback, operator='select_routeaware_bottleneck')
+    if schedule.status is ScheduleStatus.DEADLOCK:
+        return joint3b_deadlock_choice(current, schedule, model, space, embeddings, seed=seed, q=q)
+    return None, dict(reason='B32 returned neither FEASIBLE nor DEADLOCK')
+
+
+def joint3b_select_final(entries, tolerance=JOINT3B_TOLERANCE):
+    """Keep the balanced, the Cmax-best and the balance-best FEASIBLE state, then choose."""
+    feasible = [entry for entry in entries if entry[1].feasible]
+    balanced = [entry for entry in feasible if int(entry[2].get('load_allowed') or 0)]
+    best_balanced = min(balanced, key=lambda entry: entry[1].cmax) if balanced else None
+    best_cmax = min(feasible, key=lambda entry: entry[1].cmax) if feasible else None
+    best_balance = min(feasible, key=lambda entry: (joint3b_ratio(entry), entry[1].cmax)) if feasible else None
+    ratio, choice, chosen = None, None, None
+    if best_cmax is not None:
+        if best_balanced is not None:
+            ratio = (best_balanced[1].cmax-best_cmax[1].cmax)/best_cmax[1].cmax*100.
+            if ratio <= tolerance+1e-9:
+                chosen, choice = best_balanced, 'balanced'
+            else:
+                chosen, choice = best_cmax, 'cmax'
+        else:
+            chosen, choice = best_cmax, 'cmax'
+    return dict(chosen=chosen, choice=choice, best_balanced=best_balanced, best_cmax=best_cmax,
+                best_balance=best_balance, r_c_pct=ratio)
+
+
+def joint3b_write(rows):
+    """The new-stage CSV; the Joint3 CSV is never written by this path."""
+    import msvcrt
+    if not rows:
+        return
+    with JOINT3B_RESULTS.open('a+', encoding='utf-8', newline='') as stream:
+        stream.seek(0)
+        msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            stream.seek(0, 2)
+            writer = csv.DictWriter(stream, fieldnames=JOINT3B_FIELDS)
+            if stream.tell() == 0:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key) for key in JOINT3B_FIELDS})
+            stream.flush()
+        finally:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def joint3b_failure_final(name, parent_count, seed, entries, *, calls, started, run, phase):
+    """Explicit failure row: no DEADLOCK is ever reported as a successful final."""
+    deadlocks = [entry for entry in entries if entry[1].status is ScheduleStatus.DEADLOCK]
+    best = max(deadlocks, key=conflict_deadlock_progress) if deadlocks else None
+    return dict(stage='final', layout_id=name, seed=seed, method=JOINT3B_METHOD, variant='joint3b',
+        phase=phase, parent_count=parent_count, status='NO_FEASIBLE_SOLUTION', cmax_s=None,
+        load_allowed=0, load_allowed_three_ref=0, b32_calls=calls,
+        runtime_s=time.perf_counter()-started, candidate_id='final', run_id=run,
+        final_choice='none', removed_parent_ids='[]', feedback='{}',
+        diagnostic=json.dumps(dict(reason='no B32 FEASIBLE candidate inside the budget',
+            final_status='NO_FEASIBLE_SOLUTION', evaluated=len(entries),
+            deadlock_candidates=len(deadlocks),
+            best_deadlock=None if best is None else dict(
+                candidate_id=best[2]['candidate_id'], progress=conflict_deadlock_progress(best),
+                blocked_parents=sorted(joint3b_deadlock_signature(best)),
+                blocked_operations=len(best[1].deadlock_blockages),
+                deadlock_blockages=json.loads(best[2]['deadlock_blockages'] or '[]'),
+                feedback=json.loads(best[2]['feedback'] or '{}'))), ensure_ascii=False))
+
+
 def joint3_write(rows):
     """One existing CSV; an ordinary byte lock permits concurrent validation workers."""
     import msvcrt
@@ -6673,10 +6908,16 @@ def joint3_training_write(rows):
 
 @torch.no_grad()
 def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
-                max_attempts=JOINT3_ATTEMPTS, limits=None, write=True):
-    finished = [row for row in read_rows(JOINT3_RESULTS) if row.get('layout_id') == name
-                and row.get('method') == JOINT3_METHOD and row.get('stage') == 'final'
-                and int(row.get('seed') or 0) == seed]
+                max_attempts=JOINT3_ATTEMPTS, limits=None, write=True,
+                variant='joint3', sink='joint3', phase='validation',
+                tolerance=JOINT3B_TOLERANCE, limit_mode='reference'):
+    method = JOINT3B_METHOD if variant == 'joint3b' else JOINT3_METHOD
+    writer = joint3b_write if sink == 'loadkeep' else joint3_write
+    pool_fn = joint3b_pool if variant == 'joint3b' else joint3_pool
+    core_fn = joint3b_core if variant == 'joint3b' else joint3_core
+    finished = [row for row in read_rows(JOINT3B_RESULTS if sink == 'loadkeep' else JOINT3_RESULTS)
+                if row.get('layout_id') == name and row.get('method') == method
+                and row.get('stage') == 'final' and int(row.get('seed') or 0) == seed]
     if finished:
         return finished[-1]
     started = time.perf_counter()
@@ -6684,27 +6925,30 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
     embeddings = model.encode_static(space.graph)
     seen, blockers, visited, entries, pending_rows = {}, {}, set(), [], []
     calls, attempts, stale = 0, 0, 0
+    deadlock_origins, deadlock_repairs = 0, 0
     run = f'{name}-{seed}-{int(started)}'
     failures, core_sizes = Counter(), Counter()
 
     def flush():
         if write and pending_rows:
-            joint3_write(pending_rows)
+            writer(pending_rows)
             pending_rows.clear()
 
     initial = build_joint(parents, model, space=space, embeddings=embeddings)
     if initial.solution is None:
-        final = dict(stage='final', layout_id=name, seed=seed, method=JOINT3_METHOD,
-            parent_count=len(parents), status='CONSTRUCTION_FAILED', cmax_s=None, load_allowed=0,
-            runtime_s=time.perf_counter()-started, b32_calls=0, candidate_id='final', run_id=run,
-            diagnostic=json.dumps(dict(reason=initial.rejection_reason, algorithm=JOINT3_METHOD)))
+        final = dict(stage='final', layout_id=name, seed=seed, method=method,
+            variant=variant, phase=phase, parent_count=len(parents), status='CONSTRUCTION_FAILED',
+            cmax_s=None, load_allowed=0, runtime_s=time.perf_counter()-started, b32_calls=0,
+            candidate_id='final', run_id=run,
+            diagnostic=json.dumps(dict(reason=initial.rejection_reason, algorithm=method)))
         if write:
-            joint3_write([final])
+            writer([final])
         return final
     gnn_state = cycle_route_state(initial)
     gnn_peak = max(gnn_state.loads)
     gnn_spread = gnn_peak-min(gnn_state.loads)
-    limits = joint3_load_limits(name, references, gnn_peak, gnn_spread) if limits is None else limits
+    limits = (joint3_relative_limits(gnn_state) if limit_mode == 'relative' else
+              joint3_load_limits(name, references, gnn_peak, gnn_spread)) if limits is None else limits
 
     def incumbent_cmax():
         values = [entry[1].cmax for entry in entries
@@ -6726,7 +6970,7 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
         if schedule is None or schedule.status not in (ScheduleStatus.FEASIBLE, ScheduleStatus.DEADLOCK):
             return None
         modes, owners = ({}, {}) if origin is None else conflict_changes(origin[0], result, removed)
-        row = routeaware_result_row(name, JOINT3_METHOD, result, schedule, blockers.get(key, ()),
+        row = routeaware_result_row(name, method, result, schedule, blockers.get(key, ()),
             stage=stage, candidate_id=candidate_id,
             origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
             removed_parent_ids=json.dumps(list(removed)), feedback=json.dumps(feedback or {}),
@@ -6743,7 +6987,8 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
                                   and schedule.feasible),
             transfer_count=0, transfer_details='[]', pool_ids='', run_id=run)
         row.update(seed=seed, load_allowed=int(conflict_load_allowed(row, limits)),
-                   load_allowed_three_ref=int(conflict_load_allowed(row, limits['three_reference'])))
+                   load_allowed_three_ref=int(conflict_load_allowed(row, limits['three_reference'])),
+                   variant=variant, phase=phase)
         if stage != 'final':
             row['schedule'] = None
             row['wait_blockers'] = None
@@ -6763,20 +7008,44 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
         load_allowed=initial_entry[2]['load_allowed'],
         load_allowed_three_ref=initial_entry[2]['load_allowed_three_ref'])), flush=True)
     flush()
-    pool = joint3_pool([], [initial_entry])
+    pool = pool_fn([], [initial_entry])
     expanded = set()
     while calls < budget and attempts < max_attempts and stale < JOINT3_STALE:
         attempts += 1
-        origin = pool[(attempts-1) % len(pool)]
+        origin = core = feedback = removed = None
+        if variant == 'joint3b':
+            # Prefer a pool state whose measured core for this round is still
+            # unexpanded, so the same deadlock measurement is not repaired twice.
+            for offset in range(len(pool)):
+                candidate = pool[(attempts-1+offset) % len(pool)]
+                candidate_key = plan_key(candidate[0].solution, candidate[0].directions)
+                candidate_core, candidate_feedback = core_fn(candidate[0], candidate[1], model, space,
+                    embeddings, blockers.get(candidate_key, ()), seed=seed+attempts*7919, q=JOINT3_CORE)
+                if candidate_core is None:
+                    continue
+                candidate_removed = tuple(candidate_core.removed_parent_ids)
+                if (candidate_key, tuple(sorted(candidate_removed))) in expanded:
+                    continue
+                origin, core, feedback, removed = (candidate, candidate_core, candidate_feedback,
+                                                   candidate_removed)
+                break
+            if origin is None:
+                failures['every measured core of the current pool is expanded'] += 1
+                stale += 1
+                continue
+        else:
+            origin = pool[(attempts-1) % len(pool)]
+            current, schedule, _ = origin
+            origin_key = plan_key(current.solution, current.directions)
+            core, feedback = core_fn(current, schedule, model, space, embeddings,
+                blockers.get(origin_key, ()), seed=seed+attempts*7919, q=JOINT3_CORE)
+            if core is None:
+                failures[feedback.get('reason', 'empty measured core')] += 1
+                stale += 1
+                continue
+            removed = tuple(core.removed_parent_ids)
         current, schedule, origin_row = origin
         origin_key = plan_key(current.solution, current.directions)
-        core, feedback = joint3_core(current, schedule, model, space, embeddings,
-            blockers.get(origin_key, ()), seed=seed+attempts*7919, q=JOINT3_CORE)
-        if core is None:
-            failures[feedback.get('reason', 'empty measured core')] += 1
-            stale += 1
-            continue
-        removed = tuple(core.removed_parent_ids)
         expansion = (origin_key, tuple(sorted(removed)))
         if expansion in expanded:
             # This measured core of this state was already rebuilt; do not spend
@@ -6786,6 +7055,8 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
             continue
         expanded.add(expansion)
         core_sizes[len(removed)] += 1
+        if schedule.status is ScheduleStatus.DEADLOCK:
+            deadlock_origins += 1
         measured = joint3_feedback(current, schedule, blockers.get(origin_key, ()), removed)
         candidates, detail = joint3_reconstruct(parents, model, space, embeddings, current, removed,
                                                 limits, measured, width=JOINT3_BEAM)
@@ -6817,28 +7088,39 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
             stale += 1
         else:
             stale = 0
-            entries.extend(new)
-            pool = joint3_pool(pool, new)
+            pool = pool_fn(pool, new)
+            deadlock_repairs += sum(int(entry[2].get('successful_repair') or 0) for entry in new)
         print('JOINT3_ROUND', json.dumps(dict(layout_id=name, seed=seed, round=attempts,
             core=list(removed), core_size=len(removed), candidates=len(candidates),
             admissible=len(admissible), b32_calls=calls, incumbent_s=None if not math.isfinite(incumbent) else incumbent,
             pool=[entry[2]['candidate_id'] for entry in pool])), flush=True)
         flush()
-    admissible = [entry for entry in entries
-                  if entry[1].feasible and int(entry[2].get('load_allowed') or 0)]
-    feasible_entries = [entry for entry in entries if entry[1].feasible]
-    # The formal final is the minimum real Cmax among load-qualified FEASIBLE
-    # candidates.  When no candidate reaches the ceiling, the reported fallback is
-    # the best non-qualified FEASIBLE plan, then the best measured DEADLOCK state;
-    # the load flag stays false, so this never relaxes the constraint.
-    best = (min(admissible, key=lambda entry: entry[1].cmax) if admissible else
-            min(feasible_entries, key=lambda entry: entry[1].cmax) if feasible_entries else
-            max(entries, key=conflict_deadlock_progress))
+    state = joint3b_select_final(entries, tolerance)
+    if variant == 'joint3b':
+        if state['chosen'] is None:
+            # Final deadlock protection: an explicit failure, never a DEADLOCK final.
+            final = joint3b_failure_final(name, len(parents), seed, entries, calls=calls,
+                                          started=started, run=run, phase=phase)
+            if write:
+                writer([final])
+            print('JOINT3B_FINAL', json.dumps({key: final.get(key) for key in
+                ('layout_id', 'seed', 'status', 'cmax_s', 'b32_calls', 'runtime_s')}), flush=True)
+            return final
+        best = state['chosen']
+        operator = 'joint3b-final-'+str(state['choice'])
+    else:
+        admissible = [entry for entry in entries
+                      if entry[1].feasible and int(entry[2].get('load_allowed') or 0)]
+        feasible_entries = [entry for entry in entries if entry[1].feasible]
+        best = (min(admissible, key=lambda entry: entry[1].cmax) if admissible else
+                min(feasible_entries, key=lambda entry: entry[1].cmax) if feasible_entries else
+                max(entries, key=conflict_deadlock_progress))
+        operator = 'joint3-final'
     best_key = plan_key(best[0].solution, best[0].directions)
     modes, owners = conflict_changes(initial, best[0], space.parent_ids)
-    final = routeaware_result_row(name, JOINT3_METHOD, best[0], best[1], blockers.get(best_key, ()),
+    final = routeaware_result_row(name, method, best[0], best[1], blockers.get(best_key, ()),
         stage='final', candidate_id='final', origin_id=best[2]['candidate_id'],
-        operator='joint3-final', removed_parent_ids=best[2]['removed_parent_ids'],
+        operator=operator, removed_parent_ids=best[2]['removed_parent_ids'],
         feedback=best[2]['feedback'], construct_s=best[0].inference_seconds, b32_s=0.,
         runtime_s=time.perf_counter()-started, b32_calls=calls, gnn_score=best[2]['gnn_score'],
         load_limits=json.dumps(limits), mode_changes=json.dumps(modes),
@@ -6847,14 +7129,22 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
         beam_width=JOINT3_BEAM, core_size=best[2]['core_size'],
         feedback_features=best[2]['feedback_features'], load_allowed_three_ref=best[2]['load_allowed_three_ref'],
         load_limits_three_ref=best[2]['load_limits_three_ref'], successful_repair=best[2]['successful_repair'],
-        transfer_count=0, transfer_details='[]', pool_ids='', run_id=run)
+        transfer_count=0, transfer_details='[]', pool_ids='', run_id=run, variant=variant, phase=phase,
+        final_choice='joint3-balanced-first' if variant == 'joint3' else state['choice'],
+        r_c_pct=state['r_c_pct'],
+        alt_cmax_balanced_s=None if state['best_balanced'] is None else state['best_balanced'][1].cmax,
+        alt_cmax_best_s=None if state['best_cmax'] is None else state['best_cmax'][1].cmax,
+        alt_cmax_balance_s=None if state['best_balance'] is None else state['best_balance'][1].cmax,
+        deadlock_origins=deadlock_origins, deadlock_repairs=deadlock_repairs,
+        cmax_tolerance_pct=tolerance)
     final.update(seed=seed, load_allowed=int(conflict_load_allowed(final, limits)),
                  load_allowed_three_ref=int(conflict_load_allowed(final, limits['three_reference'])))
     evaluated = len(entries)
     deadlocks = sum(entry[1].status is ScheduleStatus.DEADLOCK for entry in entries)
     feasible = sum(entry[1].feasible for entry in entries)
     load_allowed = sum(int(entry[2].get('load_allowed') or 0) for entry in entries)
-    final['diagnostic'] = json.dumps(dict(algorithm=JOINT3_METHOD, run_id=run, budget=budget,
+    balanced_exists = state['best_balanced'] is not None
+    final['diagnostic'] = json.dumps(dict(algorithm=method, run_id=run, variant=variant, budget=budget,
         max_attempts=max_attempts, attempts=attempts,
         stop='B32 budget exhausted' if calls >= budget else
              'outer attempts exhausted' if attempts >= max_attempts else 'no new legal core candidate',
@@ -6862,7 +7152,17 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
         deadlock_candidates=deadlocks, deadlock_rate=deadlocks/max(1, evaluated),
         feasible_candidates=feasible, feasible_rate=feasible/max(1, evaluated),
         load_allowed_candidates=load_allowed, load_allowed_rate=load_allowed/max(1, evaluated),
+        deadlock_origins=deadlock_origins, deadlock_repairs=deadlock_repairs,
+        deadlock_repair_rate=deadlock_repairs/max(1, deadlock_origins),
         final_feasible=int(best[1].feasible), final_from_initial=best[0] is initial,
+        final_choice=final['final_choice'], r_c_pct=state['r_c_pct'],
+        choice_at_0p5=('balanced' if balanced_exists and state['r_c_pct'] is not None
+                       and state['r_c_pct'] <= 0.5+1e-9 else 'cmax'),
+        choice_at_1p0=('balanced' if balanced_exists and state['r_c_pct'] is not None
+                       and state['r_c_pct'] <= 1.0+1e-9 else 'cmax'),
+        alt_cmax_balanced_s=final['alt_cmax_balanced_s'],
+        alt_cmax_best_s=final['alt_cmax_best_s'],
+        alt_cmax_balance_s=final['alt_cmax_balance_s'],
         core_size_counts=dict(sorted(core_sizes.items())), failures=failures,
         final_core=json.loads(final['removed_parent_ids']), final_feedback=json.loads(final['feedback']),
         final_feedback_features=json.loads(final['feedback_features'] or 'null'),
@@ -6871,10 +7171,10 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
         evaluation='original FORMAL_SCOPE_V2 B32; no priority_schedule; no HGA/WAG candidate source',
         construction_source='original GNN_VNEXT_WORKLOAD'), ensure_ascii=False)
     if write:
-        joint3_write([final])
+        writer([final])
     print('JOINT3_FINAL', json.dumps({key: final.get(key) for key in
-        ('layout_id', 'seed', 'status', 'cmax_s', 'max_processing_s', 'load_allowed',
-         'load_allowed_three_ref', 'b32_calls', 'runtime_s')}), flush=True)
+        ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'max_processing_s', 'load_allowed',
+         'load_allowed_three_ref', 'final_choice', 'r_c_pct', 'b32_calls', 'runtime_s')}), flush=True)
     return final
 
 
@@ -7074,6 +7374,141 @@ def joint3_validation(workers=4, seeds=JOINT3_SEEDS):
     return finals
 
 
+def joint3b_job(payload):
+    configure_cpu()
+    name, parents, seed, variant, phase, weights, budget, limit_mode = payload
+    model = joint3_model(weights).eval()
+    model.requires_grad_(False)
+    return joint3_case(name, parents, seed, model, joint3_references(), budget=budget,
+                       variant=variant, sink='loadkeep', phase=phase, limit_mode=limit_mode)
+
+
+def joint3b_train_stage(workers=1, seeds=(SEED,), budget=JOINT3_BUDGET):
+    """Stage 1: six TRAIN layouts, original Joint3 against the load-keeping variant."""
+    layouts = dict(ppo_layouts('train'))
+    missing = [name for name in JOINT3B_TRAIN_CASES if name not in layouts]
+    if missing:
+        raise ValueError(f'missing TRAIN layouts: {missing}')
+    weights = torch.load(JOINT3_MODEL, map_location='cpu', weights_only=True)['state_dict']
+    jobs = [(name, layouts[name], seed, variant, 'train', weights, budget, 'relative')
+            for name in JOINT3B_TRAIN_CASES for seed in seeds for variant in ('joint3', 'joint3b')]
+    if workers <= 1:
+        finals = [joint3b_job(job) for job in jobs]
+    else:
+        finals = []
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for future in as_completed([pool.submit(joint3b_job, job) for job in jobs]):
+                finals.append(future.result())
+    summary = joint3b_summary(phase='train')
+    print('JOINT3B_TRAIN_STAGE', json.dumps(summary, ensure_ascii=False), flush=True)
+    return finals
+
+
+def joint3b_validation(workers=4, seeds=JOINT3_SEEDS):
+    saved = torch.load(JOINT3_MODEL, map_location='cpu', weights_only=True)
+    if not saved.get('training_complete'):
+        raise ValueError('joint3 training is incomplete')
+    layouts = dict(load_layouts('validation'))
+    if set(layouts) != set(JOINT3_LAYOUTS):
+        raise ValueError('the official ten-layout VALIDATION split changed')
+    jobs = [(name, layouts[name], seed, 'joint3b', 'validation', saved['state_dict'], JOINT3_BUDGET,
+             'reference')
+            for name in JOINT3_LAYOUTS for seed in seeds]
+    if workers <= 1:
+        finals = [joint3b_job(job) for job in jobs]
+    else:
+        finals = []
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for future in as_completed([pool.submit(joint3b_job, job) for job in jobs]):
+                finals.append(future.result())
+    summary = joint3b_summary(phase='validation')
+    print('JOINT3B_VALIDATION_SUMMARY', json.dumps(summary, ensure_ascii=False), flush=True)
+    return finals
+
+
+def joint3b_summary(phase='train'):
+    """Paired comparison of the two variants on the same layouts and seeds."""
+    rows = [row for row in read_rows(JOINT3B_RESULTS) if row.get('phase') == phase]
+    finals = {(row['layout_id'], int(row['seed']), row['variant']): row
+              for row in rows if row.get('stage') == 'final'}
+    candidates = {}
+    for row in rows:
+        if row.get('stage') in ('initial', 'candidate'):
+            candidates.setdefault((row['layout_id'], int(row['seed']), row.get('variant')), []).append(row)
+    cases = sorted({(key[0], key[1]) for key in finals})
+    output = dict(phase=phase, cases=len(cases), variants={}, paired={}, tradeoff={})
+    for variant in ('joint3', 'joint3b'):
+        chosen = [row for key, row in finals.items() if key[2] == variant]
+        feasible = [row for row in chosen if row['status'] == 'FEASIBLE' and row.get('cmax_s') not in (None, '')]
+        load_ok = [row for row in feasible if int(row.get('load_allowed') or 0)]
+        rebuilt = [row for key, group in candidates.items() if key[2] == variant for row in group]
+        output['variants'][variant] = dict(
+            finals=len(chosen), feasible=len(feasible), load_allowed=len(load_ok),
+            deadlock_finals=sum(1 for row in chosen if row['status'] == 'DEADLOCK'),
+            explicit_failures=sum(1 for row in chosen
+                                  if row['status'] not in ('FEASIBLE', 'DEADLOCK')),
+            candidate_count=len(rebuilt),
+            deadlock_candidates=sum(1 for row in rebuilt if row['status'] == 'DEADLOCK'),
+            deadlock_repairs=sum(int(row.get('successful_repair') or 0) for row in rebuilt),
+            median_cmax_s=median([float(row['cmax_s']) for row in feasible]) if feasible else None,
+            median_runtime_s=median([float(row['runtime_s']) for row in chosen]) if chosen else None,
+            median_b32_calls=median([int(row['b32_calls']) for row in chosen]) if chosen else None)
+    deltas = []
+    for name, seed in cases:
+        old = finals.get((name, seed, 'joint3'))
+        new = finals.get((name, seed, 'joint3b'))
+        if old is None or new is None:
+            continue
+        if old['status'] == 'FEASIBLE' and new['status'] == 'FEASIBLE' \
+                and old.get('cmax_s') not in (None, '') and new.get('cmax_s') not in (None, ''):
+            old_cmax, new_cmax = float(old['cmax_s']), float(new['cmax_s'])
+            deltas.append(dict(layout_id=name, seed=seed, joint3_s=old_cmax, loadkeep_s=new_cmax,
+                               delta_pct=(new_cmax-old_cmax)/old_cmax*100.))
+    output['paired'] = dict(pairs=len(deltas),
+                            median_pct=median([item['delta_pct'] for item in deltas]) if deltas else None,
+                            wins=sum(1 for item in deltas if item['delta_pct'] < -1e-9),
+                            losses=sum(1 for item in deltas if item['delta_pct'] > 1e-9),
+                            ties=sum(1 for item in deltas if abs(item['delta_pct']) <= 1e-9),
+                            detail=deltas)
+    ratios = [float(row['r_c_pct']) for key, row in finals.items()
+              if key[2] == 'joint3b' and row.get('r_c_pct') not in (None, '')]
+    output['tradeoff'] = dict(cases_with_r_c=len(ratios),
+                              median_r_c_pct=median(ratios) if ratios else None,
+                              max_r_c_pct=max(ratios) if ratios else None,
+                              within_0p5=sum(1 for value in ratios if value <= 0.5+1e-9),
+                              within_1p0=sum(1 for value in ratios if value <= 1.0+1e-9),
+                              above_1p0=sum(1 for value in ratios if value > 1.0+1e-9))
+    if phase == 'validation':
+        references = joint3_references()
+        old_csv = {(row['layout_id'], int(row['seed'])): row for row in read_rows(JOINT3_RESULTS)
+                   if row.get('stage') == 'final' and row.get('method') == JOINT3_METHOD}
+        old_deltas = []
+        for key, row in finals.items():
+            if key[2] != 'joint3b' or row['status'] != 'FEASIBLE' or row.get('cmax_s') in (None, ''):
+                continue
+            old = old_csv.get((key[0], key[1]))
+            if old is None or old['status'] != 'FEASIBLE' or old.get('cmax_s') in (None, ''):
+                continue
+            old_deltas.append((float(row['cmax_s'])-float(old['cmax_s']))/float(old['cmax_s'])*100.)
+        output['vs_joint3'] = dict(pairs=len(old_deltas),
+                                   median_pct=median(old_deltas) if old_deltas else None,
+                                   wins=sum(1 for value in old_deltas if value < -1e-9),
+                                   losses=sum(1 for value in old_deltas if value > 1e-9))
+        for tag, method in (('HGA', 'HGA'), ('WAG', 'WAG+VNS')):
+            values = []
+            for key, row in finals.items():
+                if key[2] != 'joint3b' or row['status'] != 'FEASIBLE' or row.get('cmax_s') in (None, ''):
+                    continue
+                reference = references.get((key[0], method))
+                if reference is None:
+                    continue
+                values.append((float(row['cmax_s'])-reference['cmax_s'])/reference['cmax_s']*100.)
+            output[tag] = dict(pairs=len(values), median_pct=median(values) if values else None,
+                               wins=sum(1 for value in values if value < -1e-9),
+                               losses=sum(1 for value in values if value > 1e-9))
+    return output
+
+
 def joint3_summary():
     """Thirty paired VALIDATION comparisons against the frozen HGA/WAG+VNS results."""
     references = joint3_references()
@@ -7158,12 +7593,12 @@ def joint3_summary():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary','joint3b-train','joint3b-validation','joint3b-summary'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
-    parser.add_argument('--split', choices=('validation', 'test'), default='validation', help='baseline dataset')
+    parser.add_argument('--split', choices=('train', 'validation', 'test'), default='validation', help='baseline dataset')
     parser.add_argument('--representative', action='store_true', help='small/median/large layouts, first seed only')
     parser.add_argument('--rounds', type=int, choices=(1, 2, 3), default=3, help='maximum feedback rounds; stop if validation does not improve')
     parser.add_argument('--time-limit', type=float, choices=(EQUAL_TIME_LIMIT,),
@@ -7180,6 +7615,12 @@ def main():
         joint3_validation(args.workers)
     elif args.stage == 'joint3-summary':
         print('JOINT3_SUMMARY', json.dumps(joint3_summary(), ensure_ascii=False), flush=True)
+    elif args.stage == 'joint3b-train':
+        joint3b_train_stage(args.workers)
+    elif args.stage == 'joint3b-validation':
+        joint3b_validation(args.workers)
+    elif args.stage == 'joint3b-summary':
+        print('JOINT3B_SUMMARY', json.dumps(joint3b_summary(phase=args.split), ensure_ascii=False), flush=True)
     elif args.stage == 'imitation-cycle-transfer-pilot':imitation_cycle_transfer_pilot()
     elif args.stage == 'imitation-conflict-load-pilot':imitation_conflict_load_pilot()
     elif args.stage == 'imitation-conflict-core-pilot':imitation_conflict_core_pilot()

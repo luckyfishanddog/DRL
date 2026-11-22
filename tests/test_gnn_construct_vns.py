@@ -5455,3 +5455,104 @@ def test_joint3_reconstruct_keeps_legal_distinct_complete_plans_from_the_joint_a
         for plan in candidate['joint_plans']:
             assert plan.outcome.numel()==model.joint_weights.numel()
 
+
+def test_joint3b_pool_keeps_six_protected_states_and_never_evicts_feasible():
+    import types
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import ParentWeld, ScheduleStatus, SplitKind
+    from mrta_reference.solution import canonicalize
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    parents=(ParentWeld('a',(2.,9.),(6.,9.)),ParentWeld('b',(14.,9.),(18.,9.)),
+             ParentWeld('c',(2.,5.),(6.,5.)),ParentWeld('d',(14.,5.),(18.,5.)))
+    patterns=tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents)
+    routes={0:('a::whole',),1:('b::whole',),2:('c::whole',),3:('d::whole',)}
+    solution=canonicalize(parents,patterns,routes,CONFIG,scope=FORMAL_SCOPE_V2)
+    limits='{"pmax_limit_s": 100.0, "spread_limit_s": 10.0}'
+    def feasible(cmax,peak,spread,directions):
+        plan=type('Plan',(),{'solution':solution,'directions':directions})()
+        schedule=types.SimpleNamespace(status=ScheduleStatus.FEASIBLE,feasible=True,cmax=cmax,
+                                       deadlock_blockages=())
+        row=dict(max_processing_s=peak,processing_spread_s=spread,load_limits=limits,
+                 load_allowed=int(peak<=100.+1e-9 and spread<=10.+1e-9),candidate_id=f'f{cmax}')
+        return (plan,schedule,row)
+    def deadlock(progress,blocked,directions):
+        plan=type('Plan',(),{'solution':solution,'directions':directions})()
+        event=types.SimpleNamespace(robot_id=0,next_template_index=progress,blocked_parent_ids=blocked)
+        schedule=types.SimpleNamespace(status=ScheduleStatus.DEADLOCK,feasible=False,cmax=None,
+                                       deadlock_blockages=(event,))
+        row=dict(max_processing_s=50.,processing_spread_s=1.,load_limits=limits,load_allowed=1,
+                 candidate_id=f'd{progress}')
+        return (plan,schedule,row)
+    balanced=feasible(100.,99.,8.,((0,),(0,),(0,),(0,)))
+    unbalanced=feasible(120.,95.,5.,((1,),(0,),(0,),(0,)))
+    low_ratio=feasible(110.,80.,8.,((0,),(1,),(0,),(0,)))
+    same_core=deadlock(5,('a','b'),((0,),(1,),(0,),(0,)))
+    worse_core=deadlock(2,('a','b'),((1,),(1,),(0,),(0,)))
+    other_core=deadlock(3,('c',),((0,),(0,),(1,),(0,)))
+    pool=e.joint3b_pool([],[balanced,unbalanced,low_ratio,worse_core,other_core,same_core],width=6)
+    feasible_cmax={round(float(entry[1].cmax)) for entry in pool if entry[1].feasible}
+    # With a load-qualified state present, category 3 collapses onto category 1;
+    # the unqualified feasible state is still retained by the fallback fill.
+    assert {100,120}<=feasible_cmax
+    signatures={e.joint3b_deadlock_signature(entry) for entry in pool
+                if entry[1].status is ScheduleStatus.DEADLOCK}
+    assert signatures=={frozenset({'a','b'}),frozenset({'c'})}
+    kept=[entry for entry in pool if entry[1].status is ScheduleStatus.DEADLOCK
+          and e.joint3b_deadlock_signature(entry)==frozenset({'a','b'})]
+    assert kept and kept[0][1].deadlock_blockages[0].next_template_index==5
+    assert len(pool)<=6
+    # With nothing load-qualified, the best-ratio and the min-Cmax FEASIBLE are both kept.
+    pool=e.joint3b_pool([],[unbalanced,low_ratio],width=6)
+    assert {round(float(entry[1].cmax)) for entry in pool}=={110,120}
+
+
+def test_joint3b_select_final_respects_the_cmax_tolerance_and_fails_explicitly():
+    import types
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import ScheduleStatus
+    def entry(cmax,load_allowed,tag):
+        plan=type('Plan',(),{'solution':None,'directions':None})()
+        row=dict(max_processing_s=1.,processing_spread_s=0.,load_allowed=load_allowed,
+                 load_limits='{"pmax_limit_s": 100.0, "spread_limit_s": 10.0}',candidate_id=tag)
+        schedule=types.SimpleNamespace(status=ScheduleStatus.FEASIBLE,feasible=True,cmax=cmax)
+        return (plan,schedule,row)
+    balanced=entry(100.51,1,'balanced')
+    cmax_best=entry(100.0,0,'cmax')
+    strict=e.joint3b_select_final([balanced,cmax_best],tolerance=0.5)
+    assert strict['choice']=='cmax' and strict['chosen'] is cmax_best
+    assert strict['r_c_pct']==pytest.approx(0.51)
+    loose=e.joint3b_select_final([balanced,cmax_best],tolerance=1.0)
+    assert loose['choice']=='balanced' and loose['chosen'] is balanced
+    assert e.joint3b_select_final([balanced],tolerance=0.5)['choice']=='balanced'
+    empty=e.joint3b_select_final([],tolerance=1.0)
+    assert empty['chosen'] is None and empty['choice'] is None
+    failure=e.joint3b_failure_final('x',4,1,[],calls=3,started=time.perf_counter(),run='r',phase='train')
+    assert failure['status']=='NO_FEASIBLE_SOLUTION' and failure['cmax_s'] is None
+    assert failure['load_allowed']==0
+
+
+def test_joint3b_relative_limits_match_the_training_label_rule():
+    import types
+    import run_gnn_weld_layout as e
+    limits=e.joint3_relative_limits(types.SimpleNamespace(loads=(1000.,800.,900.,700.)))
+    assert limits['pmax_limit_s']==pytest.approx(1.01*1000.)
+    assert limits['spread_limit_s']==pytest.approx(300.+20.)
+    assert limits['temporary_pmax_limit_s']==pytest.approx(1.20*1.01*1000.)
+    assert limits['three_reference']['pmax_limit_s']==limits['pmax_limit_s']
+
+
+def test_joint3_old_path_still_reproduces_the_recorded_validation_01_final():
+    import run_gnn_weld_layout as e
+    e.configure_cpu()
+    torch.manual_seed(e.SEED)
+    layouts=dict(e.load_layouts('validation'))
+    weights=torch.load(e.JOINT3_MODEL,map_location='cpu',weights_only=True)['state_dict']
+    model=e.joint3_model(weights).eval()
+    model.requires_grad_(False)
+    row=e.joint3_case('validation_01',layouts['validation_01'],20261110,model,e.joint3_references(),
+                      budget=8,write=False,sink='loadkeep',phase='train')
+    assert row['status']=='FEASIBLE'
+    assert float(row['cmax_s'])==pytest.approx(6082.481009491802)
+    assert int(row['b32_calls'])==7
+    assert row['final_choice']=='joint3-balanced-first'
+
