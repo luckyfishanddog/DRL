@@ -5541,6 +5541,100 @@ def test_joint3b_relative_limits_match_the_training_label_rule():
     assert limits['three_reference']['pmax_limit_s']==limits['pmax_limit_s']
 
 
+def test_joint4_deadlock_signature_separates_blocker_robot_and_operation():
+    import types
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import OperationKind, ScheduleStatus
+
+    def entry(blocker_robot, blocker_id, blocked_robot=0):
+        blocked = types.SimpleNamespace(kind=OperationKind.MOVE, robot_id=blocked_robot)
+        event = types.SimpleNamespace(robot_id=blocked_robot, blocked_operation=blocked,
+            blocked_parent_ids=('a',), blocked_block_ids=('a::0',),
+            blocker_operation_ids=(blocker_id,), blocker_block_ids=('b::0',),
+            blocker_parent_ids=(('b',),), next_template_index=2)
+        return (None, types.SimpleNamespace(status=ScheduleStatus.DEADLOCK,
+                                            deadlock_blockages=(event,)), {})
+
+    base = e.joint4_deadlock_signature(entry(1, 'R1:B1:MOVE'))
+    assert base == e.joint4_deadlock_signature(entry(1, 'R1:B1:MOVE'))
+    assert base != e.joint4_deadlock_signature(entry(2, 'R2:B1:MOVE'))
+    assert base != e.joint4_deadlock_signature(entry(1, 'R1:B2:WELD'))
+    assert base != e.joint4_deadlock_signature(entry(1, 'R1:B1:MOVE', blocked_robot=3))
+
+
+def test_joint4_training_rank_uses_strict_positive_then_quality_then_cmax():
+    import run_gnn_weld_layout as e
+    initial_peak, initial_spread = 120., 40.
+    good = dict(status='FEASIBLE', cmax_s=1000., max_processing_s=110., processing_spread_s=19.)
+    bad_quality = dict(status='FEASIBLE', cmax_s=900., max_processing_s=130., processing_spread_s=35.)
+    better_quality = dict(status='FEASIBLE', cmax_s=1100., max_processing_s=118., processing_spread_s=24.)
+    deadlock = dict(status='DEADLOCK', cmax_s=None)
+    good_rank = e.joint4_training_rank(good, initial_peak, initial_spread)
+    bad_rank = e.joint4_training_rank(bad_quality, initial_peak, initial_spread)
+    better_rank = e.joint4_training_rank(better_quality, initial_peak, initial_spread)
+    weak_rank = e.joint4_training_rank(deadlock, initial_peak, initial_spread)
+    assert good_rank[0] == 0 and bad_rank[0] == 1 and weak_rank[0] == 2
+    assert good_rank < bad_rank and good_rank < weak_rank
+    # Within the feasible-but-not-good class the continuous load quality ranks first.
+    assert better_rank < bad_rank
+    assert weak_rank[1] == 0.0 and weak_rank[2] == 1e9
+
+
+def test_joint4_screen_prefers_native_values_and_keeps_every_candidate(monkeypatch):
+    import types
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import ScheduleStatus
+
+    def candidate(tag, native):
+        plan = types.SimpleNamespace(solution=tag, directions=())
+        return dict(plan=plan, score=-float(len(tag)), lb=0., native=native)
+
+    values = {'a': 100., 'b': 90., 'c': None}
+    monkeypatch.setattr(e, 'priority_schedule',
+        lambda solution, config, directions=None, **kwargs: types.SimpleNamespace(
+            status=ScheduleStatus.FEASIBLE if values[solution] is not None else ScheduleStatus.DEADLOCK,
+            cmax=values[solution]))
+    items = [candidate('a', 100.), candidate('b', 90.), candidate('c', None)]
+    ordered = e.joint4_screen(list(items), origin_native=200.)
+    assert [item['plan'].solution for item in ordered] == ['b', 'a', 'c']
+    assert ordered[0]['native_cmax'] == 90. and ordered[2]['native_cmax'] is None
+    ordered = e.joint4_screen(list(items), origin_native=None)
+    # No measured native reference: native-feasible plans first, then the GNN order.
+    assert ordered[-1]['plan'].solution == 'c'
+    assert len(ordered) == 3
+
+
+def test_joint4_bottleneck_core_covers_transfer_and_receiver_robots():
+    import run_gnn_weld_layout as e
+    e.configure_cpu()
+    torch.manual_seed(e.SEED)
+    layouts = dict(e.load_layouts('validation'))
+    parents = layouts['validation_07']
+    weights = torch.load(e.JOINT4_MODEL if e.JOINT4_MODEL.exists() else e.JOINT3_MODEL,
+                         map_location='cpu', weights_only=True)['state_dict']
+    model = e.joint4_model(weights).eval()
+    model.requires_grad_(False)
+    space = e.gnn.parent_assignment_space(parents, e.CONFIG)
+    embeddings = model.encode_static(space.graph)
+    initial = e.build_joint(parents, model, space=space, embeddings=embeddings)
+    seen, blockers = {}, {}
+    schedule, _ = e.evaluate_once(initial, seen, blocker_cache=blockers)
+    core, feedback = e.joint4_core(initial, schedule, model, space, embeddings, (),
+                                   seed=e.SEED, q=e.JOINT4_CORE)
+    removed = set(core.removed_parent_ids)
+    owners = {parent: robot for robot, route in enumerate(initial.solution.routes)
+              for parent in {block.split('::', 1)[0] for block in route.block_ids}}
+    robots = {owners[parent] for parent in removed}
+    critical = max(range(4), key=lambda robot: schedule.robot_completion[robot])
+    assert feedback['transfer_robot'] == critical
+    assert feedback['receiver_robot'] != critical
+    assert schedule.robot_completion[feedback['receiver_robot']] <= schedule.robot_completion[critical]
+    assert len(removed) == e.JOINT4_CORE
+    assert len(robots) >= 2
+    assert set(feedback['transfer_parents']) <= removed
+    assert set(feedback['receiver_parents']) <= removed
+
+
 def test_joint3_old_path_still_reproduces_the_recorded_validation_01_final():
     import run_gnn_weld_layout as e
     e.configure_cpu()
