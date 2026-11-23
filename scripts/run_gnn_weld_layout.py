@@ -7631,21 +7631,37 @@ def joint4_core(current, schedule, model, space, embeddings, blockers, *, seed, 
 
 
 def joint4_screen(candidates, origin_native):
-    """Attach the existing native coordinator value and order the shortlist."""
+    """Reserve one B32 slot for the GNN choice when native and GNN disagree.
+
+    The native priority scheduler can report DEADLOCK for plans accepted by B32.
+    Since the caller evaluates only the first two candidates with B32, blindly
+    ranking every native-feasible candidate first can discard a valid GNN choice.
+    This retains all candidates and does not use native as a feasibility filter.
+    """
     for candidate in candidates:
         native = priority_schedule(candidate['plan'].solution, CONFIG, candidate['plan'].directions)
         candidate['native_status'] = native.status.value
         candidate['native_cmax'] = (native.cmax if native.status is ScheduleStatus.FEASIBLE
                                     and native.cmax is not None else None)
+    if not candidates:
+        return candidates
     if origin_native is not None:
-        # The native coordinator is informative here (it equals B32 on interference-free plans).
-        candidates.sort(key=lambda candidate: (candidate['native_cmax'] is None,
-                                               candidate['native_cmax'] or math.inf,
-                                               -candidate['score']))
+        native_order = sorted(candidates, key=lambda candidate: (
+            candidate['native_cmax'] is None,
+            candidate['native_cmax'] if candidate['native_cmax'] is not None else math.inf,
+            -candidate['score']))
     else:
-        # Native deadlocks on the origin: keep native-feasible plans first, then the GNN order.
-        candidates.sort(key=lambda candidate: (candidate['native_cmax'] is None, -candidate['score']))
-    return candidates
+        native_order = sorted(candidates, key=lambda candidate: (
+            candidate['native_cmax'] is None, -candidate['score']))
+    gnn_order = sorted(candidates, key=lambda candidate: (-candidate['score'], candidate['lb']))
+    # First B32 slot: native-ranked best. Second: the distinct top GNN choice.
+    # If both rankings agree, use the next GNN candidate instead of a duplicate.
+    selected = [native_order[0]]
+    second = next((item for item in gnn_order if item is not selected[0]), None)
+    if second is not None:
+        selected.append(second)
+    return selected + [item for item in native_order
+                       if all(item is not chosen for chosen in selected)]
 
 
 def joint4_native_value(plan):

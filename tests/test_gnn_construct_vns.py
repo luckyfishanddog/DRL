@@ -5604,6 +5604,27 @@ def test_joint4_screen_prefers_native_values_and_keeps_every_candidate(monkeypat
     assert len(ordered) == 3
 
 
+def test_joint4_screen_keeps_gnn_candidate_when_native_reports_deadlock(monkeypatch):
+    import types
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import ScheduleStatus
+
+    values = {'native_best': 90., 'native_second': 100., 'gnn_best': None}
+    monkeypatch.setattr(e, 'priority_schedule',
+        lambda solution, config, directions=None, **kwargs: types.SimpleNamespace(
+            status=ScheduleStatus.FEASIBLE if values[solution] is not None else ScheduleStatus.DEADLOCK,
+            cmax=values[solution]))
+    candidates = [
+        dict(plan=types.SimpleNamespace(solution='native_best', directions=()), score=1., lb=100.),
+        dict(plan=types.SimpleNamespace(solution='native_second', directions=()), score=0., lb=120.),
+        dict(plan=types.SimpleNamespace(solution='gnn_best', directions=()), score=10., lb=95.),
+    ]
+    ordered = e.joint4_screen(candidates, origin_native=95.)
+    assert [item['plan'].solution for item in ordered[:2]] == ['native_best', 'gnn_best']
+    assert ordered[1]['native_status'] == ScheduleStatus.DEADLOCK.value
+    assert len(ordered) == len(candidates)
+
+
 def test_joint4_bottleneck_core_covers_transfer_and_receiver_robots():
     import run_gnn_weld_layout as e
     e.configure_cpu()
