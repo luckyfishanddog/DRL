@@ -5418,8 +5418,8 @@ def test_joint3_reconstruct_keeps_legal_distinct_complete_plans_from_the_joint_a
     import run_gnn_weld_layout as e
     e.configure_cpu()
     torch.manual_seed(e.SEED)
-    layouts=dict(e.load_layouts('validation'))
-    name=e.JOINT3_LAYOUTS[0]
+    layouts=dict(e.load_layouts('train'))
+    name='train_15'
     parents=layouts[name]
     model=e.joint3_model().eval()
     model.requires_grad_(False)
@@ -5431,7 +5431,7 @@ def test_joint3_reconstruct_keeps_legal_distinct_complete_plans_from_the_joint_a
     schedule,called=e.evaluate_once(initial,seen,blocker_cache=blockers)
     assert called==1
     key=e.plan_key(initial.solution,initial.directions)
-    limits=e.joint3_load_limits(name,e.joint3_references(),max(e.cycle_route_state(initial).loads))
+    limits=e.joint3_relative_limits(e.cycle_route_state(initial))
     core,_=e.joint3_core(initial,schedule,model,space,embeddings,blockers.get(key,()),seed=e.SEED,
                          q=e.JOINT3_CORE)
     removed=tuple(core.removed_parent_ids)
@@ -5506,7 +5506,7 @@ def test_joint3b_pool_keeps_six_protected_states_and_never_evicts_feasible():
     assert {round(float(entry[1].cmax)) for entry in pool}=={110,120}
 
 
-def test_joint3b_select_final_respects_the_cmax_tolerance_and_fails_explicitly():
+def test_joint3b_select_final_always_uses_true_cmax_and_fails_explicitly():
     import types
     import run_gnn_weld_layout as e
     from mrta_reference.model import ScheduleStatus
@@ -5522,8 +5522,8 @@ def test_joint3b_select_final_respects_the_cmax_tolerance_and_fails_explicitly()
     assert strict['choice']=='cmax' and strict['chosen'] is cmax_best
     assert strict['r_c_pct']==pytest.approx(0.51)
     loose=e.joint3b_select_final([balanced,cmax_best],tolerance=1.0)
-    assert loose['choice']=='balanced' and loose['chosen'] is balanced
-    assert e.joint3b_select_final([balanced],tolerance=0.5)['choice']=='balanced'
+    assert loose['choice']=='cmax' and loose['chosen'] is cmax_best
+    assert e.joint3b_select_final([balanced],tolerance=0.5)['choice']=='cmax'
     empty=e.joint3b_select_final([],tolerance=1.0)
     assert empty['chosen'] is None and empty['choice'] is None
     failure=e.joint3b_failure_final('x',4,1,[],calls=3,started=time.perf_counter(),run='r',phase='train')
@@ -5562,7 +5562,7 @@ def test_joint4_deadlock_signature_separates_blocker_robot_and_operation():
     assert base != e.joint4_deadlock_signature(entry(1, 'R1:B1:MOVE', blocked_robot=3))
 
 
-def test_joint4_training_rank_uses_strict_positive_then_quality_then_cmax():
+def test_joint4_training_rank_ignores_load_quality_and_never_fakes_deadlock_cmax():
     import run_gnn_weld_layout as e
     initial_peak, initial_spread = 120., 40.
     good = dict(status='FEASIBLE', cmax_s=1000., max_processing_s=110., processing_spread_s=19.)
@@ -5573,11 +5573,14 @@ def test_joint4_training_rank_uses_strict_positive_then_quality_then_cmax():
     bad_rank = e.joint4_training_rank(bad_quality, initial_peak, initial_spread)
     better_rank = e.joint4_training_rank(better_quality, initial_peak, initial_spread)
     weak_rank = e.joint4_training_rank(deadlock, initial_peak, initial_spread)
-    assert good_rank[0] == 0 and bad_rank[0] == 1 and weak_rank[0] == 2
-    assert good_rank < bad_rank and good_rank < weak_rank
-    # Within the feasible-but-not-good class the continuous load quality ranks first.
-    assert better_rank < bad_rank
-    assert weak_rank[1] == 0.0 and weak_rank[2] == 1e9
+    assert good_rank[0] == bad_rank[0] == better_rank[0] == 0 and weak_rank[0] == 1
+    assert bad_rank < good_rank < better_rank < weak_rank
+    assert weak_rank[2] is None
+    scores = torch.zeros(4, requires_grad=True)
+    loss, pairs, _ = e.joint4_group_loss(scores, [good_rank, bad_rank, better_rank, weak_rank])
+    assert pairs == 6 and loss is not None
+    loss.backward()
+    assert scores.grad[1] < scores.grad[2]
 
 
 def test_joint4_screen_prefers_native_values_and_keeps_every_candidate(monkeypatch):
@@ -5629,11 +5632,11 @@ def test_joint4_bottleneck_core_covers_transfer_and_receiver_robots():
     import run_gnn_weld_layout as e
     e.configure_cpu()
     torch.manual_seed(e.SEED)
-    layouts = dict(e.load_layouts('validation'))
-    parents = layouts['validation_07']
+    layouts = dict(e.load_layouts('train'))
+    parents = layouts['train_15']
     weights = torch.load(e.JOINT4_MODEL if e.JOINT4_MODEL.exists() else e.JOINT3_MODEL,
                          map_location='cpu', weights_only=True)['state_dict']
-    model = e.joint4_model(weights).eval()
+    model = e.joint4_model(weights).enable_conflict_graph().eval()
     model.requires_grad_(False)
     space = e.gnn.parent_assignment_space(parents, e.CONFIG)
     embeddings = model.encode_static(space.graph)
@@ -5648,12 +5651,196 @@ def test_joint4_bottleneck_core_covers_transfer_and_receiver_robots():
     robots = {owners[parent] for parent in removed}
     critical = max(range(4), key=lambda robot: schedule.robot_completion[robot])
     assert feedback['transfer_robot'] == critical
-    assert feedback['receiver_robot'] != critical
-    assert schedule.robot_completion[feedback['receiver_robot']] <= schedule.robot_completion[critical]
+    assert len(feedback['receiver_robots']) >= 2
+    assert all(robot != critical for robot in feedback['receiver_robots'])
     assert len(removed) == e.JOINT4_CORE
     assert len(robots) >= 2
     assert set(feedback['transfer_parents']) <= removed
     assert set(feedback['receiver_parents']) <= removed
+
+
+def test_cmax_conflict_graph_separates_static_risk_routes_and_measured_blockers():
+    import run_gnn_weld_layout as e
+    e.configure_cpu()
+    parents = (ParentWeld('a', (1.,9.),(5.,9.)), ParentWeld('b',(9.,9.),(13.,9.)),
+               ParentWeld('c',(1.,2.),(5.,2.)), ParentWeld('d',(9.,2.),(13.,2.)))
+    space = e.gnn.parent_assignment_space(parents, e.CONFIG)
+    choices = {parent: next(a for a in space.actions if a.parent_id == parent
+                            and a.pattern.kind is SplitKind.WHOLE) for parent in space.parent_ids}
+    blocks = {b.block_id:b for a in choices.values() for b in space.children[a.pattern]}
+    nodes = {b.block_id:space.block_nodes[a.pattern,b.block_id]
+             for a in choices.values() for b in space.children[a.pattern]}
+    state = e.lns.oriented_route_state((('a::whole','b::whole'),(),('c::whole',),('d::whole',)),
+                                      ((0,0),(),(0,),(0,)), blocks, e.CONFIG)
+    static = space.graph
+    assert {0,1,2,3,4,5} <= set(static.edge_type.tolist())
+    dynamic = e.gnn.build_block_robot_graph((),(),e.CONFIG,base_graph=static,state=state,
+        block_nodes=nodes,feedback=dict(blocked_pairs=[('a::whole','d::whole')]))
+    edges = {(a,b,t) for (a,b),t in zip(dynamic.edge_index.T.tolist(),dynamic.edge_type.tolist())}
+    assert (nodes['a::whole'],nodes['b::whole'],6) in edges
+    assert (nodes['b::whole'],nodes['a::whole'],7) in edges
+    assert (nodes['a::whole'],nodes['d::whole'],8) in edges
+    assert (nodes['d::whole'],nodes['a::whole'],9) in edges
+    assert (nodes['a::whole'],static.robot_offset,10) in edges
+    # Native child IDs can recur under a different legal cut. The observed
+    # edge must retain the exact origin node, even if a current node shadows it.
+    other = next(i for i,b in enumerate(static.blocks) if b.parent_id=='a' and i!=nodes['a::whole'])
+    origin = e.gnn.build_block_robot_graph((),(),e.CONFIG,base_graph=static,state=state,
+        block_nodes=nodes,feedback=dict(blocked_pairs=[('a::whole','d::whole')],
+                                       observed_nodes={'a::whole':other}))
+    observed = {(a,b,t) for (a,b),t in zip(origin.edge_index.T.tolist(),origin.edge_type.tolist())}
+    assert (other,nodes['d::whole'],8) in observed
+    assert (nodes['a::whole'],nodes['d::whole'],8) not in observed
+    changed = e.lns.oriented_route_state((('b::whole','a::whole'),(),('c::whole',),('d::whole',)),
+                                       ((0,0),(),(0,),(0,)), blocks, e.CONFIG)
+    after = e.gnn.build_block_robot_graph((),(),e.CONFIG,base_graph=static,state=changed,block_nodes=nodes)
+    updated = {(a,b,t) for (a,b),t in zip(after.edge_index.T.tolist(),after.edge_type.tolist())}
+    assert (nodes['a::whole'],nodes['b::whole'],6) not in updated
+    assert not {8,9}.intersection(after.edge_type.tolist())
+
+
+def test_cmax_conflict_weight_migration_and_exact_graph_replay():
+    import run_gnn_weld_layout as e
+    e.configure_cpu()
+    torch.manual_seed(e.SEED)
+    saved = torch.load(e.JOINT4_MODEL, map_location='cpu', weights_only=True)['state_dict']
+    model = e.joint4_model(saved).enable_conflict_graph().eval()
+    assert torch.equal(model.layer1.linear.weight[:,:20],saved['layer1.linear.weight'])
+    assert not model.layer1.linear.weight[:,20:].count_nonzero()
+    assert torch.equal(model.layer1.relation.weight[:4],saved['layer1.relation.weight'])
+    parents = dict(e.load_layouts('train'))['train_15']
+    space = e.gnn.parent_assignment_space(parents,e.CONFIG)
+    with torch.no_grad():
+        z = model.encode_static(space.graph)
+        initial = e.build_joint(parents,model,space=space,embeddings=z)
+        schedule = e.b32(initial)
+        core,_ = e.joint4_core(initial,schedule,model,space,z,(),seed=e.SEED,q=4)
+        feedback = e.joint3_feedback(initial,schedule,(),core.removed_parent_ids)
+        candidates,_ = e.joint3_reconstruct(parents,model,space,z,initial,core.removed_parent_ids,
+            dict(temporary_pmax_limit_s=0.),feedback,width=4)
+        assert candidates  # An artificial temporary Pmax cannot remove any branch.
+        for candidate in candidates:
+            score = e.gnn.imitation_joint_scores(space,z,model,candidate['joint_plans']).mean()
+            assert candidate['score'] == pytest.approx(float(score), abs=3e-6)
+    z = model.encode_static(space.graph)
+    score = e.gnn.imitation_joint_scores(space,z,model,candidates[0]['joint_plans']).mean()
+    score.backward()
+    assert model.layer1.linear.weight.grad[:,20:].abs().sum() > 0
+    assert model.layer1.relation.weight.grad[6:].abs().sum() > 0
+
+
+def test_cmax_incumbent_has_no_load_threshold_and_uses_only_feasible_results():
+    import types
+    import run_gnn_weld_layout as e
+    feasible = (None,types.SimpleNamespace(feasible=True,cmax=80.),dict(load_allowed=0))
+    deadlock = (None,types.SimpleNamespace(feasible=False,cmax=None),dict(load_allowed=1))
+    assert e.incumbent_cmax([deadlock,feasible]) == 80.
+    assert e.incumbent_cmax([deadlock]) == math.inf
+    assert not e.joint3_safe_prune(80.-1e-10,80.)
+
+
+@pytest.mark.parametrize('robots', (3,4))
+def test_cmax_joint_beam_can_complete_three_and_four_robot_cycles(monkeypatch, robots):
+    import run_gnn_weld_layout as e
+    e.configure_cpu()
+    movable = tuple(ParentWeld(chr(97+r),(4.+3*r,6.),(5.+3*r,6.)) for r in range(4))
+    anchors = tuple(ParentWeld(f'z{r}',(1. if r%2==0 else 17.,9. if r<2 else 2.),
+                             (2. if r%2==0 else 18.,9. if r<2 else 2.)) for r in range(4))
+    parents = (*movable,*anchors)
+    space = e.gnn.parent_assignment_space(parents,e.CONFIG)
+    patterns = [next(a.pattern for a in space.actions if a.parent_id == p.parent_id
+                     and a.pattern.kind is SplitKind.WHOLE) for p in parents]
+    routes = {r:(f'z{r}::whole',f'{chr(97+r)}::whole') for r in range(4)}
+    solution = e.canonicalize(parents,patterns,routes,e.CONFIG,scope=e.FORMAL_SCOPE_V2)
+    current = e.gnn.JointCompletionResult(solution,((0,0),)*4,(),0.)
+    model = e.joint4_model(torch.load(e.JOINT4_MODEL,map_location='cpu',weights_only=True)['state_dict'])
+    model.enable_conflict_graph().eval()
+    targets = {chr(97+r):(r+1)%robots for r in range(robots)}
+    def selected_scores(space, embeddings, model, plans, **kwargs):
+        return embeddings.new_tensor([100.*float(space.actions[p.assignment_index].pattern.kind is SplitKind.WHOLE
+            and space.actions[p.assignment_index].robots == (targets.get(space.actions[p.assignment_index].parent_id,-1),))
+            for p in plans])
+    monkeypatch.setattr(e.gnn,'imitation_joint_scores',selected_scores)
+    with torch.no_grad():
+        z = model.encode_static(space.graph)
+        candidates,_ = e.joint3_reconstruct(parents,model,space,z,current,tuple(targets),
+            dict(temporary_pmax_limit_s=0.),dict(critical_robot=0),width=8)
+    assert candidates
+    for candidate in candidates:
+        actual = {b.split('::',1)[0]:r for r,route in enumerate(candidate['plan'].solution.routes)
+                  for b in route.block_ids}
+        if all(actual[p] == r for p,r in targets.items()):
+            break
+    else:
+        pytest.fail(f'joint beam discarded every legal {robots}-robot cyclic assignment')
+
+
+@pytest.mark.parametrize('changes,feasible,passed', (
+    ((-2.,-2.,-2.,-.5,0.,.2),6,True),
+    ((-2.,-2.,-2.,0.,0.,0.),6,False),
+    ((-.9,)*6,6,False),
+    ((-2.,)*6,5,False),
+))
+def test_cmax_train_comparison_requires_all_three_requested_conditions(monkeypatch, changes, feasible, passed):
+    import run_gnn_weld_layout as e
+    names = tuple(f'held_{i}' for i in range(6))
+    rows = []
+    for i,(name,change) in enumerate(zip(names,changes)):
+        common = dict(stage='final',layout_id=name,seed=e.SEED,runtime_s=1.,b32_calls=100)
+        rows.append(dict(common,phase='original_independent',method=e.JOINT4_METHOD,status='FEASIBLE',cmax_s=100.))
+        rows.append(dict(common,phase='independent',method=e.CMAX_METHOD,
+            status='FEASIBLE' if i < feasible else 'NO_FEASIBLE_SOLUTION',
+            cmax_s=100.+change if i < feasible else None))
+    monkeypatch.setattr(e,'read_rows',lambda path:rows)
+    monkeypatch.setattr(e,'cmax_train_split',lambda:([],names))
+    assert e.cmax_summary()['passed'] is passed
+
+
+def test_cmax_failed_train_never_launches_validation_or_test(monkeypatch):
+    import run_gnn_weld_layout as e
+    monkeypatch.setattr(e,'cmax_summary',lambda phase:dict(passed=False))
+    def forbidden(*args,**kwargs):
+        raise AssertionError('model/data access or scheduling after a failed comparison')
+    monkeypatch.setattr(e.torch,'load',forbidden)
+    monkeypatch.setattr(e,'load_layouts',forbidden)
+    monkeypatch.setattr(e,'joint3_case',forbidden)
+    assert e.cmax_evaluate('validation') == []
+    assert e.cmax_evaluate('test') == []
+
+
+def test_cmax_ownership_counts_weld_transfers_instead_of_subtask_renaming():
+    import run_gnn_weld_layout as e
+    anchors = tuple(ParentWeld(f'z{r}',(1. if r%2==0 else 17.,9. if r<2 else 2.),
+                             (2. if r%2==0 else 18.,9. if r<2 else 2.)) for r in range(4))
+    parent = ParentWeld('a',(8.,5.5),(8.,6.5))
+    parents = (*anchors,parent)
+    space = e.gnn.parent_assignment_space(parents,e.CONFIG)
+    whole = {p:next(a.pattern for a in space.actions if a.parent_id==p and a.pattern.kind is SplitKind.WHOLE)
+             for p in space.parent_ids}
+    split = next(a.pattern for a in space.actions if a.parent_id=='a' and a.pattern.kind is SplitKind.Y_SPLIT)
+    def plan(pattern,route0,route1):
+        routes = {0:route0,1:route1,2:('z2::whole',),3:('z3::whole',)}
+        selected = [pattern if p=='a' else whole[p] for p in space.parent_ids]
+        solution = e.canonicalize(parents,selected,routes,e.CONFIG,scope=e.FORMAL_SCOPE_V2)
+        return e.gnn.JointCompletionResult(solution,tuple((0,)*len(r.block_ids) for r in solution.routes),(),0.)
+    before = plan(whole['a'],('z0::whole',),('z1::whole','a::whole'))
+    renamed = plan(split,('z0::whole',),('a::0','z1::whole','a::1'))
+    assert e.joint3_assignment_changes(before,renamed) == {}
+    moved = plan(split,('z0::whole','a::0'),('z1::whole','a::1'))
+    actual = e.joint3_assignment_changes(before,moved)
+    assert set(actual) == {'a'}
+    assert actual['a'][0] == dict(source=1,destination=0,length_m=pytest.approx(.5))
+
+
+@pytest.mark.parametrize('removed', [('a','b'), tuple(str(i) for i in range(7)), ('a','a','b')])
+def test_cmax_joint_reconstruction_requires_three_to_six_distinct_parents(removed):
+    from types import SimpleNamespace
+    import run_gnn_weld_layout as e
+    candidates, detail = e.joint3_reconstruct(None, SimpleNamespace(conflict_graph=True),
+        None, None, None, removed, {}, {})
+    assert candidates == []
+    assert detail['legal'] == 0
+    assert '3 to 6 distinct whole parents' in detail['reason']
 
 
 def test_joint3_old_path_still_reproduces_the_recorded_validation_01_final():

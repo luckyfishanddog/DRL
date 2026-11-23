@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 /data/local/ppo_smokeset/
+results/new_dataset_final/gnn_cmax_conflict.csv 
+results/new_dataset_final/gnn_cmax_conflict.csv 

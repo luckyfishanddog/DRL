@@ -40,6 +40,12 @@ from mrta_reference.solution import canonicalize, block_map
 
 NODE_DIM = 20
 DYNAMIC_DIM = 13
+CONFLICT_STATE_DIM = 12
+# Static risk and measured blocking deliberately have different relation IDs.
+GRAPH_RELATIONS = ('self', 'near', 'rail_risk', 'eligible', 'same_parent',
+                   'rail_robots', 'successor', 'predecessor', 'blocked_by',
+                   'blocks', 'owner')
+_RELATION_MIGRATION = (0, 1, 2, 3, 2, 2, 1, 1, 2, 2, 3)
 
 # Candidate ranking uses one small GNN; the existing allocation policies and
 # their parameters remain separate and are not loaded or retrained for it.
@@ -194,6 +200,21 @@ class BlockRobotGraph:
         destination = self.edge_index[1]
         return tuple(torch.where(destination == node)[0] for node in range(len(self.node_features)))
 
+    @cached_property
+    def legacy_attention_edges(self):
+        """Exact four-relation topology for historical checkpoints/stages."""
+        pairs, types, known = [], [], set()
+        for pair, relation in zip(self.edge_index.T.tolist(), self.edge_type.tolist()):
+            if relation > 4:
+                continue
+            relation = 2 if relation == 4 else relation
+            key = (*pair, relation)
+            if key not in known:
+                pairs.append(pair); types.append(relation); known.add(key)
+        edges = torch.tensor(pairs, dtype=torch.long).T.contiguous()
+        incoming = tuple(torch.where(edges[1] == node)[0] for node in range(len(self.node_features)))
+        return edges, torch.tensor(types, dtype=torch.long), incoming
+
 
 @dataclass(frozen=True)
 class ConstructionResult:
@@ -259,8 +280,62 @@ def build_block_robot_graph(
     *,
     include_weld_edges: bool = True,
     include_parent_edges: bool = False,
+    base_graph=None,
+    state=None,
+    block_nodes=None,
+    feedback=None,
 ) -> BlockRobotGraph:
-    """Build block-nearness, same-rail-risk and block-to-eligible-robot edges."""
+    """Separate geometric risk, route relations and actual B32 blocker evidence.
+
+    A cached geometry graph can be supplied to update only the current routes
+    and observed timeline context during each step of joint reconstruction.
+    """
+    if base_graph is not None:
+        graph = base_graph
+        edges = [tuple(pair) for pair in graph.edge_index.T.tolist()]
+        types = graph.edge_type.tolist()
+        nodes = block_nodes or {}
+        evidence = feedback or {}
+        rows = torch.cat((graph.node_features[:, :NODE_DIM],
+                          graph.node_features.new_zeros((len(graph.node_features), CONFLICT_STATE_DIM))), 1)
+
+        def link(a, b, relation):
+            edges.append((a, b)); types.append(relation)
+
+        if state is not None:
+            robot_wait = evidence.get('robot_wait', (0.,)*4)
+            completion = evidence.get('completion', (0.,)*4)
+            for robot, (route, bits) in enumerate(zip(state.routes, state.directions)):
+                context = [state.loads[robot]/2500., sum(state.arc_costs[robot])/2500.,
+                           robot_wait[robot]/2500., completion[robot]/2500.]
+                rows[graph.robot_offset+robot, NODE_DIM+robot] = 1.
+                rows[graph.robot_offset+robot, NODE_DIM+4:] = rows.new_tensor((
+                    len(route)/max(1, len(nodes)), 0., *context,
+                    max(state.loads)/2500., (max(state.loads)-min(state.loads))/2500.))
+                for position, (block, direction) in enumerate(zip(route, bits)):
+                    i = nodes[block]
+                    parent = graph.blocks[i].parent_id
+                    rows[i, NODE_DIM+robot] = 1.
+                    rows[i, NODE_DIM+4:] = rows.new_tensor((
+                        position/max(1, len(route)-1), direction, *context,
+                        evidence.get('parent_wait', {}).get(parent, 0.)/2500.,
+                        evidence.get('parent_blocked', {}).get(parent, 0.)/2500.))
+                    link(i, graph.robot_offset+robot, 10)
+                    link(graph.robot_offset+robot, i, 10)
+                    if position:
+                        before = nodes[route[position-1]]
+                        link(before, i, 6); link(i, before, 7)
+        # These edges refer to the last measured B32 rollout, never to proximity.
+        # A native child ID can recur at a different cut. Keep observed edges
+        # on the exact origin-mode nodes that produced the B32 evidence.
+        observed_nodes = {**nodes, **evidence.get('observed_nodes', {})}
+        for blocked, blocker in evidence.get('blocked_pairs', ()):
+            if blocked in observed_nodes and blocker in observed_nodes:
+                a, b = observed_nodes[blocked], observed_nodes[blocker]
+                link(a, b, 8); link(b, a, 9)
+        return replace(graph, node_features=rows,
+                       edge_index=torch.tensor(edges, dtype=torch.long).T.contiguous(),
+                       edge_type=torch.tensor(types, dtype=torch.long))
     ordered = tuple(blocks)
     forced = {pattern.parent_id: pattern.mandatory for pattern in patterns}
     rows: list[list[float]] = []
@@ -337,15 +412,17 @@ def build_block_robot_graph(
                 add(left, right, 2)
     robot_offset = len(ordered)
     if include_parent_edges:
-        known = set(zip(edges, edge_types))
         for i, left in enumerate(ordered):
             for j, right in enumerate(ordered):
-                if i != j and left.parent_id == right.parent_id and ((i,j),2) not in known:
-                    add(i,j,2)
+                if i != j and left.parent_id == right.parent_id:
+                    add(i,j,4)
     for block_index, eligible in enumerate(eligibilities):
         for robot in eligible:
             add(block_index, robot_offset + robot, 3)
             add(robot_offset + robot, block_index, 3)
+    if include_parent_edges:
+        for robot in range(4):
+            add(robot_offset+robot, robot_offset+(robot ^ 1), 5)
     return BlockRobotGraph(
         node_features=torch.tensor(rows, dtype=torch.float32),
         edge_index=torch.tensor(edges, dtype=torch.long).t().contiguous(),
@@ -361,13 +438,37 @@ class _BlockRobotGAT(nn.Module):
         super().__init__()
         self.layer1 = SparseGATLayer(NODE_DIM, hidden_dim, heads)
         self.layer2 = SparseGATLayer(hidden_dim, hidden_dim, heads)
+        random_state = torch.random.get_rng_state()
+        for layer in (self.layer1, self.layer2):
+            layer.relation = nn.Embedding(len(GRAPH_RELATIONS), heads)
+            nn.init.zeros_(layer.relation.weight)
+        # Expanding relation storage must not change the initialization of any
+        # existing policy head or the seeded behavior of historical stages.
+        torch.random.set_rng_state(random_state)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Existing Joint4 parameters are copied exactly; new relations inherit
+        # the corresponding old semantic prior instead of resetting the actor.
+        for name in ('layer1.relation.weight', 'layer2.relation.weight'):
+            key = prefix+name
+            if key in state_dict and state_dict[key].shape[0] == 4:
+                state_dict[key] = state_dict[key][list(_RELATION_MIGRATION)].clone()
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def graph_features(self, graph):
+        features = graph.node_features
+        width = self.layer1.linear.in_features
+        return torch.nn.functional.pad(features, (0, width-features.shape[1]))
 
     def encode_static(self, graph: BlockRobotGraph) -> torch.Tensor:
-        hidden = torch.nn.functional.elu(
-            self.layer1(graph.node_features, graph.edge_index, graph.edge_type,
-                        incoming_edges=graph.incoming_edges)
-        )
-        return self.layer2(hidden, graph.edge_index, graph.edge_type,incoming_edges=graph.incoming_edges)
+        if getattr(self, 'conflict_graph', False):
+            hidden = torch.nn.functional.elu(_vnd_attention(
+                self.layer1, self.graph_features(graph), graph.edge_index, graph.edge_type))
+            return _vnd_attention(self.layer2, hidden, graph.edge_index, graph.edge_type)
+        edges, types, incoming = graph.legacy_attention_edges
+        hidden = torch.nn.functional.elu(self.layer1(self.graph_features(graph), edges, types,
+                                                    incoming_edges=incoming))
+        return self.layer2(hidden, edges, types, incoming_edges=incoming)
 
 
 class BlockAssignmentGNN(_BlockRobotGAT):
@@ -612,7 +713,7 @@ class CoordinationJointInsertionGNN(JointInsertionGNN):
         self.use_dynamic_context = True
 
     def encode_static(self, graph):
-        return super().encode_static(graph) + self.geometry_skip(graph.node_features)
+        return super().encode_static(graph) + self.geometry_skip(self.graph_features(graph))
 
     def contextualize_state(self, graph, embeddings, routes, directions):
         if not self.use_dynamic_context:
@@ -1824,7 +1925,7 @@ class _JointAssignmentGNN(ParentAssignmentGNN):
         self.policy = nn.Sequential(nn.Linear(width, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
 
     def encode_static(self, graph):
-        return super().encode_static(graph) + self.geometry_skip(graph.node_features)
+        return super().encode_static(graph) + self.geometry_skip(self.graph_features(graph))
 
     def assignment_features(self, space, embeddings, state, blocks, pending, config):
         indices, rows = super().assignment_features(space, embeddings, state, blocks, pending, config)
@@ -2218,6 +2319,23 @@ class VNextGNN(_JointAssignmentGNN):
         if cmax_value:
             self.enable_cmax_value()
 
+    def enable_conflict_graph(self):
+        """Extend only the existing input projections, retaining all old weights."""
+        if getattr(self, 'conflict_graph', False):
+            return self
+        for owner, name in ((self.layer1, 'linear'), (self, 'geometry_skip')):
+            old = getattr(owner, name)
+            layer = nn.Linear(NODE_DIM+CONFLICT_STATE_DIM, old.out_features,
+                              bias=old.bias is not None).to(old.weight)
+            with torch.no_grad():
+                layer.weight.zero_()
+                layer.weight[:, :NODE_DIM].copy_(old.weight)
+                if old.bias is not None:
+                    layer.bias.copy_(old.bias)
+            setattr(owner, name, layer)
+        self.conflict_graph = True
+        return self
+
     def assignment_scores(self, rows):
         return self.policy((rows - self.assignment_mean) / self.assignment_scale).squeeze(1)
 
@@ -2478,6 +2596,7 @@ class VNextJointAction(NamedTuple):
     outcome: torch.Tensor
     insertion_features: tuple[torch.Tensor, ...] = ()
     insertion_indices: tuple[torch.Tensor, ...] = ()
+    graph: object = None
 
 
 def coverage_preserving_assignments(space, indices, state, pending):
@@ -2500,8 +2619,19 @@ def coverage_preserving_assignments(space, indices, state, pending):
                         device=indices.device, dtype=torch.bool)
 
 
-def imitation_joint_scores(space, embeddings, model, plans):
+def imitation_joint_scores(space, embeddings, model, plans, *, graph_cache=None):
     """The original joint actor plus its existing directed insertion head."""
+    if not isinstance(plans, dict) and any(plan.graph is not None for plan in plans):
+        # Replay the exact per-step graph used to generate the action. Neither
+        # a static embedding nor a future candidate's B32 label enters replay.
+        encoded, values = ({} if graph_cache is None else graph_cache), []
+        for plan in plans:
+            graph = plan.graph
+            if graph is not None and id(graph) not in encoded:
+                encoded[id(graph)] = model.encode_static(graph)
+            local = encoded[id(graph)] if graph is not None else embeddings
+            values.append(imitation_joint_scores(space, local, model, (plan._replace(graph=None),))[0])
+        return torch.stack(values)
     inputs = plans if isinstance(plans,dict) else vnext_policy_inputs(space, plans, model)
     coarse = model.joint_scores(space, embeddings, inputs['indices'], inputs['assignment'], inputs['outcomes'])
     fine = model.insertion_logits(embeddings, inputs['insertion_indices'].reshape(-1, 4),
@@ -2617,6 +2747,12 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     """Rank directed insertions of eight assignments, or twelve with feedback."""
     from .lns import joint_block_candidates, prefer_joint_legal_starts
 
+    dynamic_graph = None
+    cmax_driven = getattr(model, 'conflict_graph', False)
+    if cmax_driven:
+        dynamic_graph = build_block_robot_graph((), (), config, base_graph=space.graph,
+            state=state, block_nodes=nodes, feedback=feedback)
+        embeddings = model.encode_static(dynamic_graph)
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
     balancing = getattr(model, 'imitation_balance', False)
     route_aware = getattr(model, 'route_aware', False)
@@ -2640,8 +2776,8 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
         loadfirst_values=coarse[:,0]+load_first*coarse[:,2]
     # Conflict repair keeps the checkpoint and feature semantics, but must not
     # freeze the original 1% processing band before a joint exchange completes.
-    # Exact coverage and the formal mode/owner catalog still apply. The caller
-    # bounds temporary loads and checks final loads against case references.
+    # Exact coverage and the formal mode/owner catalog still apply. Complete
+    # plans alone may be pruned against a measured feasible B32 Cmax bound.
     shortlist = (feedback_shortlist(space, indices, logits)
                  if conflict_core and assignment_indices is None else
                  shortlist_assignments(space,indices,logits,loadfirst_values=loadfirst_values)
@@ -2656,7 +2792,17 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                                        owner_alternatives=True) if assignment_indices is None
                  else tuple(index for index in assignment_indices if index in positions))
     if conflict_core and assignment_indices is not None:
-        shortlist = tuple(sorted(shortlist, key=lambda i: -float(logits[positions[i]])))[:12]
+        shortlist = tuple(sorted(shortlist, key=lambda i: -float(logits[positions[i]])))
+        if not cmax_driven:
+            shortlist = shortlist[:12]
+    if cmax_driven and conflict_core and assignment_indices is None:
+        # Reserve the best legal cut for each (parent, mode kind, owner tuple).
+        # No processing band or receiving robot is fixed before the exchange.
+        structures = {}
+        for index in indices[torch.argsort(logits, descending=True, stable=True)].tolist():
+            action = space.actions[index]
+            structures.setdefault((action.parent_id, action.pattern.kind, action.robots), index)
+        shortlist = tuple(structures.values())
     targeted = tuple(index for parent in pending for index in (assignment_targets or {}).get(parent, ())
                      if index in positions)
     if conflict_core and targeted:
@@ -2708,7 +2854,7 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
                     retained = range(len(variants))
                 else:
                     fine = .65 * model.insertion_logits(embeddings, ix, inputs)
-                    if not balancing:
+                    if not balancing and not cmax_driven:
                         fine = fine - move_delta / 32. - 1.5 * risk_by_option
                     if load_first is not None:
                         processing=features[positions[index],-8:-4]*2500.
@@ -2741,7 +2887,8 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
             outcome = moves.new_tensor((peak, peak - float(expected.min()), nominal,
                                         (after.travel - state.travel) / 45., overlap, risk))
             outcome = vnext_outcome(model, outcome)
-            plans.append(VNextJointAction(index, after, actions, assignment_features, outcome, retained_inputs, retained_indices))
+            plans.append(VNextJointAction(index, after, actions, assignment_features, outcome,
+                                          retained_inputs, retained_indices))
     legal = (tuple(range(len(plans))) if balancing and not prefer_start_recovery else
              legal_assignment_starts(plans, blocks, space, config))
     plans = tuple(plans[i] for i in legal)
@@ -2764,8 +2911,13 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
             if assignment in targeted and counts.get(assignment, 0) < 4:
                 mandatory.append(i)
                 counts[assignment] = counts.get(assignment, 0) + 1
-        retained = tuple(dict.fromkeys((*mandatory, *retained, *order)))[:24]
-        return tuple(plans[i] for i in retained), scores[list(retained)]
+        retained = tuple(dict.fromkeys((*mandatory, *retained, *order)))
+        if not cmax_driven:
+            retained = retained[:24]
+        return tuple(plans[i]._replace(graph=dynamic_graph) for i in retained), scores[list(retained)]
+    if cmax_driven:
+        scores = imitation_joint_scores(space, embeddings, model, plans)
+        return tuple(plan._replace(graph=dynamic_graph) for plan in plans), scores
     if load_first is not None:
         scores=imitation_joint_scores(space,embeddings,model,plans)
         processing=torch.stack([p.assignment_features[-8:-4]*2500. for p in plans])
