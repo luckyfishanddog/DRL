@@ -2445,3 +2445,238 @@ def test_crf_pilot_requires_strongest_history_and_time_before_validation(monkeyp
     with pytest.raises(ValueError, match='TRAIN failed'):
         entry.run_experiment('validation')
 
+
+def _rcg_fixture():
+    import numpy as np
+    from mrta_search import gnn_route_columns as c
+    parents = tuple(ParentWeld(name, (x, y), (x+.6, y)) for name, x, y in
+        (('a', 1., 9.), ('b', 5., 9.), ('c', 9., 9.), ('d', 13., 9.),
+         ('e', 2., 1.), ('f', 12., 1.)))
+    w = c._HGAWorkspace(parents, ScientificConfig(), FORMAL_SCOPE_V2)
+    ids = {w.ids[n]: int(n) for m in w.initial_selected for n in w.pattern_nodes[m] if n >= 0}
+    def bundle(names):
+        routes = [[ids[name+'::whole'] for name in row] for row in names]
+        return c.make_bundle(w, routes, [[0]*len(row) for row in routes], w.initial_selected)
+    initial = bundle((('a', 'b', 'c'), ('d',), ('e',), ('f',)))
+    balanced = bundle((('a', 'b'), ('c', 'd'), ('e',), ('f',)))
+    return c, w, initial, balanced
+
+
+def test_rcg_joint_integer_master_matches_exhaustive_route_combinations():
+    import itertools
+    c, w, initial, balanced = _rcg_fixture()
+    pools = [[a] if a.key == b.key else [a, b] for a, b in zip(initial.columns, balanced.columns)]
+    master = c.RestrictedMaster(w, pools)
+    lp, dual = master.solve_lp()
+    mip, chosen = master.solve_integer(2.)
+    feasible = []
+    for columns in itertools.product(*pools):
+        try:
+            b = c.make_bundle(w, [x.nodes for x in columns], [x.directions for x in columns], initial.selected)
+        except ValueError:
+            continue
+        feasible.append(b)
+    assert mip.success and chosen is not None and lp.fun <= chosen.period+1.e-7
+    assert chosen.period == pytest.approx(min(b.period for b in feasible))
+    assert chosen.period < initial.period and chosen.key == balanced.key
+    assert len(chosen.columns[0].nodes) == len(chosen.columns[1].nodes) == 2
+    solution, directions = c.export_bundle(w, chosen)
+    assert tuple(r.block_ids for r in solution.routes) == tuple(tuple(w.ids[n] for n in x.nodes) for x in chosen.columns)
+
+
+def test_rcg_lp_dual_signs_and_new_column_price_are_actual_matrix_marginals():
+    import numpy as np
+    c, w, initial, balanced = _rcg_fixture()
+    old = c.RestrictedMaster(w, [[x] for x in initial.columns])
+    lp, dual = old.solve_lp()
+    assert sum(dual.load) == pytest.approx(1.) and min(dual.load) >= -1.e-8
+    assert old.existing_reduced_costs(lp) == pytest.approx(lp.lower.marginals[:old.nx])
+    assert np.max(np.abs(old.existing_reduced_costs(lp))) < 1.e-7
+    enlarged = c.RestrictedMaster(w, [[a, b] if a.key != b.key else [a]
+        for a, b in zip(initial.columns, balanced.columns)])
+    extended_mu = np.r_[lp.ineqlin.marginals[:4], np.zeros(len(enlarged.conflicts))]
+    for i, column in enumerate(enlarged.columns):
+        if column.key not in {x.key for x in initial.columns}:
+            actual = (-enlarged.aeq[:, i].T@lp.eqlin.marginals-enlarged.aub[:, i].T@extended_mu).item()
+            assert dual.reduced_cost(column) == pytest.approx(actual)
+    assert dual.reduced_cost(balanced.columns[0]) < 0
+    assert dual.reduced_cost(balanced.columns[1]) >= 0  # necessary coverage companion
+
+
+def test_rcg_master_excludes_incompatible_different_first_tasks():
+    c, w, initial, balanced = _rcg_fixture()
+    # Reversing the first two heads violates the original same-rail ordering.
+    left = c.make_column(w, 0, initial.columns[0].nodes[::-1], (0, 0, 0))
+    right = c.make_column(w, 1, (initial.columns[0].nodes[0],), (0,))
+    pools = [[initial.columns[0], left], [initial.columns[1], right],
+        [initial.columns[2]], [initial.columns[3]]]
+    master = c.RestrictedMaster(w, pools)
+    a = master.columns.index(left); b = master.columns.index(right)
+    assert (a, b) in master.conflicts
+    assert not c.heads_compatible(w, left, right)
+    result, chosen = master.solve_integer(2.)
+    assert result.success
+    c.make_bundle(w, [x.nodes for x in chosen.columns], [x.directions for x in chosen.columns], chosen.selected)
+
+
+def test_rcg_master_alternative_modes_cover_all_children_and_fixed_x_owners():
+    import itertools
+    from mrta_baselines.hga import _repair_oriented_first
+    from mrta_search import gnn_route_columns as c
+    _, w, a, _ = _eax_mixed_fixture()
+    rr, dd = _repair_oriented_first(a.routes, a.directions, w.points, w.travel, w.parameters, len(w.ids))
+    split = c.make_bundle(w, rr, dd, a.selected)
+    whole = c._training_seed(w)
+    xp = next(p for p, parent in enumerate(w.parents) if parent.parent_id == 'x')
+    assert w.patterns[split.selected[xp]].kind is SplitKind.X_SPLIT
+    assert w.patterns[whole.selected[xp]].kind is SplitKind.WHOLE
+    for required in (split, whole):
+        _, b = c.RestrictedMaster(w, [[x] for x in required.columns]).solve_integer(2.)
+        assert tuple(b.selected) == tuple(required.selected)
+    xnodes = [int(n) for n in w.pattern_nodes[split.selected[xp]] if n >= 0]
+    for node in xnodes:
+        owner = next(x.robot for x in split.columns if node in x.nodes)
+        assert w.eligible[node].sum() == 1 and w.eligible[node, owner]
+        with pytest.raises(ValueError, match='qualification'):
+            c.make_column(w, owner ^ 1, (node,), (0,))
+    with pytest.raises(ValueError, match='mutually exclusive'):
+        c.make_column(w, 0, (xnodes[0], int(w.pattern_nodes[whole.selected[xp], 0])), (0, 0))
+    pools = [[a] if a.key == b.key else [a, b] for a, b in zip(split.columns, whole.columns)]
+    master = c.RestrictedMaster(w, pools)
+    _, chosen = master.solve_integer(2.)
+    expected = []
+    for columns in itertools.product(*pools):
+        for modes in (split.selected, whole.selected):
+            try:
+                expected.append(c.make_bundle(w, [x.nodes for x in columns], [x.directions for x in columns], modes))
+            except ValueError:
+                pass
+    assert chosen.period == pytest.approx(min(x.period for x in expected))
+
+
+def test_rcg_columns_reject_duplicate_missing_children_and_canonical_siblings():
+    c, w, initial, _ = _rcg_fixture()
+    node = initial.columns[0].nodes[0]
+    with pytest.raises(ValueError, match='duplicate'):
+        c.make_column(w, 0, (node, node), (0, 1))
+    with pytest.raises(ValueError, match='unaligned'):
+        c.make_column(w, 0, (node,), ())
+    with pytest.raises(ValueError, match='missing'):
+        c.make_bundle(w, [x.nodes[1:] for x in initial.columns],
+            [x.directions[1:] for x in initial.columns], initial.selected)
+
+
+def test_rcg_gnn_scores_append_choices_and_changes_columns_without_local_operators(monkeypatch):
+    import torch
+    c, w, initial, _ = _rcg_fixture()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('pricing called a scheduler or old search')
+    monkeypatch.setattr(c, 'reference_schedule_formal', forbidden)
+    monkeypatch.setattr(c, 'run_saeax', forbidden)
+    _, dual = c.RestrictedMaster(w, [[x] for x in initial.columns]).solve_lp()
+    torch.manual_seed(7)
+    policy = c.RoutePricingGNN()
+    # Controlled head: actively reverse the actual reduced-cost ordering.
+    monkeypatch.setattr(policy, 'forward', lambda rows: -rows[:, -c.FEATURE_DIM+4])
+    context = c.PricingContext(w, policy)
+    counts = dict(gnn_score_batches=0, gnn_scored_actions=0, gnn_top_choice_differences=0)
+    guided = c.construct_bundle(context, dual, initial, 0, counts=counts)
+    greedy = c.construct_bundle(c.PricingContext(w, None), dual, initial, 0)
+    assert guided is not None and greedy is not None and guided.key != greedy.key
+    assert counts['gnn_scored_actions'] > 0 and counts['gnn_top_choice_differences'] > 0
+
+
+def test_rcg_new_pricing_head_trains_from_lp_completions_with_frozen_encoder(monkeypatch):
+    import torch
+    c, w, initial, _ = _rcg_fixture()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('pricing labels used B32 or an old optimizer')
+    monkeypatch.setattr(c, 'reference_schedule_formal', forbidden)
+    monkeypatch.setattr(c, 'run_saeax', forbidden)
+    monkeypatch.setattr(c, '_training_seed', lambda workspace: initial)
+    torch.manual_seed(11); torch.set_num_threads(1)
+    policy = c.RoutePricingGNN()
+    old = {k: v.detach().clone() for k, v in policy.encoder.state_dict().items()}
+    head = policy.head[0].weight.detach().clone()
+    fit = c.fit_pricing_head(policy, [('toy_train', w.parents)], epochs=2)
+    assert fit['b32_calls'] == fit['native_calls'] == 0 and fit['lp_calls'] == 3
+    assert fit['complete_route_labels'] > 0 and fit['training_rank_pairs'] > 0
+    assert fit['final_head_gradient_norm'] > 0
+    assert not torch.equal(head[:, :64], policy.head[0].weight[:, :64])
+    assert all(torch.equal(value, policy.encoder.state_dict()[key]) for key, value in old.items())
+
+
+@pytest.mark.parametrize('status,score,improves', [('FEASIBLE', 1., True),
+    ('FEASIBLE', 10000., False), ('DEADLOCK', None, False)])
+def test_rcg_final_b32_only_and_cached_same_run_initial_fallback(monkeypatch, status, score, improves):
+    from types import SimpleNamespace
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    c, w, original, balanced = _rcg_fixture()
+    solution, directions = c.export_bundle(w, original)
+    initial = SimpleNamespace(status='FEASIBLE', cmax=original.period+100., solution=solution,
+        directions=directions, schedule=ScheduleResult(ScheduleStatus.FEASIBLE,
+        cmax=original.period+100., directions=directions), runtime=3.,
+        native_cmax=original.period, accounting=dict(native_calls=12, b32_calls=3))
+    calls = []
+    monkeypatch.setattr(c, 'construct_bundle', lambda *args, **kwargs: balanced)
+    def final(solution, config, *, scope, orientations):
+        calls.append(solution)
+        return ScheduleResult(ScheduleStatus(status), cmax=score,
+            directions=tuple(orientations[r] for r in range(4)))
+    monkeypatch.setattr(c, 'reference_schedule_formal', final)
+    monkeypatch.setattr(c, 'run_saeax', lambda *a, **k: pytest.fail('initialization repeated'))
+    result = c.optimize_route_columns(w.parents, initial, settings=c.RCGConfig(max_rounds=3, mip_seconds=1.))
+    assert len(calls) == 1 and result.accounting['final_b32_calls'] == 1
+    assert result.accounting['b32_calls'] == 4 and result.accounting['native_calls'] == 12
+    assert result.accounting['search_complete'] and result.runtime >= 3.
+    assert result.accounting['negative_columns'] > 0 and result.accounting['companion_columns'] > 0
+    if improves:
+        assert result.cmax == 1. and result.schedule is not initial.schedule
+        assert result.accounting['changes']
+    else:
+        assert result.schedule is initial.schedule and result.cmax == initial.cmax
+    if status == 'DEADLOCK':
+        assert result.final_candidates[0]['cmax_s'] is None
+
+
+def test_rcg_two_empty_rounds_stop_and_do_not_reevaluate_initial(monkeypatch):
+    from types import SimpleNamespace
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    c, w, original, _ = _rcg_fixture()
+    solution, directions = c.export_bundle(w, original)
+    initial = SimpleNamespace(status='FEASIBLE', cmax=original.period, solution=solution,
+        directions=directions, schedule=ScheduleResult(ScheduleStatus.FEASIBLE,
+        cmax=original.period, directions=directions), runtime=2.,
+        accounting=dict(native_calls=10, b32_calls=1))
+    monkeypatch.setattr(c, 'construct_bundle', lambda *a, **k: original)
+    monkeypatch.setattr(c, 'reference_schedule_formal', lambda *a, **k: pytest.fail('duplicate B32'))
+    result = c.optimize_route_columns(w.parents, initial)
+    assert result.accounting['rounds'] == 2 and result.accounting['lp_calls'] == 2
+    assert result.accounting['milp_calls'] == 0 and result.accounting['final_b32_calls'] == 0
+    assert result.schedule is initial.schedule
+    assert result.termination_reason == 'NO_NEW_VALUABLE_COLUMNS'
+
+
+def test_rcg_train_requires_initial_gain_gnn_ablation_and_runtime_before_validation(monkeypatch):
+    import json
+    import sys
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    import run_gnn_route_columns as entry
+    def records(scores):
+        return [dict(layout_id=name, seed='20261110', status='FEASIBLE', cmax_s=str(score),
+            runtime_s='50', diagnostic=json.dumps(dict(accounting=dict(search_complete=True))))
+            for name, score in zip(entry.PILOTS, scores)]
+    data = dict(gnn=records((99., 99., 100.)), initial=records((100., 100., 100.)),
+        greedy=records((99.5, 99.5, 100.)))
+    monkeypatch.setattr(entry, 'method_rows', lambda stage, method='gnn': data[method])
+    assert entry.pilot_decision()['passed']
+    data['greedy'] = records((98., 98., 100.))
+    assert not entry.pilot_decision()['passed']
+    data['greedy'] = records((99.5, 99.5, 100.))
+    data['gnn'] = records((99.9, 99.9, 100.))
+    assert not entry.pilot_decision()['passed']  # below 0.5% median improvement
+    monkeypatch.setattr(entry, 'load_layouts', lambda *a: pytest.fail('read VALIDATION after failed TRAIN'))
+    with pytest.raises(ValueError, match='TRAIN failed'):
+        entry.run_experiment('validation')
+
