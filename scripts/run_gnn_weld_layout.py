@@ -6,6 +6,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import copy
+import gzip
 from dataclasses import asdict, dataclass, replace
 import json
 import math
@@ -386,10 +387,13 @@ def hga_route_vnd_experiment():
 
 
 def read_rows(path):
+    if not path.exists() and Path(str(path)+'.gz').exists():
+        path = Path(str(path)+'.gz')
     if not path.exists():
         return []
     csv.field_size_limit(2**31-1)
-    with path.open(encoding='utf-8', newline='') as stream:
+    opener = gzip.open if path.suffix == '.gz' else open
+    with opener(path, 'rt', encoding='utf-8', newline='') as stream:
         return list(csv.DictReader(stream))
 
 
@@ -4935,9 +4939,12 @@ def priority_history_diagnosis():
         if row['stage']=='history' and row.get('solution'):
             plan=deadlock_plan(layouts[row['layout_id']],row['solution'],spaces[row['layout_id']])
             done[row['layout_id']].add(plan_key(plan.solution,plan.directions))
-    if LOADFIRST_RESULTS.exists():
+    loadfirst_source = (LOADFIRST_RESULTS if LOADFIRST_RESULTS.exists()
+                        else Path(str(LOADFIRST_RESULTS)+'.gz'))
+    if loadfirst_source.exists():
         csv.field_size_limit(2**31-1)
-        with LOADFIRST_RESULTS.open(encoding='utf-8',newline='') as stream:
+        opener = gzip.open if loadfirst_source.suffix == '.gz' else open
+        with opener(loadfirst_source, 'rt', encoding='utf-8', newline='') as stream:
             for old in csv.DictReader(stream):
                 name=old['layout_id']
                 if name not in catalog or old['stage'] not in ('initial','candidate') or not old.get('solution'):continue
@@ -6531,23 +6538,7 @@ def incumbent_cmax(entries):
 
 def joint3_assignment_changes(before, after):
     """Actual weld-length ownership changes, excluding split-only task renaming."""
-    old, new = (block_map(plan.solution, CONFIG, scope=FORMAL_SCOPE_V2) for plan in (before, after))
-    old_owner = {b:r for r,route in enumerate(before.solution.routes) for b in route.block_ids}
-    new_owner = {b:r for r,route in enumerate(after.solution.routes) for b in route.block_ids}
-    changes = {}
-    for block in old.values():
-        axis = int(abs(block.end[1]-block.start[1]) > abs(block.end[0]-block.start[0]))
-        lo, hi = sorted((block.start[axis],block.end[axis]))
-        for child in new.values():
-            if child.parent_id != block.parent_id or old_owner[block.block_id] == new_owner[child.block_id]:
-                continue
-            lower, upper = sorted((child.start[axis],child.end[axis]))
-            overlap = min(hi,upper)-max(lo,lower)
-            if overlap > CONFIG.numeric_epsilon:
-                length = overlap/(hi-lo)*block.length
-                changes.setdefault(block.parent_id,[]).append(dict(
-                    source=old_owner[block.block_id],destination=new_owner[child.block_id],length_m=length))
-    return changes
+    return lns.actual_parent_transfers(before,after,CONFIG)
 
 
 @torch.no_grad()
@@ -8404,9 +8395,535 @@ def joint3_summary():
     return result
 
 
+BVNS_MODEL = ROOT/'models/gnn_bvns.pt'
+BVNS_RESULTS = FINAL_RESULTS/'gnn_bvns.csv'
+BVNS_METHODS = ('Bottleneck-VNS-v1','GNN-BVNS-v1')
+BVNS_V2_METHOD = 'GNN-BVNS-v2'
+BVNS_CASES = ('train_04','train_26','train_16','train_03','train_14','train_10')
+BVNS_FIELDS = ('stage','phase','layout_id','seed','method','protocol','source','operator','candidate_id','origin_id',
+    'status','cmax_s','native_cmax_s','gnn_score','priority_calls','b32_calls','generated','unique',
+    'cross_robot_candidates','cross_parent_transfers','duplicate','invalid','canonical_changed','lb_pruned',
+    'accepted','native_cross_robot_candidates','native_cross_parent_transfers','accepted_parent_transfers',
+    'states','shakes','max_processing_s','move_s','wait_s','route_lb_s','runtime_s',
+    'initial_seconds','native_seconds','graph_encodings','score_batches','scored_actions','encoding_seconds',
+    'feature_seconds','scoring_seconds','route_delta_s','transfer_details','solution','diagnostic')
+
+
+def bvns_write(rows):
+    import io
+    if not rows:return
+    buffer = io.StringIO(newline='')
+    needs_header = not BVNS_RESULTS.exists() or BVNS_RESULTS.stat().st_size==0
+    writer = csv.DictWriter(buffer,fieldnames=BVNS_FIELDS)
+    if needs_header:writer.writeheader()
+    writer.writerows({key:row.get(key) for key in BVNS_FIELDS} for row in rows)
+    payload = buffer.getvalue()
+    if (BVNS_RESULTS.stat().st_size if BVNS_RESULTS.exists() else 0)+len(payload.encode('utf-8'))>100000000:
+        raise ValueError('approved BVNS CSV would exceed the requested 100MB limit')
+    with BVNS_RESULTS.open('a',encoding='utf-8',newline='') as stream:stream.write(payload)
+
+
+def bvns_model(version=1):
+    if not BVNS_MODEL.exists():
+        source = torch.load(CMAX_MODEL,map_location='cpu',weights_only=True)
+        torch.save(dict(state_dict=source['state_dict'],algorithm='GNN-BVNS-v1',
+            initialization=str(CMAX_MODEL.relative_to(ROOT)),training_complete=False,
+            stage='frozen existing actor; search integration only',training_layouts=[]),BVNS_MODEL)
+    saved = torch.load(BVNS_MODEL,map_location='cpu',weights_only=True)
+    initial = saved.get('frozen_state_dict',saved['state_dict'])
+    model = joint4_model(initial)
+    if version==2:
+        if not saved.get('training_complete') or saved.get('version')!=2:
+            raise ValueError('BVNS v2 TRAIN fitting has not completed')
+        model.enable_bvns_features();model.load_state_dict(saved['state_dict'])
+    model.eval()
+    model.requires_grad_(False)
+    return model
+
+
+def bvns_initial(parents, space, workspace, seed):
+    result,seen = [],set()
+    for scheme in ('REGION_LOCAL','RULE_X_LOCAL'):
+        reference = initial_reference(parents,CONFIG,scheme)
+        for state,_ in build_oriented_insertion_beam(reference,CONFIG,beam_width=2,insertion_limit=6,seed=seed):
+            workspace.counts['initial']['generated'] += 1
+            try:
+                solution = canonicalize(parents,reference.patterns,dict(enumerate(state.routes)),CONFIG,scope=FORMAL_SCOPE_V2)
+                if solution.patterns!=reference.patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
+                    workspace.counts['initial']['canonical_changed'] += 1;continue
+            except ValueError:
+                workspace.counts['initial']['invalid'] += 1;continue
+            key = workspace.identity(solution,state.directions)
+            if key in seen:workspace.counts['initial']['duplicate'] += 1;continue
+            seen.add(key);workspace.counts['initial']['unique'] += 1
+            exact = workspace.state(state.routes,state.directions,workspace.blocks(solution.patterns))
+            result.append(lns.BottleneckAction(solution,state.directions,exact,'initial',(),key,(0.,)*4,{}))
+    return result
+
+
+@torch.no_grad()
+def bvns_case(name, parents, seed, *, use_gnn, native_budget=500, max_states=80, max_shakes=8,
+              phase='train', write=True, version=1):
+    method = BVNS_V2_METHOD if use_gnn and version==2 else BVNS_METHODS[int(use_gnn)]
+    if write:
+        completed = [r for r in read_rows(BVNS_RESULTS) if r.get('stage')=='final' and r.get('phase')==phase
+                     and r['layout_id']==name and int(r['seed'])==seed and r['method']==method]
+        if completed:return completed[-1]
+    started = time.perf_counter()
+    model = bvns_model(version) if use_gnn else None
+    space = gnn.parent_assignment_space(parents,CONFIG)
+    workspace = lns.BottleneckWorkspace(parents,CONFIG,FORMAL_SCOPE_V2,space,seed=seed)
+    initial = bvns_initial(parents,space,workspace,seed)
+    initial_seconds = time.perf_counter()-started
+    scorer = gnn.BottleneckActionScorer(model,space,workspace,CONFIG) if use_gnn else None
+    observations,ids = [],{}
+    native_seconds = 0.
+    def observed(candidate,schedule,origin,elapsed):
+        nonlocal native_seconds
+        native_seconds += elapsed
+        ids[candidate.signature] = len(ids)+1
+        observations.append(dict(stage='native_candidate',phase=phase,layout_id=name,seed=seed,method=method,
+            protocol='native search; exactly one final B32',operator=candidate.operator,
+            candidate_id=ids[candidate.signature],origin_id='' if origin is None else ids.get(origin.signature,''),
+            status=schedule.status.value,cmax_s=None,native_cmax_s=schedule.cmax if schedule.feasible else None,
+            gnn_score=candidate.score if use_gnn else None,priority_calls=1,b32_calls=0,
+            route_lb_s=max(workspace.cycles(candidate.state)),route_delta_s=json.dumps(candidate.route_delta_s),
+            transfer_details=json.dumps(candidate.transfers),
+            solution=json.dumps(pack_directed_plan(candidate)) if phase not in ('validation','test') else '',
+            runtime_s=time.perf_counter()-started))
+    if not initial:
+        row = dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,
+                   status='CONSTRUCTION_FAILED',b32_calls=0,priority_calls=0,runtime_s=time.perf_counter()-started)
+        if write:bvns_write([row])
+        return row
+    search = lns.run_bottleneck_vns(initial,workspace,priority_schedule,
+        scorer=scorer,repair_ranker=None if scorer is None else scorer.partial_scores,
+        native_budget=native_budget,max_states=max_states,max_shakes=max_shakes,observer=observed)
+    selected,native = search['candidate'],search['native']
+    # Search has returned its final selected candidate; no earlier B32 call.
+    final_clock = time.perf_counter()
+    final_schedule = b32(selected)
+    b32_seconds = time.perf_counter()-final_clock
+    metrics = routeaware_metrics(selected,final_schedule)
+    transfers = joint3_assignment_changes(search['initial_selected'],selected)
+    counts = search['counts']
+    final = dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,
+        protocol='native search; exactly one final B32',status=final_schedule.status.value,
+        cmax_s=final_schedule.cmax if final_schedule.feasible else None,
+        native_cmax_s=native.cmax if native.feasible else None,
+        priority_calls=search['native_calls'],b32_calls=1,
+        generated=sum(v.get('generated',0) for v in counts.values()),
+        unique=sum(v.get('unique',0) for v in counts.values()),
+        cross_robot_candidates=sum(v.get('cross_robot_candidates',0) for v in counts.values()),
+        cross_parent_transfers=len(transfers),states=search['states'],shakes=search['shakes'],
+        route_lb_s=max(workspace.cycles(selected.state)),initial_seconds=initial_seconds,
+        native_seconds=native_seconds,runtime_s=time.perf_counter()-started,
+        graph_encodings=scorer.encodings if scorer else 0,score_batches=scorer.score_batches if scorer else 0,
+        scored_actions=scorer.scored_actions if scorer else 0,encoding_seconds=scorer.encoding_seconds if scorer else 0.,
+        feature_seconds=scorer.feature_seconds if scorer else 0.,scoring_seconds=scorer.scoring_seconds if scorer else 0.,
+        transfer_details=json.dumps(transfers),solution=json.dumps(pack_directed_plan(selected)),
+        **{k:metrics.get(k) for k in ('max_processing_s','move_s','wait_s')},
+        diagnostic=json.dumps(dict(stop=search['stop'],counts=counts,native_budget=native_budget,
+            max_states=max_states,max_shakes=max_shakes,route_cache_hits=search['route_cache_hits'],
+            b32_seconds=b32_seconds,
+            neighbourhood_rounds=search['rounds'],initial_selected=pack_directed_plan(search['initial_selected']),
+            route_cache_builds=search['route_cache_builds'],native_deadlock_reserve=search['native_deadlock_reserve'],
+            initial_candidates=[pack_directed_plan(c) for c in initial],
+            evaluation='unchanged priority_schedule search; unchanged final B32 once; no wall-clock cutoff')))
+    summaries = [dict(stage='neighbourhood',phase=phase,layout_id=name,seed=seed,method=method,operator=op,
+                     priority_calls=value.get('native_calls',0),b32_calls=0,
+                     **{k:v for k,v in value.items() if k in BVNS_FIELDS}) for op,value in counts.items()]
+    if write:
+        bvns_write([*observations,*summaries])
+        final['runtime_s'] = time.perf_counter()-started
+        bvns_write([final])
+    print('BVNS_FINAL',json.dumps({k:final.get(k) for k in ('layout_id','method','status','cmax_s','native_cmax_s',
+        'runtime_s','generated','unique','cross_robot_candidates','priority_calls','b32_calls','graph_encodings')},ensure_ascii=False),flush=True)
+    return final
+
+
+def bvns_summary(phase='train'):
+    rows = read_rows(BVNS_RESULTS)
+    finals = {method:{(r['layout_id'],int(r['seed'])):r for r in rows
+        if r.get('stage')=='final' and r.get('phase')==phase and r['method']==method} for method in BVNS_METHODS}
+    references = {(r['layout_id'],int(r['seed'])):r for r in rows if r.get('stage')=='reference'
+                  and r['method']==CMAX_METHOD and r.get('phase')==phase}
+    output = dict(phase=phase,methods={},historical_protocol='old Cmax-Conflict uses B32 inside search; not equal-budget evidence')
+    for method,records in finals.items():
+        paired = [(float(r['cmax_s'])/float(references[k]['cmax_s'])-1)*100 for k,r in records.items()
+                  if k in references and r['status']=='FEASIBLE' and references[k]['status']=='FEASIBLE']
+        runtime = [float(r['runtime_s']) for r in records.values()]
+        ratios = [float(r['runtime_s'])/float(references[k]['runtime_s']) for k,r in records.items() if k in references]
+        output['methods'][method] = dict(completed=len(records),feasible=sum(r['status']=='FEASIBLE' for r in records.values()),
+            pairs=len(paired),median_change_pct=median(paired) if paired else None,
+            wins=sum(x<0 for x in paired),losses=sum(x>0 for x in paired),
+            median_runtime_s=median(runtime) if runtime else None,
+            median_runtime_ratio=median(ratios) if ratios else None,
+            b32_calls=sum(int(r['b32_calls']) for r in records.values()),
+            priority_calls=sum(int(r['priority_calls']) for r in records.values()))
+    # Preserve the preceding six-case TRAIN quality criterion. This is an
+    # experiment decision, not a new scheduler/certification mechanism.
+    output['search_effective'] = any(r['completed']==6 and r['feasible']==6 and r['pairs']==6
+        and r['median_change_pct']<=-1. and r['wins']>=4 and r['median_runtime_ratio']<1.
+        for r in output['methods'].values())
+    return output
+
+
+def bvns_restore_action(parents, snapshot, workspace, *, operator='initial', removed=(), origin=None):
+    plan = unpack_directed_plan(parents,snapshot,workspace.space)
+    bits = tuple(tuple(int(d) for d in row) for row in snapshot['directions'])
+    if tuple(r.block_ids for r in plan.solution.routes)!=tuple(map(tuple,snapshot['routes'])):
+        raise ValueError('directed snapshot changed during canonicalization')
+    if len(bits)!=4 or any(len(bits[r])!=len(plan.solution.routes[r].block_ids)
+                          or any(d not in (0,1) for d in bits[r]) for r in range(4)):
+        raise ValueError('directed snapshot has invalid orientation vectors')
+    state = workspace.state(tuple(r.block_ids for r in plan.solution.routes),bits,workspace.blocks(plan.solution.patterns))
+    previous = workspace.cycles(origin.state) if origin is not None else workspace.cycles(state)
+    item = lns.BottleneckAction(plan.solution,bits,state,operator,tuple(removed),workspace.identity(plan.solution,bits),
+        tuple(b-a for a,b in zip(previous,workspace.cycles(state))),{})
+    if origin is not None:
+        item.transfers = lns.actual_parent_transfers(origin,item,CONFIG,
+            before_blocks=workspace.blocks(origin.solution.patterns),after_blocks=workspace.blocks(item.solution.patterns),
+            parents=set(removed))
+    return item
+
+
+def bvns_fit_root(name, parents, source, workspace, model, hga_record, ordinal):
+    """TRAIN roots only. Baseline labels are ignored; no B32 root evaluation."""
+    clock = time.perf_counter();calls = 0
+    if source=='HGA':
+        expected = tuple(sorted((p.parent_id,p.start,p.end) for p in parents))
+        observed = tuple(sorted((p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in hga_record['parents']))
+        if expected!=observed:raise ValueError('TRAIN teacher geometry differs from official TRAIN')
+        hga_space = native_hga._HGAWorkspace(parents,CONFIG,FORMAL_SCOPE_V2)
+        groups = hga_record['groups'];middle = len(groups)//2
+        root = None
+        for offset in range(len(groups)):
+            group = groups[(middle+offset)%len(groups)]
+            solution = hga_space.solution(group['routes'],group['selected'])
+            if tuple(r.block_ids for r in solution.routes)!=tuple(tuple(hga_space.ids[n] for n in row) for row in group['routes']):
+                continue
+            trial = bvns_restore_action(parents,dict(patterns=[p.pattern_id for p in solution.patterns],
+                routes=[r.block_ids for r in solution.routes],directions=group['directions']),workspace)
+            blocks = workspace.blocks(trial.solution.patterns)
+            points = {r:oriented_endpoints(blocks[row[0]],trial.directions[r][0])[0]
+                      for r,row in enumerate(trial.state.routes) if row}
+            if lns._initial_error(points,CONFIG) is None:root=trial;break
+        metadata = dict(reused_hga_trajectory=True,teacher_labels_used=False)
+    elif source=='WAG':
+        settings = AdaptedWAGConfig(n=2,imax=10,max_wag_variants=2,max_route_combinations_per_wag=4)
+        teacher = run_adapted_wag_vns_v2(parents,CONFIG,settings,seed=SEED+ordinal,time_limit=math.inf,
+            checkpoints=(),certify=False,candidate_evaluator=priority_schedule)
+        calls = teacher.reference_calls
+        root = (bvns_restore_action(parents,dict(patterns=[p.pattern_id for p in teacher.solution.patterns],
+            routes=[r.block_ids for r in teacher.solution.routes],directions=teacher.directions),workspace)
+            if teacher.solution is not None and teacher.directions is not None else None)
+        metadata = dict(teacher_budget=asdict(settings),formal_baseline=False,teacher_b32_calls=0)
+    else:
+        initial = bvns_initial(parents,workspace.space,workspace,SEED+ordinal)
+        if not initial:return None,None,dict(source=source,unavailable=True),time.perf_counter()-clock,0
+        if source=='GNN':
+            actor = gnn.BottleneckActionScorer(model,workspace.space,workspace,CONFIG)
+            search = lns.run_bottleneck_vns(initial,workspace,priority_schedule,scorer=actor,
+                repair_ranker=actor.partial_scores,native_budget=100,max_states=20,max_shakes=2)
+            root = search['candidate'];calls = search['native_calls']
+        else:
+            tested = [(c,priority_schedule(c.solution,CONFIG,c.directions)) for c in initial]
+            calls = len(tested);feasible = [(c,s) for c,s in tested if s.feasible]
+            root = min(feasible,key=lambda x:x[1].cmax)[0] if feasible else initial[0]
+        metadata = dict(teacher_b32_calls=0,native_budget=100 if source=='GNN' else 4)
+    if root is None:return None,None,metadata,time.perf_counter()-clock,calls
+    native = priority_schedule(root.solution,CONFIG,root.directions);calls += 1
+    return root,native,metadata,time.perf_counter()-clock,calls
+
+
+def bvns_fit():
+    if not bvns_summary()['search_effective']:
+        print('BVNS_STOP: search mechanism did not pass the fixed TRAIN screen',flush=True);return
+    saved = torch.load(BVNS_MODEL,map_location='cpu',weights_only=True)
+    if saved.get('training_complete') and saved.get('version')==2:
+        print('BVNS_FIT_ALREADY_COMPLETE',flush=True);return saved
+    frozen = copy.deepcopy(saved.get('frozen_state_dict',saved['state_dict']))
+    model = joint4_model(frozen).enable_bvns_features().eval();model.requires_grad_(False)
+    names,heldout = cmax_train_split();layouts = dict(load_layouts('train'))
+    if set(names)&set(heldout) or set(names)&set(BVNS_CASES):
+        raise ValueError('BVNS fitting layouts overlap the independent TRAIN comparison')
+    with gzip.open(DATA/'hga_vnd_teacher.jsonl.gz','rt',encoding='utf-8') as stream:
+        hga_records = {r['layout_id']:r for r in map(json.loads,stream) if r['layout_id'] in names}
+    history_rows = [r for r in read_rows(BVNS_RESULTS) if r.get('phase')=='fit']
+    roots = {r['candidate_id']:r for r in history_rows if r['stage']=='training_root'}
+    groups_done = {r['candidate_id'] for r in history_rows if r['stage']=='training_group'}
+    labels = {root:[r for r in history_rows if r['stage']=='training_candidate' and r.get('origin_id')==root]
+              for root in roots}
+    prepared=[];label_calls=0;started=time.perf_counter()
+    families = (('RULE','HGA'),('GNN','WAG'),('HGA','RULE'),('WAG','GNN'))
+    for ordinal,name in enumerate(names):
+        parents=layouts[name];space=gnn.parent_assignment_space(parents,CONFIG)
+        cached = {}
+        replay = lns.BottleneckWorkspace(parents,CONFIG,FORMAL_SCOPE_V2,space)
+        for row in history_rows:
+            if row.get('stage')=='training_candidate' and row['layout_id']==name:
+                key = bvns_restore_action(parents,json.loads(row['solution']),replay).signature
+                cached[key] = row['status'],float(row['cmax_s']) if row.get('cmax_s') else None
+        for source in families[ordinal%4]:
+            group_id=f'fit-{name}-{source}'
+            print('BVNS_FIT_ROOT',name,source,flush=True)
+            w=lns.BottleneckWorkspace(parents,CONFIG,FORMAL_SCOPE_V2,space,seed=SEED+ordinal)
+            if group_id in roots:
+                root=bvns_restore_action(parents,json.loads(roots[group_id]['solution']),w)
+                native=priority_schedule(root.solution,CONFIG,root.directions)
+            else:
+                with torch.no_grad():root,native,meta,seconds,calls=bvns_fit_root(name,parents,source,w,model,hga_records.get(name),ordinal)
+                if root is None:
+                    bvns_write([dict(stage='training_root_unavailable',phase='fit',layout_id=name,seed=SEED,
+                        method=BVNS_V2_METHOD,source=source,candidate_id=group_id,b32_calls=0,priority_calls=calls,
+                        runtime_s=seconds,diagnostic=json.dumps(meta))]);continue
+                rootrow=dict(stage='training_root',phase='fit',layout_id=name,seed=SEED,method=BVNS_V2_METHOD,
+                    source=source,candidate_id=group_id,status=native.status.value,native_cmax_s=native.cmax if native.feasible else None,
+                    b32_calls=0,priority_calls=calls,runtime_s=seconds,solution=json.dumps(pack_directed_plan(root)),diagnostic=json.dumps(meta))
+                bvns_write([rootrow]);roots[group_id]=rootrow;labels.setdefault(group_id,[])
+            if group_id not in groups_done:
+                actor=gnn.BottleneckActionScorer(model,space,w,CONFIG);pool=[];native_values={}
+                with torch.no_grad():
+                    families_pool=[w.neighbours(root,native,kind) for kind in ('relocate','swap','two_opt')]
+                    families_pool.append(w.reconstruct(root,native,ordinal=ordinal,ranker=actor.partial_scores))
+                    for candidates in families_pool:
+                        if not candidates:continue
+                        for c,score in zip(candidates,actor(root,native,candidates)):c.score=float(score)
+                        tested=[(c,priority_schedule(c.solution,CONFIG,c.directions)) for c in candidates]
+                        native_values.update({c.signature:s.cmax if s.feasible else None for c,s in tested})
+                        feasible=[(c,s) for c,s in tested if s.feasible]
+                        chosen=[]
+                        if feasible:chosen.append(min(feasible,key=lambda x:x[1].cmax)[0])
+                        best=max(candidates,key=lambda c:c.score)
+                        if all(c.signature!=best.signature for c in chosen):chosen.append(best)
+                        rest=[c for c in candidates if all(c.signature!=x.signature for x in chosen)]
+                        w.ranking_rng.shuffle(rest);pool.extend((chosen+rest)[:4])
+                    selected={c.signature:c for c in pool}
+                    if len(selected)<16:
+                        rest=[c for group in families_pool for c in group if c.signature not in selected]
+                        w.ranking_rng.shuffle(rest)
+                        for c in rest[:16-len(selected)]:selected[c.signature]=c
+                    for index,candidate in enumerate(selected.values()):
+                        if index>=16 or len(labels[group_id])>=16:break
+                        old = next((r for r in labels[group_id] if json.loads(r['solution'])==json.loads(json.dumps(pack_directed_plan(candidate)))),None)
+                        if old is not None:continue
+                        clock=time.perf_counter();called=candidate.signature not in cached
+                        if called:
+                            outcome=b32(candidate);cached[candidate.signature]=(outcome.status.value,outcome.cmax if outcome.feasible else None)
+                            label_calls+=1
+                        status,cmax=cached[candidate.signature]
+                        row=dict(stage='training_candidate',phase='fit',layout_id=name,seed=SEED,method=BVNS_V2_METHOD,
+                            source=source,candidate_id=f'{group_id}-{index}',origin_id=group_id,operator=candidate.operator,
+                            status=status,cmax_s=cmax,native_cmax_s=native_values.get(candidate.signature),
+                            b32_calls=int(called),gnn_score=candidate.score,route_delta_s=json.dumps(candidate.route_delta_s),
+                            transfer_details=json.dumps(candidate.transfers),solution=json.dumps(pack_directed_plan(candidate)),
+                            runtime_s=time.perf_counter()-started,diagnostic=json.dumps(dict(parents=candidate.parents,
+                                b32_seconds=time.perf_counter()-clock,teacher_label_used=False)))
+                        bvns_write([row]);labels[group_id].append(row)
+                bvns_write([dict(stage='training_group',phase='fit',layout_id=name,seed=SEED,method=BVNS_V2_METHOD,
+                    source=source,candidate_id=group_id,unique=len(labels[group_id]),b32_calls=0,
+                    priority_calls=sum(len(group) for group in families_pool),
+                    diagnostic=json.dumps(dict(counts=w.counts,graph_encodings=actor.encodings,
+                        scoring_seconds=actor.scoring_seconds,feature_seconds=actor.feature_seconds)))])
+                groups_done.add(group_id)
+            candidates=[];ranks=[]
+            for row in labels[group_id]:
+                if row['status'] not in ('FEASIBLE','DEADLOCK'):continue
+                candidate=bvns_restore_action(parents,json.loads(row['solution']),w,operator=row['operator'],
+                    removed=json.loads(row['diagnostic'])['parents'],origin=root)
+                candidates.append(candidate);ranks.append(joint4_training_rank(row,0.,0.))
+            if len(set(ranks))>1:prepared.append((name,source,w,root,native,candidates,ranks))
+            print('BVNS_FIT_GROUP',json.dumps(dict(layout_id=name,source=source,candidates=len(candidates),
+                feasible=sum(r[0]==0 for r in ranks),new_b32_total=label_calls)),flush=True)
+    if not prepared:raise ValueError('no usable true-B32 TRAIN preferences')
+    collection_seconds=time.perf_counter()-started
+    model.requires_grad_(True);model.train()
+    optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4);history=[]
+    if saved.get('version')==2 and saved.get('history'):
+        model.load_state_dict(saved['state_dict']);optimizer.load_state_dict(saved['optimizer']);history=saved['history']
+    for epoch in range(len(history)+1,4):
+        order=list(range(len(prepared)));Random(SEED+epoch).shuffle(order)
+        losses=[];pairs=correct=ff_pairs=ff_correct=0
+        for index in order:
+            name,source,w,root,native,candidates,ranks=prepared[index]
+            optimizer.zero_grad(set_to_none=True)
+            actor=gnn.BottleneckActionScorer(model,w.space,w,CONFIG)
+            scores=actor(root,native,candidates)
+            loss,n,ok=joint4_group_loss(scores,ranks)
+            if loss is None:continue
+            loss.backward();gradient=float(torch.nn.utils.clip_grad_norm_(model.parameters(),1.))
+            if not math.isfinite(float(loss.detach())) or not math.isfinite(gradient):raise ArithmeticError('nonfinite BVNS ranking gradient')
+            optimizer.step();losses.append(float(loss.detach()));pairs+=n;correct+=ok
+            for a in range(len(ranks)):
+                for b in range(a+1,len(ranks)):
+                    if ranks[a][0]==ranks[b][0]==0 and ranks[a][2]!=ranks[b][2]:
+                        ff_pairs+=1;ff_correct+=int((float(scores[a].detach())-float(scores[b].detach()))*(ranks[a][2]-ranks[b][2])<0)
+        record=dict(epoch=epoch,loss=sum(losses)/max(1,len(losses)),pairs=pairs,accuracy=correct/max(1,pairs),
+            feasible_pairs=ff_pairs,feasible_accuracy=ff_correct/max(1,ff_pairs),updates=len(losses),
+            groups=len(prepared),new_b32_calls=label_calls,collection_seconds=collection_seconds,
+            elapsed_s=time.perf_counter()-started)
+        history.append(record)
+        torch.save(dict(version=2,state_dict=model.state_dict(),frozen_state_dict=frozen,
+            optimizer=optimizer.state_dict(),history=history,training_complete=epoch==3,
+            training_layouts=names,heldout_layouts=heldout,features=dict(node_extra=2,edge=6,action_extra=32),
+            label='same-state actual feasible B32 Cmax; DEADLOCK separately, no fake Cmax'),BVNS_MODEL)
+        bvns_write([dict(stage='epoch',phase='fit',seed=SEED,method=BVNS_V2_METHOD,b32_calls=0,
+                         runtime_s=record['elapsed_s'],diagnostic=json.dumps(record))])
+        print('BVNS_FIT_EPOCH',json.dumps(record),flush=True)
+    return history
+
+
+def bvns_warmup(phase):
+    """Measure process-wide native compilation separately for all search arms."""
+    clock = time.perf_counter()
+    parents = tuple(ParentWeld(f'BVNS_SETUP_R{r}',(1. if r%2==0 else 17.,9. if r<2 else 2.),
+        (2. if r%2==0 else 18.,9. if r<2 else 2.)) for r in range(4))
+    space = gnn.parent_assignment_space(parents,CONFIG)
+    patterns = tuple(next(a.pattern for a in space.actions if a.parent_id==p.parent_id
+        and a.pattern.kind is SplitKind.WHOLE) for p in parents)
+    warm = canonicalize(parents,patterns,{r:(f'BVNS_SETUP_R{r}::whole',) for r in range(4)},
+                        CONFIG,scope=FORMAL_SCOPE_V2)
+    priority_schedule(warm,CONFIG,((0,),)*4)
+    row = dict(stage='setup',phase=phase,method='BVNS_SHARED_SETUP',priority_calls=1,b32_calls=0,
+        runtime_s=time.perf_counter()-clock,source='synthetic native kernel compilation; no training label')
+    bvns_write([row]);print('BVNS_SHARED_SETUP',json.dumps(row),flush=True)
+
+
+def bvns_trained_summary():
+    rows = read_rows(BVNS_RESULTS)
+    finals = {r['layout_id']:r for r in rows if r.get('stage')=='final' and r.get('phase')=='train-v2'
+              and r['method']==BVNS_V2_METHOD and int(r['seed'])==SEED and r['layout_id'] in BVNS_CASES}
+    output = dict(completed=len(finals),feasible=sum(r['status']=='FEASIBLE' for r in finals.values()),paired={})
+    for method,stage,phase in ((CMAX_METHOD,'reference','train'),(BVNS_METHODS[0],'final','train'),
+                               (BVNS_METHODS[1],'final','train')):
+        reference = {r['layout_id']:r for r in rows if r.get('stage')==stage and r.get('phase')==phase
+                     and r['method']==method and int(r['seed'])==SEED}
+        changes = [(float(r['cmax_s'])/float(reference[name]['cmax_s'])-1)*100 for name,r in finals.items()
+                   if r['status']=='FEASIBLE' and name in reference and reference[name]['status']=='FEASIBLE']
+        output['paired'][method] = dict(pairs=len(changes),wins=sum(x<-1e-9 for x in changes),
+            losses=sum(x>1e-9 for x in changes),ties=sum(abs(x)<=1e-9 for x in changes),
+            median_change_pct=median(changes) if changes else None)
+    runtimes = [float(r['runtime_s']) for r in finals.values()]
+    output['median_runtime_s'] = median(runtimes) if runtimes else None
+    output['priority_calls'] = sum(int(r['priority_calls']) for r in finals.values())
+    output['b32_calls'] = sum(int(r['b32_calls']) for r in finals.values())
+    old,plain = output['paired'][CMAX_METHOD],output['paired'][BVNS_METHODS[0]]
+    output['criteria'] = dict(feasible_6=output['completed']==output['feasible']==6,
+        historical_median_1pct=old['pairs']==6 and old['median_change_pct']<=-1.,
+        historical_wins_4=old['wins']>=4,
+        beats_plain_median=plain['pairs']==6 and plain['median_change_pct']<-1e-9,
+        beats_plain_wins=plain['wins']>plain['losses'],
+        runtime_engineering_target=bool(runtimes) and output['median_runtime_s']<=100.)
+    output['passed'] = all(output['criteria'].values())
+    output['runtime_target_note'] = '100s median engineering reference only; no wall-clock search stopping condition'
+    return output
+
+
+def bvns_trained_train():
+    if not bvns_summary()['search_effective']:
+        print('BVNS_STOP: the search mechanism has not passed TRAIN',flush=True);return
+    saved = torch.load(BVNS_MODEL,map_location='cpu',weights_only=True)
+    if not saved.get('training_complete') or saved.get('version')!=2:
+        raise ValueError('complete the fixed TRAIN fit before the independent six-case comparison')
+    rows = read_rows(BVNS_RESULTS)
+    done = {r['layout_id'] for r in rows if r.get('stage')=='final' and r.get('phase')=='train-v2'
+            and r['method']==BVNS_V2_METHOD and int(r['seed'])==SEED}
+    if any(name not in done for name in BVNS_CASES):bvns_warmup('train-v2')
+    layouts = dict(load_layouts('train'))
+    for name in BVNS_CASES:
+        bvns_case(name,layouts[name],SEED,use_gnn=True,version=2,phase='train-v2')
+    print('BVNS_TRAINED_SUMMARY',json.dumps(bvns_trained_summary(),ensure_ascii=False),flush=True)
+
+
+def bvns_formal_summary(phase='validation'):
+    if phase not in ('validation','test'):raise ValueError('formal BVNS split must be validation or test')
+    expected = {(name,seed) for name,_ in load_layouts(phase) for seed in TEST_SEEDS}
+    chosen = {(r['layout_id'],int(r['seed'])):r for r in read_rows(BVNS_RESULTS)
+              if r.get('stage')=='final' and r.get('phase')==phase and r['method']==BVNS_V2_METHOD}
+    records = [chosen[k] for k in sorted(expected) if k in chosen]
+    output = dict(phase=phase,expected=len(expected),completed=len(records),
+        feasible=sum(r['status']=='FEASIBLE' for r in records),paired={},detail=[],
+        median_runtime_s=median([float(r['runtime_s']) for r in records]) if records else None,
+        priority_calls=sum(int(r['priority_calls']) for r in records),
+        b32_calls=sum(int(r['b32_calls']) for r in records))
+    for method,(_,_,filename) in BASELINES.items():
+        reference = {(r['layout_id'],int(r['seed'])):r for r in read_rows(FINAL_RESULTS/filename)
+                     if r.get('method')==method and completed_baseline_row(r)}
+        changes=[];runtime_ratios=[];feasibility_wins=feasibility_losses=0
+        for key in sorted(expected):
+            new,old = chosen.get(key),reference.get(key)
+            if old is None:continue
+            if new is None:continue
+            change = None
+            if new['status']==old['status']=='FEASIBLE':
+                change = (float(new['cmax_s'])/float(old['cmax_s'])-1)*100
+                changes.append(change)
+            else:
+                feasibility_wins += new['status']=='FEASIBLE' and old['status']!='FEASIBLE'
+                feasibility_losses += old['status']=='FEASIBLE' and new['status']!='FEASIBLE'
+            runtime_ratios.append(float(new['runtime_s'])/float(old['runtime_s']))
+            output['detail'].append(dict(layout_id=key[0],seed=key[1],reference=method,
+                status=new['status'],reference_status=old['status'],
+                cmax_s=float(new['cmax_s']) if new['status']=='FEASIBLE' else None,
+                reference_cmax_s=float(old['cmax_s']) if old['status']=='FEASIBLE' else None,
+                delta_pct=change,runtime_s=float(new['runtime_s']),reference_runtime_s=float(old['runtime_s']),
+                b32_calls=int(new['b32_calls']),reference_b32_calls=int(old['b32_calls'])))
+        output['paired'][method] = dict(reference_records=sum(k in reference for k in expected),
+            reference_feasible=sum(k in reference and reference[k]['status']=='FEASIBLE' for k in expected),
+            pairs=len(changes),median_change_pct=median(changes) if changes else None,
+            wins=sum(x<-1e-9 for x in changes),losses=sum(x>1e-9 for x in changes),
+            ties=sum(abs(x)<=1e-9 for x in changes),feasibility_wins=feasibility_wins,
+            feasibility_losses=feasibility_losses,median_runtime_ratio=median(runtime_ratios) if runtime_ratios else None)
+    output['criteria'] = dict(all_feasible=output['completed']==output['feasible']==len(expected),
+        one_final_b32=len(records)==len(expected) and all(int(r['b32_calls'])==1 for r in records),
+        all_references=all(p['reference_records']==len(expected) for p in output['paired'].values()),
+        better_medians=all(p['median_change_pct'] is not None and p['median_change_pct']<0 for p in output['paired'].values()),
+        more_cmax_wins=all(p['wins']>p['losses'] for p in output['paired'].values()))
+    output['passed'] = all(output['criteria'].values())
+    return output
+
+
+def bvns_formal_evaluate(phase='validation'):
+    if phase=='validation' and not bvns_trained_summary()['passed']:
+        print('BVNS_STOP: trained GNN did not pass independent TRAIN',flush=True);return []
+    if phase=='test' and not bvns_formal_summary('validation')['passed']:
+        print('BVNS_STOP: VALIDATION did not pass; TEST will not run',flush=True);return []
+    if phase not in ('validation','test'):raise ValueError('formal BVNS split must be validation or test')
+    summary = bvns_formal_summary(phase)
+    if not summary['criteria']['all_references']:
+        raise ValueError('formal frozen baseline rows are incomplete; no baseline will be rerun')
+    if summary['completed']<summary['expected']:bvns_warmup(phase)
+    finals = [bvns_case(name,parents,seed,use_gnn=True,version=2,phase=phase)
+              for name,parents in load_layouts(phase) for seed in TEST_SEEDS]
+    result=bvns_formal_summary(phase)
+    print('BVNS_FORMAL_SUMMARY',json.dumps({k:v for k,v in result.items() if k!='detail'},ensure_ascii=False),flush=True)
+    return finals
+
+
+def bvns_pilot():
+    layouts = dict(load_layouts('train'))
+    existing = read_rows(BVNS_RESULTS)
+    recorded = {(r['layout_id'],int(r['seed'])) for r in existing if r.get('stage')=='reference'}
+    references = [r for r in read_rows(CMAX_RESULTS) if r.get('stage')=='final' and r.get('phase')=='independent'
+                  and r.get('method')==CMAX_METHOD and r['layout_id'] in BVNS_CASES and int(r['seed'])==SEED]
+    for row in references:
+        if (row['layout_id'],int(row['seed'])) in recorded:continue
+        bvns_write([dict(stage='reference',phase='train',layout_id=row['layout_id'],seed=row['seed'],method=CMAX_METHOD,
+            protocol='historical B32-in-search; not equal-B32-budget comparison',
+            **{k:row.get(k) for k in ('status','cmax_s','runtime_s','b32_calls','max_processing_s','move_s','wait_s')},
+            source='gnn_cmax_conflict.csv.gz phase=independent')])
+    completed = {(r['layout_id'],r['method']) for r in existing if r.get('stage')=='final' and r.get('phase')=='train'}
+    if any((name,method) not in completed for name in BVNS_CASES for method in BVNS_METHODS):
+        bvns_warmup('train')
+    for name in BVNS_CASES:
+        for use_gnn in (False,True):bvns_case(name,layouts[name],SEED,use_gnn=use_gnn)
+    print('BVNS_SUMMARY',json.dumps(bvns_summary(),ensure_ascii=False),flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train', 'feedback-continue', 'feedback-full-validation', 'feedback-test', 'feedback-summary', 'child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary','joint3b-train','joint3b-validation','joint3b-summary','joint4-fit','joint4-train','joint4-validation','joint4-summary','cmax-fit','cmax-independent','cmax-validation','cmax-test','cmax-summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train','feedback-continue','feedback-full-validation','feedback-test','feedback-summary','child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary','joint3b-train','joint3b-validation','joint3b-summary','joint4-fit','joint4-train','joint4-validation','joint4-summary','cmax-fit','cmax-independent','cmax-validation','cmax-test','cmax-summary','bvns-pilot','bvns-summary','bvns-fit','bvns-trained-train','bvns-trained-summary','bvns-validation','bvns-test','bvns-formal-summary'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -8420,7 +8937,22 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'cmax-fit':
+    if args.stage == 'bvns-pilot':
+        bvns_pilot()
+    elif args.stage == 'bvns-summary':
+        print('BVNS_SUMMARY',json.dumps(bvns_summary(),ensure_ascii=False),flush=True)
+    elif args.stage == 'bvns-fit':
+        bvns_fit()
+    elif args.stage == 'bvns-trained-train':
+        bvns_trained_train()
+    elif args.stage == 'bvns-trained-summary':
+        print('BVNS_TRAINED_SUMMARY',json.dumps(bvns_trained_summary(),ensure_ascii=False),flush=True)
+    elif args.stage in ('bvns-validation','bvns-test'):
+        bvns_formal_evaluate(args.stage.removeprefix('bvns-'))
+    elif args.stage == 'bvns-formal-summary':
+        if args.split=='train':parser.error('BVNS formal summary requires validation or test')
+        print('BVNS_FORMAL_SUMMARY',json.dumps(bvns_formal_summary(args.split),ensure_ascii=False),flush=True)
+    elif args.stage == 'cmax-fit':
         joint4_fit(args.workers, cmax_driven=True)
     elif args.stage in ('cmax-independent', 'cmax-validation', 'cmax-test'):
         cmax_evaluate(args.stage.removeprefix('cmax-'))

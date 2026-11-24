@@ -5858,3 +5858,331 @@ def test_joint3_old_path_still_reproduces_the_recorded_validation_01_final():
     assert int(row['b32_calls'])==7
     assert row['final_choice']=='joint3-balanced-first'
 
+
+def _bvns_fixture():
+    import run_gnn_weld_layout as e
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    e.configure_cpu()
+    anchors = tuple(ParentWeld(f'z{r}',(1. if r%2==0 else 17.,9. if r<2 else 2.),
+                              (2. if r%2==0 else 18.,9. if r<2 else 2.)) for r in range(4))
+    movable = tuple(ParentWeld(chr(97+r),(5.,6.),(9.-r,6.)) for r in range(4))
+    parents = (*anchors,*movable)
+    space = e.gnn.parent_assignment_space(parents,e.CONFIG)
+    patterns = tuple(next(a.pattern for a in space.actions if a.parent_id==p.parent_id
+                         and a.pattern.kind is SplitKind.WHOLE) for p in parents)
+    routes = {0:('z0::whole','a::whole','b::whole'),1:('z1::whole','c::whole'),
+              2:('z2::whole','d::whole'),3:('z3::whole',)}
+    solution = e.canonicalize(parents,patterns,routes,e.CONFIG,scope=e.FORMAL_SCOPE_V2)
+    bits = tuple((0,)*len(r.block_ids) for r in solution.routes)
+    workspace = e.lns.BottleneckWorkspace(parents,e.CONFIG,e.FORMAL_SCOPE_V2,space,seed=27,candidate_limit=48)
+    state = workspace.state(tuple(r.block_ids for r in solution.routes),bits,workspace.blocks(solution.patterns))
+    current = e.lns.BottleneckAction(solution,bits,state,'initial',(),workspace.identity(solution,bits),(0.,)*4,{})
+    completion = workspace.cycles(state)
+    schedule = ScheduleResult(ScheduleStatus.FEASIBLE,cmax=max(completion),robot_completion=completion,directions=bits)
+    return e,space,workspace,current,schedule
+
+
+@pytest.mark.parametrize('operator',('relocate','swap','two_opt'))
+def test_bvns_neighbour_routes_have_exact_cycles_legal_parent_coverage_and_transfers(operator):
+    e,space,w,current,schedule = _bvns_fixture()
+    candidates = w.neighbours(current,schedule,operator)
+    assert candidates
+    old = w.cycles(current.state)
+    for candidate in candidates:
+        blocks = w.blocks(candidate.solution.patterns)
+        recomputed = e.lns.oriented_route_state(candidate.state.routes,candidate.directions,blocks,e.CONFIG)
+        assert candidate.state.loads == pytest.approx(recomputed.loads)
+        assert w.cycles(candidate.state) == pytest.approx(w.cycles(recomputed))
+        assert candidate.route_delta_s == pytest.approx(tuple(b-a for a,b in zip(old,w.cycles(recomputed))))
+        assert set(b for route in candidate.state.routes for b in route)==set(blocks)
+        assert all(e.robot_is_eligible(blocks[b],r,e.CONFIG) for r,route in enumerate(candidate.state.routes) for b in route)
+        if operator=='relocate':
+            assert candidate.transfers and len(candidate.parents)==1
+            assert sum(abs(x)>1e-6 for x in candidate.route_delta_s)>=2
+        elif operator=='swap':
+            assert len(candidate.transfers)==2 and len(candidate.parents)==2
+        else:
+            assert candidate.transfers=={}
+
+
+def test_bvns_repeated_proposals_are_deduplicated_before_canonicalization(monkeypatch):
+    e,space,w,current,schedule = _bvns_fixture()
+    w.candidate_limit = 4096
+    original = e.lns.canonicalize;calls = []
+    def observed(*args,**kwargs):
+        calls.append(1);return original(*args,**kwargs)
+    monkeypatch.setattr(e.lns,'canonicalize',observed)
+    assert w.neighbours(current,schedule,'relocate')
+    previous = len(calls)
+    assert not w.neighbours(current,schedule,'relocate')
+    assert len(calls)==previous
+
+
+@pytest.mark.parametrize('operator',('relocate','swap'))
+def test_bvns_parent_action_preserves_independent_sibling_ownership(operator):
+    from test_gnn_schedule_blocker_pilot import _selection_fixture
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    import run_gnn_weld_layout as e
+    solution,_,_,config = _selection_fixture()
+    space=e.gnn.parent_assignment_space(solution.parents,config)
+    w=e.lns.BottleneckWorkspace(solution.parents,config,e.FORMAL_SCOPE_V2,space,seed=23,candidate_limit=192)
+    bits=tuple((0,)*len(r.block_ids) for r in solution.routes)
+    state=w.state(tuple(r.block_ids for r in solution.routes),bits,w.blocks(solution.patterns))
+    current=e.lns.BottleneckAction(solution,bits,state,'initial',(),w.identity(solution,bits),(0.,)*4,{})
+    completion=list(w.cycles(state));completion[0]=max(completion)+100.
+    schedule=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=max(completion),robot_completion=tuple(completion))
+    candidates=w.neighbours(current,schedule,operator)
+    def preserved(candidate):
+        owners={b:r for r,route in enumerate(candidate.state.routes) for b in route}
+        return owners.get('a::0')==2 and owners.get('a::1')==1
+    assert any(preserved(c) for c in candidates)
+
+
+def test_bvns_scores_reuse_one_graph_for_multiple_neighbourhoods_and_lns():
+    e,space,w,current,schedule = _bvns_fixture()
+    model = e.joint4_model(torch.load(e.CMAX_MODEL,map_location='cpu',weights_only=True)['state_dict']).eval()
+    model.requires_grad_(False)
+    scorer = e.gnn.BottleneckActionScorer(model,space,w,e.CONFIG)
+    with torch.no_grad():
+        for operator in ('relocate','swap','two_opt'):
+            candidates = w.neighbours(current,schedule,operator)[:3]
+            scores = scorer(current,schedule,candidates)
+            assert len(scores)==len(candidates) and torch.isfinite(scores).all()
+        assert scorer.encodings==1 and scorer.score_batches==3
+        proposals = w.reconstruct(current,schedule,ordinal=0,ranker=scorer.partial_scores,width=2)
+        assert proposals
+        assert scorer.encodings==1
+        assert all(3<=len(c.parents)<=6 for c in proposals)
+
+
+def test_bvns_updates_bottleneck_after_real_route_changes(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    e,space,w,current,schedule = _bvns_fixture()
+    original=w.bottleneck
+    alternatives=w.neighbours(current,schedule,'relocate')
+    chosen=next(c for c in alternatives if max(w.cycles(c.state))<schedule.cmax
+        and max(range(4),key=lambda r:w.cycles(c.state)[r])!=original(current,schedule)[0])
+    real_neighbours=w.neighbours
+    def neighbours(c,s,operator):
+        real_neighbours(c,s,operator)
+        return [chosen] if c is current and operator=='relocate' else []
+    monkeypatch.setattr(w,'neighbours',neighbours)
+    observed=[]
+    def bottleneck(c,s):
+        value=original(c,s);observed.append(value[0]);return value
+    w.bottleneck=bottleneck
+    def native(solution,config,directions):
+        state=w.state(tuple(r.block_ids for r in solution.routes),directions,w.blocks(solution.patterns))
+        completion=w.cycles(state)
+        return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=max(completion),robot_completion=completion,directions=directions)
+    result=e.lns.run_bottleneck_vns([current],w,native,native_budget=60,max_states=2,max_shakes=1)
+    assert result['native_calls']<=60
+    assert len(set(observed))>1
+    assert result['native'].cmax<schedule.cmax
+
+
+def test_bvns_native_deadlock_is_retained_as_a_search_branch(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    e,space,w,current,schedule=_bvns_fixture()
+    changed=replace(current,operator='lns',signature=('failed-native-branch',),score=100.)
+    monkeypatch.setattr(w,'neighbours',lambda *args:[])
+    monkeypatch.setattr(w,'reconstruct',lambda *args,**kwargs:[changed])
+    calls=[]
+    def native(*args):
+        calls.append(1)
+        return schedule if len(calls)==1 else ScheduleResult(ScheduleStatus.DEADLOCK)
+    result=e.lns.run_bottleneck_vns([current],w,native,native_budget=5,max_states=4,max_shakes=1)
+    assert len(calls)==2
+    assert result['native_deadlock_reserve']==1
+    assert result['counts']['lns']['native_deadlock_branches']==1
+    assert result['candidate'] is current
+
+
+def test_bvns_calls_b32_once_only_after_native_search_returns(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    e,space,w,current,schedule=_bvns_fixture()
+    events=[]
+    monkeypatch.setattr(e,'bvns_initial',lambda *args:[current])
+    original=e.lns.run_bottleneck_vns
+    def run(*args,**kwargs):
+        result=original(*args,**kwargs);events.append('search_returned');return result
+    monkeypatch.setattr(e.lns,'run_bottleneck_vns',run)
+    monkeypatch.setattr(e,'priority_schedule',lambda *args:schedule)
+    def final(*args):
+        assert events==['search_returned'];events.append('b32')
+        return ScheduleResult(ScheduleStatus.DEADLOCK)
+    monkeypatch.setattr(e,'b32',final)
+    row=e.bvns_case('fixture',current.solution.parents,1,use_gnn=False,native_budget=7,max_states=2,max_shakes=1,write=False)
+    assert events==['search_returned','b32'] and row['b32_calls']==1
+    assert row['cmax_s'] is None and row['priority_calls']<=7
+
+
+def test_bvns_unscored_initial_does_not_override_negative_gnn_deadlock_backup(monkeypatch):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    e,space,w,current,_=_bvns_fixture()
+    changed=replace(current,operator='lns',signature=('gnn-negative-logit',),score=-2.)
+    monkeypatch.setattr(w,'neighbours',lambda *args:[])
+    monkeypatch.setattr(w,'reconstruct',lambda *args,**kwargs:[changed])
+    result=e.lns.run_bottleneck_vns([current],w,lambda *args:ScheduleResult(ScheduleStatus.DEADLOCK),
+        native_budget=4,max_states=3,max_shakes=1)
+    assert result['candidate'] is changed
+    assert result['native'].cmax is None
+
+
+def test_bvns_ranking_randomness_does_not_change_the_proposal_stream():
+    e,space,first,current,schedule=_bvns_fixture()
+    _,_,second,other,other_schedule=_bvns_fixture()
+    for _ in range(1000):first.ranking_rng.random()
+    a=first.neighbours(current,schedule,'relocate')
+    b=second.neighbours(other,other_schedule,'relocate')
+    assert [c.signature for c in a]==[c.signature for c in b]
+
+
+def test_bvns_rejects_known_b32_initial_geometry_before_expensive_evaluation(monkeypatch):
+    e,space,w,current,schedule=_bvns_fixture()
+    routes=list(current.state.routes)
+    routes[0]=('a::whole','z0::whole','b::whole')
+    routes[1]=('c::whole','z1::whole')
+    state=w.state(routes,current.directions,w.blocks(current.solution.patterns))
+    def forbidden(*args,**kwargs):raise AssertionError('known input geometry should precede canonical/evaluation')
+    monkeypatch.setattr(e.lns,'canonicalize',forbidden)
+    assert w.finish(current,current.solution.patterns,state,'two_opt',('a','b','c')) is None
+    assert w.counts['two_opt']['initial_geometry_invalid']==1
+
+
+def test_bvns_v2_zero_input_extension_preserves_existing_actor_scores():
+    e,space,w,current,schedule=_bvns_fixture()
+    weights=torch.load(e.CMAX_MODEL,map_location='cpu',weights_only=True)['state_dict']
+    base=e.joint4_model(weights).eval()
+    extended=e.joint4_model(weights).enable_bvns_features().eval()
+    assert extended.layer1.linear.in_features==34
+    assert extended.layer1.heads==extended.layer2.heads==4
+    assert extended.layer1.linear.out_features==extended.layer2.linear.out_features==64
+    assert torch.equal(extended.layer1.linear.weight[:,:32],base.layer1.linear.weight)
+    assert torch.equal(extended.layer1.relation.weight,base.layer1.relation.weight)
+    assert not extended.layer1.edge_projection.weight.count_nonzero()
+    candidates=w.neighbours(current,schedule,'relocate')[:4]
+    with torch.no_grad():
+        a=e.gnn.BottleneckActionScorer(base,space,w,e.CONFIG)(current,schedule,candidates)
+        b=e.gnn.BottleneckActionScorer(extended,space,w,e.CONFIG)(current,schedule,candidates)
+    assert torch.allclose(a,b,atol=3e-6,rtol=1e-6)
+
+
+def test_bvns_v2_edge_attributes_express_four_directions_and_actual_route_time():
+    e,space,w,current,schedule=_bvns_fixture()
+    model=e.joint4_model(torch.load(e.CMAX_MODEL,map_location='cpu',weights_only=True)['state_dict']).enable_bvns_features()
+    scorer=e.gnn.BottleneckActionScorer(model,space,w,e.CONFIG)
+    graph,_=scorer.encode(current,schedule)
+    edge=next(k for k,t in enumerate(graph.edge_type.tolist()) if t==6)
+    source,destination=graph.edge_index[:,edge].tolist()
+    first,second=graph.blocks[source],graph.blocks[destination]
+    expected=[math.dist(e.oriented_endpoints(first,i)[1],e.oriented_endpoints(second,j)[0])/e.CONFIG.empty_speed
+              for i in (0,1) for j in (0,1)]
+    assert (graph.edge_features[edge,:4]*45.).tolist()==pytest.approx(expected,abs=2e-5)
+    reverse=next(k for k,(pair,t) in enumerate(zip(graph.edge_index.T.tolist(),graph.edge_type.tolist()))
+                 if pair==[destination,source] and t==7)
+    assert graph.edge_features[edge,4]==pytest.approx(float(graph.edge_features[reverse,4]))
+    assert graph.edge_features[edge,5]==1.
+    assert len(e.gnn.GRAPH_RELATIONS)==11
+
+
+def test_bvns_v2_source_destination_delta_inputs_and_new_parameters_receive_gradients(monkeypatch):
+    e,space,w,current,schedule=_bvns_fixture()
+    model=e.joint4_model(torch.load(e.CMAX_MODEL,map_location='cpu',weights_only=True)['state_dict']).enable_bvns_features()
+    scorer=e.gnn.BottleneckActionScorer(model,space,w,e.CONFIG)
+    candidate=w.neighbours(current,schedule,'relocate')[0]
+    captured=[];original=model.insertion_logits
+    def inputs(z,indices,features):
+        captured.append(features.detach());return original(z,indices,features)
+    monkeypatch.setattr(model,'insertion_logits',inputs)
+    values=scorer(current,schedule,[candidate])
+    offset=e.gnn._VNEXT_FEATURE_DIM
+    assert captured[0].shape[1]==offset+e.gnn.BVNS_ACTION_EXTRA_DIM
+    assert (captured[0][0,offset+8:offset+12]*2500.).tolist()==pytest.approx(candidate.route_delta_s,abs=3e-5)
+    values.sum().backward()
+    assert model.layer1.linear.weight.grad[:,-2:].abs().sum()>0
+    assert model.layer1.edge_projection.weight.grad.abs().sum()>0
+    assert model.insertion_head[0].weight.grad[:,-e.gnn.BVNS_ACTION_EXTRA_DIM:].abs().sum()>0
+    assert scorer.encodings==1
+
+
+def test_bvns_fit_uses_same_state_b32_labels_and_preserves_frozen_actor_without_file_writes(monkeypatch):
+    import copy
+    import io
+    import json
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    e,space,w,current,native=_bvns_fixture()
+    frozen=torch.load(e.CMAX_MODEL,map_location='cpu',weights_only=True)['state_dict']
+    captured=[];checkpoints=[];calls=[]
+    monkeypatch.setattr(e,'bvns_summary',lambda:dict(search_effective=True))
+    monkeypatch.setattr(e,'cmax_train_split',lambda:(['fixture'],list(e.BVNS_CASES)))
+    def layouts(split):
+        assert split=='train'
+        return [('fixture',current.solution.parents)]
+    monkeypatch.setattr(e,'load_layouts',layouts)
+    monkeypatch.setattr(e.gzip,'open',lambda *args,**kwargs:io.StringIO(json.dumps(dict(layout_id='fixture'))+'\n'))
+    monkeypatch.setattr(e,'read_rows',lambda *args:[])
+    monkeypatch.setattr(e,'bvns_write',lambda rows:captured.extend(copy.deepcopy(rows)))
+    monkeypatch.setattr(e.torch,'load',lambda *args,**kwargs:dict(state_dict=frozen,training_complete=False))
+    monkeypatch.setattr(e.torch,'save',lambda saved,*args:checkpoints.append(saved))
+    original=e.lns.BottleneckWorkspace
+    monkeypatch.setattr(e.lns,'BottleneckWorkspace',lambda *args,**kwargs:original(*args,**kwargs,candidate_limit=12))
+    monkeypatch.setattr(e,'bvns_fit_root',lambda *args:(current,native,dict(teacher_b32_calls=0),0.,1))
+    monkeypatch.setattr(e,'priority_schedule',lambda *args:native)
+    def measured(candidate):
+        calls.append(candidate.signature)
+        return (ScheduleResult(ScheduleStatus.DEADLOCK) if len(calls)%4==0 else
+                ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.+len(calls)))
+    monkeypatch.setattr(e,'b32',measured)
+    history=e.bvns_fit()
+    labels=[r for r in captured if r['stage']=='training_candidate']
+    assert labels and all(r['layout_id']=='fixture' for r in labels)
+    assert len(calls)==len(set(calls))==sum(r['b32_calls'] for r in labels)<=32
+    assert all(r['cmax_s'] is None for r in labels if r['status']=='DEADLOCK')
+    assert all(r['cmax_s']!=r['native_cmax_s'] for r in labels if r['status']=='FEASIBLE')
+    assert len(history)==3 and history[-1]['feasible_pairs']>0
+    assert checkpoints[-1]['training_complete'] and checkpoints[-1]['training_layouts']==['fixture']
+    assert all(torch.equal(value,checkpoints[-1]['frozen_state_dict'][key]) for key,value in frozen.items())
+
+
+def test_bvns_formal_pairing_uses_exact_seeds_full_baselines_and_no_fake_deadlock_cmax(monkeypatch):
+    import json
+    import run_gnn_weld_layout as e
+    monkeypatch.setattr(e,'load_layouts',lambda phase:[('fixture',())])
+    finals=[dict(stage='final',phase='validation',layout_id='fixture',seed=seed,method=e.BVNS_V2_METHOD,
+        status='FEASIBLE',cmax_s=1000.,runtime_s=20.,priority_calls=500,b32_calls=1) for seed in e.TEST_SEEDS]
+    references={}
+    for method,(_,_,filename) in e.BASELINES.items():
+        records=[]
+        for index,seed in enumerate(e.TEST_SEEDS):
+            deadlock=method=='WAG+VNS' and index==1
+            records.append(dict(layout_id='fixture',seed=seed,method=method,
+                status='DEADLOCK' if deadlock else 'FEASIBLE',
+                cmax_s='' if deadlock else ([900.,950.,1100.][index] if method=='HGA' else [1200.,0.,1300.][index]),
+                runtime_s=100.,iterations=e.BASELINE_ITERATIONS[method],b32_calls=1,
+                source=e.FORMAL_BASELINE_SOURCES[method],diagnostic=json.dumps(dict(phase='FULL',run_status='COMPLETED'))))
+        records.append({**records[0],'iterations':1000,'cmax_s':1.})
+        references[filename]=records
+    monkeypatch.setattr(e,'read_rows',lambda path:finals if path==e.BVNS_RESULTS else references[path.name])
+    result=e.bvns_formal_summary()
+    assert result['completed']==result['feasible']==3 and result['b32_calls']==3
+    assert result['paired']['HGA']['wins']==1 and result['paired']['HGA']['losses']==2
+    assert [r['reference_cmax_s'] for r in result['detail'] if r['reference']=='HGA']==[900.,950.,1100.]
+    assert result['paired']['WAG+VNS']['pairs']==2
+    assert result['paired']['WAG+VNS']['wins']==2 and result['paired']['WAG+VNS']['feasibility_wins']==1
+    missing_cmax=[r for r in result['detail'] if r['reference_status']=='DEADLOCK']
+    assert len(missing_cmax)==1 and missing_cmax[0]['reference_cmax_s'] is missing_cmax[0]['delta_pct'] is None
+    assert not result['passed']
+
+
+def test_bvns_failed_train_or_validation_never_starts_a_later_dataset(monkeypatch):
+    import run_gnn_weld_layout as e
+    def forbidden(*args,**kwargs):raise AssertionError('failed screening must stop before later data or search')
+    monkeypatch.setattr(e,'load_layouts',forbidden)
+    monkeypatch.setattr(e,'bvns_case',forbidden)
+    monkeypatch.setattr(e,'bvns_warmup',forbidden)
+    monkeypatch.setattr(e,'bvns_trained_summary',lambda:dict(passed=False))
+    monkeypatch.setattr(e,'bvns_formal_summary',lambda phase:dict(passed=False))
+    assert e.bvns_formal_evaluate('validation')==[]
+    assert e.bvns_formal_evaluate('test')==[]
+

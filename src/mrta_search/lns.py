@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import itertools
 import math
 import random
+import time
 from typing import Mapping, Sequence
 
 from mrta_reference.geometry import (
@@ -34,6 +36,444 @@ from mrta_reference.solution import block_map, canonicalize
 
 from .direction import DirectionVectors, _initial_error
 from .initialization import bounded_insertion_positions
+
+
+@dataclass
+class BottleneckAction:
+    solution: CanonicalSolution
+    directions: tuple
+    state: object
+    operator: str
+    parents: tuple
+    signature: tuple
+    route_delta_s: tuple
+    transfers: dict
+    score: float = 0.
+
+
+def actual_parent_transfers(before, after, config, *, before_blocks=None, after_blocks=None,
+                            parents=None):
+    """Positive geometric weld length changing owner, including changed cuts."""
+    old = before_blocks if before_blocks is not None else block_map(before.solution, config)
+    new = after_blocks if after_blocks is not None else block_map(after.solution, config)
+    old_owner = {b:r for r,route in enumerate(before.solution.routes) for b in route.block_ids}
+    new_owner = {b:r for r,route in enumerate(after.solution.routes) for b in route.block_ids}
+    grouped = {}
+    for child in new.values():
+        grouped.setdefault(child.parent_id, []).append(child)
+    changes = {}
+    for block in old.values():
+        if parents is not None and block.parent_id not in parents:
+            continue
+        axis = int(abs(block.end[1]-block.start[1]) > abs(block.end[0]-block.start[0]))
+        lo,hi = sorted((block.start[axis],block.end[axis]))
+        for child in grouped.get(block.parent_id, ()):
+            if old_owner[block.block_id] == new_owner[child.block_id]:
+                continue
+            lower,upper = sorted((child.start[axis],child.end[axis]))
+            overlap = min(hi,upper)-max(lo,lower)
+            if overlap > config.numeric_epsilon:
+                changes.setdefault(block.parent_id, []).append(dict(source=old_owner[block.block_id],
+                    destination=new_owner[child.block_id], length_m=overlap/(hi-lo)*block.length))
+    return changes
+
+
+class BottleneckWorkspace:
+    """Parent-atomic proposals and reusable route costs; no scheduler or GNN here."""
+    def __init__(self, parents, config, scope, space, *, seed=0, candidate_limit=192):
+        self.parents,self.config,self.scope,self.space = tuple(parents),config,scope,space
+        self.rng = random.Random(seed)
+        self.ranking_rng = random.Random(seed+1000003)
+        self.candidate_limit = candidate_limit
+        self.counts = {name:Counter() for name in ('initial','relocate','swap','two_opt','lns')}
+        self.route_cache,self.block_cache,self.raw_seen = {},{},set()
+        self.evaluated = set()
+        self.route_cache_hits = self.route_cache_builds = 0
+        self.actions_by_parent = {}
+        for index,assignment in enumerate(space.actions):
+            self.actions_by_parent.setdefault(assignment.parent_id, []).append(index)
+
+    @staticmethod
+    def identity(solution, directions):
+        return solution.patterns,tuple((tuple(r.block_ids),tuple(d)) for r,d in zip(solution.routes,directions))
+
+    def blocks(self, patterns):
+        key = tuple(patterns)
+        if key not in self.block_cache:
+            self.block_cache[key] = {b.block_id:b for p in key for b in self.space.children[p]}
+        return self.block_cache[key]
+
+    def state(self, routes, directions, blocks):
+        loads,arcs = [],[]
+        for route,bits in zip(routes,directions):
+            key = tuple((blocks[b].start,blocks[b].end,d) for b,d in zip(route,bits))
+            if key in self.route_cache:
+                self.route_cache_hits += 1
+                p,m = self.route_cache[key]
+            else:
+                self.route_cache_builds += 1
+                p = sum(self.config.process_time(blocks[b].length) for b in route)
+                m = _route_arc_costs(route,bits,blocks,self.config)
+                self.route_cache[key] = p,m
+            loads.append(p);arcs.append(m)
+        return OrientedRouteState(tuple(map(tuple,routes)),tuple(map(tuple,directions)),tuple(loads),tuple(arcs))
+
+    @staticmethod
+    def cycles(state):
+        return tuple(p+sum(m) for p,m in zip(state.loads,state.arc_costs))
+
+    def ownership_structure(self, candidate):
+        selected = {p.parent_id:p for p in candidate.solution.patterns}
+        owners = {b:r for r,route in enumerate(candidate.state.routes) for b in route}
+        return tuple((parent,selected[parent].pattern_id,
+                      tuple(owners[b.block_id] for b in self.space.children[selected[parent]]))
+                     for parent in candidate.parents)
+
+    def bottleneck(self, current, schedule):
+        cycles = self.cycles(current.state)
+        # Actual native completion includes waiting; failed native timelines do
+        # not supply completion labels. Exact route periods remain observable.
+        completion = schedule.robot_completion if schedule.feasible else cycles
+        critical = max(range(4), key=lambda r:(completion[r],cycles[r],-r))
+        receivers = sorted((r for r in range(4) if r != critical),
+                           key=lambda r:(completion[r],cycles[r],r))
+        blocks = self.blocks(current.solution.patterns)
+        contributions = {}
+        for k,b in enumerate(current.state.routes[critical]):
+            parent = blocks[b].parent_id
+            contribution = self.config.process_time(blocks[b].length)
+            if k:contribution += current.state.arc_costs[critical][k-1]
+            if k < len(current.state.arc_costs[critical]):contribution += current.state.arc_costs[critical][k]
+            contributions[parent] = contributions.get(parent,0.)+contribution
+        ordered = sorted(contributions,key=lambda p:(-contributions[p],p))
+        return critical,tuple(receivers),tuple(ordered)
+
+    def partial(self, current, removed):
+        blocks = self.blocks(current.solution.patterns)
+        routes,bits = [],[]
+        for route,vector in zip(current.state.routes,current.directions):
+            keep = [k for k,b in enumerate(route) if blocks[b].parent_id not in removed]
+            routes.append(tuple(route[k] for k in keep));bits.append(tuple(vector[k] for k in keep))
+        return self.state(routes,bits,blocks)
+
+    def _positions(self, state, child, robot, blocks, *, limit):
+        route,bits = state.routes[robot],state.directions[robot]
+        def delta(k):
+            best = math.inf
+            for d in (0,1):
+                start,end = oriented_endpoints(child,d)
+                incoming = math.dist(oriented_endpoints(blocks[route[k-1]],bits[k-1])[1],start) if k else 0.
+                outgoing = math.dist(end,oriented_endpoints(blocks[route[k]],bits[k])[0]) if k<len(route) else 0.
+                removed = (math.dist(oriented_endpoints(blocks[route[k-1]],bits[k-1])[1],
+                                     oriented_endpoints(blocks[route[k]],bits[k])[0]) if 0<k<len(route) else 0.)
+                best = min(best,incoming+outgoing-removed)
+            return best
+        # Local insertion geometry proposes positions; only native Cmax accepts
+        # a complete action. No weighted processing/MOVE/WAIT objective is used.
+        nearest = sorted(range(len(route)+1),key=lambda k:(delta(k),k))[:2]
+        spread = list(bounded_insertion_positions(len(route),max(2,limit)))
+        self.rng.shuffle(spread)
+        return tuple(dict.fromkeys((*nearest,*spread)))[:limit]
+
+    def insert_parent(self, state, assignment, blocks, *, positions=3, keep=6):
+        children = self.space.children[assignment.pattern]
+        blocks = {**{k:b for k,b in blocks.items() if b.parent_id!=assignment.parent_id},
+                  **{b.block_id:b for b in children}}
+        beam = [(state,())]
+        for child,robot in zip(children,assignment.robots):
+            expanded = []
+            for partial,actions in beam:
+                for k in self._positions(partial,child,robot,blocks,limit=positions):
+                    for direction in (0,1):
+                        route = partial.routes[robot][:k]+(child.block_id,)+partial.routes[robot][k:]
+                        bits = partial.directions[robot][:k]+(direction,)+partial.directions[robot][k:]
+                        costs = _insert_route_arc_costs(partial.routes[robot],partial.directions[robot],
+                            partial.arc_costs[robot],child,k,direction,blocks,self.config)
+                        after = OrientedRouteState(partial.routes[:robot]+(route,)+partial.routes[robot+1:],
+                            partial.directions[:robot]+(bits,)+partial.directions[robot+1:],
+                            tuple(p+self.config.process_time(child.length)*(r==robot) for r,p in enumerate(partial.loads)),
+                            partial.arc_costs[:robot]+(costs,)+partial.arc_costs[robot+1:])
+                        expanded.append((after,actions+(OrientedInsertionAction(child.block_id,robot,k,direction),)))
+            # Keep both directions and spread positions before a neural or
+            # native score exists. This is a bounded proposal beam, not LB ranking.
+            if len(expanded)>keep:
+                slots = tuple(round(i*(len(expanded)-1)/max(1,keep-1)) for i in range(keep))
+                expanded = [expanded[i] for i in dict.fromkeys(slots)]
+            beam = expanded
+        return tuple((s,a,blocks) for s,a in beam)
+
+    def _transfer_assignments(self, current, parent, source, target, selected):
+        owners = {b:r for r,route in enumerate(current.state.routes) for b in route}
+        before = tuple(owners[b.block_id] for b in self.space.children[selected])
+        transferred = tuple(target if r==source else r for r in before)
+        indices = []
+        for i in self.actions_by_parent[parent]:
+            assignment = self.space.actions[i]
+            keep_split = assignment.pattern==selected and assignment.robots==transferred and transferred!=before
+            whole_option = (assignment.pattern.kind is SplitKind.WHOLE and assignment.pattern!=selected
+                            and assignment.robots==(target,))
+            if keep_split or whole_option:indices.append(i)
+        return tuple(sorted(indices,key=lambda i:(self.space.actions[i].pattern!=selected,i)))
+
+    def finish(self, current, patterns, state, operator, parents):
+        counts = self.counts[operator];counts['generated'] += 1
+        patterns = tuple(sorted(patterns,key=lambda p:p.parent_id))
+        raw = patterns,state.routes,state.directions
+        local = self.raw_seen
+        if raw in local or raw == (current.solution.patterns,current.state.routes,current.directions):
+            counts['duplicate'] += 1;return None
+        local.add(raw)
+        blocks = self.blocks(patterns)
+        first_points = {r:oriented_endpoints(blocks[route[0]],state.directions[r][0])[0]
+                        for r,route in enumerate(state.routes) if route}
+        # This is the existing B32 input geometry rule, not a native DEADLOCK
+        # filter. Apply it only after both source/target routes are complete.
+        if _initial_error(first_points,self.config) is not None:
+            counts['invalid'] += 1;counts['initial_geometry_invalid'] += 1;return None
+        try:
+            solution = canonicalize(self.parents,patterns,dict(enumerate(state.routes)),self.config,scope=self.scope)
+            # Do not reuse a noncanonical split's processing/MOVE as a bound
+            # after canonicalize merged it. Legal WHOLE proposals are separate.
+            if solution.patterns!=patterns or tuple(r.block_ids for r in solution.routes)!=state.routes:
+                counts['canonical_changed'] += 1;return None
+        except ValueError:
+            counts['invalid'] += 1;return None
+        signature = self.identity(solution,state.directions)
+        if signature in self.evaluated:
+            counts['duplicate'] += 1;return None
+        after = self.state(state.routes,state.directions,blocks)
+        old_cycles,new_cycles = self.cycles(current.state),self.cycles(after)
+        candidate = BottleneckAction(solution,after.directions,after,operator,tuple(parents),signature,
+                                     tuple(b-a for a,b in zip(old_cycles,new_cycles)),{})
+        candidate.transfers = actual_parent_transfers(current,candidate,self.config,
+            before_blocks=self.blocks(current.solution.patterns),after_blocks=blocks,parents=set(parents))
+        counts['unique'] += 1
+        counts['cross_robot_candidates'] += bool(candidate.transfers)
+        counts['cross_parent_transfers'] += len(candidate.transfers)
+        return candidate
+
+    def neighbours(self, current, schedule, operator):
+        critical,receivers,parents = self.bottleneck(current,schedule)
+        selected = {p.parent_id:p for p in current.solution.patterns}
+        blocks = self.blocks(current.solution.patterns)
+        streams = []
+        if operator=='two_opt':
+            route,bits = current.state.routes[critical],current.directions[critical]
+            pairs = [(i,j) for i in range(len(route)) for j in range(i+2,len(route)+1)]
+            self.rng.shuffle(pairs)
+            result = []
+            for i,j in pairs:
+                routes = list(current.state.routes);vectors = list(current.directions)
+                routes[critical] = route[:i]+tuple(reversed(route[i:j]))+route[j:]
+                vectors[critical] = bits[:i]+tuple(1-d for d in reversed(bits[i:j]))+bits[j:]
+                affected = tuple(dict.fromkeys(blocks[b].parent_id for b in route[i:j]))
+                state = self.state(routes,vectors,blocks)
+                item = self.finish(current,current.solution.patterns,state,operator,affected)
+                if item is not None:result.append(item)
+                if len(result)>=self.candidate_limit:break
+            return result
+        for parent in parents[:4]:
+            for receiver in receivers:
+                left = self._transfer_assignments(current,parent,critical,receiver,selected[parent])
+                if not left:continue
+                partners = (None,)
+                if operator=='swap':
+                    partners = tuple(dict.fromkeys(blocks[b].parent_id for b in current.state.routes[receiver]
+                        if blocks[b].parent_id!=parent))
+                    partners = tuple(sorted(partners,key=lambda p:(-sum(self.config.process_time(b.length)
+                        for b in blocks.values() if b.parent_id==p),p)))[:3]
+                for partner in partners:
+                    right = (None,) if partner is None else self._transfer_assignments(
+                        current,partner,receiver,critical,selected[partner])
+                    if not right:continue
+                    removed = (parent,) if partner is None else (parent,partner)
+                    partial = self.partial(current,set(removed))
+                    options = []
+                    for first in left:
+                        assignment = self.space.actions[first]
+                        changed = {**selected,parent:assignment.pattern}
+                        for a,_,local_blocks in self.insert_parent(partial,assignment,blocks,positions=3,keep=6):
+                            if partner is None:
+                                options.append((tuple(changed.values()),a,removed));continue
+                            for second in right:
+                                other = self.space.actions[second]
+                                both = {**changed,partner:other.pattern}
+                                for b,_,_ in self.insert_parent(a,other,local_blocks,positions=3,keep=6):
+                                    options.append((tuple(both.values()),b,removed))
+                    self.rng.shuffle(options);streams.append(iter(options))
+        # Round robin prevents a single receiving robot or parent pair filling
+        # the proposal cap before another ownership structure is considered.
+        result = []
+        while streams and len(result)<self.candidate_limit:
+            alive = []
+            for stream in streams:
+                try:patterns,state,removed = next(stream)
+                except StopIteration:continue
+                alive.append(stream)
+                item = self.finish(current,patterns,state,operator,removed)
+                if item is not None:result.append(item)
+                if len(result)>=self.candidate_limit:break
+            streams = alive
+        return result
+
+    def reconstruct(self, current, schedule, *, ordinal, ranker=None, width=4):
+        critical,receivers,ordered = self.bottleneck(current,schedule)
+        q = min(len(self.parents),3+ordinal%4)
+        if q<3:return []
+        blocks = self.blocks(current.solution.patterns)
+        removed = list(ordered[:min(2,len(ordered))])
+        receive_parents = list(dict.fromkeys(blocks[b].parent_id for r in receivers for b in current.state.routes[r]))
+        self.rng.shuffle(receive_parents)
+        for parent in (*receive_parents,*ordered,*(p.parent_id for p in self.parents)):
+            if parent not in removed:removed.append(parent)
+            if len(removed)>=q:break
+        removed = tuple(removed[:q])
+        selected = {p.parent_id:p for p in current.solution.patterns}
+        retained = {k:b for k,b in blocks.items() if b.parent_id not in removed}
+        beam = [(self.partial(current,set(removed)),selected,retained,0.)]
+        for step,parent in enumerate(removed):
+            proposals = []
+            choices = {}
+            for index in self.actions_by_parent[parent]:
+                assignment = self.space.actions[index]
+                key = assignment.pattern.kind,assignment.robots
+                previous = choices.get(key)
+                if previous is None or assignment.pattern==selected[parent]:choices[key] = index
+            indices = list(choices.values());self.rng.shuffle(indices)
+            # Rotate through legal mode/owner structures, without a Pmax band.
+            indices = indices[:12]
+            for state,patterns,local_blocks,total in beam:
+                for index in indices:
+                    assignment = self.space.actions[index]
+                    for after,actions,after_blocks in self.insert_parent(state,assignment,local_blocks,positions=3,keep=4):
+                        proposals.append(dict(state=after,patterns={**patterns,parent:assignment.pattern},
+                            blocks=after_blocks,total=total,index=index,before=state,actions=actions,
+                            pending=removed[step:]))
+            if not proposals:return []
+            scores = ranker(current,schedule,proposals) if ranker is not None else [self.ranking_rng.random() for _ in proposals]
+            for proposal,score in zip(proposals,scores):proposal['total'] += float(score)
+            order = sorted(range(len(proposals)),key=lambda i:-proposals[i]['total'])
+            kept,structures = [],set()
+            for i in order:
+                proposal = proposals[i]
+                structure = tuple((p.parent_id,p.pattern_id) for p in proposal['patterns'].values()),tuple(
+                    (r,tuple(sorted(b for b in route if self._parent_id_from_blocks(b,proposal['blocks']) in removed)))
+                    for r,route in enumerate(proposal['state'].routes))
+                if structure in structures:continue
+                structures.add(structure)
+                kept.append((proposal['state'],proposal['patterns'],proposal['blocks'],proposal['total']))
+                if len(kept)>=width:break
+            beam = kept
+        result = []
+        for state,patterns,_,total in beam:
+            item = self.finish(current,tuple(patterns.values()),state,'lns',removed)
+            if item is not None:item.score = total/max(1,len(removed));result.append(item)
+        return result
+
+    @staticmethod
+    def _parent_id_from_blocks(block_id, blocks):
+        return blocks[block_id].parent_id
+
+
+def run_bottleneck_vns(initial, workspace, native_evaluator, *, scorer=None, repair_ranker=None,
+                       native_budget=500, max_states=80, max_shakes=8, batch_size=24, observer=None):
+    """One VNS: native Cmax improvement, parent LNS escape, final B32 outside."""
+    started = time.perf_counter()
+    cache,archive = {},[]
+    native_calls = 0
+    best = None
+    def evaluate(candidate, origin=None):
+        nonlocal native_calls,best
+        if candidate.signature in cache:return cache[candidate.signature]
+        if native_calls>=native_budget:return None
+        clock = time.perf_counter()
+        schedule = native_evaluator(candidate.solution,workspace.config,candidate.directions)
+        elapsed = time.perf_counter()-clock
+        native_calls += 1;workspace.evaluated.add(candidate.signature)
+        cache[candidate.signature] = schedule
+        counts = workspace.counts[candidate.operator]
+        counts['native_calls'] += 1;counts['native_feasible'] += int(schedule.feasible)
+        counts['native_cross_robot_candidates'] += bool(candidate.transfers)
+        counts['native_cross_parent_transfers'] += len(candidate.transfers)
+        if schedule.feasible and (best is None or schedule.cmax<best[1].cmax):best = candidate,schedule
+        if not schedule.feasible:archive.append((candidate,schedule))
+        if observer is not None:observer(candidate,schedule,origin,elapsed)
+        return schedule
+    starts = [(candidate,evaluate(candidate)) for candidate in initial]
+    starts = [(c,s) for c,s in starts if s is not None]
+    if not starts:raise ValueError('BVNS has no complete initial candidate')
+    current,schedule = best if best is not None else starts[0]
+    initial_selected = current
+    current_states = set()
+    neighbourhood = shakes = states = 0
+    operators = ('relocate','swap','two_opt')
+    stop = 'state budget exhausted'
+    while native_calls<native_budget and states<max_states:
+        states += 1
+        current_states.add(current.signature)
+        operator = operators[neighbourhood]
+        candidates = workspace.neighbours(current,schedule,operator)
+        if schedule.feasible:
+            kept = [c for c in candidates if max(workspace.cycles(c.state))<schedule.cmax]
+            workspace.counts[operator]['lb_pruned'] += len(candidates)-len(kept)
+            candidates = kept
+        if scorer is not None and candidates:
+            for c,score in zip(candidates,scorer(current,schedule,candidates)):c.score = float(score)
+        else:
+            for c in candidates:c.score = workspace.ranking_rng.random()
+        candidates.sort(key=lambda c:-c.score)
+        distinct,fill,structures = [],[],set()
+        for candidate in candidates:
+            structure = workspace.ownership_structure(candidate)
+            if structure in structures:fill.append(candidate)
+            else:structures.add(structure);distinct.append(candidate)
+        prefix = distinct[:batch_size//2]
+        prefix_ids = {id(c) for c in prefix}
+        ordered = prefix+[c for c in candidates if id(c) not in prefix_ids]
+        evaluated = []
+        for candidate in ordered[:batch_size]:
+            result = evaluate(candidate,current)
+            if result is not None:evaluated.append((candidate,result))
+        improving = [(c,s) for c,s in evaluated if s.feasible and
+                     (not schedule.feasible or s.cmax<schedule.cmax)]
+        if improving:
+            current,schedule = min(improving,key=lambda x:x[1].cmax)
+            workspace.counts[operator]['accepted'] += 1;neighbourhood = 0
+            workspace.counts[operator]['accepted_parent_transfers'] += len(current.transfers)
+            continue
+        neighbourhood += 1
+        if neighbourhood<len(operators):continue
+        neighbourhood = 0
+        if shakes>=max_shakes:stop = 'LNS perturbation budget exhausted';break
+        proposals = workspace.reconstruct(current,schedule,ordinal=shakes,ranker=repair_ranker)
+        shakes += 1
+        if scorer is not None and proposals:
+            for c,score in zip(proposals,scorer(current,schedule,proposals)):c.score = float(score)
+        proposals.sort(key=lambda c:-c.score)
+        tested = [(candidate,evaluate(candidate,current)) for candidate in proposals]
+        tested = [(c,s) for c,s in tested if s is not None]
+        if not tested:continue
+        feasible = [(c,s) for c,s in tested if s.feasible]
+        failed = [(c,s) for c,s in tested if not s.feasible]
+        # Failed native scheduling is a search branch, not a proof. Periodic
+        # GNN-ranked failed perturbations get local repair even if a feasible
+        # incumbent exists; that incumbent remains in best.
+        if failed and (not feasible or shakes%2==0):
+            current,schedule = max(failed,key=lambda x:x[0].score)
+            workspace.counts['lns']['native_deadlock_branches'] += 1
+        else:current,schedule = min(feasible,key=lambda x:x[1].cmax)
+        workspace.counts['lns']['accepted'] += 1
+        workspace.counts['lns']['accepted_parent_transfers'] += len(current.transfers)
+    if native_calls>=native_budget:stop = 'native evaluation budget exhausted'
+    # Initial proposals have no action score. Their default zero must not
+    # outrank every genuine GNN alternative when learned logits are negative.
+    backups = [entry for entry in archive if entry[0].operator!='initial'] or archive
+    selected = best if best is not None else max(backups,key=lambda x:x[0].score)
+    return dict(candidate=selected[0],native=selected[1],initial_selected=initial_selected,native_calls=native_calls,
+        states=len(current_states),rounds=states,shakes=shakes,
+        stop=stop,counts={k:dict(v) for k,v in workspace.counts.items()},
+        route_cache_hits=workspace.route_cache_hits,route_cache_builds=workspace.route_cache_builds,
+        native_deadlock_reserve=len(archive),runtime_s=time.perf_counter()-started)
 
 
 class CandidateSourceKind(str, Enum):
