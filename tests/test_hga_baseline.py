@@ -2680,3 +2680,275 @@ def test_rcg_train_requires_initial_gain_gnn_ablation_and_runtime_before_validat
     with pytest.raises(ValueError, match='TRAIN failed'):
         entry.run_experiment('validation')
 
+
+def _jn_fixture():
+    from mrta_search import gnn_joint_mip as j
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    parents = tuple(ParentWeld(name, (x, y), (x+.8, y)) for name, x, y in
+        (('a', 1., 9.), ('b', 10., 9.), ('c', 13., 9.), ('d', 3., 1.), ('e', 12., 1.)))
+    w = j._HGAWorkspace(parents, ScientificConfig(), FORMAL_SCOPE_V2)
+    lookup = {w.ids[int(n)]: int(n) for m in w.initial_selected for n in w.pattern_nodes[m] if n >= 0}
+    routes = [[lookup[name+'::whole'] for name in row] for row in (('a', 'b'), ('c',), ('d',), ('e',))]
+    plan = j.make_plan(w, routes, [[0]*len(row) for row in routes], w.initial_selected)
+    plan.schedule = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=plan.period+100., directions=plan.directions)
+    return j, w, plan
+
+
+def _jn_matrix_feasible(model, x):
+    import numpy as np
+    values = model.matrix@x
+    return (np.all(x >= np.array(model.lower)-1.e-6) and np.all(x <= np.array(model.upper)+1.e-6)
+        and np.all(values >= model.constraints.lb-1.e-6) and np.all(values <= model.constraints.ub+1.e-6))
+
+
+def test_jnmip_original_witness_and_all_gap_direction_milp_match_exhaustive():
+    import itertools
+    from mrta_search.saeax import _route_statistics
+    j, w, old = _jn_fixture()
+    parents = (0, 1)
+    model = j.JointArcModel(w, old, parents)
+    assert _jn_matrix_feasible(model, model.encode(old))
+    answer, info = j.solve_joint(w, old, parents, 3.)
+    assert info['status'] == 0 and answer is not None
+    chosen = [int(n) for p in parents for n in w.pattern_nodes[old.selected[p]] if n >= 0]
+    fixed = [[(int(n), int(d)) for n, d in zip(row, bits) if int(w.parent_index[n]) not in parents]
+        for row, bits in zip(old.routes, old.bits)]
+    minimum = old.period
+    for owners in itertools.product(*[list(__import__('numpy').flatnonzero(w.eligible[n])) for n in chosen]):
+        tasks = [[n for n, owner in zip(chosen, owners) if owner == r]+[n for n, d in fixed[r]] for r in range(4)]
+        for routes in itertools.product(*(itertools.permutations(row) for row in tasks)):
+            if any([n for n in row if n in dict(fixed[r])] != [n for n, d in fixed[r]] for r, row in enumerate(routes)): continue
+            for vector in itertools.product((0, 1), repeat=len(chosen)):
+                direction = dict(zip(chosen, vector)); direction.update({n: d for row in fixed for n, d in row})
+                bits = [[direction[n] for n in row] for row in routes]
+                try: candidate = j.make_plan(w, routes, bits, old.selected)
+                except ValueError: continue
+                minimum = min(minimum, candidate.period)
+    assert answer.period == pytest.approx(minimum)
+    assert answer.period < old.period
+    assert _jn_matrix_feasible(model, model.encode(answer))
+    assert answer.selected.tolist() == old.selected.tolist()
+
+
+def test_jnmip_joint_modes_x_fixed_owners_y_separate_coverage_and_canonical():
+    import numpy as np
+    from scipy.optimize import Bounds, milp
+    from mrta_search import gnn_joint_mip as j
+    parents = (ParentWeld('y', (3., 8.), (3., 4.)), ParentWeld('x', (1., 9.), (10., 9.)),
+        ParentWeld('a', (2., 9.), (3.2, 9.)), ParentWeld('b', (11., 9.), (12.2, 9.)),
+        ParentWeld('c', (1., 3.), (2.2, 3.)), ParentWeld('d', (12., 3.), (13.2, 3.)))
+    w = j._HGAWorkspace(parents, ScientificConfig(), FORMAL_SCOPE_V2)
+    lookup = {w.ids[int(n)]: int(n) for m in w.initial_selected for n in w.pattern_nodes[m] if n >= 0}
+    rows = (('a::whole', 'y::0', 'x::whole'), ('b::whole',), ('c::whole', 'y::1'), ('d::whole',))
+    old = j.make_plan(w, [[lookup[n] for n in row] for row in rows], [[0]*len(row) for row in rows], w.initial_selected)
+    xp = next(p for p, parent in enumerate(w.parents) if parent.parent_id == 'x')
+    yp = next(p for p, parent in enumerate(w.parents) if parent.parent_id == 'y')
+    model = j.JointArcModel(w, old, (xp, yp))
+    assert _jn_matrix_feasible(model, model.encode(old))
+    modes = [next(m for m in w.options[xp] if w.patterns[m].kind is kind) for kind in (SplitKind.WHOLE, SplitKind.X_SPLIT)]
+    for m in modes:
+        lower = np.array(model.lower); upper = np.array(model.upper)
+        lower[model.mode[m]] = upper[model.mode[m]] = 1.
+        result = milp(model.objective, integrality=np.array(model.integer), bounds=Bounds(lower, upper),
+            constraints=model.constraints, options=dict(time_limit=3.))
+        assert result.x is not None
+        answer = model.decode(result.x)
+        assert answer.selected[xp] == m
+        for r, route in enumerate(answer.routes):
+            for n in route:
+                assert w.eligible[n, r]
+                if w.node_pattern[n] == m and w.patterns[m].kind is SplitKind.X_SPLIT:
+                    assert w.eligible[n].sum() == 1
+        for p in (xp, yp):
+            expected = {int(n) for n in w.pattern_nodes[answer.selected[p]] if n >= 0}
+            assert {int(n) for row in answer.routes for n in row if w.parent_index[n] == p} == expected
+        assert [list(r.block_ids) for r in answer.solution.routes] == [[w.ids[n] for n in row] for row in answer.routes]
+
+
+def test_jnmip_subtour_cannot_hide_optional_tasks_off_the_depot_path():
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    j, w, old = _jn_fixture()
+    model = j.JointArcModel(w, old, (0, 1))
+    a, b = 0, 2  # a(direction0), b(direction0), no retained R0 vertices
+    assert w.parent_index[model.vertices[0][a][0]] != w.parent_index[model.vertices[0][b][0]]
+    row = np.zeros(len(model.lower)); row[model.arcs[0][a, b]] = row[model.arcs[0][b, a]] = 1.
+    result = milp(model.objective, integrality=np.array(model.integer),
+        bounds=Bounds(model.lower, model.upper), constraints=(model.constraints, LinearConstraint(row, 2., 2.)),
+        options=dict(time_limit=2.))
+    assert result.status == 2 and result.x is None
+
+
+def test_jnmip_illegal_different_robot_heads_are_inside_model():
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    j, w, old = _jn_fixture()
+    model = j.JointArcModel(w, old, (0, 1, 2))
+    left = next(i for i, (n, d) in enumerate(model.vertices[0]) if w.ids[n] == 'c::whole' and d == 0)
+    right = next(i for i, (n, d) in enumerate(model.vertices[1]) if w.ids[n] == 'a::whole' and d == 0)
+    row = np.zeros(len(model.lower))
+    row[model.arcs[0][model.SOURCE, left]] = row[model.arcs[1][model.SOURCE, right]] = 1.
+    result = milp(model.objective, integrality=np.array(model.integer), bounds=Bounds(model.lower, model.upper),
+        constraints=(model.constraints, LinearConstraint(row, 2., 2.)), options=dict(time_limit=2.))
+    assert model.head_conflicts > 0 and result.status == 2
+
+
+def test_jnmip_parent_sets_have_multiple_robots_and_real_set_head_inputs():
+    import torch
+    j, w, old = _jn_fixture()
+    selector = j.SetSelector()
+    context = j.SelectionContext(w, old, selector)
+    sets = context.candidate_sets()
+    assert sets and all(4 <= len(q) <= 6 for q in sets)
+    assert all(len(set().union(*(context.owners[p] for p in q))) >= 2 for q in sets)
+    rows = context.rows(sets)
+    assert rows.shape == (len(sets), 4*64+j.SET_DIM)
+    assert torch.isfinite(rows).all()
+    assert selector(rows).shape == (len(sets),)
+    # This is a whole-set representation, not an action/insert-position head.
+    assert len(set(sets)) == len(sets)
+
+
+def test_jnmip_fit_stops_without_positive_b32_labels_and_uses_real_preferences():
+    import torch
+    j, w, old = _jn_fixture()
+    torch.manual_seed(17)
+    selector = j.SetSelector()
+    rows = j.SelectionContext(w, old, selector).rows(((0, 1, 2, 3), (0, 1, 2, 4))).detach()
+    before = selector.head[0].weight.detach().clone()
+    no_gain = [dict(b32_status='FEASIBLE', actual_gain_s=0.), dict(b32_status='FEASIBLE', actual_gain_s=-10.)]
+    stopped = j.fit_selector(selector, [(rows, no_gain)])
+    assert not stopped['trained'] and stopped['epochs'] == 0
+    assert torch.equal(before, selector.head[0].weight)
+    frozen = {k: v.detach().clone() for k, v in selector.encoder.state_dict().items()}
+    yes_gain = [dict(b32_status='FEASIBLE', actual_gain_s=10.), dict(b32_status='FEASIBLE', actual_gain_s=-10.)]
+    fit = j.fit_selector(selector, [(rows, yes_gain)], epochs=2)
+    assert fit['trained'] and fit['preference_pairs'] == 1 and fit['head_gradient_norm'] > 0
+    assert not torch.equal(before[:, :64], selector.head[0].weight[:, :64])
+    assert all(torch.equal(value, selector.encoder.state_dict()[key]) for key, value in frozen.items())
+
+
+@pytest.mark.parametrize('status,cmax,accept', [('FEASIBLE', 100., True),
+    ('FEASIBLE', 10000., False), ('DEADLOCK', None, False)])
+def test_jnmip_acceptance_requires_actual_b32_not_better_route_proxy(monkeypatch, status, cmax, accept):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    j, w, old = _jn_fixture()
+    rr = [row.copy() for row in old.routes]; dd = [row.copy() for row in old.bits]
+    rr[1] = __import__('numpy').r_[rr[0][-1:], rr[1]]; dd[1] = __import__('numpy').r_[dd[0][-1:], dd[1]]
+    rr[0], dd[0] = rr[0][:-1], dd[0][:-1]
+    candidate = j.make_plan(w, rr, dd, old.selected)
+    assert candidate.period < old.period
+    monkeypatch.setattr(j.SelectionContext, 'candidate_sets', lambda *a: [(0, 1, 2, 3)])
+    def solve(*args, **kwargs):
+        return j.make_plan(w, rr, dd, old.selected), dict(build_s=0., solve_s=0., status=0)
+    monkeypatch.setattr(j, 'solve_joint', solve)
+    count = []
+    def evaluate(plan, workspace):
+        count.append(plan.key)
+        plan.schedule = ScheduleResult(ScheduleStatus(status), cmax=cmax, directions=plan.directions)
+        return 0.
+    monkeypatch.setattr(j, 'evaluate_plan', evaluate)
+    result = j.optimize(w, old, 2., settings=j.JNConfig(max_rounds=1))
+    assert len(count) == 1 and result.accounting['b32_calls'] == 1 and result.runtime >= 2.
+    assert bool(result.accounting['accepted']) == accept
+    assert (result.plan.schedule.cmax == 100.) if accept else result.plan is old
+    if status == 'DEADLOCK': assert result.records[0]['b32_cmax_s'] is None
+
+
+def test_jnmip_unchanged_candidate_reuses_initial_b32(monkeypatch):
+    j, w, old = _jn_fixture()
+    monkeypatch.setattr(j.SelectionContext, 'candidate_sets', lambda *a: [(0, 1, 2, 3)])
+    monkeypatch.setattr(j, 'solve_joint', lambda *a, **k: (old, dict(build_s=0., solve_s=0., status=0)))
+    monkeypatch.setattr(j, 'evaluate_plan', lambda *a: pytest.fail('initial B32 repeated'))
+    result = j.optimize(w, old, 0.)
+    assert result.plan is old and result.accounting['b32_calls'] == 0
+    assert result.reason == 'NO_B32_IMPROVEMENT' and result.accounting['milp_calls'] == 1
+
+
+def test_jnmip_initial_observer_forwards_once_and_restores_existing_saeax(monkeypatch):
+    from types import SimpleNamespace
+    j, w, old = _jn_fixture()
+    calls = []
+    def schedule(solution, config, *, feasible_dispatch_observer, **kwargs):
+        calls.append(solution)
+        feasible_dispatch_observer(old.schedule, ())
+        return old.schedule
+    monkeypatch.setattr(j.saeax, 'reference_schedule_formal', schedule)
+    def initialize(*args, **kwargs):
+        result = j.saeax.reference_schedule_formal(old.solution, w.config)
+        return SimpleNamespace(status='FEASIBLE', solution=old.solution, directions=old.directions, schedule=result)
+    monkeypatch.setattr(j.saeax, 'run_saeax', initialize)
+    result, blockers, elapsed = j.initialize(w.parents)
+    assert result.schedule is old.schedule and len(calls) == 1 and elapsed >= 0
+    assert j.saeax.reference_schedule_formal is schedule
+
+
+def test_jnmip_pilot_needs_b32_gain_ablation_and_time(monkeypatch):
+    import json
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    import run_gnn_joint_mip as entry
+    def records(scores):
+        return [dict(layout_id=name, seed='20261110', status='FEASIBLE', cmax_s=str(score),
+            runtime_s='50', diagnostic=json.dumps(dict(accounting=dict(search_complete=True))))
+            for name, score in zip(entry.PILOTS, scores)]
+    data = dict(gnn=records((99., 99., 100.)), initial=records((100., 100., 100.)), rule=records((99.5, 99.5, 100.)))
+    monkeypatch.setattr(entry, 'method_rows', lambda stage, method='gnn': data[method])
+    assert entry.pilot_decision()['passed']
+    data['gnn'] = records((99.9, 99.9, 100.))
+    assert not entry.pilot_decision()['passed']
+    data['gnn'] = records((99., 99., 100.)); data['rule'] = records((98., 98., 100.))
+    assert not entry.pilot_decision()['passed']
+
+
+def test_jnmip_retained_multiple_tasks_keep_relative_order_across_all_gaps():
+    from mrta_search import gnn_joint_mip as j
+    parents = tuple(ParentWeld(name, (x, y), (x+length, y)) for name, x, y, length in
+        (('a', 1., 9., .8), ('b', 10., 9., .8), ('c', 13., 9., .1),
+         ('d', 3., 1., .8), ('e', 12., 1., .8), ('f', 13.5, 9., .1)))
+    w = j._HGAWorkspace(parents, ScientificConfig(), FORMAL_SCOPE_V2)
+    lookup = {w.ids[int(n)]: int(n) for m in w.initial_selected for n in w.pattern_nodes[m] if n >= 0}
+    routes = [[lookup[name+'::whole'] for name in row] for row in (('a', 'b'), ('c', 'f'), ('d',), ('e',))]
+    old = j.make_plan(w, routes, [[0]*len(row) for row in routes], w.initial_selected)
+    answer, info = j.solve_joint(w, old, (0, 1), 3.)
+    assert info['status'] == 0 and answer.period < old.period
+    for r in range(4):
+        before = [(int(n), int(d)) for n, d in zip(old.routes[r], old.bits[r]) if w.parent_index[n] not in (0, 1)]
+        after = [(int(n), int(d)) for n, d in zip(answer.routes[r], answer.bits[r]) if w.parent_index[n] not in (0, 1)]
+        assert after == before
+
+
+def test_jnmip_real_b32_selected_rollout_observer_evaluates_once(monkeypatch):
+    j, w, old = _jn_fixture()
+    original = j.reference_schedule_formal
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(j, 'reference_schedule_formal', counted)
+    elapsed = j.evaluate_plan(old, w)
+    assert len(calls) == 1 and elapsed >= 0 and old.schedule.feasible
+    assert old.schedule.directions == old.directions
+    context = j.SelectionContext(w, old, j.SetSelector())
+    assert context.feedback['completion'] == old.schedule.robot_completion
+
+
+def test_jnmip_failed_shared_initialization_is_saved_without_search_or_rerun(monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    import run_gnn_joint_mip as entry
+    j, w, old = _jn_fixture()
+    initial = SimpleNamespace(status='DEADLOCK', cmax=None, solution=old.solution,
+        directions=old.directions, accounting=dict(native_calls=20, b32_calls=3))
+    calls, rows = [], []
+    def failed(*args, **kwargs):
+        calls.append('initial')
+        return initial, (), .1
+    monkeypatch.setattr(j, 'initialize', failed)
+    monkeypatch.setattr(j, 'optimize', lambda *a, **k: pytest.fail('search after failed initializer'))
+    entry.run_case('pilot', 'toy', w.parents, 20261110, None, rows.append)
+    assert calls == ['initial'] and len(rows) == 3
+    assert all(r['status'] == 'DEADLOCK' and r['cmax_s'] is None for r in rows)
+    assert all(r['termination_reason'] == 'INITIALIZATION_FAILED' for r in rows)
+
