@@ -3386,8 +3386,8 @@ class _VNextPartialState:
 
 
 def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, state, selected,
-                               deadline, step_observer, decision_observer):
-    """Keep two global directed partial plans, using only the existing GNN scores."""
+                               deadline, step_observer, decision_observer, beam_width=2):
+    """Keep a small diverse global beam, using only the existing GNN scores."""
     from .lns import oriented_route_state
 
     started = time.perf_counter()
@@ -3469,7 +3469,7 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
                    and partial.state.directions == kept.state.directions for kept in beam):
                 continue
             beam.append(partial)
-            if len(beam) == 2:
+            if len(beam) == beam_width:
                 break
     completed, failures = [], []
     for partial in beam:
@@ -3500,12 +3500,13 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
                           feedback=None, policy_observer=None):
     from .lns import oriented_route_state
 
-    if beam_width == 2:
+    if beam_width in (2,4):
         if rng is not None:
             raise ValueError('width-two joint construction is deterministic; rng must be None')
         return _construct_vnext_joint_beam(parents, model, config, space=space, embeddings=embeddings,
                                            state=state, selected=selected, deadline=deadline,
-                                           step_observer=step_observer, decision_observer=decision_observer)
+                                           step_observer=step_observer, decision_observer=decision_observer,
+                                           beam_width=beam_width)
     started = time.perf_counter()
     preserve_prefix = getattr(model, 'schedule_feedback', False) and state is not None
     fixed_directions = ({b:d for route,bits in zip(state.routes,state.directions) for b,d in zip(route,bits)}
@@ -3575,7 +3576,7 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
 def construct_vnext_gnn(parents, model, config, *, decision_observer=None, space=None, embeddings=None,
                         state=None, selected=None, rng=None, deadline=None, step_observer=None, beam_width=1,
                         feedback=None, policy_observer=None):
-    """Construct greedily (width one), or return up to two global joint beam plans."""
+    """Construct greedily or return a diverse beam; ChildJoint also permits four."""
     from .lns import joint_block_candidates, oriented_route_state
 
     if getattr(model,'load_first_lambda',None) is not None or getattr(model,'route_aware',False):
@@ -3583,8 +3584,8 @@ def construct_vnext_gnn(parents, model, config, *, decision_observer=None, space
         if not space.four_robot_cover_possible:
             return JointCompletionResult(None,None,(),0.,rejection_reason='NO_LEGAL_FOUR_ROBOT_COVER')
 
-    if beam_width not in (1, 2):
-        raise ValueError('supported joint beam widths are 1 and 2')
+    if beam_width not in (1, 2, 4) or beam_width==4 and not getattr(model,'child_joint',False):
+        raise ValueError('supported joint beam widths are 1, 2 and ChildJoint 4')
     if getattr(model, 'cmax_value_head', None) is not None and (beam_width != 1 or rng is not None):
         raise ValueError('Cmax value construction uses deterministic width one')
     if getattr(model, 'joint_weights', None) is not None:

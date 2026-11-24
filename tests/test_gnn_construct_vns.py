@@ -6432,3 +6432,156 @@ def test_child_joint_cycles_do_not_require_individual_improvement():
     assert any(c.operator=='cycle3' and c.score>0 for c in candidates)
     assert all(c.score<0 for c in candidates if len(c.moves)==1)
 
+
+def test_child_construct_replay_matches_inference_and_directly_trains_both_heads():
+    import json
+    e,space,w,current,_=_child_joint_fixture()
+    model=e.child_joint_model(trained=False);samples=[]
+    def observe(state,selected,plans,scores):
+        if len(selected)!=1 or samples:return
+        keep=e.child_construct_choices(space,plans,scores)
+        inputs=e.gnn.vnext_policy_inputs(space,tuple(plans[i] for i in keep),model)
+        samples.append((e.child_construct_state(state,selected),
+            {k:v.detach().tolist() for k,v in inputs.items()},scores[keep].detach()))
+    e.gnn.construct_vnext_gnn(current.solution.parents,model,e.CONFIG,space=space,step_observer=observe)
+    state,inputs,online=samples[0]
+    model.requires_grad_(True)
+    replay=e.child_construct_replay(space,json.loads(json.dumps(state)),inputs,model)
+    torch.testing.assert_close(replay,online,rtol=1.e-5,atol=2.e-6)
+    labels=[dict(status='FEASIBLE',cmax_s=1000.+70*i) for i in range(len(replay))]
+    loss,metrics=e.child_joint_loss(replay,labels);loss.backward()
+    assert sum(float(p.grad.abs().sum()) for p in model.policy.parameters() if p.grad is not None)>0
+    assert sum(float(p.grad.abs().sum()) for p in model.insertion_head.parameters() if p.grad is not None)>0
+    assert metrics['huber_terms']==len(replay)
+    assert model.layer1.heads==model.layer2.heads==4
+    assert model.insertion_mean.numel()==80
+
+
+def test_child_construct_huber_targets_are_measured_normalized_and_noop_zero():
+    import run_gnn_weld_layout as e
+    rows=[dict(status='FEASIBLE',cmax_s=v) for v in (1000.,900.,1100.)]
+    values=torch.tensor([7.,7.1,6.9],requires_grad=True)
+    loss,metrics=e.child_joint_loss(values,rows)
+    assert float(loss)<1.e-10 and metrics['huber_terms']==3
+    loss.backward()
+    failed=[dict(status='DEADLOCK',cmax_s=None)]*3
+    loss,metrics=e.child_joint_loss(values,failed)
+    assert loss is None and metrics['pairs']==metrics['huber_terms']==0
+    rows=[dict(status='DEADLOCK',cmax_s=None),dict(status='FEASIBLE',cmax_s=1000.)]
+    values=torch.tensor([0.,-.3],requires_grad=True)
+    loss,metrics=e.child_joint_loss(values,rows);loss.backward()
+    assert metrics['huber_terms']==0 and metrics['feasibility_pairs']==1
+    assert values.grad[1]<0 and values.grad[0]>0
+
+
+def test_child_construct_collection_is_self_gnn_common_seed_cached_and_bounded(monkeypatch):
+    import copy,json
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    e,space,w,current,_=_child_joint_fixture();outputs=[];evaluated=[];continuations=[]
+    model=e.child_joint_model(trained=False)
+    monkeypatch.setattr(e,'read_rows',lambda *args:copy.deepcopy(outputs))
+    monkeypatch.setattr(e,'child_joint_write',lambda rows:outputs.extend(copy.deepcopy(rows)))
+    def forbidden(*args,**kwargs):raise AssertionError('external teacher, RULE or native scheduler used for construction labels')
+    for name in ('baseline_run','bvns_initial','rule_beam','run_adapted_wag_vns_v2','priority_schedule'):
+        monkeypatch.setattr(e,name,forbidden)
+    original=e.gnn.construct_vnext_gnn
+    def construct(*args,**kwargs):
+        if kwargs.get('state') is not None:continuations.append(kwargs['rng'].getstate())
+        return original(*args,**kwargs)
+    monkeypatch.setattr(e.gnn,'construct_vnext_gnn',construct)
+    def measured(candidate):
+        evaluated.append(candidate.signature)
+        return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.+len(evaluated))
+    monkeypatch.setattr(e,'b32',measured)
+    spent=e.child_construct_collect(model,['fixture'],{'fixture':current.solution.parents})
+    labels=[r for r in outputs if r['stage']=='construct_candidate']
+    assert 0<spent==len(evaluated)==len(set(evaluated))<=12<=e.CHILD_CONSTRUCT_B32_LIMIT
+    assert labels and all(r['source']=='SELF_GNN_CONSTRUCT_COUNTERFACTUAL' for r in labels)
+    roots=[r for r in outputs if r['stage']=='construct_state']
+    assert len(roots)==2
+    for root in roots:
+        group=[r for r in labels if r['origin_id']==root['candidate_id']]
+        assert group[0]['operator']=='noop'
+        assert len({json.loads(r['diagnostic'])['continuation_seed'] for r in group})==1
+        assert len({(json.loads(r['diagnostic'])['pattern'],tuple(json.loads(r['diagnostic'])['robots']),
+                     json.loads(r['diagnostic'])['parent']) for r in group})==len(group)
+    before=len(continuations)
+    assert e.child_construct_collect(model,['fixture'],{'fixture':current.solution.parents})==spent
+    assert len(evaluated)==spent and len(continuations)==before
+
+
+def test_child_construct_beam4_remains_neural_and_preserves_ownership_diversity(monkeypatch):
+    e,space,w,current,_=_child_joint_fixture()
+    model=e.child_joint_model(trained=False)
+    def forbidden(*args,**kwargs):raise AssertionError('RULE/baseline/B32 called in neural beam')
+    for name in ('bvns_initial','baseline_run','b32'):monkeypatch.setattr(e,name,forbidden)
+    initial,diagnostic=e.child_joint_initial(current.solution.parents,space,w,53,model,beam_width=4)
+    assert diagnostic['source']=='SELF_GNN_BEAM4' and 1<=len(initial)<=4
+    assert len({w.ownership_structure(c) for c in initial})==len(initial)
+
+
+def test_child_construct_fit_uses_clean_weights_and_updates_actual_policy(monkeypatch):
+    import copy
+    from unittest.mock import Mock
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    e,space,w,current,_=_child_joint_fixture();outputs=[];saved=[]
+    monkeypatch.setattr(e,'CHILD_CONSTRUCT_MODEL',Mock(exists=lambda:False))
+    monkeypatch.setattr(e,'cmax_train_split',lambda:(['fixture'],list(e.BVNS_CASES)))
+    monkeypatch.setattr(e,'load_layouts',lambda split:[('fixture',current.solution.parents)])
+    monkeypatch.setattr(e,'read_rows',lambda *args:copy.deepcopy(outputs))
+    monkeypatch.setattr(e,'child_joint_write',lambda rows:outputs.extend(copy.deepcopy(rows)))
+    monkeypatch.setattr(e.torch,'save',lambda state,*args:saved.append(copy.deepcopy(state)))
+    count=[0]
+    def measured(candidate):
+        count[0]+=1
+        return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.+count[0]*20.)
+    monkeypatch.setattr(e,'b32',measured)
+    result=e.child_joint_fit(construction_supervised=True)
+    assert result['training_complete'] and len(result['history'])==3
+    assert result['initialization']=='models/gnn_bvns.pt:frozen_state_dict'
+    assert result['assignment_weight_change']>0 and result['insertion_weight_change']>0
+    assert all(r['assignment_gradient_groups']>0 and r['insertion_gradient_groups']>0 for r in result['history'])
+    assert result['new_b32_calls']==count[0]<=12
+    assert not any('HGA' in s or 'WAG' in s for s in result['training_sources'])
+    # An interruption after epoch three must finish evaluation from the same
+    # checkpoint and labels, with no fourth epoch or repeated B32 call.
+    original_load=e.torch.load;path=e.CHILD_CONSTRUCT_MODEL
+    partial=copy.deepcopy(saved[-1]);partial['training_complete']=False
+    path.exists=lambda:True
+    monkeypatch.setattr(e.torch,'load',lambda p,*a,**kw:copy.deepcopy(partial) if p is path else original_load(p,*a,**kw))
+    monkeypatch.setattr(e,'read_rows',lambda *args:[{k:r.get(k,'') for k in e.CHILD_JOINT_FIELDS} for r in outputs])
+    before=count[0];resumed=e.child_joint_fit(construction_supervised=True)
+    assert resumed['training_complete'] and len(resumed['history'])==3 and count[0]==before
+
+
+def test_child_construct_failed_development_never_starts_validation(monkeypatch):
+    import run_gnn_weld_layout as e
+    monkeypatch.setattr(e,'child_construct_summary',lambda:dict(passed=False))
+    def forbidden(*args,**kwargs):raise AssertionError('VALIDATION started after failed development screening')
+    monkeypatch.setattr(e,'load_layouts',forbidden)
+    monkeypatch.setattr(e,'child_joint_case',forbidden)
+    assert e.child_construct_evaluate('validation')==[]
+    with pytest.raises(ValueError,match='TEST'):e.child_construct_evaluate('test')
+
+
+def test_child_construct_screen_uses_common_feasible_cmax_without_fake_deadlock_numbers(monkeypatch):
+    import run_gnn_weld_layout as e
+    rows=[]
+    for i,name in enumerate(e.BVNS_CASES):
+        rows.append(dict(stage='final',phase='independent',layout_id=name,seed=e.SEED,
+            method=e.CHILD_JOINT_METHODS[1],status='FEASIBLE' if i<4 else 'DEADLOCK',
+            cmax_s=1000. if i<4 else None,runtime_s=20.,priority_calls=500,b32_calls=1))
+        rows.append(dict(stage='final',phase='independent',layout_id=name,seed=e.SEED,
+            method=e.CHILD_CONSTRUCT_METHOD,status='FEASIBLE',cmax_s=980.,
+            runtime_s=30.,priority_calls=500,b32_calls=1))
+    monkeypatch.setattr(e,'read_rows',lambda *args:rows)
+    result=e.child_construct_summary()
+    assert result['passed'] and result['pairs']==4 and result['feasibility_wins']==2
+    assert result['median_change_pct']==pytest.approx(-2.)
+    rows[-1].update(status='DEADLOCK',cmax_s=None)
+    assert not e.child_construct_summary()['passed']
+    rows[-1].update(status='FEASIBLE',cmax_s=980.)
+    for row in rows:
+        if row['method']==e.CHILD_CONSTRUCT_METHOD:row['cmax_s']=1001.
+    assert not e.child_construct_summary()['passed']
+

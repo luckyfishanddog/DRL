@@ -675,4 +675,132 @@ GNN确实生成、原生评价并接受了三/四机器人循环：cycle3评价5
 
 权重为models/gnn_child_joint.pt，数据为results/new_dataset_final/gnn_child_joint.csv。已有完整记录的fit/independent入口只读复用；VALIDATION/TEST入口在前阶段不通过时先返回，不读取后续数据或启动搜索。
 
+## 12. 2026-11-24：构造策略的自生成反事实B32直接监督
+
+### 12.1 实际问题与修改范围
+
+开始时外层Git HEAD仍为 `0935ad8a723057084be190e31c6be4733ce3cb62`；DRL无独立.git。以当前README、上述第9～11节及实际源码为基准，保留已有CRF-DP等工作。历史ChildJoint模型478312字节、实验CSV7315214字节；本轮不写历史权重，也不删除/改写历史行。
+
+实查调用链为 `child_joint_initial → construct_vnext_gnn → _construct_vnext_joint[_beam] → vnext_joint_actions → imitation_joint_scores → assignment_contribution / insertion_logits`。旧 `child_joint_fit → ChildJointScorer` 的整体子任务动作评分只调用原插入MLP，未调用assignment policy。因此共享GAT得到梯度不能证明构造归属头得到了直接监督。
+
+本轮修改原 `scripts/run_gnn_weld_layout.py`、`src/mrta_search/gnn_constructor.py`、`tests/test_gnn_construct_vns.py`、本报告和README，结果继续追加原 `gnn_child_joint.csv`。唯一新增文件是用户批准的 `models/gnn_child_joint_construct.pt`。不修改LNS动作实现、priority_schedule、B32、正式数据或模型约束。
+
+### 12.2 同状态构造反事实及同一评分定义
+
+训练名单仍为9.3节既定20个TRAIN。每个布局先由干净原Cmax-Conflict GNN自主构造一条轨迹，在约15%、50%父任务已构造时取两个部分状态。每状态保留最多6个不同任务/模式类型/子段归属结构的合法联合动作，包含当前最高分动作作为no-op参考。每个动作均包含完整父模式、子段机器人、插入位置和显式方向；没有RULE、REGION、HGA或WAG状态。
+
+分别强制这些动作后，用同一冻结GNN、相同续构造随机种子及相同宽度1策略完成剩余任务，再对完整方案调用真实B32。使用原workspace完整方案身份复用已有SELF_GNN标签；新增构造B32总上限240次，不重复评价已存完整方案。保留全DEADLOCK原始组，不为其生成Cmax偏好；构造失败也独立保留，不称为B32死锁。
+
+构造评分保持原定义：`q(s,a)=assignment_contribution + outcomes·joint_weights + 0.65×有效子段insertion_logits平均`，没有新网络头。采集时保存原 `vnext_policy_inputs` 及部分路线/已选模式；训练重建同一可观察动态图，用同一个 `imitation_joint_scores` 重放。动态图只包含当前状态，没有候选未来B32阻塞特征。新回归逐项核对重放分数与在线构造分数一致，并直接检查policy及insertion_head的非零梯度。
+
+### 12.3 损失、训练来源及推理
+
+若no-op及动作均B32 FEASIBLE，目标为 `t=(Cmax_noop−Cmax_action)/Cmax_noop`，对 `q(action)−q(noop)` 使用Huber（SmoothL1，beta=0.05）。no-op自身的目标和评分差严格为0。FEASIBLE/DEADLOCK只学习可行性优先softplus，不向DEADLOCK填入虚构Cmax；no-op DEADLOCK时不构造依赖其Cmax的数值回归项。两个DEADLOCK之间无损失，全失败组保留但不更新。
+
+初始化只加载 `gnn_bvns.pt:frozen_state_dict`，不加载经过HGA/WAG状态训练的v2 state_dict或旧ChildJoint微调权重。训练由新增构造反事实与原文件中SELF_GNN_CONSTRUCT/SELF_GNN_SEARCH真实标签共同组成；旧局部标签复用而不重跑B32，仍由原ChildJointScorer训练同一组GAT/插入参数。固定AdamW lr=1e-4、3轮，逐轮记录构造组assignment及insertion的梯度，再记录两头相对干净初始化的实际参数变化；不按开发六例选择epoch。
+
+两层GAT、hidden64、4头、11关系、80维现有动作输入和51092个参数不变。新推理仍GNN自主构造，初始Beam固定为4并按模式/归属结构保留多样性；原Beam2历史入口保持兼容。局部仍使用relocate_child、swap_children、cycle3、cycle4、mode及原学习分数相对no-op接受。原生只提供完整方案快速信息，原生DEADLOCK不硬过滤；在线搜索不调用B32，最多500原生、80状态检查、8联合扰动，无墙钟截止，每个最终方案一次B32。没有增加算子、独立Cmax预测器或原生回退。
+
+### 12.4 回归与预定开发判定
+
+新增梯度、原评分重放一致性、归一化Huber/no-op、失败类别、同种子续构造/缓存、自主Beam4、干净权重拟合和失败停止测试。相关构造/ChildJoint/BVNS/Joint4/冲突图回归首批60项通过；入口补丁的缩进错误已在标注前由测试发现并修正，未消耗B32标签。
+
+开发仍为train_04、26、16、03、14、10，seed均20261110，和既定20例拟合名单不重叠。它们是重复使用的开发筛查，不是新独立TEST证据。CSV沿用phase=independent，但用新method=`GNN-ChildJoint-ConstructB32-v1`区分历史。要求新方案6/6可行、至少4例改善、共同可行Cmax配对中位至少降低1%；旧方法DEADLOCK而新方法FEASIBLE单列可行性胜数，不编造数值Cmax。只有通过才冻结模型并运行原10个VALIDATION×3种子；正式要求30/30可行，且对冻结完整HGA/WAG共同可行配对中位均小于0、两组胜数均大于负数。不达标停止，不启动TEST、不继续追调。
+
+### 12.5 实际训练覆盖、梯度与训练内结果
+
+20/20布局、40/40部分状态完成，236条完整方案反事实标签：166 FEASIBLE、70 DEADLOCK；新增B32 **233次**、缓存命中3条，低于240上限。没有CONSTRUCTION_FAILED或全DEADLOCK新组，40组均参与训练。no-op为29 FEASIBLE、11 DEADLOCK；29个可行参考组内，非参考可行候选为40个正改善目标、61个负改善目标、3个零目标。全部失败Cmax留空，未用外部教师替换任何组。
+
+旧520条SELF_GNN局部标签直接复用，其中原25个有偏好组325条进入本轮训练；15个旧全DEADLOCK组保留且不更新。合计65组、561条用于更新的标签；没有为重用旧标签再次调用B32。构造组提供133个Huber项（含29个no-op零项）、206个可行性对；局部组144个Huber项、682个可行性对。no-op DEADLOCK的组只学习可行性优先，不使用其未知Cmax回归。
+
+| epoch | 混合loss | 更新组 | 构造assignment有梯度组 | 构造insertion有梯度组 | assignment梯度最大范数 | insertion梯度最大范数 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 0.842901 | 65 | 40 | 40 | 5.760082 | 2.737519 |
+| 2 | 0.677012 | 65 | 40 | 40 | 5.612065 | 3.598156 |
+| 3 | 0.638452 | 65 | 40 | 40 | 5.616179 | 3.454236 |
+
+梯度范数在clip之前测量；两头相对干净初始化的参数变化L2范数分别 **0.296506 / 0.414510**。因此本轮assignment policy确实获得直接梯度并更新，不能再仅以共享GAT变化代替这个结论。新checkpoint648239字节、training_complete=True，仍51092参数；原gnn_child_joint.pt和gnn_bvns.pt长度/修改时间未变。
+
+完成第三轮后的训练内整组复核（同一最终参数，不是逐组更新过程统计）：
+
+| 标签类型 | 全偏好对准确率 | 相对no-op准确率 | FEASIBLE Cmax排序准确率 |
+|---|---:|---:|---:|
+| 构造反事实 | 254/504 = 50.3968% | 85/171 = 49.7076% | 147/298 = 49.3289% |
+| 原SELF_GNN局部动作 | 793/1200 = 66.0833% | 119/185 = 64.3243% | 252/518 = 48.6486% |
+
+标签覆盖和梯度缺口已补齐，但构造的Cmax排序仍接近随机，不能把loss下降或全组有标签说成构造策略已学好。以上全部为训练内统计，六例开发结果另列，未据这些准确率追加epoch或改变超参数。
+
+采集及准备实测1223.650835秒，至固定三轮末累计1231.524317秒；最后的训练内只读评分复核和保存未单独计时。原CSV沙箱追加权限在正式标注前已检测到，随后使用获批执行环境，全部本轮标签正常持久化，没有重跑或补造日志。
+
+相关回归为60项批量通过，加新增开发判定1项，共61项不同测试；另单独复测扩展后的拟合测试通过，覆盖第三轮保存后中断的恢复：只完成复核，不出现第四轮或重复B32。没有增加新的结果管理模块。
+
+### 12.6 六个开发TRAIN的逐例实测
+
+仅使用冻结新checkpoint，每例seed=20261110、500次原生、最多80状态检查/8扰动，最终恰好一次原B32。旧ChildJoint直接读取历史同键结果，不重跑、不缩减预算；本轮未重跑无GNN、HGA或WAG。
+
+| TRAIN | 历史ChildJoint B32 Cmax(s) | 新方法B32状态/Cmax(s) | 历史/新在线耗时(s) | 新原生/最终B32 | 状态检查/扰动 |
+|---|---:|---:|---:|---|---|
+| train_04 | 7153.214770 | FEASIBLE / 6354.158552 | 27.243163 / 46.420870 | 500 / 1 | 22 / 0 |
+| train_26 | DEADLOCK | DEADLOCK | 29.208563 / 41.635234 | 500 / 1 | 21 / 0 |
+| train_16 | 6989.765095 | DEADLOCK | 31.329345 / 48.295530 | 500 / 1 | 21 / 0 |
+| train_03 | 8953.204154 | DEADLOCK | 28.969588 / 37.809188 | 500 / 1 | 21 / 0 |
+| train_14 | DEADLOCK | DEADLOCK | 52.756198 / 63.866025 | 500 / 1 | 21 / 0 |
+| train_10 | 9044.633366 | DEADLOCK | 62.665458 / 93.805258 | 500 / 1 | 21 / 0 |
+
+**新方法1/6可行，历史4/6。** 只有train_04形成共同可行数值配对，改善11.170589%；这一个配对不能代表六例总体Cmax改善。无可行性胜例，3个历史可行案例变为DEADLOCK，另2例仍DEADLOCK。未满足6/6可行或至少4例改善，开发判定passed=False，**停止，不进入VALIDATION/TEST，不补跑失败案例、不追加epoch或调参**。
+
+六例在线耗时中位 **47.358200秒**（历史30.268954秒），配对时间倍率中位1.461184；总在线时间331.832105秒（历史232.172315秒）。train_10实际93.805秒，没有60秒截止。新方法没有另做原生预热，首例冷启动计入实测；旧方法的共享预热曾单列，因此首例时间存在这一差别。即使不将冷启动归因于模型本身，本轮全部六例记录的在线时间都高于旧记录，不能宣称成本改善。
+
+六例初始化合计162.538238秒（历史72.203207秒）；构造图编码2238次（历史1122），构造加搜索总编码2367次（历史1252），与Beam2改为用户指定Beam4的额外工作一致。原生计时23.897609秒（含冷启动）、主搜索特征38.040459秒、主评分头0.290328秒；编码20.056017秒包含在初始化等计时中，不能重复相加。时间变化不是增加GAT层/头或额外B32评价造成的。
+
+初始方案没有额外B32，因此下面只列真实路线下界，不把它称为初始B32 Cmax：
+
+| TRAIN | 历史初始LB | 新初始LB | 新最终LB | 新最终净转移父数 |
+|---|---:|---:|---:|---:|
+| train_04 | 6155.790619 | 6354.158552 | 6354.158552 | 3 |
+| train_26 | 5182.056843 | 5604.199704 | 6131.007741 | 5 |
+| train_16 | 6462.261187 | 6448.140574 | 6499.457547 | 5 |
+| train_03 | 8023.098757 | 8059.744584 | 8068.004102 | 5 |
+| train_14 | 6531.491558 | 7239.201404 | 7260.061205 | 7 |
+| train_10 | 8307.054505 | 9517.136990 | 9081.364640 | 6 |
+
+5/6新初始LB高于旧初始LB；本次搜索后4例LB上升、1例持平、1例下降。assignment有梯度和更新不等于构造已学会更好分配；本轮没有用负载约束或下界回退来掩盖这些结果。
+
+### 12.7 动作、接受机制及具体失败环节
+
+| 动作 | 生成（含预览） | 唯一完整候选 | 原生评价 | 原生可行 | 接受 | 接受转移父次 |
+|---|---:|---:|---:|---:|---:|---:|
+| initial | 24 | 24 | 24 | 1 | 0 | 0 |
+| relocate_child | 32686 | 1461 | 866 | 248 | 31 | 19 |
+| swap_children | 13866 | 964 | 823 | 208 | 32 | 68 |
+| cycle3 | 14752 | 579 | 528 | 91 | 2 | 9 |
+| cycle4 | 19722 | 577 | 355 | 45 | 0 | 0 |
+| mode | 19830 | 488 | 404 | 113 | 62 | 72 |
+
+原生共3000次，最终B32恰好6次；本轮新增B32总计239=构造标签233+六例最终6。完整候选均复用既有合法性和canonicalize；原生失败没有硬过滤，4机器人循环仍实际评价355次，没有增加或删除算子。
+
+失败已定位到学习结果与最终决策质量，而不是assignment梯度缺失仍未修复：
+
+1. **构造监督确实到达实际头，但未学出可靠Cmax排序。** 40组都有可用比较、两头在120个构造更新中都获得非零梯度，原来的训练缺口已修复；然而训练内构造可行Cmax排序仍49.3289%、no-op判断49.7076%，开发5/6初始LB又更高。本轮233个新标签和三轮训练下，构造决策没有形成稳定改善。
+2. **局部改善评分仍有明显的线上校准问题。** 六例127次接受全部满足relative_score>0，34次增加LB、20次降低、73次持平；8次在双方原生可行时接受更差native Cmax，13次从原生可行接受到原生DEADLOCK。它们不等于已知真实B32退化（中间状态无B32标签），但结合最终1/6可行，不能把学习分数正值当作实际改善的证据。所有shake仍为0，持续宣告改善耗完500次预算，没有触发保留状态扰动。
+3. **快调度和B32的不一致仍然存在。** train_16最终native=6499.457547、train_10=9153.988238秒均有限，但最终B32均DEADLOCK。没有将原生状态当成数学证明，也没有为了修复五例失败追加在线B32或HGA/WAG回退。
+4. **成本没有达到竞争优势。** Beam4增加构造量，六例时间都更高。loss下降、标签覆盖改善和直接梯度都是已验证的实现事实；它们既不能替代最终Cmax/可行性结果，也不能证明本方法优于正式对照。
+
+本轮未隔离构造监督、局部Huber校准和Beam4各自的因果贡献；不能把唯一可行配对的改善全部归因于assignment训练，也不能将失败单独归咎于某个图特征。没有据此添加模块、网络、算子或新的训练轮数。
+
+### 12.8 保存与复核
+
+新权重 `models/gnn_child_joint_construct.pt` 648239字节；原CSV新增method及phase行、保留旧结果。源模型仍为原Cmax-Conflict干净frozen_state_dict，不读取v2训练state_dict。既有GNN层数/关系和B32、priority_schedule、LNS均未修改。六例没有进入后续数据集。
+
+结束检查：CSV由7691条、7315214字节增至14416条、12886682字节；6725条新记录均为本轮construct-fit/independent，历史7691条通过追加方式保留。新method没有VALIDATION或TEST记录。旧gnn_child_joint.pt（478312字节）、gnn_bvns.pt（821196字节）及LNS/HGA/WAG文件长度和修改时间与开始一致；外层HEAD仍为0935ad8a723057084be190e31c6be4733ce3cb62。全DRL检查没有超过100000000字节的文件。唯一新增文件为已批准的新权重，其余均为原文件修改或追加。
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 -m pytest -p no:cacheprovider tests/test_gnn_construct_vns.py -k 'bvns or vnext or child_joint or child_construct or joint4 or conflict_graph' -q --disable-warnings
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py child-construct-fit
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_weld_layout.py child-construct-independent
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_gnn_weld_layout.py child-construct-summary
+```
+
+已有完整权重及六例时，fit/independent按既有完成记录复用，summary只读；VALIDATION入口在开发筛查未通过时先返回。新入口不提供TEST命令。本轮结束于开发筛查失败，未使用VALIDATION/TEST调参。
+
 

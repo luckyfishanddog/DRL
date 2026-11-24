@@ -4,6 +4,8 @@
 
 2026-11-24 **CRF-DP已完成实现和三个TRAIN实测，未通过筛查，停止，未进入VALIDATION/TEST。** 三例均B32可行，完整耗时中位26.29秒；相对SAEAX为2胜1平，但相对SAEAX/BC-ECS/RC-IG中的同键最强为0胜3负，Cmax变化中位+0.2300%。DP接受的改善均为路线内重排/方向，最终跨机器人任务转移为0。120项测试通过。逐例结果、调用数、精确性范围和首例日志恢复说明见[报告第19节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#19-2026-11-24crf-dp-关键路线片段联合动态规划)。
 
+2026-11-24 **GNN构造策略B32直接监督已完成，开发筛查未通过，停止，未进入VALIDATION/TEST。** 修复了原ChildJoint没有直接训练assignment policy的缺口：既定20个TRAIN自生成40组、236条构造反事实标签，新增233次B32；assignment和insertion两头均获得直接梯度，固定三轮训练后保存独立[权重](models/gnn_child_joint_construct.pt)。但构造训练内可行Cmax排序仅49.33%，六个开发案例新方法1/6可行（历史ChildJoint 4/6），仅一个共同可行配对改善11.17%，另3例由可行变为DEADLOCK；在线时间中位47.36秒（旧30.27秒）。**梯度缺口修复不代表性能达标，未追加调参。** 数据继续追加原CSV，完整调用链、监督定义、梯度、逐例实测及失败分析见[报告第12节](docs/GNN_JOINT4_REASSIGN_REPORT.md#12-2026-11-24构造策略的自生成反事实b32直接监督)。
+
 ## 正式模型
 
 实验共用 `ScientificConfig()`、`FORMAL_SCOPE_V2` 和原 B32。每个 canonical 焊接块的加工时间为 `20 + L/0.0108 + 30` 秒，空走速度为 0.20 m/s，合法拆分的子焊缝最短 0.50 m。机器人的完成时间包括加工、相邻任务间空走和调度等待。
@@ -17,8 +19,9 @@
 - EG-GNN-PVND 第一阶段只学习 HGA 已访问动作的优先级与真实原生评价成本。20 个 TRAIN 轨迹中，15 个排样拟合、5 个排样留出；评分器为两层 hidden32/2头，共 14,938 参数，未重新训练原焊缝分配 GNN。
 - GNN-BVNS 用原两层64维/4头GAT对父级Relocate、Swap、瓶颈路线2-opt及LNS修复候选批量评分；每个当前状态编码一次，搜索复用原priority_schedule，最终只调用一次B32。加入有向转移连续属性与来源/目标路线增量，使用TRAIN真实B32 Cmax配对续训；没有新增独立GNN或Cmax预测器。旧GNN联合构造及反馈实验继续保留。
 - GNN-ChildJoint-B32Rank 从原Cmax-Conflict冻结权重初始化，用同一GNN构造Beam2初解、选择子焊缝转移关系并解码完整插入/方向，支持单子段、双子段及三/四机器人循环。整体动作只经一个原评分头，真实B32训练的无动作相对分数控制接受和状态保留；原生Cmax只作快速信息，最终一次B32。未使用HGA/WAG轨迹或v2微调权重。
+- GNN-ChildJoint-ConstructB32 直接重放实际构造的assignment＋insertion联合评分，用同一部分状态、共同种子续构造的真实B32结果拟合相对no-op归一化Cmax改善。仍为原两层64维/4头/11关系GNN，沿用原ChildJoint局部动作；初始Beam4，500原生/80状态/8扰动，每个最终方案一次B32。
 
-最新子焊缝方法完成59项相关回归、20个TRAIN排样自产候选标注（520标签、519次新增B32）、固定3轮学习及六例同预算消融。新GNN可行4/6，无GNN可行5/6；4个共同可行Cmax配对为0胜4负、中位增加37.012%，在线墙钟中位30.27s/9.29s。学习接受已实际生效，但训练内无动作判断仅45.41%，六例关键路线周期均继续上升。**本轮未通过TRAIN，停止于阶段2，未运行VALIDATION/TEST，也未追加调参。** 数学定义、真实调用链、动作计数与负结果见[报告第11节](docs/GNN_JOINT4_REASSIGN_REPORT.md)，独立[权重](models/gnn_child_joint.pt)与[实验CSV](results/new_dataset_final/gnn_child_joint.csv)保留；第10节BVNS历史结果不覆盖。
+此前ChildJoint方法完成59项相关回归、20个TRAIN排样自产候选标注（520标签、519次新增B32）、固定3轮学习及六例同预算消融。新GNN可行4/6，无GNN可行5/6；4个共同可行Cmax配对为0胜4负、中位增加37.012%，在线墙钟中位30.27s/9.29s。学习接受已实际生效，但训练内无动作判断仅45.41%，六例关键路线周期均继续上升。**本轮未通过TRAIN，停止于阶段2，未运行VALIDATION/TEST，也未追加调参。** 数学定义、真实调用链、动作计数与负结果见[报告第11节](docs/GNN_JOINT4_REASSIGN_REPORT.md)，独立[权重](models/gnn_child_joint.pt)与[实验CSV](results/new_dataset_final/gnn_child_joint.csv)保留；第10节BVNS历史结果不覆盖。
 
 2026-11-24 GNN-BVNS完成调用链/耗时分析、三臂TRAIN比较、固定20排样/624个真实B32标签/3轮训练及官方30次VALIDATION。独立六例为6/6可行，相对历史Cmax-Conflict中位改善1.988%；相对无GNN仅3胜2负1平、中位改善0.0093%。正式VALIDATION为23/30可行，共同可行Cmax相对HGA/WAG中位分别增加3.110%/1.285%，为0胜23负/1胜19负；墙钟中位33.90s，每例一次最终B32。**质量未达标，停止于阶段4，未运行TEST或继续调参。** 完整六例、30例精确种子配对、各邻域计数及失败分析见[报告第10节](docs/GNN_JOINT4_REASSIGN_REPORT.md)，新权重为[gnn_bvns.pt](models/gnn_bvns.pt)，唯一新实验表为[gnn_bvns.csv](results/new_dataset_final/gnn_bvns.csv)。历史Cmax-Conflict参照使用旧多B32协议，不能当成同预算正式对照。
 
@@ -38,6 +41,7 @@ BC-ECS 已完成本次运行内实际生成 SAEAX 初解的3个 TRAIN及30次 VA
 
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_gnn_weld_layout.py child-joint-summary
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_gnn_weld_layout.py child-construct-summary
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_gnn_weld_layout.py bvns-summary
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_gnn_weld_layout.py bvns-trained-summary
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_gnn_weld_layout.py bvns-formal-summary --split validation
