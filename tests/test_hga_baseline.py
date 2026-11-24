@@ -2244,3 +2244,204 @@ def test_rcig_shared_csv_reader_handles_full_repair_traces():
     finally:
         csv.field_size_limit(previous)
 
+
+def test_crf_dp_all_subset_costs_and_partition_match_small_brute_force():
+    """Independent exhaustive enumeration of the SAME fixed-gap neighborhood."""
+    from itertools import permutations, product
+    import numpy as np
+    from mrta_search.crf_dp import _subset_routes, _partition_subsets
+    rng = np.random.default_rng(24)
+    nodes = np.arange(4, 8, dtype=np.int64)
+    parent = np.array([5, 1, 2, 3, 4, 5, 4, 6, 4, 9, 10, 11], np.int64)
+    processing = rng.uniform(1., 7., 12)
+    travel = rng.uniform(0., 10., (12, 12, 2, 2))
+    eligible = np.ones((12, 4), np.bool_)
+    eligible[5] = [False, True, False, False]  # Workspace-style fixed X owner.
+    eligible[7] = [False, False, True, True]
+    expected = np.full((4, 16), np.inf)
+    tables = []
+    for r in range(4):
+        route, bits = np.array([r, 8+r]), np.array([r % 2, (r+1) % 2])
+        base = sum(processing[route]) + travel[route[0], route[1], bits[0], bits[1]]
+        table = _subset_routes(nodes, r, route, bits, np.array([1, 2]), float(base),
+            travel, processing, eligible, parent)
+        tables.append(table[0])
+        for mask in range(16):
+            subset = [int(nodes[i]) for i in range(4) if mask & (1 << i)]
+            if any(not eligible[n, r] for n in subset):
+                continue
+            for order in permutations(subset):
+                for vector in product((0, 1), repeat=len(subset)):
+                    for position in (1, 2):
+                        rr = list(route[:position]) + list(order) + list(route[position:])
+                        dd = list(bits[:position]) + list(vector) + list(bits[position:])
+                        if any(parent[a] == parent[b] for a, b in zip(rr, rr[1:])):
+                            continue
+                        value = sum(processing[n] for n in rr) + sum(
+                            travel[a, b, x, y] for a, b, x, y in zip(rr, rr[1:], dd, dd[1:]))
+                        expected[r, mask] = min(expected[r, mask], value)
+        np.testing.assert_allclose(table[0], expected[r], rtol=1.e-13, atol=1.e-12)
+    optimum, allocation = _partition_subsets(np.array(tables))
+    exhaustive = np.inf
+    for owners in product(range(4), repeat=4):
+        masks = [sum(1 << i for i, owner in enumerate(owners) if owner == r) for r in range(4)]
+        exhaustive = min(exhaustive, max(expected[r, masks[r]] for r in range(4)))
+    assert optimum == pytest.approx(exhaustive, abs=1.e-12)
+    assert sum(int(m).bit_count() for m in allocation) == 4
+    assert int(allocation[0] | allocation[1] | allocation[2] | allocation[3]) == 15
+    assert allocation[1] & 2  # Fixed child 5 is assigned to robot 1.
+
+
+def test_crf_traceback_preserves_modes_heads_and_unmodified_tasks():
+    import numpy as np
+    from mrta_search import crf_dp as c
+    _, w, item, _ = _saeax_fixture()
+    original = c.complete_identity(item.routes, item.directions, item.selected)
+    candidate = c.reconstruct_fragment(item, w, 0, 1, 3)
+    assert candidate is not None
+    rr, dd, cc, pp, key, trace = candidate
+    c.validate_individual(w, rr, dd, item.selected)
+    removed = set(int(n) for n in item.routes[0][1:])
+    for r in range(4):
+        before = [(int(n), int(d)) for n, d in zip(item.routes[r], item.directions[r]) if int(n) not in removed]
+        after = [(int(n), int(d)) for n, d in zip(rr[r], dd[r]) if int(n) not in removed]
+        assert before == after
+        if len(item.routes[r]):
+            assert (rr[r][0], dd[r][0]) == (item.routes[r][0], item.directions[r][0])
+        else:
+            assert len(rr[r]) == 0  # Explicit head-preserving restriction.
+    assert c.complete_identity(item.routes, item.directions, item.selected) == original
+    assert trace['lower_bound_s'] == pytest.approx(max(cc))
+    assert key[0] == original[0]
+    solution = w.solution(rr, item.selected)
+    assert tuple(r.block_ids for r in solution.routes) == tuple(tuple(w.ids[n] for n in row) for row in rr)
+    with pytest.raises(ValueError, match='head'):
+        c.reconstruct_fragment(item, w, 0, 0, 2)
+
+
+def _crf_mock_search(monkeypatch, *, native=800., repeat=True):
+    import numpy as np
+    from mrta_search import crf_dp as c
+    _, w, item, _, initial = _bc_initial_fixture()
+    calls = dict(seed=0, dp=0, native=0, final=0, critical=[])
+    def seed(*args, **kwargs):
+        calls['seed'] += 1
+        return initial
+    def windows(current, workspace, settings):
+        critical = int(np.argmax(current.costs))
+        calls['critical'].append(critical)
+        return critical, [(10., 1, 5)] * 6
+    def reconstruction(*args, **kwargs):
+        index = calls['dp'] % 6 + 1 if repeat else calls['dp']+1
+        calls['dp'] += 1
+        rr, dd = [row.copy() for row in item.routes], [row.copy() for row in item.directions]
+        for bit, (r, k) in enumerate((r, k) for r in (0, 1) for k in range(1, len(dd[r]))):
+            dd[r][k] ^= (index >> bit) & 1
+        cc, pp = np.array([100., 110., 0., 0.]), np.array([90., 100., 0., 0.])
+        return rr, dd, cc, pp, c.complete_identity(rr, dd, item.selected), dict(
+            cross_robot_transfers=[], lower_bound_s=110., route_periods_s=cc.tolist())
+    def score(*args):
+        calls['native'] += 1
+        return native-calls['native'] if np.isfinite(native) else native, None, [], None
+    monkeypatch.setattr(c, 'run_saeax', seed)
+    monkeypatch.setattr(c, 'select_windows', windows)
+    monkeypatch.setattr(c, 'reconstruct_fragment', reconstruction)
+    monkeypatch.setattr(c, '_priority_arrays', score)
+    return c, w, initial, calls
+
+
+@pytest.mark.parametrize('status,cmax,reason', [
+    ('FEASIBLE', 850., 'IMPROVED_B32'), ('FEASIBLE', 1100., 'INITIAL_B32_BETTER_OR_EQUAL'),
+    ('DEADLOCK', None, 'FINAL_B32_FAILED')])
+def test_crf_best_improvement_one_final_b32_and_cached_initial_fallback(monkeypatch, status, cmax, reason):
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    c, w, initial, calls = _crf_mock_search(monkeypatch)
+    def final(*args, orientations, **kwargs):
+        calls['final'] += 1
+        return ScheduleResult(ScheduleStatus(status), cmax=cmax,
+            directions=tuple(orientations[r] for r in range(4)))
+    monkeypatch.setattr(c, 'reference_schedule_formal', final)
+    result = c.run_crf_dp(w.parents)
+    a = result.accounting
+    assert (calls['seed'], calls['dp'], calls['native'], calls['final']) == (1, 12, 6, 1)
+    assert a['duplicate_candidates'] == 6 and a['accepted_improvements'] == 1
+    assert a['native_calls'] == 18 and a['b32_calls'] == 4
+    assert a['return_reason'] == reason and a['search_complete']
+    assert result.rounds == 2 and result.termination_reason == 'NO_IMPROVEMENT'
+    assert calls['critical'] == [0, 1]  # Recomputed after the accepted best state.
+    assert result.native_cmax == 794. if reason == 'IMPROVED_B32' else result.schedule is initial.schedule
+    if status == 'DEADLOCK':
+        assert result.final_candidate['cmax_s'] is None
+
+
+@pytest.mark.parametrize('native', [float('inf'), float('nan'), 950.])
+def test_crf_no_native_improvement_has_no_extra_b32(monkeypatch, native):
+    c, w, initial, calls = _crf_mock_search(monkeypatch, native=native)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('unexpected final B32')
+    monkeypatch.setattr(c, 'reference_schedule_formal', forbidden)
+    result = c.run_crf_dp(w.parents)
+    assert result.schedule is initial.schedule and result.cmax == initial.cmax
+    assert result.accounting['final_b32_calls'] == 0
+    assert result.accounting['native_nonfinite'] == (6 if native != 950. else 0)
+    assert result.accounting['return_reason'] == 'NO_NATIVE_IMPROVEMENT'
+
+
+def test_crf_native_budget_and_defaults_not_wall_clock(monkeypatch):
+    from types import SimpleNamespace
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    c, w, initial, calls = _crf_mock_search(monkeypatch, repeat=False)
+    clock = [0.]
+    def elapsed():
+        clock[0] += 10.
+        return clock[0]
+    monkeypatch.setattr(c, 'time', SimpleNamespace(perf_counter=elapsed))
+    monkeypatch.setattr(c, 'reference_schedule_formal', lambda *args, orientations, **kwargs:
+        ScheduleResult(ScheduleStatus.FEASIBLE, cmax=850., directions=tuple(orientations[r] for r in range(4))))
+    result = c.run_crf_dp(w.parents)
+    assert result.termination_reason == 'NATIVE_LIMIT' and result.rounds == 7
+    assert calls['native'] == 40 and result.runtime > 103.59
+    assert result.accounting['accepted_improvements'] == 7
+    for kwargs in (dict(max_rounds=9), dict(max_native_evaluations=41), dict(max_fragment=9)):
+        with pytest.raises(ValueError):
+            c.CRFDPConfig(**kwargs)
+
+
+def test_crf_lower_bound_prunes_before_native_and_initial_failure_stops(monkeypatch):
+    import numpy as np
+    c, w, initial, calls = _crf_mock_search(monkeypatch)
+    original = c.reconstruct_fragment
+    def bounded(*args, **kwargs):
+        rr, dd, _, pp, key, trace = original(*args, **kwargs)
+        return rr, dd, np.array([900., 110., 0., 0.]), pp, key, trace
+    monkeypatch.setattr(c, 'reconstruct_fragment', bounded)
+    result = c.run_crf_dp(w.parents)
+    assert result.accounting['lower_bound_pruned'] == 6
+    assert calls['native'] == 0 and result.accounting['b32_calls'] == 3
+    initial.status, initial.cmax = 'DEADLOCK', None
+    result = c.run_crf_dp(w.parents)
+    assert result.termination_reason == 'INITIALIZATION_FAILED' and result.cmax is None
+    assert calls['dp'] == 6  # The failed fresh initialization starts no DP.
+
+
+def test_crf_pilot_requires_strongest_history_and_time_before_validation(monkeypatch):
+    import json
+    import run_crf_dp as entry
+    rows = [dict(layout_id=name, seed='20261110', status='FEASIBLE', cmax_s=str(score), runtime_s='100',
+        diagnostic=json.dumps(dict(accounting=dict(search_complete=True))))
+        for name, score in zip(entry.PILOTS, (90., 95., 100.))]
+    strong = {(r['layout_id'], int(r['seed'])): dict(r, cmax_s='101') for r in rows}
+    monkeypatch.setattr(entry, 'method_rows', lambda stage: rows)
+    monkeypatch.setattr(entry, 'pilot_references', lambda: ({}, strong))
+    assert entry.pilot_decision()['passed']
+    rows[0]['runtime_s'], rows[1]['runtime_s'] = '104', '104'
+    assert not entry.pilot_decision()['passed']
+    rows[0]['runtime_s'], rows[1]['runtime_s'] = '100', '100'
+    rows[0]['cmax_s'], rows[1]['cmax_s'] = '102', '102'
+    assert not entry.pilot_decision()['passed']
+    def forbidden(*args, **kwargs):
+        raise AssertionError('VALIDATION data accessed after failed TRAIN')
+    monkeypatch.setattr(entry, 'load_layouts', forbidden)
+    with pytest.raises(ValueError, match='TRAIN failed'):
+        entry.run_experiment('validation')
+

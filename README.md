@@ -2,6 +2,8 @@
 
 本项目联合决定父焊缝的合法拆分、四机器人归属、路线顺序和焊接方向，以 B32 调度返回的 Cmax 为优化目标。当前数据来自真实小组立排样，TRAIN、VALIDATION、TEST 分别包含 40、10、20 个排样和 3,749、936、2,060 条父焊缝。所有最终父焊缝的平面长度至少为 50 mm，TEST 的构件型号独立于训练侧。
 
+2026-11-24 **CRF-DP已完成实现和三个TRAIN实测，未通过筛查，停止，未进入VALIDATION/TEST。** 三例均B32可行，完整耗时中位26.29秒；相对SAEAX为2胜1平，但相对SAEAX/BC-ECS/RC-IG中的同键最强为0胜3负，Cmax变化中位+0.2300%。DP接受的改善均为路线内重排/方向，最终跨机器人任务转移为0。120项测试通过。逐例结果、调用数、精确性范围和首例日志恢复说明见[报告第19节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#19-2026-11-24crf-dp-关键路线片段联合动态规划)。
+
 ## 正式模型
 
 实验共用 `ScientificConfig()`、`FORMAL_SCOPE_V2` 和原 B32。每个 canonical 焊接块的加工时间为 `20 + L/0.0108 + 30` 秒，空走速度为 0.20 m/s，合法拆分的子焊缝最短 0.50 m。机器人的完成时间包括加工、相邻任务间空走和调度等待。
@@ -11,6 +13,7 @@
 - RULE/BEAM 用原单提案构造，作为快速基线。
 - 正式 WAG+VNS 使用 `n=10`、`p=0.50`、500 轮；正式 HGA 使用显式方向、完整路线 M1–M6 VND、`μ=20/λ=10/α=20`、200,000 个有效子代。两者使用原生协调评价选择完整方案，最终各调用一次 B32。正式结果与历史短测、120 秒预算结果分开统计。
 - 4R-SAEAX 从双亲有向邻接组装路线片段，联合选择机器人、插入位置和方向，搜索使用既有原生协调内核，结束后最多 3 次 B32 选优。采用 12 个体、每代 4 子代、最多 400 代、至少 80 代、连续 120 代停滞停止，没有墙钟硬截止。
+- CRF-DP 从本次重新运行的SAEAX开始，对关键路线5～8条子焊缝用带方向Held–Karp子集DP及四机器人集合划分，联合决定归属、顺序和方向。固定父模式及首任务，每状态至多6窗、8轮、40次新原生评价，仅接受严格native改善，最后至多一次额外B32；不改GNN或原调度器。见[算法](src/mrta_search/crf_dp.py)及[入口](scripts/run_crf_dp.py)。
 - EG-GNN-PVND 第一阶段只学习 HGA 已访问动作的优先级与真实原生评价成本。20 个 TRAIN 轨迹中，15 个排样拟合、5 个排样留出；评分器为两层 hidden32/2头，共 14,938 参数，未重新训练原焊缝分配 GNN。
 - GNN-BVNS 用原两层64维/4头GAT对父级Relocate、Swap、瓶颈路线2-opt及LNS修复候选批量评分；每个当前状态编码一次，搜索复用原priority_schedule，最终只调用一次B32。加入有向转移连续属性与来源/目标路线增量，使用TRAIN真实B32 Cmax配对续训；没有新增独立GNN或Cmax预测器。旧GNN联合构造及反馈实验继续保留。
 - GNN-ChildJoint-B32Rank 从原Cmax-Conflict冻结权重初始化，用同一GNN构造Beam2初解、选择子焊缝转移关系并解码完整插入/方向，支持单子段、双子段及三/四机器人循环。整体动作只经一个原评分头，真实B32训练的无动作相对分数控制接受和状态保留；原生Cmax只作快速信息，最终一次B32。未使用HGA/WAG轨迹或v2微调权重。
@@ -44,6 +47,7 @@ BC-ECS 已完成本次运行内实际生成 SAEAX 初解的3个 TRAIN及30次 VA
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py summary
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py pilot --workers 1
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_saeax.py validation --workers 3
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -X utf8 scripts/run_crf_dp.py summary
 ```
 
 EG 入口在已有20个教师排样及模型时直接读取，不重新采集或训练。SAEAX 入口在已有3次预实验及30次验证时直接读取，不重复搜索或B32。旧GNN与对照入口保留在原脚本中。
