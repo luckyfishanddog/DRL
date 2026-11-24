@@ -6585,3 +6585,229 @@ def test_child_construct_screen_uses_common_feasible_cmax_without_fake_deadlock_
         if row['method']==e.CHILD_CONSTRUCT_METHOD:row['cmax_s']=1001.
     assert not e.child_construct_summary()['passed']
 
+
+def _cem_fixture(mixed=False):
+    from mrta_reference.model import ParentWeld, ScientificConfig, ScheduleResult, ScheduleStatus
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search import gnn_cem as c
+    if mixed:
+        parents = (ParentWeld('y', (3., 8.), (3., 4.)), ParentWeld('x', (1., 9.), (10., 9.)),
+            ParentWeld('a', (2., 9.), (3.2, 9.)), ParentWeld('b', (11., 9.), (12.2, 9.)),
+            ParentWeld('c', (1., 3.), (2.2, 3.)), ParentWeld('d', (12., 3.), (13.2, 3.)))
+        names = (('a::whole', 'y::0', 'x::whole'), ('b::whole',), ('c::whole', 'y::1'), ('d::whole',))
+    else:
+        parents = tuple(ParentWeld(name, (x, y), (x+.8, y)) for name, x, y in
+            (('a', 1., 9.), ('b', 10., 9.), ('c', 13., 9.), ('d', 3., 1.), ('e', 12., 1.)))
+        names = (('a::whole', 'b::whole'), ('c::whole',), ('d::whole',), ('e::whole',))
+    w = c._HGAWorkspace(parents, ScientificConfig(), FORMAL_SCOPE_V2)
+    ids = {w.ids[int(n)]: int(n) for m in w.initial_selected for n in w.pattern_nodes[m] if n >= 0}
+    routes = [[ids[name] for name in row] for row in names]
+    plan = c.plan_from_arrays(w, w.initial_selected, routes, [[0]*len(row) for row in routes])
+    plan.schedule = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=1000., directions=plan.directions)
+    plan.origin = 'initial'
+    return c, w, plan
+
+
+def test_cem_dynamic_graph_contains_stable_parents_and_only_activated_children():
+    from mrta_reference.model import SplitKind
+    c, w, initial = _cem_fixture(True)
+    world = c.World(w)
+    selected = list(initial.trace.selected)
+    xp = next(p for p, parent in enumerate(w.parents) if parent.parent_id == 'x')
+    whole = world.space(selected)
+    selected[xp] = next(m for m in w.options[xp] if w.patterns[m].kind is SplitKind.X_SPLIT)
+    split = world.space(selected)
+    assert len(split.active) == len(whole.active)+1
+    assert len(split.features) == len(w.parents)+len(split.active)+4
+    assert split.robot_offset == len(w.parents)+len(split.active)
+    assert split.parents == whole.parents == len(w.parents)
+    assert len(split.features) < len(w.parents)+len(w.ids)+4
+    graph = split.graph(c.Prefix())
+    assert graph.node_features.shape == (len(split.features), 32)
+    for n in split.active:
+        child = split.child_index[n]
+        assert (int(w.parent_index[n]), child) in split.edges
+        graph_robots = {b-split.robot_offset for (a, b), t in zip(split.edges, split.relations)
+            if a == child and b >= split.robot_offset and t == 3}
+        assert graph_robots == {r for r in range(4) if w.eligible[n, r]}
+
+
+def test_cem_sampling_full_coverage_qualification_and_direction_with_fixed_seed():
+    c, w, _ = _cem_fixture()
+    world = c.World(w)
+    def sample():
+        torch.manual_seed(123); torch.set_num_threads(1)
+        model = c.CEMPolicy()
+        return c.draw(world, model, torch.Generator().manual_seed(20261110))
+    first, a = sample(); second, b = sample()
+    assert first is not None and first.key == second.key and first.trace == second.trace and a == b
+    active = {int(n) for m in first.trace.selected for n in w.pattern_nodes[m] if n >= 0}
+    assert {n for n, r, d in first.trace.actions} == active
+    assert len(first.trace.actions) == len(active)
+    for n, r, d in first.trace.actions:
+        assert w.eligible[n, r] and d in (0, 1)
+    assert tuple(r.block_ids for r in first.solution.routes) == tuple(
+        tuple(w.ids[n] for n, owner, d in first.trace.actions if owner == r) for r in range(4))
+
+
+def test_cem_x_fixed_ownership_and_canonical_sibling_mask_are_actual_masks():
+    from mrta_reference.model import SplitKind
+    c, w, old = _cem_fixture(True)
+    world = c.World(w); selected = list(old.trace.selected)
+    xp = next(p for p, parent in enumerate(w.parents) if parent.parent_id == 'x')
+    selected[xp] = next(m for m in w.options[xp] if w.patterns[m].kind is SplitKind.X_SPLIT)
+    space, prefix = world.space(selected), c.Prefix()
+    children = [int(n) for n in w.pattern_nodes[selected[xp]] if n >= 0]
+    choices = c.legal_actions(w, space.active, prefix)
+    for n in children:
+        assert w.eligible[n].sum() == 1
+        assert all(w.eligible[n, r] for b, r, d in choices if b == n)
+    action = next(a for a in choices if a[0] == children[0]); prefix.append(w, action)
+    choices = c.legal_actions(w, space.active, prefix)
+    assert not any(n == children[0] for n, r, d in choices)
+    assert all(w.parent_index[n] != xp for n, r, d in choices if r == action[1])
+
+
+def test_cem_mode_distribution_depends_on_gnn_geometry_not_cancelling_linear_context():
+    c, w, _ = _cem_fixture(True)
+    torch.manual_seed(21); world = c.World(w); policy = c.CEMPolicy()
+    first = [p.detach().clone() for p in policy.modes(world)]
+    world.mode_graph.node_features[:, 2:6] += .7
+    second = policy.modes(world)
+    assert any(len(a) > 1 and torch.max(torch.abs(a-b)) > 1.e-7 for a, b in zip(first, second))
+
+
+def test_cem_complete_elite_likelihood_updates_encoder_mode_and_route_parameters():
+    c, w, initial = _cem_fixture(True)
+    torch.manual_seed(32); torch.set_num_threads(1)
+    world, policy = c.World(w), c.CEMPolicy()
+    settings = c.CEMConfig()
+    optimizer = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=settings.learning_rate)
+    with torch.no_grad(): before = float(c.trajectory_logp(world, policy, initial.trace))
+    update = c.cem_update(world, policy, optimizer, [initial], settings)
+    with torch.no_grad(): after = float(c.trajectory_logp(world, policy, initial.trace))
+    assert after > before
+    assert all(update['gradient_norm'][k] > 0 and update['parameter_delta_l2'][k] > 0
+        for k in ('encoder.', 'mode_head.', 'route_head.'))
+    assert update['factors'] == len(w.parents)+len(initial.trace.actions)
+    assert all(not p.requires_grad for name, p in policy.encoder.named_parameters()
+        if not name.startswith(('layer1.', 'layer2.', 'geometry_skip.')))
+
+
+def test_cem_driver_elites_use_b32_and_cache_every_complete_solution_once(monkeypatch):
+    from dataclasses import replace as copy_plan
+    from types import SimpleNamespace
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    c, w, initial = _cem_fixture()
+    variants = []
+    for mask in range(4):
+        bits = [list(row) for row in initial.directions]
+        bits[0][0], bits[0][1] = mask&1, (mask>>1)&1
+        variants.append(c.plan_from_arrays(w, initial.trace.selected, w.encode(initial.solution), bits))
+    queue = [copy_plan(p, schedule=None) for p in variants]*2
+    def draw(*args):
+        plan = copy_plan(queue.pop(0), schedule=None)
+        return plan, dict(reason='COMPLETE', active_children=5, graph_nodes=14, normalized_entropy=.7)
+    monkeypatch.setattr(c, 'draw', draw)
+    monkeypatch.setattr(c, 'load_policy', lambda *a: c.CEMPolicy())
+    calls, chosen = [], []
+    def evaluate(plan, workspace):
+        calls.append(plan.key)
+        mask = next(i for i, p in enumerate(variants) if p.key == plan.key)
+        plan.schedule = ScheduleResult(ScheduleStatus.DEADLOCK if mask == 1 else ScheduleStatus.FEASIBLE,
+            cmax=None if mask == 1 else (950. if mask == 2 else 900.), directions=plan.directions)
+        return plan.schedule
+    monkeypatch.setattr(c, 'evaluate', evaluate)
+    def update(world, policy, optimizer, elites, settings):
+        chosen.append([p.key for p in elites]); return dict(elites=len(elites))
+    monkeypatch.setattr(c, 'cem_update', update)
+    builder = lambda *a: (SimpleNamespace(solution=initial.solution, directions=initial.directions,
+        schedule=initial.schedule), dict(b32_calls=1))
+    result = c.run_cem(w.parents, None, builder, settings=c.CEMConfig(population_size=4,
+        max_generations=2, elite_fraction=.25, max_new_b32=8))
+    assert len(calls) == len(set(calls)) == result.accounting['new_b32_calls'] == 3
+    assert result.accounting['b32_calls'] == 4 and result.accounting['duplicates'] == 5
+    assert chosen == [[variants[3].key], [variants[3].key]]
+    assert max(variants[3].costs) > max(variants[0].costs)  # true Cmax, not proxy, selects the elite
+    assert result.best.key == variants[3].key and result.best.schedule.cmax == 900.
+    assert result.accounting['updates'] == 2 and not queue
+
+
+def test_cem_empty_generations_keep_cached_initial_elite_without_resampling(monkeypatch):
+    from types import SimpleNamespace
+    c, w, initial = _cem_fixture()
+    monkeypatch.setattr(c, 'load_policy', lambda *a: c.CEMPolicy())
+    monkeypatch.setattr(c, 'draw', lambda *a: (None, dict(reason='NO_LEGAL_APPEND', normalized_entropy=.5)))
+    monkeypatch.setattr(c, 'evaluate', lambda *a: pytest.fail('unexpected B32'))
+    seen = []
+    def update(world, policy, optimizer, elites, settings):
+        seen.append([p.origin for p in elites]); return dict(elites=len(elites))
+    monkeypatch.setattr(c, 'cem_update', update)
+    builder = lambda *a: (SimpleNamespace(solution=initial.solution, directions=initial.directions,
+        schedule=initial.schedule), dict(b32_calls=1))
+    result = c.run_cem(w.parents, None, builder)
+    assert result.accounting['sample_attempts'] == result.accounting['construction_failures'] == 24
+    assert result.accounting['b32_calls'] == 1 and result.accounting['accepted_elites'] == 3
+    assert result.best.schedule is initial.schedule and seen == [['initial']]*3
+    assert all(row['retained_previous_elites'] for row in result.progress)
+
+
+def test_cem_no_feasible_plan_has_no_fictitious_cmax_or_update(monkeypatch):
+    c, w, _ = _cem_fixture()
+    monkeypatch.setattr(c, 'load_policy', lambda *a: c.CEMPolicy())
+    monkeypatch.setattr(c, 'draw', lambda *a: (None, dict(reason='NO_LEGAL_APPEND')))
+    monkeypatch.setattr(c, 'cem_update', lambda *a: pytest.fail('no feasible elite'))
+    result = c.run_cem(w.parents, None, lambda *a: (None, dict(b32_calls=0)),
+        settings=c.CEMConfig(population_size=2, max_generations=2, max_new_b32=4))
+    assert result.best is None and result.initial is None and result.accounting['updates'] == 0
+    assert result.termination_reason == 'NO_FEASIBLE_COMPLETE_PLAN'
+
+
+def test_cem_fast_common_initial_is_one_original_b32_call_without_legacy_search(monkeypatch):
+    import run_gnn_cem as entry
+    c, w, initial = _cem_fixture()
+    original = entry.common.reference_schedule_formal
+    counts = []
+    def evaluate(solution, config, **kwargs):
+        counts.append(solution); return initial.schedule
+    monkeypatch.setattr(entry.common, 'reference_schedule_formal', evaluate)
+    def common(parents, config, *, seed, max_reference_calls):
+        assert max_reference_calls == 1 and seed == 20261110
+        schedule = entry.common.reference_schedule_formal(initial.solution, config,
+            orientations=dict(enumerate(initial.directions)))
+        from types import SimpleNamespace
+        return SimpleNamespace(solution=initial.solution, directions=initial.directions, schedule=schedule), []
+    monkeypatch.setattr(entry.common, 'common_initial_beam', common)
+    plan, meta = entry.fast_initial(w.parents, w.config, 20261110)
+    assert len(counts) == meta['b32_calls'] == 1 and plan.schedule is initial.schedule
+    assert entry.common.reference_schedule_formal is evaluate
+
+
+def test_cem_train_decision_keeps_one_percent_and_runtime_requirements(monkeypatch):
+    import json
+    import run_gnn_cem as entry
+    def rows(score=98.9, runtime=100.):
+        return [dict(stage='pilot', layout_id=name, seed='20261110', status='FEASIBLE',
+            initial_cmax='100', final_cmax=str(score), improvement_pct=str(100-score), runtime_s=str(runtime),
+            diagnostic=json.dumps(dict(accounting=dict(search_complete=True, new_b32_calls=24, sample_attempts=24))))
+            for name in entry.PILOTS]
+    assert entry.train_decision(rows())['passed']
+    assert not entry.train_decision(rows(99.5))['passed']
+    assert not entry.train_decision(rows(runtime=121.))['passed']
+    incomplete = rows(); incomplete[0]['initial_cmax'] = ''
+    assert not entry.train_decision(incomplete)['passed']
+
+
+def test_cem_existing_checkpoint_loads_geometry_without_using_old_action_heads():
+    import run_gnn_cem as entry
+    c, w, _ = _cem_fixture()
+    policy = c.load_policy(entry.ENCODER)
+    saved = torch.load(entry.ENCODER, weights_only=False, map_location='cpu')['state_dict']
+    assert torch.equal(policy.encoder.layer1.linear.weight[:, :20], saved['layer1.linear.weight'])
+    assert torch.count_nonzero(policy.encoder.layer1.linear.weight[:, 20:]) == 0
+    assert policy.encoder.layer1.heads == policy.encoder.layer2.heads == 4
+    assert policy.encoder.layer2.bias.numel() == 64
+    world = c.World(w)
+    plan, info = c.draw(world, policy, torch.Generator().manual_seed(20261110))
+    assert plan is not None and info['reason'] == 'COMPLETE'
+
