@@ -15,6 +15,7 @@ from typing import Mapping, NamedTuple, Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from mrta_ranker.model import SparseGATLayer
 from mrta_reference.geometry import (
@@ -48,6 +49,7 @@ GRAPH_RELATIONS = ('self', 'near', 'rail_risk', 'eligible', 'same_parent',
 _RELATION_MIGRATION = (0, 1, 2, 3, 2, 2, 1, 1, 2, 2, 3)
 BVNS_EDGE_DIM = 6
 BVNS_ACTION_EXTRA_DIM = 32
+CHILD_JOINT_FEATURE_DIM = 80
 
 # Candidate ranking uses one small GNN; the existing allocation policies and
 # their parameters remain separate and are not loaded or retrained for it.
@@ -192,6 +194,7 @@ class BlockRobotGraph:
     block_index: Mapping[str, int]
     robot_offset: int
     edge_features: torch.Tensor | None = None
+    empty_speed: float = .20
 
     @cached_property
     def block_points(self):
@@ -455,6 +458,7 @@ def build_block_robot_graph(
         blocks=ordered,
         block_index={block.block_id: index for index, block in enumerate(ordered)},
         robot_offset=robot_offset,
+        empty_speed=config.empty_speed,
     )
 
 
@@ -486,6 +490,7 @@ class _BlockRobotGAT(nn.Module):
         return torch.nn.functional.pad(features, (0, width-features.shape[1]))
 
     def encode_static(self, graph: BlockRobotGraph) -> torch.Tensor:
+        if getattr(self,'child_joint',False):graph=child_joint_graph(graph)
         if getattr(self, 'conflict_graph', False):
             hidden = torch.nn.functional.elu(_vnd_attention(
                 self.layer1, self.graph_features(graph), graph.edge_index, graph.edge_type,getattr(graph,'edge_features',None)))
@@ -2385,6 +2390,21 @@ class VNextGNN(_JointAssignmentGNN):
         self.bvns_features = True
         return self
 
+    def enable_child_joint(self):
+        """Reuse the original insertion MLP for ONE whole child-action score."""
+        self.enable_bvns_features()
+        if getattr(self,'child_joint',False):return self
+        extra=CHILD_JOINT_FEATURE_DIM-self.insertion_mean.numel()
+        old=self.insertion_head[0]
+        layer=nn.Linear(old.in_features+extra,old.out_features).to(old.weight)
+        with torch.no_grad():
+            layer.weight.zero_();layer.weight[:,:old.in_features].copy_(old.weight);layer.bias.copy_(old.bias)
+        self.insertion_head[0]=layer
+        self.insertion_mean=torch.cat((self.insertion_mean,self.insertion_mean.new_zeros(extra)))
+        self.insertion_scale=torch.cat((self.insertion_scale,self.insertion_scale.new_ones(extra)))
+        self.child_joint=True
+        return self
+
     def assignment_scores(self, rows):
         return self.policy((rows - self.assignment_mean) / self.assignment_scale).squeeze(1)
 
@@ -2398,6 +2418,8 @@ class VNextGNN(_JointAssignmentGNN):
 
     def insertion_logits(self, embeddings, indices, features):
         neighbors = embeddings[indices.clamp_min(0)] * (indices >= 0).unsqueeze(-1)
+        if getattr(self,'child_joint',False) and features.shape[1]<self.insertion_mean.numel():
+            features=F.pad(features,(0,self.insertion_mean.numel()-features.shape[1]))
         normalized = (features - self.insertion_mean) / self.insertion_scale
         return self.insertion_head(torch.cat((neighbors.flatten(1), normalized), dim=1)).squeeze(1)
 
@@ -2646,6 +2668,141 @@ class VNextJointAction(NamedTuple):
     insertion_features: tuple[torch.Tensor, ...] = ()
     insertion_indices: tuple[torch.Tensor, ...] = ()
     graph: object = None
+
+
+def child_joint_graph(graph):
+    """Same observable dynamic graph for construction, fitting and online search."""
+    if graph.node_features.shape[1]==34 and graph.edge_features is not None:return graph
+    rows=F.pad(graph.node_features,(0,max(0,32-graph.node_features.shape[1])))[:,:32]
+    robots=rows[graph.robot_offset:graph.robot_offset+4]
+    cycles=robots[:,26]+robots[:,27]
+    completion=robots[:,29]
+    observed=completion if bool(completion.max()>0) else cycles
+    critical=int(observed.argmax());slack=observed.max()-observed
+    context=rows.new_zeros((len(rows),2))
+    context[graph.robot_offset:graph.robot_offset+4,0]=F.one_hot(torch.tensor(critical),4)
+    context[graph.robot_offset:graph.robot_offset+4,1]=slack
+    owned=rows[:graph.robot_offset,20:24]
+    context[:graph.robot_offset,0]=owned[:,critical]
+    context[:graph.robot_offset,1]=owned@slack
+    times=graph.directed_transfer_distances/graph.empty_speed/45.
+    source,target=graph.edge_index
+    bits=rows[:,25].long().clamp(0,1)
+    active=(rows[:,20:24].sum(1)>0)
+    actual=((graph.edge_type==6)|(graph.edge_type==7))&active[source]&active[target]
+    choice=torch.where(graph.edge_type==7,2*(1-bits[source])+1-bits[target],2*bits[source]+bits[target])
+    selected=times.gather(1,choice[:,None]).squeeze(1)*actual
+    return replace(graph,node_features=torch.cat((rows,context),1),
+        edge_features=torch.cat((times,selected[:,None],actual.float()[:,None]),1))
+
+
+class ChildJointScorer:
+    """One nonlinear existing-head score over the WHOLE action relation set.
+
+    No per-parent scores are averaged. Child/robot/boundary roles interact
+    before pooling; full four-route deltas enter the same old insertion MLP.
+    The no-op has its own actual current-plan representation and is labelled.
+    """
+    def __init__(self,model,space,workspace,config):
+        self.model,self.space,self.workspace,self.config=model,space,workspace,config
+        self.cache={};self.encodings=self.score_batches=self.scored_actions=0
+        self.encoding_seconds=self.feature_seconds=self.scoring_seconds=0.
+
+    def encode(self,current,schedule):
+        key=current.signature
+        if key in self.cache:return self.cache[key]
+        clock=time.perf_counter()
+        nodes={b.block_id:self.space.block_nodes[p,b.block_id] for p in current.solution.patterns
+               for b in self.space.children[p]}
+        waits=[sum(op.duration for op in schedule.operations if op.robot_id==r and op.kind.value=='WAIT')
+               for r in range(4)] if schedule.feasible else [0.]*4
+        graph=build_block_robot_graph((),(),self.config,base_graph=self.space.graph,state=current.state,
+            block_nodes=nodes,feedback=dict(completion=schedule.robot_completion if schedule.feasible else [0.]*4,
+                                           robot_wait=waits,blocked_pairs=[]))
+        graph=child_joint_graph(graph)
+        z=self.model.encode_static(graph)
+        self.cache[key]=(graph,z,waits);self.encodings+=1;self.encoding_seconds+=time.perf_counter()-clock
+        return self.cache[key]
+
+    def inputs(self,current,schedule,candidates):
+        graph,z,waits=self.encode(current,schedule)
+        clock=time.perf_counter();contexts=[];features=[]
+        old_blocks=self.workspace.blocks(current.solution.patterns)
+        cycles=self.workspace.cycles(current.state)
+        completion=schedule.robot_completion if schedule.feasible else cycles
+        total=max(1.,sum(current.state.loads));horizon=max(1.,max(cycles))
+        old_directions={b:d for row,bits in zip(current.state.routes,current.directions) for b,d in zip(row,bits)}
+        old_patterns={p.parent_id:p for p in current.solution.patterns}
+        for candidate in candidates:
+            blocks=self.workspace.blocks(candidate.solution.patterns)
+            nodes={b.block_id:self.space.block_nodes[p,b.block_id] for p in candidate.solution.patterns
+                   for b in self.space.children[p]}
+            contexts_i=[];local=[];four_times=[];nominal=[];flow=[0.]*16
+            for move in candidate.moves:
+                child=blocks[move.block_id];r,k=move.target,move.position
+                route=candidate.state.routes[r];bits=candidate.directions[r]
+                predecessor=blocks[route[k-1]] if k else None
+                successor=blocks[route[k+1]] if k+1<len(route) else None
+                b=z[nodes[move.block_id]];destination=z[graph.robot_offset+r]
+                source=z[graph.robot_offset+move.source] if move.source>=0 else z.new_zeros(z.shape[1])
+                pre=z[nodes[predecessor.block_id]] if predecessor is not None else z.new_zeros(z.shape[1])
+                post=z[nodes[successor.block_id]] if successor is not None else z.new_zeros(z.shape[1])
+                sign=1.-2.*move.direction
+                contexts_i.append(torch.cat((b*(1+destination.tanh()),destination+b*source.tanh(),
+                    pre*(1+b.tanh())*sign,post*(1+b.tanh())*sign)))
+                before_bit=bits[k-1] if k else 0;after_bit=bits[k+1] if k+1<len(route) else 0
+                before_time=sum(self.config.process_time(blocks[v].length) for v in route[:k])+sum(candidate.state.arc_costs[r][:max(0,k)])
+                nominal.append((before_time/horizon,(before_time+self.config.process_time(child.length))/horizon,
+                                candidate.state.loads[r]/horizon))
+                local.append((k/max(1,len(route)-1),move.direction,before_bit,before_bit,after_bit,after_bit,0.,0.))
+                times=[]
+                for left,right in ((predecessor,child),(child,successor)):
+                    times.extend(math.dist(oriented_endpoints(left,a)[1],oriented_endpoints(right,d)[0])/
+                        self.config.empty_speed/45. if left is not None and right is not None else 0.
+                        for a in (0,1) for d in (0,1))
+                four_times.append(times)
+                if move.source>=0:flow[move.source*4+r]+=1/max(1,len(candidate.moves))
+            if contexts_i:
+                contexts.append(torch.stack(contexts_i).mean(0))
+                summary=[sum(x[i] for x in local)/len(local) for i in range(8)]
+                transition=[sum(x[i] for x in four_times)/len(four_times) for i in range(8)]
+                nominal_summary=[sum(x[i] for x in nominal)/len(nominal) for i in range(3)]
+            else:
+                contexts.append(z[graph.robot_offset:graph.robot_offset+4].flatten())
+                summary=[0.]*8;transition=[0.]*8
+                nominal_summary=[0.,0.,sum(candidate.state.loads)/4/horizon]
+            after=self.workspace.cycles(candidate.state)
+            # The original 20 columns remain finite local/nominal summaries;
+            # the appended 60 columns specify the complete joint relation.
+            base=[*(v/total for v in after),*summary,*([0.]*5),*nominal_summary]
+            operators=('noop','relocate_child','swap_children','cycle3','cycle4','mode')
+            moved=sum(self.config.process_time(blocks[m.block_id].length) for m in candidate.moves)
+            changed=sum(old_patterns[p.parent_id]!=p for p in candidate.solution.patterns)
+            sources={m.source for m in candidate.moves if m.source>=0};targets={m.target for m in candidate.moves}
+            flips=sum(m.direction!=old_directions.get(m.block_id,m.direction) for m in candidate.moves)
+            mask=sum(1<<r for r in sources|targets)
+            extra=[*(float(candidate.operator==op) for op in operators),*(v/2500. for v in cycles),
+                *(v/2500. for v in candidate.route_delta_s),*(v/2500. for v in completion),
+                *((max(completion)-v)/2500. for v in completion),*(v/2500. for v in waits),
+                float(schedule.feasible),len(candidate.moves)/max(1,len(blocks)),moved/total,
+                len(sources)/4.,len(targets)/4.,flips/max(1,len(candidate.moves)),
+                changed/max(1,len(current.solution.patterns)),mask/15.,max(after)/2500.,
+                (max(after)-max(cycles))/2500.,*flow,*transition]
+            values=base+extra
+            if len(values)!=CHILD_JOINT_FEATURE_DIM:raise ValueError(f'joint action feature width {len(values)}')
+            features.append(values)
+        self.feature_seconds+=time.perf_counter()-clock
+        return torch.stack(contexts),z.new_tensor(features)
+
+    def __call__(self,current,schedule,candidates):
+        if not candidates:return []
+        context,features=self.inputs(current,schedule,candidates)
+        clock=time.perf_counter()
+        normalized=(features-self.model.insertion_mean)/self.model.insertion_scale
+        values=self.model.insertion_head(torch.cat((context,normalized),1)).squeeze(1)
+        self.score_batches+=1;self.scored_actions+=len(candidates)
+        self.scoring_seconds+=time.perf_counter()-clock
+        return values
 
 
 class BottleneckActionScorer:
@@ -2899,7 +3056,8 @@ def vnext_policy_inputs(space, plans, model, feedback=None):
         size = len(plan.actions)
         child_indices.append(torch.stack((*plan.insertion_indices,
             *((torch.full((4,), -1, dtype=torch.long, device=reference.device),) * (2 - size)))))
-        child_features.append(torch.stack((*plan.insertion_features,
+        child_features.append(torch.stack((*(F.pad(x,(0,model.insertion_mean.numel()-x.numel()))
+            if getattr(model,'child_joint',False) else x for x in plan.insertion_features),
             *((reference.new_zeros(model.insertion_mean.numel()),) * (2 - size)))))
         mask.append((1., float(size == 2)))
     return dict(indices=indices, assignment=torch.stack([p.assignment_features for p in plans]),
@@ -3002,7 +3160,12 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     if cmax_driven:
         dynamic_graph = build_block_robot_graph((), (), config, base_graph=space.graph,
             state=state, block_nodes=nodes, feedback=feedback)
-        embeddings = model.encode_static(dynamic_graph)
+        cache=getattr(model,'_child_construction_cache',None)
+        key=(state.routes,state.directions,tuple(sorted(nodes.items()))) if cache is not None and feedback is None else None
+        if key is not None and key in cache:embeddings=cache[key]
+        else:
+            embeddings = model.encode_static(dynamic_graph)
+            if key is not None:cache[key]=embeddings
     indices, features = model.assignment_features(space, embeddings, state, blocks, pending, config)
     balancing = getattr(model, 'imitation_balance', False)
     route_aware = getattr(model, 'route_aware', False)
@@ -3231,7 +3394,7 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
     fixed_directions = ({b:d for route,bits in zip(state.routes,state.directions) for b,d in zip(route,bits)}
                         if state is not None and getattr(model,'imitation_balance',False) else None)
     space = parent_assignment_space(parents, config) if space is None else space
-    embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
+    if embeddings is None and not getattr(model,'child_joint',False):embeddings=model.encode_static(space.graph)
     selected = {} if selected is None else dict(selected)
     blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
     nodes = {b.block_id: space.block_nodes[pattern, b.block_id]
@@ -3262,7 +3425,17 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
             if step_observer is not None:
                 step_observer(partial.state, partial.selected, plans, scores)
             log_probs = scores.log_softmax(0)
-            for index in torch.argsort(scores, descending=True, stable=True)[:2].tolist():
+            ranked=torch.argsort(scores,descending=True,stable=True).tolist()
+            if getattr(model,'child_joint',False):
+                choices=[];structures=set()
+                for index in ranked:
+                    assignment=space.actions[plans[index].assignment_index]
+                    structure=(assignment.parent_id,assignment.pattern,assignment.robots)
+                    if structure in structures:continue
+                    structures.add(structure);choices.append(index)
+                    if len(choices)>=4:break
+            else:choices=ranked[:2]
+            for index in choices:
                 plan = plans[index]
                 assignment = space.actions[plan.assignment_index]
                 children = space.children[assignment.pattern]
@@ -3279,7 +3452,7 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
         if not expanded:
             return JointCompletionResult(None, None, beam[0].actions, time.perf_counter() - started,
                                          rejection_reason=' | '.join(failures))
-        beam = []
+        beam = [];child_structures=set()
         if load_first is not None:
             # Cumulative learned log probabilities cannot revive a distant-J
             # branch when the two global partial beams are merged.
@@ -3287,6 +3460,11 @@ def _construct_vnext_joint_beam(parents, model, config, *, space, embeddings, st
             tolerance=max(1.,.001*abs(minimum))
             expanded=[p for p in expanded if p.proxy<=minimum+tolerance]
         for partial in sorted(expanded, key=lambda p: -p.score):
+            if getattr(model,'child_joint',False):
+                structure=(tuple(sorted((p.parent_id,p.pattern_id) for p in partial.selected.values())),
+                           tuple(tuple(sorted(row)) for row in partial.state.routes))
+                if structure in child_structures:continue
+                child_structures.add(structure)
             if any(partial.selected == kept.selected and partial.state.routes == kept.state.routes
                    and partial.state.directions == kept.state.directions for kept in beam):
                 continue
@@ -3333,7 +3511,7 @@ def _construct_vnext_joint(parents, model, config, *, space, embeddings, state, 
     fixed_directions = ({b:d for route,bits in zip(state.routes,state.directions) for b,d in zip(route,bits)}
                         if state is not None and getattr(model,'imitation_balance',False) else None)
     space = parent_assignment_space(parents, config) if space is None else space
-    embeddings = model.encode_static(space.graph) if embeddings is None else embeddings
+    if embeddings is None and not getattr(model,'child_joint',False):embeddings=model.encode_static(space.graph)
     selected = {} if selected is None else dict(selected)
     blocks = {b.block_id: b for pattern in selected.values() for b in space.children[pattern]}
     nodes = {b.block_id: space.block_nodes[pattern, b.block_id]

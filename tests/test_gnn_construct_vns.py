@@ -6186,3 +6186,249 @@ def test_bvns_failed_train_or_validation_never_starts_a_later_dataset(monkeypatc
     assert e.bvns_formal_evaluate('validation')==[]
     assert e.bvns_formal_evaluate('test')==[]
 
+
+def _child_joint_fixture():
+    e,space,_,old,schedule=_bvns_fixture()
+    w=e.lns.ChildJointWorkspace(old.solution.parents,e.CONFIG,e.FORMAL_SCOPE_V2,space,seed=53)
+    return e,space,w,w.wrap(old.solution,old.directions),schedule
+
+
+@pytest.mark.parametrize('robots',((0,1),(0,1,2),(0,1,2,3)))
+def test_child_joint_atomic_exchange_updates_all_routes_and_preserves_modes(robots):
+    e,space,w,current,schedule=_child_joint_fixture()
+    children={0:'a::whole',1:'c::whole',2:'d::whole',3:'z3::whole'}
+    # The fourth movable has been placed on robot2 by the common fixture.
+    if len(robots)==4:
+        routes=[list(row) for row in current.state.routes]
+        routes[0].remove('b::whole');routes[3].append('b::whole')
+        solution=e.canonicalize(current.solution.parents,current.solution.patterns,dict(enumerate(routes)),e.CONFIG,scope=e.FORMAL_SCOPE_V2)
+        current=w.wrap(solution,tuple((0,)*len(row) for row in routes));children[3]='b::whole'
+    operator={2:'swap_children',3:'cycle3',4:'cycle4'}[len(robots)]
+    pairs=tuple((children[r],robots[(i+1)%len(robots)]) for i,r in enumerate(robots))
+    preview=w._representative(current,pairs,operator)
+    assert preview is not None
+    candidate=w.finish_child(current,preview)
+    assert candidate is not None and candidate.solution.patterns==current.solution.patterns
+    owners={b:r for r,row in enumerate(candidate.state.routes) for b in row}
+    assert all(owners[b]==r for b,r in pairs)
+    recomputed=e.lns.oriented_route_state(candidate.state.routes,candidate.directions,w.blocks(candidate.solution.patterns),e.CONFIG)
+    assert w.cycles(candidate.state)==pytest.approx(w.cycles(recomputed))
+    assert candidate.route_delta_s==pytest.approx(tuple(b-a for a,b in zip(w.cycles(current.state),w.cycles(recomputed))))
+    assert len(candidate.moves)==len(robots) and all(m.source!=m.target for m in candidate.moves)
+
+
+def test_child_joint_single_y_child_moves_without_moving_its_sibling_or_changing_mode():
+    from test_gnn_schedule_blocker_pilot import _selection_fixture
+    import run_gnn_weld_layout as e
+    solution,_,_,config=_selection_fixture()
+    space=e.gnn.parent_assignment_space(solution.parents,config)
+    w=e.lns.ChildJointWorkspace(solution.parents,config,e.FORMAL_SCOPE_V2,space,seed=1)
+    current=w.wrap(solution,tuple((0,)*len(r.block_ids) for r in solution.routes))
+    owner={b:r for r,row in enumerate(current.state.routes) for b in row}
+    target=next(r for r in range(4) if r!=owner['a::0'] and r in e.lns.joint_block_robots(
+        w.blocks(solution.patterns)['a::0'],next(p for p in solution.patterns if p.parent_id=='a'),config))
+    candidate=w._representative(current,(('a::0',target),),'relocate_child')
+    assert candidate is not None and candidate.solution.patterns==solution.patterns
+    after={b:r for r,row in enumerate(candidate.state.routes) for b in row}
+    assert after['a::0']==target and after['a::1']==owner['a::1']
+    assert len(candidate.moves)==1
+
+
+@pytest.mark.parametrize('native_feasible,learned_gain,expected_move',((True,2.,True),(False,2.,True),(True,-2.,False)))
+def test_child_joint_noop_and_b32_preference_control_acceptance_instead_of_native_cmax(monkeypatch,native_feasible,learned_gain,expected_move):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    e,space,w,current,schedule=_child_joint_fixture()
+    candidate=w.finish_child(current,w._representative(current,(('a::whole',1),),'relocate_child'))
+    assert candidate is not None
+    monkeypatch.setattr(w,'proposals',lambda c,*args,**kwargs:[candidate] if c.signature==current.signature else [])
+    def native(solution,config,bits):
+        if w.identity(solution,bits)==current.signature:return schedule
+        return (ScheduleResult(ScheduleStatus.FEASIBLE,cmax=schedule.cmax+100.,robot_completion=(schedule.cmax+100.,)*4)
+                if native_feasible else ScheduleResult(ScheduleStatus.DEADLOCK))
+    def learned(reference,observed,actions):
+        return [0. if a.signature==reference.signature else learned_gain for a in actions]
+    result=e.lns.run_child_joint([current],w,native,ranker=learned,native_budget=10,max_states=4,max_shakes=1)
+    assert (result['candidate'].signature==candidate.signature)==expected_move
+    assert result['native_calls']==2 and result['runtime_objective'].startswith('learned')
+    if expected_move and native_feasible:assert result['native'].cmax>schedule.cmax
+
+
+def test_child_joint_one_holistic_head_binds_all_child_robot_relations_and_uses_one_graph(monkeypatch):
+    e,space,w,current,schedule=_child_joint_fixture()
+    frozen=torch.load(e.BVNS_MODEL,map_location='cpu',weights_only=True)['frozen_state_dict']
+    model=e.joint4_model(frozen).enable_child_joint().eval()
+    forward=[];handle=model.insertion_head.register_forward_hook(lambda module,args,output:forward.append(output.shape))
+    a=w._representative(current,(('a::whole',1),('c::whole',2),('d::whole',0)),'cycle3')
+    b=w._representative(current,(('a::whole',2),('d::whole',1),('c::whole',0)),'cycle3')
+    assert a is not None and b is not None
+    scorer=e.gnn.ChildJointScorer(model,space,w,e.CONFIG)
+    contexts,features=scorer.inputs(current,schedule,[w.noop(current),a,b])
+    assert contexts.shape==(3,256) and features.shape==(3,80)
+    assert not torch.allclose(contexts[1],contexts[2])
+    assert features[1,30:34].tolist()==pytest.approx([x/2500. for x in a.route_delta_s],abs=1e-7)
+    values=scorer(current,schedule,[w.noop(current),a,b])
+    assert len(forward)==1 and forward[0]==(3,1) and scorer.encodings==1
+    loss,_,_=e.joint4_group_loss(values,[(0,0.,1000.),(0,0.,900.),(1,0.,None)])
+    loss.backward()
+    assert model.insertion_head[0].weight.grad[:,-60:].abs().sum()>0
+    assert model.layer1.edge_projection.weight.grad.abs().sum()>0
+    assert model.layer1.heads==model.layer2.heads==4
+    assert torch.equal(model.layer1.linear.weight[:,:32],frozen['layer1.linear.weight'])
+    handle.remove()
+
+
+def test_child_joint_neural_generation_contains_legal_atomic_cyclic_actions():
+    e,space,w,current,schedule=_child_joint_fixture()
+    def scores(root,s,actions):
+        return [float(len(c.moves))-.001*sum(abs(v) for v in c.route_delta_s) for c in actions]
+    candidates=w.proposals(current,schedule,scores,limit=24)
+    assert candidates and len({c.signature for c in candidates})==len(candidates)
+    assert {'relocate_child','swap_children','cycle3'}<=set(c.operator for c in candidates)
+    for c in candidates:
+        blocks=w.blocks(c.solution.patterns)
+        assert all(e.robot_is_eligible(blocks[b],r,e.CONFIG) for r,row in enumerate(c.state.routes) for b in row)
+        assert c.route_delta_s==pytest.approx(tuple(b-a for a,b in zip(w.cycles(current.state),w.cycles(c.state))))
+
+
+def test_child_joint_initial_is_neural_and_never_calls_rule_or_baseline_sources(monkeypatch):
+    e,space,w,current,schedule=_child_joint_fixture()
+    model=e.child_joint_model(trained=False)
+    def forbidden(*args,**kwargs):raise AssertionError('GNN construction must not use a rule or baseline initializer')
+    monkeypatch.setattr(e,'bvns_initial',forbidden)
+    monkeypatch.setattr(e,'baseline_run',forbidden)
+    initial,diagnostic=e.child_joint_initial(current.solution.parents,space,w,53,model)
+    assert initial and diagnostic['source']=='SELF_GNN_BEAM2'
+    assert 1<=len(initial)<=2 and diagnostic['graph_encodings']<=2*len(current.solution.parents)
+    if len(initial)==2:assert w.ownership_structure(initial[0])!=w.ownership_structure(initial[1])
+    assert all(len(c.solution.patterns)==len(current.solution.parents) for c in initial)
+
+
+def test_child_joint_loss_explicitly_trains_improvement_against_noop_without_deadlock_cmax():
+    import run_gnn_weld_layout as e
+    scores=torch.tensor([0.,-.2,.3,.8],requires_grad=True)
+    rows=[dict(status='FEASIBLE',cmax_s=1000.),dict(status='FEASIBLE',cmax_s=900.),
+          dict(status='FEASIBLE',cmax_s=1100.),dict(status='DEADLOCK',cmax_s=None)]
+    loss,metrics=e.child_joint_loss(scores,rows)
+    assert metrics['reference_pairs']==3 and metrics['reference_correct']==0
+    loss.backward()
+    assert scores.grad[1]<0 and scores.grad[2]>0 and scores.grad[3]>0
+
+
+def test_child_joint_final_b32_is_once_and_only_after_learned_search(monkeypatch):
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    e,space,w,current,native=_child_joint_fixture()
+    events=[]
+    monkeypatch.setattr(e,'child_joint_initial',lambda *args:([current],dict(source='fixture',graph_encodings=0,encoding_seconds=0.)))
+    monkeypatch.setattr(e,'priority_schedule',lambda *args:native)
+    original=e.lns.run_child_joint
+    def search(*args,**kwargs):
+        result=original(*args,**kwargs);events.append('search returned');return result
+    monkeypatch.setattr(e.lns,'run_child_joint',search)
+    def final(*args):
+        assert events==['search returned'];events.append('B32')
+        return ScheduleResult(ScheduleStatus.DEADLOCK)
+    monkeypatch.setattr(e,'b32',final)
+    row=e.child_joint_case('fixture',current.solution.parents,53,use_gnn=False,write=False,native_budget=8,max_states=2,max_shakes=1)
+    assert events==['search returned','B32'] and row['b32_calls']==1
+    assert row['cmax_s'] is None and row['priority_calls']<=8
+
+
+def test_child_joint_reference_frame_does_not_miscount_shifted_unchanged_children():
+    e,space,w,current,native=_child_joint_fixture()
+    candidate=w._representative(current,(('a::whole',1),),'relocate_child')
+    comparison=w.between(current,candidate)
+    assert {m.block_id for m in comparison.moves}=={'a::whole'}
+    assert comparison.route_delta_s==candidate.route_delta_s
+    reconstructed=w.make(current,comparison.moves,comparison.operator,patterns=comparison.solution.patterns)
+    assert reconstructed.signature==candidate.signature
+
+
+def test_child_joint_fit_uses_only_self_gnn_and_measured_noop_b32_labels(monkeypatch):
+    import copy
+    from unittest.mock import Mock
+    from mrta_reference.model import ScheduleResult,ScheduleStatus
+    e,space,w,current,native=_child_joint_fixture()
+    frozen=torch.load(e.BVNS_MODEL,map_location='cpu',weights_only=True)['frozen_state_dict']
+    outputs=[];saved=[];evaluated=[]
+    monkeypatch.setattr(e,'CHILD_JOINT_MODEL',Mock(exists=lambda:False))
+    monkeypatch.setattr(e,'cmax_train_split',lambda:(['fixture'],list(e.BVNS_CASES)))
+    def layouts(split):
+        assert split=='train';return [('fixture',current.solution.parents)]
+    monkeypatch.setattr(e,'load_layouts',layouts)
+    monkeypatch.setattr(e,'read_rows',lambda *args:[])
+    monkeypatch.setattr(e,'child_joint_write',lambda rows:outputs.extend(copy.deepcopy(rows)))
+    def load(path,*args,**kwargs):
+        assert path==e.BVNS_MODEL
+        return dict(frozen_state_dict=frozen,state_dict={'must_not_be_loaded':'HGA/WAG-trained-v2'})
+    monkeypatch.setattr(e.torch,'load',load)
+    monkeypatch.setattr(e.torch,'save',lambda state,*args:saved.append(state))
+    def forbidden(*args,**kwargs):raise AssertionError('external teacher/rule state is forbidden in self-GNN fitting')
+    for name in ('baseline_run','bvns_initial','rule_beam','run_adapted_wag_vns_v2'):
+        monkeypatch.setattr(e,name,forbidden)
+    monkeypatch.setattr(e.native_hga,'_HGAWorkspace',forbidden)
+    monkeypatch.setattr(e,'child_joint_initial',lambda *args:([current],dict(source='SELF_GNN_BEAM2',graph_encodings=0,encoding_seconds=0.)))
+    monkeypatch.setattr(e,'priority_schedule',lambda *args:native)
+    def measured(candidate):
+        evaluated.append(candidate.signature)
+        return ScheduleResult(ScheduleStatus.DEADLOCK) if len(evaluated)%3==0 else ScheduleResult(ScheduleStatus.FEASIBLE,cmax=2000.+len(evaluated))
+    monkeypatch.setattr(e,'b32',measured)
+    history=e.child_joint_fit()
+    labels=[r for r in outputs if r['stage']=='training_candidate']
+    assert labels and all(r['source'].startswith('SELF_GNN') for r in labels)
+    assert any(r['operator']=='noop' for r in labels)
+    assert len(evaluated)==len(set(evaluated))==sum(r['b32_calls'] for r in labels)<=26
+    assert all(r['cmax_s'] is None for r in labels if r['status']=='DEADLOCK')
+    assert len(history)==3 and history[-1]['reference_pairs']>0
+    assert saved[-1]['training_complete'] and saved[-1]['training_sources']==['SELF_GNN']
+
+
+@pytest.mark.parametrize('changes,feasible,passed',(([-2.,-2.,-2.,-.2,1.,1.],6,True),
+    ([-.9]*6,6,False),([-3.,-2.,-1.,1.,1.,1.],6,False),([-2.]*6,5,False)))
+def test_child_joint_train_screen_requires_real_one_percent_and_four_wins(monkeypatch,changes,feasible,passed):
+    import run_gnn_weld_layout as e
+    rows=[]
+    for index,name in enumerate(e.BVNS_CASES):
+        for use_gnn in (False,True):
+            good=not use_gnn or index<feasible
+            rows.append(dict(stage='final',phase='independent',layout_id=name,seed=e.SEED,
+                method=e.CHILD_JOINT_METHODS[int(use_gnn)],status='FEASIBLE' if good else 'DEADLOCK',
+                cmax_s=1000.*(1+changes[index]/100) if use_gnn and good else 1000. if good else None,
+                runtime_s=20.,priority_calls=500,b32_calls=1))
+    monkeypatch.setattr(e,'read_rows',lambda *args:rows)
+    assert e.child_joint_summary()['passed']==passed
+
+
+def test_child_joint_failed_screen_never_runs_validation_or_test(monkeypatch):
+    import run_gnn_weld_layout as e
+    def forbidden(*args,**kwargs):raise AssertionError('failed stage must stop before later data or evaluation')
+    monkeypatch.setattr(e,'load_layouts',forbidden)
+    monkeypatch.setattr(e,'child_joint_case',forbidden)
+    monkeypatch.setattr(e,'child_joint_summary',lambda:dict(passed=False))
+    monkeypatch.setattr(e,'bvns_formal_summary',lambda *args,**kwargs:dict(passed=False))
+    assert e.child_joint_evaluate('validation')==[]
+    assert e.child_joint_evaluate('test')==[]
+
+
+def test_child_joint_x_split_qualification_and_explicit_mode_boundary():
+    e,space,w,current,native=_child_joint_fixture()
+    assignment=next(a for a in space.actions if a.parent_id=='a' and a.pattern.kind is e.SplitKind.X_SPLIT)
+    patterns=tuple(assignment.pattern if p.parent_id=='a' else p for p in current.solution.patterns)
+    pairs=tuple((b.block_id,r) for b,r in zip(space.children[assignment.pattern],assignment.robots))
+    with pytest.raises(ValueError,match='cannot change parent modes'):
+        w._representative(current,pairs,'relocate_child',patterns=patterns)
+    changed=w._representative(current,pairs,'mode',patterns=patterns)
+    assert changed is not None
+    assert w.between(current,replace(changed,operator='cycle3')).operator=='mode'
+    child=space.children[assignment.pattern][0]
+    illegal=e.lns.JointChildMove(child.block_id,assignment.robots[0],assignment.robots[1],0,0)
+    assert w.make(changed,(illegal,),'relocate_child') is None
+
+
+def test_child_joint_cycles_do_not_require_individual_improvement():
+    e,space,w,current,native=_child_joint_fixture()
+    def score(root,s,actions):
+        return [(10. if len(c.moves)>=3 else -10.)-.001*sum(abs(x) for x in c.route_delta_s) for c in actions]
+    candidates=w.proposals(current,native,score)
+    assert any(c.operator=='cycle3' and c.score>0 for c in candidates)
+    assert all(c.score<0 for c in candidates if len(c.moves)==1)
+

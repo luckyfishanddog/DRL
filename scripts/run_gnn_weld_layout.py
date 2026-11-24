@@ -8836,11 +8836,11 @@ def bvns_trained_train():
     print('BVNS_TRAINED_SUMMARY',json.dumps(bvns_trained_summary(),ensure_ascii=False),flush=True)
 
 
-def bvns_formal_summary(phase='validation'):
+def bvns_formal_summary(phase='validation',*,results_path=None,method=None):
     if phase not in ('validation','test'):raise ValueError('formal BVNS split must be validation or test')
     expected = {(name,seed) for name,_ in load_layouts(phase) for seed in TEST_SEEDS}
-    chosen = {(r['layout_id'],int(r['seed'])):r for r in read_rows(BVNS_RESULTS)
-              if r.get('stage')=='final' and r.get('phase')==phase and r['method']==BVNS_V2_METHOD}
+    chosen = {(r['layout_id'],int(r['seed'])):r for r in read_rows(BVNS_RESULTS if results_path is None else results_path)
+              if r.get('stage')=='final' and r.get('phase')==phase and r['method']==(BVNS_V2_METHOD if method is None else method)}
     records = [chosen[k] for k in sorted(expected) if k in chosen]
     output = dict(phase=phase,expected=len(expected),completed=len(records),
         feasible=sum(r['status']=='FEASIBLE' for r in records),paired={},detail=[],
@@ -8921,9 +8921,342 @@ def bvns_pilot():
     print('BVNS_SUMMARY',json.dumps(bvns_summary(),ensure_ascii=False),flush=True)
 
 
+CHILD_JOINT_MODEL = ROOT/'models/gnn_child_joint.pt'
+CHILD_JOINT_RESULTS = FINAL_RESULTS/'gnn_child_joint.csv'
+CHILD_JOINT_METHODS = ('ChildJoint-NoGNN-v1','GNN-ChildJoint-B32Rank-v1')
+CHILD_JOINT_FIELDS = (*BVNS_FIELDS,'noop_score','relative_score','moves','scored','retained','perturbation','cross_child_transfers','native_feasible')
+
+
+def child_joint_write(rows):
+    import io
+    if not rows:return
+    buffer=io.StringIO(newline='')
+    writer=csv.DictWriter(buffer,fieldnames=CHILD_JOINT_FIELDS)
+    if not CHILD_JOINT_RESULTS.exists() or not CHILD_JOINT_RESULTS.stat().st_size:writer.writeheader()
+    writer.writerows({key:row.get(key) for key in CHILD_JOINT_FIELDS} for row in rows)
+    payload=buffer.getvalue()
+    if (CHILD_JOINT_RESULTS.stat().st_size if CHILD_JOINT_RESULTS.exists() else 0)+len(payload.encode('utf-8'))>100000000:
+        raise ValueError('child-joint CSV would exceed the user 100MB file limit')
+    with CHILD_JOINT_RESULTS.open('a',encoding='utf-8',newline='') as stream:stream.write(payload)
+
+
+def child_joint_model(*,trained=True):
+    inherited=torch.load(BVNS_MODEL,map_location='cpu',weights_only=True)
+    frozen=inherited['frozen_state_dict']
+    model=joint4_model(frozen).enable_child_joint()
+    if trained:
+        saved=torch.load(CHILD_JOINT_MODEL,map_location='cpu',weights_only=True)
+        if not saved.get('training_complete'):raise ValueError('self-GNN child-joint fitting is incomplete')
+        model.load_state_dict(saved['state_dict'])
+    return model.eval().requires_grad_(False)
+
+
+def child_joint_initial(parents,space,workspace,seed,model):
+    if model is None:
+        # Explicit full no-GNN ablation only. These RULE states NEVER enter
+        # GNN construction, its training sources, or a GNN fallback.
+        candidates=bvns_initial(parents,space,workspace,seed)
+        return [workspace.wrap(c.solution,c.directions) for c in candidates],dict(source='NO_GNN_RULE_CONTROL',graph_encodings=0,encoding_seconds=0.)
+    original=model.encode_static;count=0;seconds=0.
+    def measured(graph):
+        nonlocal count,seconds
+        clock=time.perf_counter();z=original(graph);count+=1;seconds+=time.perf_counter()-clock;return z
+    model.encode_static=measured;model._child_construction_cache={}
+    try:
+        result=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,beam_width=2)
+    finally:
+        model.encode_static=original;del model._child_construction_cache
+    candidates=[];seen=set()
+    for plan in result.candidates or (result,):
+        if plan.solution is None:continue
+        item=workspace.wrap(plan.solution,plan.directions)
+        workspace.counts['initial']['generated']+=1
+        if item.signature in seen:continue
+        seen.add(item.signature);candidates.append(item);workspace.counts['initial']['unique']+=1
+    return candidates,dict(source='SELF_GNN_BEAM2',graph_encodings=count,encoding_seconds=seconds,
+        failure=result.rejection_reason if not candidates else None)
+
+
+def child_joint_restore(parents,snapshot,workspace,*,operator='initial',moves=(),origin=None):
+    restored=bvns_restore_action(parents,snapshot,workspace)
+    action=workspace.wrap(restored.solution,restored.directions,operator)
+    action.moves=tuple(lns.JointChildMove(**row) for row in moves)
+    if origin is not None:
+        action.parents=tuple(sorted({workspace.blocks(action.solution.patterns)[m.block_id].parent_id for m in action.moves}))
+        action.route_delta_s=tuple(b-a for a,b in zip(workspace.cycles(origin.state),workspace.cycles(action.state)))
+        action.transfers=lns.actual_parent_transfers(origin,action,CONFIG)
+    return action
+
+
+@torch.no_grad()
+def child_joint_case(name,parents,seed,*,use_gnn=True,phase='independent',write=True,
+                     native_budget=500,max_states=80,max_shakes=8):
+    method=CHILD_JOINT_METHODS[int(use_gnn)]
+    if write:
+        done=[r for r in read_rows(CHILD_JOINT_RESULTS) if r['stage']=='final' and r['phase']==phase
+              and r['layout_id']==name and int(r['seed'])==seed and r['method']==method]
+        if done:return done[-1]
+    clock=time.perf_counter();model=child_joint_model() if use_gnn else None
+    space=gnn.parent_assignment_space(parents,CONFIG)
+    w=lns.ChildJointWorkspace(parents,CONFIG,FORMAL_SCOPE_V2,space,seed=seed)
+    initial,initial_diag=child_joint_initial(parents,space,w,seed,model)
+    init_seconds=time.perf_counter()-clock
+    if not initial:
+        row=dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,status='CONSTRUCTION_FAILED',
+            priority_calls=0,b32_calls=0,runtime_s=time.perf_counter()-clock,diagnostic=json.dumps(initial_diag))
+        if write:child_joint_write([row])
+        print('CHILD_JOINT_FINAL',json.dumps(row),flush=True);return row
+    actor=gnn.ChildJointScorer(model,space,w,CONFIG) if model is not None else None
+    observations=[];ids={};native_seconds=0.
+    def observed(candidate,native,origin,seconds):
+        nonlocal native_seconds
+        native_seconds+=seconds;ids[candidate.signature]=len(ids)+1
+        observations.append(dict(stage='native_candidate',phase=phase,layout_id=name,seed=seed,method=method,
+            operator=candidate.operator,candidate_id=ids[candidate.signature],
+            origin_id=ids.get(origin.signature,'') if origin is not None else '',status=native.status.value,
+            cmax_s=None,native_cmax_s=native.cmax if native.feasible else None,priority_calls=1,b32_calls=0,
+            gnn_score=candidate.score if use_gnn else None,
+            route_lb_s=max(w.cycles(candidate.state)),route_delta_s=json.dumps(candidate.route_delta_s),
+            transfer_details=json.dumps(candidate.transfers),moves=json.dumps([asdict(m) for m in candidate.moves]),
+            runtime_s=time.perf_counter()-clock))
+    def decision(reference,pool,values,selected):
+        for candidate,value in zip(pool,values):
+            action=w.between(reference,candidate)
+            observations.append(dict(stage='learned_decision',phase=phase,layout_id=name,seed=seed,method=method,
+                protocol='whole-action B32 preference; no B32 label online',operator=action.operator,
+                candidate_id=ids[candidate.signature],origin_id=ids[reference.signature],
+                gnn_score=value,noop_score=values[0],relative_score=value-values[0],b32_calls=0,
+                route_delta_s=json.dumps(action.route_delta_s),transfer_details=json.dumps(action.transfers),
+                accepted=int(selected.signature!=reference.signature and candidate.signature==selected.signature)))
+    search=lns.run_child_joint(initial,w,priority_schedule,ranker=actor,native_budget=native_budget,
+        max_states=max_states,max_shakes=max_shakes,observer=observed,decision_observer=decision if use_gnn else None)
+    selected,native=search['candidate'],search['native'];b32_clock=time.perf_counter()
+    schedule=b32(selected);b32_seconds=time.perf_counter()-b32_clock
+    metrics=routeaware_metrics(selected,schedule)
+    transfers=lns.actual_parent_transfers(search['initial_selected'],selected,CONFIG)
+    counts=search['counts']
+    row=dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,
+        protocol='GNN no-op-relative acceptance; native context only; one final B32' if use_gnn else 'no-GNN child-space/native acceptance control; one final B32',
+        status=schedule.status.value,cmax_s=schedule.cmax if schedule.feasible else None,
+        native_cmax_s=native.cmax if native.feasible else None,priority_calls=search['native_calls'],b32_calls=1,
+        generated=sum(c.get('generated',0) for c in counts.values()),unique=sum(c.get('unique',0) for c in counts.values()),
+        cross_robot_candidates=sum(c.get('cross_robot_candidates',0) for c in counts.values()),cross_parent_transfers=len(transfers),
+        states=search['states'],shakes=search['shakes'],route_lb_s=max(w.cycles(selected.state)),initial_seconds=init_seconds,
+        native_seconds=native_seconds,graph_encodings=initial_diag['graph_encodings']+(actor.encodings if actor else 0),
+        score_batches=actor.score_batches if actor else 0,scored_actions=actor.scored_actions if actor else 0,
+        encoding_seconds=initial_diag['encoding_seconds']+(actor.encoding_seconds if actor else 0.),
+        feature_seconds=actor.feature_seconds if actor else 0.,scoring_seconds=actor.scoring_seconds if actor else 0.,
+        transfer_details=json.dumps(transfers),solution=json.dumps(pack_directed_plan(selected)),
+        **{k:metrics.get(k) for k in ('max_processing_s','move_s','wait_s')},
+        diagnostic=json.dumps(dict(stop=search['stop'],counts=counts,objective=search['runtime_objective'],
+            native_budget=native_budget,max_states=max_states,max_shakes=max_shakes,initial=initial_diag,
+            initial_selected=pack_directed_plan(search['initial_selected']),b32_seconds=b32_seconds,
+            b32_diagnostics=schedule.diagnostics,route_cache_hits=search['route_cache_hits'],
+            search_encodings=actor.encodings if actor else 0)))
+    if write:
+        child_joint_write([*observations,*[dict(stage='action_count',phase=phase,layout_id=name,seed=seed,
+            method=method,operator=op,diagnostic=json.dumps(value)) for op,value in counts.items()]])
+        row['runtime_s']=time.perf_counter()-clock;child_joint_write([row])
+    else:row['runtime_s']=time.perf_counter()-clock
+    print('CHILD_JOINT_FINAL',json.dumps({k:row.get(k) for k in ('layout_id','seed','method','status','cmax_s',
+        'native_cmax_s','runtime_s','priority_calls','b32_calls','generated','unique')}),flush=True)
+    return row
+
+
+def child_joint_loss(scores,rows):
+    ranks=[joint4_training_rank(row,0.,0.) for row in rows]
+    ranking,pairs,correct=joint4_group_loss(scores,ranks)
+    reference=[];ref_correct=0
+    for i in range(1,len(rows)):
+        if ranks[i]==ranks[0]:continue
+        gain=scores[i]-scores[0];better=ranks[i]<ranks[0]
+        reference.append(F.softplus(-gain if better else gain))
+        ref_correct+=int(bool(gain>0)==better)
+    if ranking is None:return None,dict(pairs=0,correct=0,reference_pairs=0,reference_correct=0)
+    loss=.5*ranking+.5*torch.stack(reference).mean() if reference else ranking
+    return loss,dict(pairs=pairs,correct=correct,reference_pairs=len(reference),reference_correct=ref_correct)
+
+
+def child_joint_fit():
+    if CHILD_JOINT_MODEL.exists():
+        saved=torch.load(CHILD_JOINT_MODEL,map_location='cpu',weights_only=True)
+        if saved.get('training_complete'):
+            print('CHILD_JOINT_FIT_ALREADY_COMPLETE',flush=True);return saved
+    else:saved={}
+    started=time.perf_counter();model=child_joint_model(trained=False)
+    names,heldout=cmax_train_split();layouts=dict(load_layouts('train'))
+    if set(names)&set(heldout):raise ValueError('self-GNN fitting overlaps independent TRAIN')
+    existing=[r for r in read_rows(CHILD_JOINT_RESULTS) if r['phase']=='fit']
+    roots={r['candidate_id']:r for r in existing if r['stage']=='training_root'}
+    done={r['candidate_id'] for r in existing if r['stage']=='training_group'}
+    label_rows={key:[r for r in existing if r['stage']=='training_candidate' and r['origin_id']==key] for key in roots}
+    prepared=[];new_b32=0
+    for ordinal,name in enumerate(names):
+        print('CHILD_JOINT_SELF_LAYOUT',name,flush=True)
+        parents=layouts[name];space=gnn.parent_assignment_space(parents,CONFIG)
+        trajectory_w=lns.ChildJointWorkspace(parents,CONFIG,FORMAL_SCOPE_V2,space,seed=SEED+ordinal)
+        group_ids=[f'self-{name}-{i}' for i in range(2)]
+        if not any(key in roots for key in group_ids):
+            with torch.no_grad():
+                initial,initial_diag=child_joint_initial(parents,space,trajectory_w,SEED+ordinal,model)
+                if not initial:
+                    child_joint_write([dict(stage='construction_failed',phase='fit',layout_id=name,
+                        method=CHILD_JOINT_METHODS[1],source='SELF_GNN',b32_calls=0,diagnostic=json.dumps(initial_diag))]);continue
+                actor=gnn.ChildJointScorer(model,space,trajectory_w,CONFIG)
+                trajectory=lns.run_child_joint(initial,trajectory_w,priority_schedule,ranker=actor,
+                    native_budget=64,max_states=4,max_shakes=1)
+                proposals=[trajectory['initial_selected'],trajectory['candidate'],*reversed(trajectory['visited_states'])]
+                selected=list({c.signature:c for c in proposals}.values())[:2]
+                child_joint_write([dict(stage='self_trajectory',phase='fit',layout_id=name,seed=SEED+ordinal,
+                    method=CHILD_JOINT_METHODS[1],source='SELF_GNN',priority_calls=trajectory['native_calls'],b32_calls=0,
+                    states=trajectory['states'],diagnostic=json.dumps(dict(initial=initial_diag,counts=trajectory['counts'],
+                        no_label_feedback=True,source_weights='gnn_bvns.pt:frozen_state_dict')))])
+                for index,root in enumerate(selected):
+                    row=dict(stage='training_root',phase='fit',layout_id=name,seed=SEED+ordinal,
+                        method=CHILD_JOINT_METHODS[1],source='SELF_GNN_CONSTRUCT' if index==0 else 'SELF_GNN_SEARCH',
+                        candidate_id=group_ids[index],solution=json.dumps(pack_directed_plan(root)),b32_calls=0)
+                    child_joint_write([row]);roots[group_ids[index]]=row;label_rows[group_ids[index]]=[]
+        cache={}
+        for key in group_ids:
+            for row in label_rows.get(key,[]):
+                action=child_joint_restore(parents,json.loads(row['solution']),trajectory_w)
+                cache[action.signature]=(row['status'],float(row['cmax_s']) if row.get('cmax_s') else None)
+        for index,key in enumerate(group_ids):
+            if key not in roots:continue
+            w=lns.ChildJointWorkspace(parents,CONFIG,FORMAL_SCOPE_V2,space,seed=SEED+ordinal*17+index)
+            root=child_joint_restore(parents,json.loads(roots[key]['solution']),w)
+            native=priority_schedule(root.solution,CONFIG,root.directions)
+            if key not in done:
+                actor=gnn.ChildJointScorer(model,space,w,CONFIG)
+                with torch.no_grad():candidates=w.proposals(root,native,actor,limit=24)
+                chosen=[]
+                for kind in ('relocate_child','swap_children','cycle3','cycle4','mode'):
+                    options=sorted((c for c in candidates if c.operator==kind),key=lambda c:-c.score)
+                    chosen.extend(options[:2])
+                used={c.signature for c in chosen}
+                remaining=[c for c in candidates if c.signature not in used];w.ranking_rng.shuffle(remaining)
+                chosen=[w.noop(root),*(chosen+remaining)[:12]]
+                for number,candidate in enumerate(chosen):
+                    if len(label_rows[key])>=13:break
+                    snapshot=pack_directed_plan(candidate)
+                    if any(json.loads(r['solution'])==json.loads(json.dumps(snapshot)) for r in label_rows[key]):continue
+                    called=candidate.signature not in cache;clock=time.perf_counter()
+                    if called:
+                        outcome=b32(candidate);cache[candidate.signature]=(outcome.status.value,outcome.cmax if outcome.feasible else None)
+                        new_b32+=1
+                    status,cmax=cache[candidate.signature]
+                    row=dict(stage='training_candidate',phase='fit',layout_id=name,seed=SEED+ordinal,
+                        method=CHILD_JOINT_METHODS[1],source=roots[key]['source'],origin_id=key,
+                        candidate_id=f'{key}-{number}',operator=candidate.operator,status=status,cmax_s=cmax,
+                        b32_calls=int(called),solution=json.dumps(snapshot),moves=json.dumps([asdict(m) for m in candidate.moves]),
+                        diagnostic=json.dumps(dict(b32_seconds=time.perf_counter()-clock,no_op=candidate.operator=='noop',
+                            label='actual B32; no HGA/WAG/native labels')))
+                    child_joint_write([row]);label_rows[key].append(row)
+                child_joint_write([dict(stage='training_group',phase='fit',layout_id=name,method=CHILD_JOINT_METHODS[1],
+                    source=roots[key]['source'],candidate_id=key,unique=len(label_rows[key]),b32_calls=0,
+                    priority_calls=1,diagnostic=json.dumps(dict(counts=w.counts,graph_encodings=actor.encodings)))])
+                done.add(key)
+            labels=sorted(label_rows[key],key=lambda r:r['operator']!='noop')
+            if not labels or labels[0]['operator']!='noop':raise ValueError('TRAIN group has no measured no-op reference')
+            actions=[child_joint_restore(parents,json.loads(r['solution']),w,operator=r['operator'],
+                moves=json.loads(r['moves']),origin=root) for r in labels]
+            ranks=[joint4_training_rank(r,0.,0.) for r in labels]
+            if len(set(ranks))>1:prepared.append((w,root,native,actions,labels))
+            print('CHILD_JOINT_SELF_GROUP',json.dumps(dict(layout_id=name,group=index,candidates=len(labels),
+                feasible=sum(r['status']=='FEASIBLE' for r in labels),new_b32_total=new_b32)),flush=True)
+    if not prepared:raise ValueError('self-GNN trajectories produced no usable B32 preference; stop without external teachers')
+    collection_seconds=time.perf_counter()-started
+    model.requires_grad_(True);model.train();optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4)
+    history=saved.get('history',[])
+    if history:model.load_state_dict(saved['state_dict']);optimizer.load_state_dict(saved['optimizer'])
+    for epoch in range(len(history)+1,4):
+        order=list(range(len(prepared)));Random(SEED+epoch).shuffle(order)
+        losses=[];totals=Counter();ff_pairs=ff_correct=0
+        for i in order:
+            w,root,native,actions,labels=prepared[i]
+            optimizer.zero_grad(set_to_none=True)
+            actor=gnn.ChildJointScorer(model,w.space,w,CONFIG);scores=actor(root,native,actions)
+            loss,metrics=child_joint_loss(scores,labels)
+            if loss is None:continue
+            loss.backward();grad=float(torch.nn.utils.clip_grad_norm_(model.parameters(),1.))
+            if not math.isfinite(grad) or not math.isfinite(float(loss.detach())):raise ArithmeticError('nonfinite child-joint gradient')
+            optimizer.step();losses.append(float(loss.detach()));totals.update(metrics)
+            for a in range(len(labels)):
+                for b in range(a+1,len(labels)):
+                    if labels[a]['status']==labels[b]['status']=='FEASIBLE' and float(labels[a]['cmax_s'])!=float(labels[b]['cmax_s']):
+                        ff_pairs+=1;ff_correct+=int((float(scores[a].detach())-float(scores[b].detach()))*
+                            (float(labels[a]['cmax_s'])-float(labels[b]['cmax_s']))<0)
+        record=dict(epoch=epoch,loss=sum(losses)/max(1,len(losses)),groups=len(prepared),updates=len(losses),
+            pair_accuracy=totals['correct']/max(1,totals['pairs']),reference_accuracy=totals['reference_correct']/max(1,totals['reference_pairs']),
+            feasible_accuracy=ff_correct/max(1,ff_pairs),feasible_pairs=ff_pairs,reference_pairs=totals['reference_pairs'],
+            collection_seconds=collection_seconds,elapsed_s=time.perf_counter()-started,new_b32_calls=new_b32)
+        history.append(record)
+        torch.save(dict(state_dict=model.state_dict(),optimizer=optimizer.state_dict(),history=history,
+            training_complete=epoch==3,training_layouts=names,heldout_layouts=heldout,training_sources=['SELF_GNN'],
+            initialization='models/gnn_bvns.pt:frozen_state_dict',method=CHILD_JOINT_METHODS[1],feature_dim=80,
+            target='measured B32 feasible Cmax ranking + relative-to-no-op preference'),CHILD_JOINT_MODEL)
+        child_joint_write([dict(stage='epoch',phase='fit',method=CHILD_JOINT_METHODS[1],b32_calls=0,diagnostic=json.dumps(record))])
+        print('CHILD_JOINT_EPOCH',json.dumps(record),flush=True)
+    return history
+
+
+def child_joint_summary():
+    rows=[r for r in read_rows(CHILD_JOINT_RESULTS) if r['stage']=='final' and r['phase']=='independent']
+    records={method:{(r['layout_id'],int(r['seed'])):r for r in rows if r['method']==method} for method in CHILD_JOINT_METHODS}
+    expected={(name,SEED) for name in BVNS_CASES};new=records[CHILD_JOINT_METHODS[1]];plain=records[CHILD_JOINT_METHODS[0]]
+    changes=[(float(new[k]['cmax_s'])/float(plain[k]['cmax_s'])-1)*100 for k in sorted(expected)
+             if k in new and k in plain and new[k]['status']==plain[k]['status']=='FEASIBLE']
+    output=dict(completed=sum(k in new for k in expected),feasible=sum(k in new and new[k]['status']=='FEASIBLE' for k in expected),
+        pairs=len(changes),median_change_pct=median(changes) if changes else None,
+        wins=sum(x<-1e-9 for x in changes),losses=sum(x>1e-9 for x in changes),ties=sum(abs(x)<=1e-9 for x in changes),
+        methods={method:dict(completed=sum(k in rs for k in expected),feasible=sum(k in rs and rs[k]['status']=='FEASIBLE' for k in expected),
+            median_runtime_s=median([float(rs[k]['runtime_s']) for k in expected if k in rs]) if rs else None,
+            priority_calls=sum(int(rs[k]['priority_calls']) for k in expected if k in rs),
+            b32_calls=sum(int(rs[k]['b32_calls']) for k in expected if k in rs)) for method,rs in records.items()})
+    output['passed']=(output['completed']==output['feasible']==output['pairs']==6 and output['median_change_pct']<=-1. and output['wins']>=4)
+    return output
+
+
+def child_joint_evaluate(phase='independent'):
+    if phase=='validation' and not child_joint_summary()['passed']:
+        print('CHILD_JOINT_STOP: independent TRAIN did not pass',flush=True);return []
+    if phase=='test' and not bvns_formal_summary('validation',results_path=CHILD_JOINT_RESULTS,method=CHILD_JOINT_METHODS[1])['passed']:
+        print('CHILD_JOINT_STOP: VALIDATION did not pass; TEST not started',flush=True);return []
+    if phase not in ('independent','validation','test'):raise ValueError('unsupported child-joint phase')
+    if not CHILD_JOINT_MODEL.exists() or not torch.load(CHILD_JOINT_MODEL,map_location='cpu',weights_only=True).get('training_complete'):
+        raise ValueError('finish self-GNN TRAIN fitting before the independent/official comparison')
+    layouts=dict(load_layouts('train' if phase=='independent' else phase))
+    names=BVNS_CASES if phase=='independent' else tuple(layouts);seeds=(SEED,) if phase=='independent' else TEST_SEEDS
+    rows=[r for r in read_rows(CHILD_JOINT_RESULTS) if r['stage']=='final' and r['phase']==phase]
+    done={(r['layout_id'],int(r['seed']),r['method']) for r in rows}
+    needed={(name,seed,CHILD_JOINT_METHODS[int(use)]) for name in names for seed in seeds
+            for use in ((False,True) if phase=='independent' else (True,))}
+    if needed<=done:
+        print('CHILD_JOINT_ALREADY_COMPLETE',phase,flush=True);return rows
+    if phase!='independent' and not bvns_formal_summary(phase,results_path=CHILD_JOINT_RESULTS,method=CHILD_JOINT_METHODS[1])['criteria']['all_references']:
+        raise ValueError('frozen full-budget HGA/WAG reference records are incomplete')
+    # Same shared synthetic native warm-up already used by the historical BVNS.
+    # It never provides a plan or label to the GNN.
+    warm_parents=tuple(ParentWeld(f'CJ_SETUP_{r}',(1. if r%2==0 else 17.,9. if r<2 else 2.),
+        (2. if r%2==0 else 18.,9. if r<2 else 2.)) for r in range(4))
+    space=gnn.parent_assignment_space(warm_parents,CONFIG)
+    patterns=tuple(next(a.pattern for a in space.actions if a.parent_id==p.parent_id and a.pattern.kind is SplitKind.WHOLE) for p in warm_parents)
+    warm=canonicalize(warm_parents,patterns,{r:(f'CJ_SETUP_{r}::whole',) for r in range(4)},CONFIG,scope=FORMAL_SCOPE_V2)
+    clock=time.perf_counter();priority_schedule(warm,CONFIG,((0,),)*4)
+    child_joint_write([dict(stage='setup',phase=phase,method='SHARED_NATIVE_SETUP',b32_calls=0,priority_calls=1,runtime_s=time.perf_counter()-clock)])
+    output=[]
+    for name in names:
+        for seed in seeds:
+            for use_gnn in ((False,True) if phase=='independent' else (True,)):
+                output.append(child_joint_case(name,layouts[name],seed,use_gnn=use_gnn,phase=phase))
+    summary=child_joint_summary() if phase=='independent' else bvns_formal_summary(phase,results_path=CHILD_JOINT_RESULTS,method=CHILD_JOINT_METHODS[1])
+    print('CHILD_JOINT_SUMMARY',json.dumps({k:v for k,v in summary.items() if k!='detail'},ensure_ascii=False),flush=True)
+    return output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train','feedback-continue','feedback-full-validation','feedback-test','feedback-summary','child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary','joint3b-train','joint3b-validation','joint3b-summary','joint4-fit','joint4-train','joint4-validation','joint4-summary','cmax-fit','cmax-independent','cmax-validation','cmax-test','cmax-summary','bvns-pilot','bvns-summary','bvns-fit','bvns-trained-train','bvns-trained-summary','bvns-validation','bvns-test','bvns-formal-summary'))
+    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train','feedback-continue','feedback-full-validation','feedback-test','feedback-summary','child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary','joint3b-train','joint3b-validation','joint3b-summary','joint4-fit','joint4-train','joint4-validation','joint4-summary','cmax-fit','cmax-independent','cmax-validation','cmax-test','cmax-summary','bvns-pilot','bvns-summary','bvns-fit','bvns-trained-train','bvns-trained-summary','bvns-validation','bvns-test','bvns-formal-summary','child-joint-fit','child-joint-independent','child-joint-validation','child-joint-test','child-joint-summary','child-joint-formal-summary'))
     parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
@@ -8937,7 +9270,17 @@ def main():
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage == 'bvns-pilot':
+    if args.stage=='child-joint-fit':
+        child_joint_fit()
+    elif args.stage in ('child-joint-independent','child-joint-validation','child-joint-test'):
+        child_joint_evaluate(args.stage.removeprefix('child-joint-'))
+    elif args.stage=='child-joint-summary':
+        print('CHILD_JOINT_SUMMARY',json.dumps(child_joint_summary(),ensure_ascii=False),flush=True)
+    elif args.stage=='child-joint-formal-summary':
+        if args.split=='train':parser.error('child-joint formal summary requires validation or test')
+        print('CHILD_JOINT_FORMAL_SUMMARY',json.dumps(bvns_formal_summary(args.split,
+            results_path=CHILD_JOINT_RESULTS,method=CHILD_JOINT_METHODS[1]),ensure_ascii=False),flush=True)
+    elif args.stage == 'bvns-pilot':
         bvns_pilot()
     elif args.stage == 'bvns-summary':
         print('BVNS_SUMMARY',json.dumps(bvns_summary(),ensure_ascii=False),flush=True)

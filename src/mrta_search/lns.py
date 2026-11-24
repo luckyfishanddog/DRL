@@ -476,6 +476,300 @@ def run_bottleneck_vns(initial, workspace, native_evaluator, *, scorer=None, rep
         native_deadlock_reserve=len(archive),runtime_s=time.perf_counter()-started)
 
 
+@dataclass(frozen=True)
+class JointChildMove:
+    block_id: str
+    source: int
+    target: int
+    position: int
+    direction: int
+
+
+@dataclass
+class ChildJointAction(BottleneckAction):
+    moves: tuple = ()
+
+
+class ChildJointWorkspace(BottleneckWorkspace):
+    """Atomic child actions; inherited code supplies only route/geometry caches."""
+    operators = ('initial','relocate_child','swap_children','cycle3','cycle4','mode')
+
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.counts = {name:Counter() for name in self.operators}
+        self.comparison_cache={}
+
+    def wrap(self, solution, directions, operator='initial'):
+        bits=tuple(map(tuple,directions));routes=tuple(r.block_ids for r in solution.routes)
+        state=self.state(routes,bits,self.blocks(solution.patterns))
+        return ChildJointAction(solution,bits,state,operator,(),self.identity(solution,bits),(0.,)*4,{},moves=())
+
+    def noop(self,current):
+        return ChildJointAction(current.solution,current.directions,current.state,'noop',(),
+            current.signature,(0.,)*4,{},moves=())
+
+    def make(self,current,moves,operator,*,patterns=None):
+        """Commit every removal before any insertion. No intermediate objective test."""
+        self.counts[operator]['generated'] += 1
+        moves=tuple(moves)
+        if not moves or len({m.block_id for m in moves})!=len(moves):return None
+        old_patterns={p.parent_id:p for p in current.solution.patterns}
+        selected=old_patterns if patterns is None else {p.parent_id:p for p in patterns}
+        changed={p for p in selected if selected[p]!=old_patterns[p]}
+        if changed and operator!='mode':raise ValueError('ordinary child moves cannot change parent modes')
+        old_blocks=self.blocks(current.solution.patterns)
+        blocks=self.blocks(tuple(selected.values()))
+        owner={b:r for r,route in enumerate(current.state.routes) for b in route}
+        for move in moves:
+            if move.block_id not in blocks or move.target not in range(4) or move.direction not in (0,1):return None
+            block=blocks[move.block_id]
+            if move.target not in joint_block_robots(block,selected[block.parent_id],self.config):return None
+            if block.parent_id not in changed and owner.get(move.block_id)!=move.source:return None
+        removed={m.block_id for m in moves}|{b for b,block in old_blocks.items() if block.parent_id in changed}
+        routes=[];bits=[]
+        for route,vector in zip(current.state.routes,current.directions):
+            keep=[i for i,b in enumerate(route) if b not in removed]
+            routes.append([route[i] for i in keep]);bits.append([vector[i] for i in keep])
+        for move in sorted(moves,key=lambda m:(m.target,m.position,m.block_id)):
+            r,k=move.target,move.position
+            if not 0<=k<=len(routes[r]):return None
+            routes[r].insert(k,move.block_id);bits[r].insert(k,move.direction)
+        if sorted(b for row in routes for b in row)!=sorted(blocks):return None
+        patterns=tuple(sorted(selected.values(),key=lambda p:p.parent_id))
+        solution=CanonicalSolution(self.parents,patterns,tuple(Route(r,tuple(row)) for r,row in enumerate(routes)))
+        state=self.state(routes,bits,blocks);signature=self.identity(solution,state.directions)
+        if signature==current.signature:return None
+        normalized=tuple(JointChildMove(m.block_id,m.source,m.target,routes[m.target].index(m.block_id),m.direction) for m in moves)
+        parents=tuple(sorted({blocks[m.block_id].parent_id for m in moves}|changed))
+        delta=tuple(b-a for a,b in zip(self.cycles(current.state),self.cycles(state)))
+        return ChildJointAction(solution,state.directions,state,operator,parents,signature,delta,{},moves=normalized)
+
+    def finish_child(self,current,preview):
+        if preview is None:return None
+        c=self.counts[preview.operator]
+        if preview.signature in self.raw_seen or preview.signature in self.evaluated:
+            c['duplicate']+=1;return None
+        self.raw_seen.add(preview.signature)
+        blocks=self.blocks(preview.solution.patterns)
+        points={r:oriented_endpoints(blocks[row[0]],preview.directions[r][0])[0]
+                for r,row in enumerate(preview.state.routes) if row}
+        if _initial_error(points,self.config) is not None:c['invalid']+=1;return None
+        try:
+            canonical=canonicalize(self.parents,preview.solution.patterns,dict(enumerate(preview.state.routes)),
+                                   self.config,scope=self.scope)
+        except ValueError:c['invalid']+=1;return None
+        if canonical.patterns!=preview.solution.patterns or tuple(r.block_ids for r in canonical.routes)!=preview.state.routes:
+            c['canonical_changed']+=1;return None
+        preview.solution=canonical
+        preview.transfers=actual_parent_transfers(current,preview,self.config,
+            before_blocks=self.blocks(current.solution.patterns),after_blocks=blocks,parents=set(preview.parents))
+        c['unique']+=1;c['cross_robot_candidates']+=bool(preview.transfers)
+        c['cross_parent_transfers']+=len(preview.transfers)
+        c['cross_child_transfers']+=sum(m.source>=0 and m.source!=m.target for m in preview.moves)
+        return preview
+
+    def between(self,origin,target):
+        """Describe a retained full plan in one reference state, including all affected routes."""
+        if origin.signature==target.signature:return self.noop(origin)
+        key=origin.signature,target.signature
+        if key in self.comparison_cache:return self.comparison_cache[key]
+        old_blocks=self.blocks(origin.solution.patterns);new_blocks=self.blocks(target.solution.patterns)
+        old={b:(r,k,d) for r,(row,bits) in enumerate(zip(origin.state.routes,origin.directions))
+             for k,(b,d) in enumerate(zip(row,bits))}
+        old_patterns={p.parent_id:p for p in origin.solution.patterns}
+        changed={p.parent_id for p in target.solution.patterns if old_patterns[p.parent_id]!=p}
+        from difflib import SequenceMatcher
+        stays=set()
+        for r,(row,bits) in enumerate(zip(target.state.routes,target.directions)):
+            stable={b for b,d in zip(row,bits) if b in old and old[b][0]==r and old[b][2]==d
+                    and new_blocks[b].parent_id not in changed}
+            before=[b for b in origin.state.routes[r] if b in stable]
+            after=[b for b in row if b in stable]
+            for match in SequenceMatcher(None,before,after,autojunk=False).get_matching_blocks():
+                stays.update(before[match.a:match.a+match.size])
+        moves=[]
+        for r,(row,bits) in enumerate(zip(target.state.routes,target.directions)):
+            for k,(b,d) in enumerate(zip(row,bits)):
+                if b not in stays:
+                    moves.append(JointChildMove(b,old.get(b,(-1,))[0],r,k,d))
+        parents=tuple(sorted({new_blocks[m.block_id].parent_id for m in moves}|changed))
+        delta=tuple(b-a for a,b in zip(self.cycles(origin.state),self.cycles(target.state)))
+        transfers=actual_parent_transfers(origin,target,self.config,before_blocks=old_blocks,after_blocks=new_blocks)
+        action=ChildJointAction(target.solution,target.directions,target.state,'mode' if changed else target.operator,parents,
+            target.signature,delta,transfers,target.score,tuple(moves))
+        self.comparison_cache[key]=action
+        return action
+
+    def ownership_structure(self,candidate):
+        return tuple((p.pattern_id,tuple((b.block_id,r) for r,row in enumerate(candidate.state.routes)
+            for b in self.space.children[p] if b.block_id in row)) for p in candidate.solution.patterns)
+
+    def _joint_scores(self,current,schedule,candidates,ranker):
+        if not candidates:return []
+        values=ranker(current,schedule,candidates) if ranker is not None else [self.ranking_rng.random() for _ in candidates]
+        for c,v in zip(candidates,values):
+            c.score=float(v);self.counts[c.operator]['scored']+=1
+        return candidates
+
+    def _representative(self,current,pairs,operator,*,patterns=None):
+        blocks=self.blocks(current.solution.patterns)
+        removed={b for b,_ in pairs}
+        target_patterns=current.solution.patterns if patterns is None else patterns
+        new_blocks=self.blocks(target_patterns)
+        changed={p.parent_id for p in target_patterns if p not in current.solution.patterns}
+        removed|={b for b,x in blocks.items() if x.parent_id in changed}
+        owner={b:(r,k,current.directions[r][k]) for r,row in enumerate(current.state.routes) for k,b in enumerate(row)}
+        available=[sum(b not in removed for b in row) for row in current.state.routes]
+        moves=[]
+        for b,r in pairs:
+            source,k,d=owner.get(b,(-1,0,0))
+            # A neutral representative, not a MOVE/load-ranked insertion.
+            position=self.rng.randrange(available[r]+1);available[r]+=1
+            if source==r and len(pairs)==1:d=1-d
+            moves.append(JointChildMove(b,source,r,position,d))
+        return self.make(current,moves,operator,patterns=target_patterns)
+
+    def proposals(self,current,schedule,ranker,*,limit=24,decode_width=2):
+        """Learn child/robot relations first, then decode complete joint insertions."""
+        blocks=self.blocks(current.solution.patterns);patterns={p.parent_id:p for p in current.solution.patterns}
+        singles=[];by_pair={}
+        for source,row in enumerate(current.state.routes):
+            for b in row:
+                for target in joint_block_robots(blocks[b],patterns[blocks[b].parent_id],self.config):
+                    c=self._representative(current,((b,target),),'relocate_child')
+                    if c is not None:singles.append(c)
+        self._joint_scores(current,schedule,singles,ranker)
+        for c in sorted(singles,key=lambda c:-c.score):
+            m=c.moves[0]
+            if m.source!=m.target:
+                bucket=by_pair.setdefault((m.source,m.target),[])
+                if len(bucket)<2:bucket.append(m.block_id)
+        pools={'relocate_child':singles,'swap_children':[],'cycle3':[],'cycle4':[],'mode':[]}
+        for q in (2,3,4):
+            operator={2:'swap_children',3:'cycle3',4:'cycle4'}[q]
+            for robots in itertools.permutations(range(4),q):
+                if robots[0]!=min(robots):continue
+                edges=tuple(zip(robots,robots[1:]+robots[:1]))
+                choices=[by_pair.get(edge,()) for edge in edges]
+                if not all(choices):continue
+                for children in itertools.product(*choices):
+                    c=self._representative(current,tuple((b,t) for b,(_,t) in zip(children,edges)),operator)
+                    if c is not None:pools[operator].append(c)
+        for assignment in self.space.actions:
+            if assignment.pattern==patterns[assignment.parent_id]:continue
+            selected=tuple(assignment.pattern if p.parent_id==assignment.parent_id else p for p in current.solution.patterns)
+            pairs=tuple((b.block_id,r) for b,r in zip(self.space.children[assignment.pattern],assignment.robots))
+            c=self._representative(current,pairs,'mode',patterns=selected)
+            if c is not None:pools['mode'].append(c)
+        templates=[]
+        caps={'relocate_child':6,'swap_children':4,'cycle3':3,'cycle4':3,'mode':2}
+        for operator,pool in pools.items():
+            if operator!='relocate_child':self._joint_scores(current,schedule,pool,ranker)
+            structures=set()
+            for c in sorted(pool,key=lambda c:-c.score):
+                structure=tuple((m.block_id,m.source,m.target) for m in c.moves),c.solution.patterns
+                if structure in structures:continue
+                structures.add(structure);templates.append(c)
+                if len(structures)>=caps[operator]:break
+        beams={i:[c] for i,c in enumerate(templates)}
+        for step in range(max((len(c.moves) for c in templates),default=0)):
+            expanded={};unique={}
+            for i,beam in beams.items():
+                rows=[]
+                for c in beam:
+                    if step>=len(c.moves):rows.append(c);continue
+                    move=c.moves[step]
+                    length=len(c.state.routes[move.target])-1
+                    positions=bounded_insertion_positions(length,4)
+                    for k in positions:
+                        for d in (0,1):
+                            moves=list(c.moves);moves[step]=replace(move,position=k,direction=d)
+                            trial=self.make(current,moves,c.operator,patterns=c.solution.patterns)
+                            if trial is not None:rows.append(trial);unique.setdefault(trial.signature,trial)
+                expanded[i]=rows
+            self._joint_scores(current,schedule,list(unique.values()),ranker)
+            for i,rows in expanded.items():
+                rows=list({c.signature:unique.get(c.signature,c) for c in rows}.values())
+                beams[i]=sorted(rows,key=lambda c:-c.score)[:decode_width]
+        previews=[c for rows in beams.values() for c in rows]
+        candidates=[]
+        for c in sorted(previews,key=lambda c:-c.score):
+            complete=self.finish_child(current,c)
+            if complete is not None:candidates.append(complete)
+        # Keep whole ownership alternatives; all are still ranked by this GNN.
+        diverse=[];taken=set()
+        for operator in pools:
+            for c in (c for c in candidates if c.operator==operator):
+                if sum(x.operator==operator for x in diverse)>=2:break
+                diverse.append(c);taken.add(c.signature)
+        ordered=diverse+[c for c in candidates if c.signature not in taken]
+        return ordered[:limit]
+
+
+def run_child_joint(initial,workspace,native_evaluator,*,ranker=None,native_budget=500,
+                    max_states=80,max_shakes=8,width=3,observer=None,decision_observer=None):
+    """Learned relative B32 preference controls current, state bank and final plan.
+
+    The no-GNN ablation uses the same child action space with native acceptance.
+    No B32 is called here. Native DEADLOCK is never a hard candidate filter.
+    """
+    cache={};calls=0;states=0;shakes=0;expanded=set();accepted=set();visited=[]
+    def evaluate(c,origin=None):
+        nonlocal calls
+        if c.signature in cache:return cache[c.signature]
+        if calls>=native_budget:return None
+        clock=time.perf_counter();s=native_evaluator(c.solution,workspace.config,c.directions)
+        elapsed=time.perf_counter()-clock;calls+=1;cache[c.signature]=s;workspace.evaluated.add(c.signature)
+        counts=workspace.counts[c.operator];counts['native_calls']+=1;counts['native_feasible']+=int(s.feasible)
+        counts['native_cross_robot_candidates']+=bool(c.transfers)
+        counts['native_cross_parent_transfers']+=len(c.transfers)
+        if observer is not None:observer(c,s,origin,elapsed)
+        return s
+    starts=[c for c in initial if evaluate(c) is not None]
+    if not starts:raise ValueError('child joint search has no complete GNN construction')
+    best=starts[0];initial_selected=best;bank=list(starts)
+    def preferences(reference,plans):
+        actions=[workspace.between(reference,c) for c in plans]
+        if ranker is not None:
+            values=ranker(reference,cache[reference.signature],actions)
+            return [float(v) for v in values]
+        # Only the explicit no-GNN control uses native Cmax as its objective.
+        return [(1,-cache[c.signature].cmax) if cache[c.signature].feasible else (0,0.) for c in plans]
+    scores=preferences(best,[best,*starts[1:]])
+    if len(starts)>1 and max(scores)>scores[0]:best=starts[max(range(len(scores)),key=lambda i:scores[i])]
+    initial_selected=best;accepted.add(best.signature);current=best;stop='state check budget exhausted'
+    while calls<native_budget and states<max_states:
+        states+=1;expanded.add(current.signature);visited.append(current)
+        proposed=workspace.proposals(current,cache[current.signature],ranker)
+        tested=[c for c in proposed if evaluate(c,current) is not None]
+        pool=list({c.signature:c for c in [best,*bank,*tested]}.values())
+        reference=best;values=preferences(reference,pool);reference_value=values[0]
+        eligible=[i for i,c in enumerate(pool) if c.signature not in accepted and values[i]>reference_value]
+        improved=bool(eligible)
+        if improved:
+            index=max(eligible,key=lambda i:values[i]);best=workspace.between(reference,pool[index]);accepted.add(best.signature)
+            workspace.counts[best.operator]['accepted']+=1
+            workspace.counts[best.operator]['accepted_parent_transfers']+=len(best.transfers)
+        if decision_observer is not None:decision_observer(reference,pool,values,best)
+        order=sorted(range(len(pool)),key=lambda i:values[i],reverse=True);bank=[best];structures={workspace.ownership_structure(best)}
+        for i in order:
+            c=pool[i];structure=workspace.ownership_structure(c)
+            if c.signature==best.signature or structure in structures:continue
+            structures.add(structure);bank.append(c);workspace.counts[c.operator]['retained']+=1
+            if len(bank)>=width:break
+        if best.signature not in expanded:current=best;continue
+        alternatives=[c for c in bank if c.signature not in expanded]
+        if not alternatives:stop='no new learned ownership state';break
+        if shakes>=max_shakes:stop='joint perturbation budget exhausted';break
+        current=alternatives[0];shakes+=1;workspace.counts[current.operator]['perturbation']+=1
+    if calls>=native_budget:stop='native evaluation budget exhausted'
+    return dict(candidate=best,native=cache[best.signature],initial_selected=initial_selected,native_calls=calls,
+        states=states,shakes=shakes,stop=stop,counts={k:dict(v) for k,v in workspace.counts.items()},
+        visited_states=tuple(visited),
+        runtime_objective='learned same-state B32 preference versus no-op' if ranker is not None else 'no-GNN native control',
+        route_cache_hits=workspace.route_cache_hits,route_cache_builds=workspace.route_cache_builds)
+
+
 class CandidateSourceKind(str, Enum):
     ATOMIC = "ATOMIC"
     LNS_REPAIRED = "LNS_REPAIRED"
