@@ -1,4 +1,4 @@
-"""B32 exact acceleration and rule-guided GNN development experiments."""
+"""NATIVE exact acceleration and rule-guided GNN development experiments."""
 from __future__ import annotations
 
 import argparse
@@ -28,12 +28,12 @@ import run_gnn_multi_initial as study
 from mrta_reference.model import ParentWeld, SplitPattern, SplitKind, Rail, ScheduleStatus
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import canonicalize, block_map
-from mrta_reference.scheduler import SchedulerProfile, reference_schedule_formal
+from mrta_reference.scheduler import SchedulerProfile, native_schedule
 from mrta_data.ppo_instances import load_ppo_platform_instance, to_parent_welds
 
 CONFIG = study.CONFIG_05
-CSV = ROOT / 'results/gnn_rule_guided.csv'
-REPORT = ROOT / 'docs/GNN_RULE_GUIDED_EXPERIMENT.md'
+CSV = ROOT / 'results/native_priority/gnn_rule_guided.csv'
+REPORT = ROOT / 'docs/NATIVE_GNN_RULE_GUIDED_EXPERIMENT.md'
 INSTANCES = ROOT / 'data/gnn_rule_guided/instances.csv'
 CHECKPOINT = ROOT / 'models/gnn_coordination_constructor_05.pt'
 TRAINED_CHECKPOINT = ROOT / 'models/gnn_rule_guided_constructor_05.pt'
@@ -43,7 +43,7 @@ BINS = ((20, 30), (31, 50), (51, 70), (71, 90))
 INSTANCE_FIELDS = ('instance', 'tier', 'purpose', 'workbook', 'sheet', 'N', 'geometry_seed', 'role')
 FIELDS = ('phase', 'instance', 'tier', 'N', 'solver_seed', 'method', 'status', 'initial_cmax',
           'final_cmax', 'initialization_seconds', 'search_seconds', 'actual_runtime',
-          'b32_calls', 'b32_seconds', 'iterations', 'pruned', 'accepted', 'mode_accepted', 'payload')
+          'coordination_calls', 'coordination_seconds', 'iterations', 'pruned', 'accepted', 'mode_accepted', 'payload')
 
 
 def read_results():
@@ -143,22 +143,22 @@ def run_profile():
         solution, bits = restore(case['solution'], case['directions'])
         previous = None
         for repeat in range(3):
-            method = f'B32_REPEAT_{repeat + 1}'
+            method = f'NATIVE_REPEAT_{repeat + 1}'
             if (name, method) in done:
                 continue
             profile = SchedulerProfile()
             tick = time.perf_counter()
-            result = reference_schedule_formal(solution, CONFIG, orientations=dict(enumerate(bits)),
+            result = native_schedule(solution, CONFIG, orientations=dict(enumerate(bits)),
                                                scope=FORMAL_SCOPE_V2, profile=profile)
             elapsed = time.perf_counter() - tick
             if previous is not None and asdict(result) != previous:
-                raise ValueError('repeated B32 changed the complete schedule')
+                raise ValueError('repeated NATIVE changed the complete schedule')
             previous = asdict(result)
             save(dict(phase='profile', instance=name, N=len(solution.parents), method=method,
                       status=result.status.value, final_cmax=result.cmax, actual_runtime=elapsed,
-                      b32_calls=1, b32_seconds=elapsed,
-                      payload=dict(profile=profile.as_dict(), baseline_deadlock=result.baseline_deadlock,
-                                   recovery_rollouts=result.recovery_rollouts, source_expected=case['expected'],
+                      coordination_calls=1, coordination_seconds=elapsed,
+                      payload=dict(profile=profile.as_dict(), native_status=result.status.value,
+                                   robot_completion=result.robot_completion, source_expected=case['expected'],
                                    case=case if repeat == 0 else None)))
 
 
@@ -167,26 +167,26 @@ def run_profile_detail():
     rows = read_results()
     done = {r['instance'] for r in rows if r['phase'] == 'profile_detail'}
     for source in rows:
-        if source['phase'] != 'profile' or source['method'] != 'B32_REPEAT_1' or source['instance'] in done:
+        if source['phase'] != 'profile' or source['method'] != 'NATIVE_REPEAT_1' or source['instance'] in done:
             continue
         case = source['payload']['case']
         solution, bits = restore(case['solution'], case['directions'])
         profile = SchedulerProfile()
         tick = time.perf_counter()
-        result = reference_schedule_formal(solution, CONFIG, orientations=dict(enumerate(bits)),
+        result = native_schedule(solution, CONFIG, orientations=dict(enumerate(bits)),
                                            scope=FORMAL_SCOPE_V2, profile=profile)
         elapsed = time.perf_counter() - tick
         if result.status.value != source['status'] or (result.cmax is not None and result.cmax != float(source['final_cmax'])):
-            raise ValueError('additional SchedulerProfile timers changed B32 output')
+            raise ValueError('additional SchedulerProfile timers changed NATIVE output')
         state = oriented_route_state(tuple(r.block_ids for r in solution.routes), bits, block_map(solution, CONFIG), CONFIG)
         bound = oriented_route_lower_bound(state)
         if result.status is ScheduleStatus.FEASIBLE and bound > result.cmax + 1e-8:
-            raise ValueError('P+MOVE bound exceeds actual B32 makespan')
-        save(dict(phase='profile_detail', instance=source['instance'], N=len(solution.parents), method='B32_TIMERS',
+            raise ValueError('P+MOVE bound exceeds actual NATIVE makespan')
+        save(dict(phase='profile_detail', instance=source['instance'], N=len(solution.parents), method='NATIVE_TIMERS',
                   status=result.status.value, final_cmax=result.cmax, actual_runtime=elapsed,
-                  b32_calls=1, b32_seconds=elapsed,
-                  payload=dict(profile=profile.as_dict(), baseline_deadlock=result.baseline_deadlock,
-                               recovery_rollouts=result.recovery_rollouts, lower_bound=bound)))
+                  coordination_calls=1, coordination_seconds=elapsed,
+                  payload=dict(profile=profile.as_dict(), native_status=result.status.value,
+                               robot_completion=result.robot_completion, lower_bound=bound)))
 
 
 def worker_init():
@@ -227,7 +227,7 @@ def benchmark_pair(job):
     initial = shared.pilot.oriented.schedule_explicit(solution, bits, CONFIG)
     initial_seconds = time.perf_counter() - tick
     if initial.schedule.status is not ScheduleStatus.FEASIBLE:
-        raise ValueError('saved initial is not B32 feasible')
+        raise ValueError('saved initial is not NATIVE feasible')
     results = {}
     order = (False, True) if seed % 2 else (True, False)
     for prune in order:
@@ -235,7 +235,7 @@ def benchmark_pair(job):
                                      40 if phase == 'equivalence' else 1_000_000, prune,
                                      initial_seconds, [dict(status='FEASIBLE')])
         if stats['calls'] + 1 != out['reference_calls']:
-            raise ValueError('B32 call accounting differs from actual calls')
+            raise ValueError('NATIVE call accounting differs from actual calls')
         results[prune] = dict(out=out, stats=stats)
     old, new = results[False]['out'], results[True]['out']
     identical = (old['cmax'] == new['cmax'] and old['solution'] == new['solution']
@@ -250,7 +250,7 @@ def benchmark_pair(job):
         out, stats = value['out'], value['stats']
         arms['PRUNED' if prune else 'ORIGINAL'] = dict(
             cmax=out['cmax'], iterations=out['iterations'], calls=out['reference_calls'],
-            b32_seconds=stats['seconds'], runtime=out['actual_runtime'], pruned=out['pruned_by_cmax_lb'],
+            coordination_seconds=stats['seconds'], runtime=out['actual_runtime'], pruned=out['pruned_by_cmax_lb'],
             accepted=out['accepted'], mode_accepted=out['mode_accepted'],
             solution=out['solution'], directions=out['directions'], accepted_trace=accepted_signature(out),
             last_improvement_seconds=out['best_events'][-1][0])
@@ -258,7 +258,7 @@ def benchmark_pair(job):
                  solver_seed=seed, method='PRUNED_vs_ORIGINAL', status=status,
                  initial_cmax=initial.schedule.cmax, final_cmax=new['cmax'],
                  initialization_seconds=initial_seconds, actual_runtime=new['actual_runtime'],
-                 b32_calls=new['reference_calls'], b32_seconds=results[True]['stats']['seconds'],
+                 coordination_calls=new['reference_calls'], coordination_seconds=results[True]['stats']['seconds'],
                  iterations=new['iterations'], pruned=new['pruned_by_cmax_lb'],
                  accepted=new['accepted'], mode_accepted=new['mode_accepted'],
                  payload=dict(arms=arms, identical=identical,
@@ -427,7 +427,7 @@ def validation_worker(job):
     parents = load_entry(entry)
     row = dict(phase=phase, instance=entry['instance'], tier=entry['tier'], N=len(parents), solver_seed=seed,
                method=method, status='ERROR', initial_cmax=None, final_cmax=None, initialization_seconds=0.,
-               search_seconds=0., actual_runtime=0., b32_calls=0, b32_seconds=0., iterations=0, pruned=0,
+               search_seconds=0., actual_runtime=0., coordination_calls=0, coordination_seconds=0., iterations=0, pruned=0,
                accepted=0, mode_accepted=0)
     original = shared.pilot.oriented.schedule_explicit
     stats = dict(calls=0, seconds=0.)
@@ -472,7 +472,7 @@ def validation_worker(job):
             if info['selected_seconds'] is not None:
                 detail['initial_found_seconds'] = portfolio_started - started + info['selected_seconds']
         row['initialization_seconds'] = time.perf_counter() - started
-        detail.update(initial_b32_calls=stats['calls'], initial_b32_seconds=stats['seconds'], initial_attempts=attempts)
+        detail.update(initial_coordination_calls=stats['calls'], initial_coordination_seconds=stats['seconds'], initial_attempts=attempts)
         if initial is None:
             row['status'] = 'INITIALIZATION_TIMEOUT' if time.perf_counter() > deadline else 'INITIALIZATION_FAILED'
         else:
@@ -484,19 +484,19 @@ def validation_worker(job):
             row.update(status=out['status'], final_cmax=out['cmax'], iterations=out['iterations'],
                        pruned=out['pruned_by_cmax_lb'], accepted=out['accepted'], mode_accepted=out['mode_accepted'])
             if out['reference_calls'] != stats['calls']:
-                raise ValueError('actual B32 calls differ from backend count')
+                raise ValueError('actual NATIVE calls differ from backend count')
             detail['last_improvement_seconds'] = (out['best_events'][-1][0] if out['accepted']
                                                     else detail['initial_found_seconds'])
         detail['initial_attempts'] = attempts
-        detail['search_b32_seconds'] = stats['seconds'] - detail['initial_b32_seconds']
-        detail['search_b32_calls'] = stats['calls'] - detail['initial_b32_calls']
+        detail['search_coordination_seconds'] = stats['seconds'] - detail['initial_coordination_seconds']
+        detail['search_coordination_calls'] = stats['calls'] - detail['initial_coordination_calls']
     except Exception:
         row['status'] = 'ERROR'
         detail['error'] = traceback.format_exc()
         detail['initial_attempts'] = attempts
     finally:
         shared.pilot.oriented.schedule_explicit = original
-    row.update(actual_runtime=time.perf_counter() - started, b32_calls=stats['calls'], b32_seconds=stats['seconds'], payload=detail)
+    row.update(actual_runtime=time.perf_counter() - started, coordination_calls=stats['calls'], coordination_seconds=stats['seconds'], payload=detail)
     row['search_seconds'] = max(0., row['actual_runtime'] - row['initialization_seconds'])
     return [row]
 
@@ -551,7 +551,7 @@ def initial_equivalence_worker(job):
                 reference_calls=3, use_learned_modes=False, certify=False, prune_cmax_lb=prune,
                 parent_selection_mode='learned' if method == 'CURRENT_GNN' else 'mrv',
                 action_selection_mode='rule_guided' if method == 'RULE_GUIDED_GNN' else 'gnn')
-            attempts, calls = info['attempts'], info['b32_calls']
+            attempts, calls = info['attempts'], info['coordination_calls']
         outcomes.append(dict(cmax=None if initial is None else initial.schedule.cmax, calls=calls,
                              solution=None if initial is None else asdict(initial.solution),
                              directions=None if initial is None else initial.directions,
@@ -560,7 +560,7 @@ def initial_equivalence_worker(job):
     same = all(a[k] == b[k] for k in ('cmax','solution','directions')) and b['calls'] <= a['calls']
     return [dict(phase='initial_equivalence', instance=entry['instance'], tier=entry['tier'], N=len(parents),
                  solver_seed=20261900, method=method, status='EQUIVALENT' if same else 'MISMATCH',
-                 final_cmax=b['cmax'], b32_calls=b['calls'], pruned=b['pruned'],
+                 final_cmax=b['cmax'], coordination_calls=b['calls'], pruned=b['pruned'],
                  payload=dict(original=a, pruned=b, wall_clock_disabled=True))]
 
 
@@ -624,7 +624,7 @@ def teacher_worker(entry):
         payload['error'] = traceback.format_exc()
     finally:
         shared.pilot.oriented.schedule_explicit = original
-    row.update(actual_runtime=time.perf_counter()-started, b32_calls=stats['calls'], b32_seconds=stats['seconds'], payload=payload)
+    row.update(actual_runtime=time.perf_counter()-started, coordination_calls=stats['calls'], coordination_seconds=stats['seconds'], payload=payload)
     row['search_seconds'] = max(0., row['actual_runtime'] - row['initialization_seconds'])
     return [row]
 
@@ -637,7 +637,7 @@ def fallback_teacher_worker(entry):
         states = [dict(method=method, state=out['final_state'])] if out.get('final_state') else []
         rows.append(dict(phase='teacher_fallback', instance=entry['instance'], tier=entry['tier'], N=len(parents),
                          solver_seed=SEEDS[0], method=method, status=out['status'], final_cmax=out['cmax'],
-                         actual_runtime=out['actual_runtime'], b32_calls=out['reference_calls'], iterations=out['iterations'],
+                         actual_runtime=out['actual_runtime'], coordination_calls=out['reference_calls'], iterations=out['iterations'],
                          payload=dict(states=states, error='')))
         if states:
             break
@@ -688,7 +688,7 @@ def run_training():
                              status='FEASIBLE', details=dict(final_state=saved['state'])))
     teachers, coverage = shared.research_teachers(rows, CONFIG, deployment_only=False)
     for teacher in teachers:
-        teacher['b32_status'] = 'FEASIBLE'
+        teacher['coordination_status'] = 'FEASIBLE'
     if TRAINED_CHECKPOINT.exists():
         raise FileExistsError('new checkpoint already exists; do not overwrite or retrain it')
     _, model = shared.load_neural_initial_models(CHECKPOINT)
@@ -707,7 +707,7 @@ def run_training():
     candidate['use_dynamic_context'] = False
     candidate['refinement'] = dict(training=training, coverage=coverage, replays=replays,
         retained_geometry_count=21, additional_teacher_geometry_count=len(new_names),
-        teacher_source='B32 FEASIBLE states retained in results/gnn_rule_guided.csv and original 21-geometry training rows',
+        teacher_source='NATIVE FEASIBLE states retained in results/gnn_rule_guided.csv and original 21-geometry training rows',
         inference=dict(parent_selection_mode='mrv',action_selection_mode='rule_guided',use_learned_modes=False),
         holdout='8 reserved PPO sheets never opened; no validation teacher or normalization input')
     payload['refinement_candidate'] = candidate
@@ -722,33 +722,33 @@ def run_training():
 def report():
     rows = read_results()
     profiles = [r for r in rows if r['phase'] == 'profile']
-    lines = ['# B32安全剪枝与规则引导GNN实验', '', '## 实施边界与剪枝依据', '',
+    lines = ['# NATIVE安全剪枝与规则引导GNN实验', '', '## 实施边界与剪枝依据', '',
              '执行环境为D:\\pybullet_test\\.venv\\Scripts\\python.exe，工作目录为项目DRL。'
-             '固定四机器人双轨、min_child_length=0.50m、delta_x=delta_y=0.50m、FORMAL_SCOPE_V2和B32最多32次恢复rollout。'
+             '固定四机器人双轨、min_child_length=0.50m、delta_x=delta_y=0.50m、FORMAL_SCOPE_V2和NATIVE最多32次恢复rollout。'
              'MODE_NEW的父选择、模式调整、方向联合插入和严格Cmax接受不变，WAG/HGA代码不修改。',
              '对当前完整路线及方向，LB=max_r(P_r+M_r)。P由config.process_time累计SETUP/WELD/POST，'
-             'M为当前方向下的相邻焊缝空走；既有开放路线不计首任务进场或返家。B32只增加非负等待，故LB≤真实Cmax。',
-             '搜索沿用epsilon=1e−9×max(1,Cmax_best)，LB≥Cmax_best−epsilon时跳过B32。'
+             'M为当前方向下的相邻焊缝空走；既有开放路线不计首任务进场或返家。NATIVE只增加非负等待，故LB≤真实Cmax。',
+             '搜索沿用epsilon=1e−9×max(1,Cmax_best)，LB≥Cmax_best−epsilon时跳过NATIVE。'
              '初始化原来按精确最小Cmax选择，因此采用更保守的LB≥Cmax_best，保留小于搜索epsilon的初始化改善。'
-             '没有可行初解时继续B32；跳过项标记PRUNED_BY_CMAX_LB，Cmax留空。',
+             '没有可行初解时继续NATIVE；跳过项标记PRUNED_BY_CMAX_LB，Cmax留空。',
              '实现复用OrientedRouteState.loads和arc_costs；未使用round后的oriented_time_score或exposure_score。'
              'RepairResult/JointCompletionResult保留已有路线状态以避免重复计算。报告数值为显示取整，CSV保留原始精度。', '',
              '主要修改位于src/mrta_search/lns.py、src/mrta_search/gnn_constructor.py、'
              'scripts/run_gnn_multi_initial.py、scripts/run_joint_oriented_repair_pilot.py和scripts/run_gnn_shared_construction.py。'
              'scheduler.py只为既有SchedulerProfile补充基准/完整恢复计时，PreparedDispatchProblem缓存与正式调度策略保留。', '',
-             '## B32固定候选性能测量', '',
+             '## NATIVE固定候选性能测量', '',
              '沿用SchedulerProfile和正式FORMAL_SCOPE_V2；相同候选重复3次，调度结果逐项比较。',
-             '基准调度正常结束时不执行恢复；只有基准DEADLOCK才进入最多32个rollout的既有恢复。', '',
-             '|状态|调度数|平均总秒|路线/模板秒|主循环秒|ESS秒|干涉区间秒|冲突验证秒|恢复rollout秒|平均rollout数|',
-             '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+             '正式评价只调用现有Numba原生内核，不进行替代派工。', '',
+             '|状态|调度数|平均总秒|路线/模板秒|主循环秒|ESS秒|干涉区间秒|冲突验证秒|',
+             '|---|---:|---:|---:|---:|---:|---:|---:|']
     for status in sorted({r['status'] for r in profiles}):
         arm = [r for r in profiles if r['status'] == status]
         def avg(key):
             return statistics.fmean(r['payload']['profile'][key] for r in arm)
         lines.append(f"|{status}|{len(arm)}|{statistics.fmean(float(r['actual_runtime']) for r in arm):.6f}|"
                      + '|'.join(f'{avg(k):.6f}' for k in ('route_template', 'scheduler_main_loop', 'ESS',
-                         'forbidden_interval', 'conflict', 'recovery_rollout_time', 'recovery_rollout_count')) + '|')
-    lines += ['', '各计时项有嵌套关系，不能相加；恢复rollout计时不包含整个恢复前沿管理。', '']
+                         'forbidden_interval', 'conflict')) + '|')
+    lines += ['', 'Python诊断分项不代表Numba内部耗时；原生总耗时单独记录。', '']
     detail = [r for r in rows if r['phase'] == 'profile_detail']
     if detail:
         p = [r['payload']['profile'] for r in detail]
@@ -759,13 +759,13 @@ def report():
                   '状态和Cmax与原测量一致。模板占比很小，故未新增模板缓存或削减恢复。', '']
     for phase, title in (('equivalence', '固定40迭代等价验证'), ('time', '相同60秒预算比较')):
         selected = [r for r in rows if r['phase'] == phase]
-        lines += ['## ' + title, '', '|实例|种子|状态|原始/剪枝Cmax|原始/剪枝B32计次（含初解）|原始/剪枝迭代数|剪枝数|',
+        lines += ['## ' + title, '', '|实例|种子|状态|原始/剪枝Cmax|原始/剪枝NATIVE计次（含初解）|原始/剪枝迭代数|剪枝数|',
                   '|---|---:|---|---|---|---|---:|']
         for row in selected:
             a, b = row['payload']['arms']['ORIGINAL'], row['payload']['arms']['PRUNED']
             lines.append(f"|{row['instance']}|{row['solver_seed']}|{row['status']}|{a['cmax']:.6f}/{b['cmax']:.6f}|"
                          f"{a['calls']}/{b['calls']}|{a['iterations']}/{b['iterations']}|{b['pruned']}|")
-        lines += ['', '两臂复用同一个保存的可行初解，重放及一次B32耗时等额计入各臂。'
+        lines += ['', '两臂复用同一个保存的可行初解，重放及一次NATIVE耗时等额计入各臂。'
                   '固定迭代使用无限墙钟预算；比较最终完整方案、方向和逐次接受方案/顺序。'
                   '60秒比较允许完成不同迭代数，但仍拒绝截止后改善。', '']
     equivalent = [r for r in rows if r['phase'] == 'equivalence']
@@ -778,7 +778,7 @@ def report():
         wins = sum(p['PRUNED']['cmax'] < p['ORIGINAL']['cmax'] - 1e-7 for p in timed)
         ties = sum(abs(p['PRUNED']['cmax'] - p['ORIGINAL']['cmax']) <= 1e-7 for p in timed)
         ratio = statistics.median(p['PRUNED']['iterations'] / p['ORIGINAL']['iterations'] for p in timed)
-        lines += [f'固定工作量18组全部等价，搜索阶段B32实际调用{old_search_calls}→{new_search_calls}，减少'
+        lines += [f'固定工作量18组全部等价，搜索阶段NATIVE实际调用{old_search_calls}→{new_search_calls}，减少'
                   f'{100*(old_search_calls-new_search_calls)/old_search_calls:.3f}%。'
                   f'初解每对物理重放一次，共{replay_calls}次；为两臂等额计入后，表中计次为{old_calls}→{new_calls}。'
                   f'60秒12组为{wins}胜/{ties}平/{12-wins-ties}负，迭代数比值中位数{ratio:.3f}倍。'
@@ -803,18 +803,18 @@ def report():
     display_methods = METHODS + (('RULE_GUIDED_GNN_RETRAINED',) if retrained else ())
     smoke = [r for r in rows if r['phase'] == 'smoke']
     lines += ['## 规则引导GNN验证', '', f'验证完成{len(validation)}/96条；冒烟{len(smoke)}/8条，不进入统计。',
-              '三种GNN组合均为旧模型贪心、旧模型采样、新模型固定模式贪心，各最多3次初始B32，不增加采样。'
+              '三种GNN组合均为旧模型贪心、旧模型采样、新模型固定模式贪心，各最多3次初始NATIVE，不增加采样。'
               'CURRENT使用学习父选择和原logits；MRV仅改父选择；RULE_GUIDED使用MRV和规则/GNN名次融合。',
               '规则归属为软先验，所有合法动作保留。按GNN与规则名次和排序，同名次依次按规则成本、原logits和原候选顺序打破。'
               '贪心取第一名；原有采样槽使用负融合名次作为logits，保留原温度1和固定种子，不新增融合权重。',
-              '四方法均使用启用安全剪枝的同一MODE_NEW、B32、CONFIG_05和60秒总预算；模型读取、构造、初始B32及搜索均计时。'
+              '四方法均使用启用安全剪枝的同一MODE_NEW、NATIVE、CONFIG_05和60秒总预算；模型读取、构造、初始NATIVE及搜索均计时。'
               '验证Excel读取在计时外。失败不回退、不剔除，Cmax只统计有效结果。', '',
-              '|方法|可行/总次数|初始几何中位数均值|最终几何中位数均值|初始化平均秒|搜索平均秒|B32平均次数|B32平均秒|平均迭代|',
+              '|方法|可行/总次数|初始几何中位数均值|最终几何中位数均值|初始化平均秒|搜索平均秒|NATIVE平均次数|NATIVE平均秒|平均迭代|',
               '|---|---:|---:|---:|---:|---:|---:|---:|---:|']
     init_pairs = [r for r in rows if r['phase'] == 'initial_equivalence']
     if init_pairs:
         lines[-2:-2] = [f"初始化独立等价核查：{sum(r['status']=='EQUIVALENT' for r in init_pairs)}/{len(init_pairs)}组；"
-                        '覆盖四个数量段和四种初始化，关闭墙钟截止，比较完整方案、方向和Cmax，B32次数不增加。', '']
+                        '覆盖四个数量段和四种初始化，关闭墙钟截止，比较完整方案、方向和Cmax，NATIVE次数不增加。', '']
     for method in display_methods:
         arm = [r for r in all_validation if r['method'] == method]
         if not arm:
@@ -830,7 +830,7 @@ def report():
         initial, final = mean_medians('initial_cmax'), mean_medians('final_cmax')
         lines.append(f"|{method}|{sum(bool(r['final_cmax']) for r in arm)}/{len(arm)}|"
                      f"{f'{initial:.3f}' if initial is not None else '—'}|{f'{final:.3f}' if final is not None else '—'}|"
-                     + '|'.join(f'{avg(f):.3f}' for f in ('initialization_seconds','search_seconds','b32_calls','b32_seconds','iterations')) + '|')
+                     + '|'.join(f'{avg(f):.3f}' for f in ('initialization_seconds','search_seconds','coordination_calls','coordination_seconds','iterations')) + '|')
     lines += ['', '先取同一几何三种子的有效Cmax中位数，再按8个几何比较；部分种子失败时样本量可能不同，'
               '条件Cmax不能抵消可行率下降。改善=(对照−规则引导)/对照，正值更好。', '',
               '|阶段|对照|规则引导胜/平/负|中位改善/%|', '|---|---|---|---:|']
@@ -862,8 +862,8 @@ def report():
                   f"原训练几何保留{plan['retained_geometries']}个、去重教师{plan['retained_teachers']}个；"
                   f"静态新增PPO训练几何{plan['additional_geometries']}个，与原几何重复数为{plan['duplicate_geometries']}。",
                   f'新增几何取得可执行教师：{len(complete)}/40。RULE和MODE_NEW共享一次真实初始化；'
-                  '缺少教师时使用原WAG/HGA，不改变对照算法。只使用已记录的B32 FEASIBLE方案，'
-                  '离线重放动作时不再B32或独立认证；不能重放的教师保留失败原因，不伪造动作标签。', '']
+                  '缺少教师时使用原WAG/HGA，不改变对照算法。只使用已记录的NATIVE FEASIBLE方案，'
+                  '离线重放动作时不再NATIVE或独立认证；不能重放的教师保留失败原因，不伪造动作标签。', '']
     for row in training:
         info = row['payload']; out = info['training']
         checkpoint = shared.read_neural_checkpoint(TRAINED_CHECKPOINT)
@@ -892,22 +892,22 @@ def report():
         lines += ['', f"新权重可行：{sum(bool(r['final_cmax']) for r in retrained)}/{len(retrained)}。", '']
     if len(validation) == 96 and len(retrained) == 24:
         lines += ['## 失败分析与下一步决定', '',
-                  '1. **保留B32安全剪枝。** 固定工作量结果与接受轨迹一致，60秒比较增加迭代并取得9胜3平。'
+                  '1. **保留NATIVE安全剪枝。** 固定工作量结果与接受轨迹一致，60秒比较增加迭代并取得9胜3平。'
                   '恢复策略、合法候选和Cmax目标均保留；测量不支持为模板生成另加缓存。',
                   '2. **规则融合优于当前GNN，但仍没有建立对RULE的整体Cmax优势。** 现有权重融合对CURRENT'
                   '初始8胜、最终7胜1负，中位改善24.772%/2.703%；对RULE的7个有效几何配对，'
                   '初始0胜7负、最终2胜1平4负，最终中位改善−0.362%。'
                   '融合24/24可行，RULE为21/24，故成功样本的总体均值不能直接横比。',
                   '3. **单独MRV不够。** 其N31–50第二个几何和较大几何终解明显较弱；'
-                  'N71–90首个几何的一次初始化中，三个候选均被B32返回DEADLOCK。'
+                  'N71–90首个几何的一次初始化中，三个候选均被NATIVE返回DEADLOCK。'
                   '规则融合在相同合法池内改善了排名，但P+MOVE排序与网络排名都不能保证更低真实协调Cmax。',
-                  '4. **初始化失败来自有界候选菜单耗尽。** RULE在N31–50首个几何三种子共24次初始B32评价均返回DEADLOCK；'
+                  '4. **初始化失败来自有界候选菜单耗尽。** RULE在N31–50首个几何三种子共24次初始NATIVE评价均返回DEADLOCK；'
                   '未取得任何可行初解时没有启用下界剪枝。该现象不等于证明几何不可行，其他GNN方法在同几何可行。',
                   '5. **本次扩展训练新增收益不足，停止继续加训。** 相对未扩训融合模型，初始为0胜7平1负、中位改善0%；'
                   '最终4胜2平2负、中位改善仅0.023%。7个几何初始中位Cmax完全相同，'
                   '不能把不同运行阶段的迭代速度差异全部归因于训练。对RULE最终仍为3胜4负、中位改善−0.316%，'
                   '尚不支持以新权重替换主方法。原权重与融合结果保留，新权重保存为本次研究证据，不继续堆叠模块。',
-                  '主方法保留RULE初始化的MODE_NEW并使用已证明等价的B32安全剪枝；规则融合保留为开发候选。'
+                  '主方法保留RULE初始化的MODE_NEW并使用已证明等价的NATIVE安全剪枝；规则融合保留为开发候选。'
                   '8个保留holdout维持未打开状态，本报告仅为既有验证集上的开发证据。', '']
     checks = [r for r in rows if r['phase'] == 'verification']
     if checks:
@@ -919,9 +919,9 @@ def report():
     REPORT.write_text('\n'.join(lines), encoding='utf-8')
 
 
-DIAGNOSTIC_CSV = ROOT / 'results/gnn_long_budget_diagnostic.csv'
-DIAGNOSTIC_REPORT = ROOT / 'docs/GNN_LONG_BUDGET_DIAGNOSTIC.md'
-DIAGNOSTIC_FIGURE = ROOT / 'docs/figures/GNN_LONG_BUDGET_CONVERGENCE.png'
+DIAGNOSTIC_CSV = ROOT / 'results/native_priority/gnn_long_budget_diagnostic.csv'
+DIAGNOSTIC_REPORT = ROOT / 'docs/NATIVE_GNN_LONG_BUDGET_DIAGNOSTIC.md'
+DIAGNOSTIC_FIGURE = ROOT / 'docs/NATIVE_figures/GNN_LONG_BUDGET_CONVERGENCE.png'
 DIAGNOSTIC_CASES = ('VALIDATION_N20_30_01', 'VALIDATION_N31_50_02',
                     'VALIDATION_N51_70_02', 'VALIDATION_N71_90_01')
 DIAGNOSTIC_METHODS = ('RULE', 'CURRENT_GNN', 'RULE_GUIDED_GNN')
@@ -1025,7 +1025,7 @@ def diagnostic_worker(job):
             detail.update(selected_proposal=info['selected_proposal'],
                           selected_seconds=None if info['selected_seconds'] is None else offset+info['selected_seconds'])
         row['initialization_seconds']=time.perf_counter()-started
-        detail.update(initial_attempts=attempts,initial_b32_calls=stats['calls'],initial_b32_seconds=stats['seconds'])
+        detail.update(initial_attempts=attempts,initial_coordination_calls=stats['calls'],initial_coordination_seconds=stats['seconds'])
         if initial is None:
             row.update(status='INITIALIZATION_FAILED',initial_cmax=None,final_cmax=None,iterations=0)
         else:
@@ -1035,7 +1035,7 @@ def diagnostic_worker(job):
                 prune_cmax_lb=True,minimum_runtime=minimum_runtime,
                 iteration_checkpoints=(200,500,1000) if phase=='long_mode' else (limit,),compact_trace=True)
             if out['reference_calls'] != stats['calls']:
-                raise ValueError('diagnostic B32 accounting differs from MODE_NEW')
+                raise ValueError('diagnostic NATIVE accounting differs from MODE_NEW')
             row.update(status=out['status'],initial_cmax=initial.schedule.cmax,final_cmax=out['cmax'],
                 iterations=out['iterations'],accepted=out['accepted'],mode_accepted=out['mode_accepted'],
                 pruned=out['pruned_by_cmax_lb'])
@@ -1048,9 +1048,9 @@ def diagnostic_worker(job):
     finally:
         shared.pilot.oriented.schedule_explicit=original
     elapsed=time.perf_counter()-started
-    row.update(actual_runtime=elapsed,b32_calls=stats['calls'],b32_seconds=stats['seconds'],
+    row.update(actual_runtime=elapsed,coordination_calls=stats['calls'],coordination_seconds=stats['seconds'],
                search_seconds=max(0.,elapsed-row.get('initialization_seconds',elapsed)))
-    detail['b32_events']=stats['events']
+    detail['coordination_events']=stats['events']
     detail['wall_checkpoints']={str(t): min((e[1] for e in detail['best_events'] if e[0]<=t),default=None)
                                 for t in (60,300,600) if t<=elapsed}
     row['payload']=detail
@@ -1073,8 +1073,8 @@ def diagnostic_wag_worker(job):
                    'TIME_LIMIT_NO_FEASIBLE' if out.status.value=='COMPLETED' else out.status.value,
             initial_cmax=None if initial is None or initial.schedule is None else initial.schedule.cmax,
             final_cmax=cmax,initialization_seconds=out.initialization_time,search_seconds=out.search_time,
-            actual_runtime=out.actual_runtime,b32_calls=out.reference_calls,
-            b32_seconds=out.accounting['scheduler_time'],iterations=out.iterations,
+            actual_runtime=out.actual_runtime,coordination_calls=out.reference_calls,
+            coordination_seconds=out.accounting['scheduler_time'],iterations=out.iterations,
             accepted=len(out.best_events),mode_accepted=out.accounting.get('x_pattern_accepted',0))
         detail.update(best_events=[[e.elapsed,e.cmax,e.source] for e in out.best_events],
             wall_checkpoints=out.checkpoints,accounting=out.accounting,diagnostics=out.diagnostics,
@@ -1088,12 +1088,12 @@ def diagnostic_wag_worker(job):
 
 
 def diagnostic_action_worker(job):
-    """Counterfactual rankings on identical prefixes/pools; no B32 calls."""
+    """Counterfactual rankings on identical prefixes/pools; no NATIVE calls."""
     from mrta_search import gnn_constructor as constructor
     from mrta_search.lns import joint_action_key
     entry,seed=job
     row=dict(phase='action_audit',instance=entry['instance'],tier=entry['tier'],N=int(entry['N']),
-             solver_seed=seed,method='SAME_POOL',status='ERROR',b32_calls=0)
+             solver_seed=seed,method='SAME_POOL',status='ERROR',coordination_calls=0)
     started=time.perf_counter()
     detail=dict(trajectories=[],error='')
     try:
@@ -1234,7 +1234,7 @@ def diagnostic_render():
     at200=lambda r:next((p['cmax'] for p in r['payload'].get('iteration_checkpoints',[]) if p['iterations']==200),None)
     lines=['# 规则—GNN长预算与排序贡献诊断', '',
         '研究目标为开发能够超过RULE、WAG+VNS和HGA的协同方法；本轮仅作开发诊断，不训练、不改变网络结构。',
-        '运行环境：D:\\pybullet_test\\.venv\\Scripts\\python.exe。固定CONFIG_05、FORMAL_SCOPE_V2、B32、'
+        '运行环境：D:\\pybullet_test\\.venv\\Scripts\\python.exe。固定CONFIG_05、FORMAL_SCOPE_V2、NATIVE、'
         '严格P+M下界剪枝和MODE_NEW原接受规则。只读取已消费验证几何；holdout和ID_TEST_SEALED均不载入。', '',
         '## 实验口径', '',
         '选取24、40、60、80条焊缝的四个已消费验证几何，各用20261901、20261902两个种子。'
@@ -1242,7 +1242,7 @@ def diagnostic_render():
         'MODE_NEW初始化及搜索的deadline均取消；一条连续、确定种子路径在200/500/1000迭代处保存精确前缀，'
         '达到1000次后若尚不足600秒则继续同一路径；达到600秒时若不足1000次则继续至1000次。'
         '最大迭代数只控制停止，未参与动作、随机种子或接受计算。新增默认关闭的检查点已作前缀一致性单元测试。',
-        '墙钟从模型加载/初始化开始，Excel载入不计入；60/300/600秒取当时已完成的B32可行最优解，'
+        '墙钟从模型加载/初始化开始，Excel载入不计入；60/300/600秒取当时已完成的NATIVE可行最优解，'
         '绝不把截止后改善追溯计入。固定迭代结果与等时间结果分开列出。',
         'WAG使用现有原生算法与默认配置，分别独立执行60、300、600秒预算。其deadline会影响内部路径构造，'
         '所以短预算独立端点不冒充600秒运行的前缀。无额外认证、代理Cmax或二次评价。',
@@ -1264,7 +1264,7 @@ def diagnostic_render():
             '2. **当前GNN的大规模初解发生机器人分配塌缩。** 60、80条几何只使用两台机器人，'
             '初始Cmax几乎等于P+MOVE下界，主要损失来自分工与空走而非初始协调等待。'
             '动作重放还显示早期决策收缩了后续合法分配机会，并非所有闲置都能归因于后期单次logit偏置。'
-            'MODE_NEW随后承担重分配，部分路径B32耗时占比超过90%。单纯延长预算在消化初解质量欠账。',
+            'MODE_NEW随后承担重分配，部分路径NATIVE耗时占比超过90%。单纯延长预算在消化初解质量欠账。',
             '3. **扩训输出有变化，完整方案收益没有同步出现。** 同池审计排除了“输出完全不变”和“GNN完全被覆盖”。'
             '六个配对仍选旧分支，完整初解、200次终解及接受顺序相同；80条两个配对选第三候选，扩训后初始与200次质量均更差。'
             '相同初解下60秒结果的微小差异来自完成迭代数，不归因为模型训练收益。',
@@ -1282,7 +1282,7 @@ def diagnostic_render():
                 '这项负结果保留在代码和CSV中；局部P+MOVE成本同序不能保证完整路线的真实协调Cmax改善。'
                 f'60条几何初始中位Cmax为{number(median([r["initial_cmax"] for r in bad]) if len(bad)==2 else None)}，'
                 f'P+MOVE下界为{number(median([p[0] for p in nominal]) if len(bad)==2 else None)}，协调增量为{number(gap)}秒。']
-        summary += ['6. **下一次只改一个核心机制：训练目标。** 在现有joint_action_logits头上学习相对于规则完整方案的真实B32 Cmax收益，'
+        summary += ['6. **下一次只改一个核心机制：训练目标。** 在现有joint_action_logits头上学习相对于规则完整方案的真实NATIVE Cmax收益，'
             '保留规则空间分工作为锚点，以现有可行完整教师及动作轨迹提供相对监督。'
             '具体位置为scripts/run_gnn_shared_construction.py的research_train插入动作损失（当前第683行起）；'
             '本轮已实现的推理锚定入口位于src/mrta_search/gnn_constructor.py的rule_anchored_action_logits（第799行起）。'
@@ -1317,19 +1317,19 @@ def diagnostic_render():
         '轨迹保留初始化过程中的可行候选改善；表格“初始Cmax”指完整初始化结束后的最优值。', '',
         '## Portfolio实际获胜来源', '',
         '三个提案固定为0=旧模型greedy、1=旧模型sample、2=refinement模型greedy。'
-        '所有GNN组最多三次初始B32；重复方案和数学下界剪枝会减少实际调用。未调度候选的Cmax保持空值。'
+        '所有GNN组最多三次初始NATIVE；重复方案和数学下界剪枝会减少实际调用。未调度候选的Cmax保持空值。'
         '任务一使用原checkpoint；扩训checkpoint仅在受控消融中替换第三个提案。', '',
-        '|几何|种子|策略|获胜提案|初始Cmax|初始B32|提案状态0/1/2|', '|---|---:|---|---:|---:|---:|---|']
+        '|几何|种子|策略|获胜提案|初始Cmax|初始NATIVE|提案状态0/1/2|', '|---|---:|---|---:|---:|---:|---|']
     for r in mode+ablation+anchored:
         if r['method']=='RULE':continue
         p=r['payload']
-        lines.append(f"|{r['instance']}|{r['solver_seed']}|{r['method']}|{p.get('selected_proposal','—')}|{number(r['initial_cmax'])}|{p.get('initial_b32_calls','—')}|{' / '.join(a['status'] for a in p.get('initial_attempts',[]))}|")
+        lines.append(f"|{r['instance']}|{r['solver_seed']}|{r['method']}|{p.get('selected_proposal','—')}|{number(r['initial_cmax'])}|{p.get('initial_coordination_calls','—')}|{' / '.join(a['status'] for a in p.get('initial_attempts',[]))}|")
     lines += ['', '## 受控排序消融', '',
         '三种排序均采用MRV父选择和同一个合法动作生成函数。pure GNN与pure rule都转为负序号后采样，'
         '与融合的采样尺度一致；CURRENT_GNN保持原始logits采样和学习父选择，不能把其差异全部归给插入排名。'
         'RULE_RANK是GNN构造流程内的规则排序消融，RULE仍使用common_initial_beam。'
         'pure rule仍计算网络输出以保持执行路径可比，但决策不使用网络排名；没有减少任何合法动作。'
-        '融合原权重的200次结果复用任务一精确前缀；其余组运行至少200次及60秒，同样不作二次B32认证。', '',
+        '融合原权重的200次结果复用任务一精确前缀；其余组运行至少200次及60秒，同样不作二次NATIVE认证。', '',
         'RULE_ANCHORED_GNN是诊断后新增的一项保守尝试：规则成本(归属偏好,max P+MOVE,sum P+MOVE)作为主序，'
         '成本完全相同时按GNN logits排序；全部候选仍具有有限排名，采样规则与三提案上限相同。'
         '它使用原冻结权重，不是经过训练的Cmax残差模型；没有引入容差、融合权重或新网络。', '',
@@ -1361,7 +1361,7 @@ def diagnostic_render():
         lines.append(f"|{case}|{'|'.join(str(sum(p[i] for p in pairs))+'/'+str(len(pairs)) for i in range(3))}|")
     lines += ['', '## 完全相同动作池的反事实诊断', '',
         '在每个规则、GNN、融合驱动路径上，逐步保留相同prefix与variants，分别计算规则、GNN和融合top1；'
-        '另用原refinement与扩训refinement对相同池评分。审计不调用B32，也不并入正式算法计时。'
+        '另用原refinement与扩训refinement对相同池评分。审计不调用NATIVE，也不并入正式算法计时。'
         '这些比例是同池决策一致率，不是不同路径上恰好相同的动作数。', '',
         '|几何|动作池数|规则=GNN/%|规则=融合/%|GNN=融合/%|扩训改变GNN top1/%|扩训改变融合top1/%|',
         '|---|---:|---:|---:|---:|---:|---:|']
@@ -1386,7 +1386,7 @@ def diagnostic_render():
                   str(all(r['payload'].get('previous_weights_unchanged',False) for r in audits))+
                   '；refinement改变tensor数：'+str(sorted({r['payload'].get('expanded_changed_tensors',0) for r in audits}))+ '。']
     lines += ['', '只取融合驱动路径的实际选中动作，进一步区分空间归属与顺序/方向贡献。'
-              'P+MOVE差为同状态下相对于规则动作的差，不是完整B32调度收益。动作池之间有路径依赖，不当作独立统计样本。', '',
+              'P+MOVE差为同状态下相对于规则动作的差，不是完整NATIVE调度收益。动作池之间有路径依赖，不当作独立统计样本。', '',
               '|几何|规则归属一致/%|比规则动作更大max(P+MOVE)的比例/%|平均max(P+MOVE)差/秒|',
               '|---|---:|---:|---:|']
     for case in DIAGNOSTIC_CASES:
@@ -1397,7 +1397,7 @@ def diagnostic_render():
                      f"{100.*sum(s['selected_cost'][1]>s['rule_cost'][1]+1e-8 for s in steps)/len(steps):.2f}|"
                      f"{statistics.mean(s['selected_cost'][1]-s['rule_cost'][1] for s in steps):.3f}|")
     lines += ['', '## 初始调度劣势来源', '',
-        '仅对已保存的初始完整方案计算既有P+MOVE严格下界，不新增B32评价。'
+        '仅对已保存的初始完整方案计算既有P+MOVE严格下界，不新增NATIVE评价。'
         'Cmax−LB只帮助区分机器人自身负载/空走与协调等待，LB仍不代替正式Cmax。', '',
         '|几何|方法|初始Cmax|P+MOVE下界|Cmax−LB|四机器人P+MOVE中位数|', '|---|---|---:|---:|---:|---|']
     for case in DIAGNOSTIC_CASES:
@@ -1412,7 +1412,7 @@ def diagnostic_render():
             vector=', '.join(number(median([v[i] for v in components])) for i in range(4)) if components else '—'
             lines.append(f"|{case}|{method}|{number(median([r['initial_cmax'] for r in rr]))}|{number(median(bounds))}|{number(median(gaps))}|[{vector}]|")
     lines += ['', '## 早期决策与合法动作池收缩', '',
-        '用现有prepare_joint_teacher_steps重放已保存的CURRENT_GNN获胜动作，不调用B32、不重新推理、'
+        '用现有prepare_joint_teacher_steps重放已保存的CURRENT_GNN获胜动作，不调用NATIVE、不重新推理、'
         '不放宽合法性约束。统计同轨另一台机器人在几何上可用时，是否仍出现在当前合法动作池。'
         '这是路径诊断，不是新增可行性认证。N60的大部分另一机器人选择已被早期决策后的合法性约束排除；'
         'N80仍有大量双机器人选择机会，故分配塌缩同时包含动作池收缩和神经决策偏置。', '',
@@ -1442,18 +1442,18 @@ def diagnostic_render():
     lines += ['', '## 完整路径成本与失败', '',
         '下表为两种子中位数；MODE_NEW完成至少1000次且覆盖600秒，WAG为原生600秒运行，'
         '故此处迭代数不能跨算法当作相同工作量。每条原始记录、其他WAG预算及消融成本见CSV。', '',
-        '|几何|方法|初始化秒|搜索秒|实际秒|B32次数/秒|实际迭代数|',
+        '|几何|方法|初始化秒|搜索秒|实际秒|NATIVE次数/秒|实际迭代数|',
         '|---|---|---:|---:|---:|---:|---:|']
     for case in DIAGNOSTIC_CASES:
         for method in DIAGNOSTIC_METHODS+('WAG_600',):
             rr=find(wag if method=='WAG_600' else mode,case,method)
             lines.append(f"|{case}|{method}|{number(median([r['initialization_seconds'] for r in rr]))}|"
                 f"{number(median([r['search_seconds'] for r in rr]))}|{number(median([r['actual_runtime'] for r in rr]))}|"
-                f"{number(median([r['b32_calls'] for r in rr]))}/{number(median([r['b32_seconds'] for r in rr]))}|"
+                f"{number(median([r['coordination_calls'] for r in rr]))}/{number(median([r['coordination_seconds'] for r in rr]))}|"
                 f"{number(median([r['iterations'] for r in rr]))}|")
     failures=[r for r in rows if r['status'] in ('ERROR','INITIALIZATION_FAILED','TIME_LIMIT_NO_FEASIBLE','NUMERIC_FAILURE')]
     if failures:
-        lines += ['', 'GNN_RANK在80条几何第二种子的三次初始B32均返回DEADLOCK，菜单耗尽，'
+        lines += ['', 'GNN_RANK在80条几何第二种子的三次初始NATIVE均返回DEADLOCK，菜单耗尽，'
                   '不代表几何不可行，也不是60秒截止或下界剪枝造成。'
                   'diagnostic_wag_smoke是开发1秒探针：早期KeyError已修复，原始错误及修复后预算内无可行解记录均保留，'
                   '不混入正式WAG可行率。']
@@ -1462,10 +1462,10 @@ def diagnostic_render():
         reason=p.get('error')
         if not reason and p.get('initial_attempts'):
             reason='\n'.join(f"proposal {a.get('proposal_index')}: {a.get('policy')}/{a.get('decode')}, "
-                             f"status={a['status']}, B32={a.get('b32_calls')}, elapsed={a.get('elapsed')}"
+                             f"status={a['status']}, NATIVE={a.get('coordination_calls')}, elapsed={a.get('elapsed')}"
                              for a in p['initial_attempts'])
         if not reason:
-            reason=f"budget={p.get('budget')}s, termination={p.get('termination_reason')}, B32 calls={r['b32_calls']}"
+            reason=f"budget={p.get('budget')}s, termination={p.get('termination_reason')}, NATIVE calls={r['coordination_calls']}"
         lines += ['', f"失败：{r['phase']} / {r['instance']} / {r['method']} / {r['solver_seed']}",
                   '```text',reason,'```']
     checks=[r for r in rows if r['phase']=='verification']
@@ -1475,7 +1475,7 @@ def diagnostic_render():
             p=r['payload']
             lines += [f"{r['method']}：{r['status']}，{p.get('passed','—')}项，{p.get('seconds','—')}秒。",
                       '```powershell',p.get('command',''),'```','']
-    lines += ['', 'CSV保存逐次改善时间、完整200/500/1000次方案、候选来源、动作审计、B32状态及计次；'
+    lines += ['', 'CSV保存逐次改善时间、完整200/500/1000次方案、候选来源、动作审计、NATIVE状态及计次；'
               '旧正式实验CSV、checkpoint和旧报告均不写入。', '']
     lines += ['## 运行与续跑', '', '现有CSV中的成功和失败均保留；重复执行只补缺失的运行，不覆盖旧记录。', '',
               '```powershell', "Set-Location 'D:\\pybullet_test\\MRTA_GA\\DRL'",

@@ -226,7 +226,7 @@ class BottleneckWorkspace:
         blocks = self.blocks(patterns)
         first_points = {r:oriented_endpoints(blocks[route[0]],state.directions[r][0])[0]
                         for r,route in enumerate(state.routes) if route}
-        # This is the existing B32 input geometry rule, not a native DEADLOCK
+        # This is the existing NATIVE input geometry rule, not a native DEADLOCK
         # filter. Apply it only after both source/target routes are complete.
         if _initial_error(first_points,self.config) is not None:
             counts['invalid'] += 1;counts['initial_geometry_invalid'] += 1;return None
@@ -377,7 +377,7 @@ class BottleneckWorkspace:
 
 def run_bottleneck_vns(initial, workspace, native_evaluator, *, scorer=None, repair_ranker=None,
                        native_budget=500, max_states=80, max_shakes=8, batch_size=24, observer=None):
-    """One VNS: native Cmax improvement, parent LNS escape, final B32 outside."""
+    """One VNS: native Cmax improvement, parent LNS escape, final NATIVE outside."""
     started = time.perf_counter()
     cache,archive = {},[]
     native_calls = 0
@@ -708,10 +708,10 @@ class ChildJointWorkspace(BottleneckWorkspace):
 
 def run_child_joint(initial,workspace,native_evaluator,*,ranker=None,native_budget=500,
                     max_states=80,max_shakes=8,width=3,observer=None,decision_observer=None):
-    """Learned relative B32 preference controls current, state bank and final plan.
+    """Learned relative NATIVE preference controls current, state bank and final plan.
 
     The no-GNN ablation uses the same child action space with native acceptance.
-    No B32 is called here. Native DEADLOCK is never a hard candidate filter.
+    No NATIVE is called here. Native DEADLOCK is never a hard candidate filter.
     """
     cache={};calls=0;states=0;shakes=0;expanded=set();accepted=set();visited=[]
     def evaluate(c,origin=None):
@@ -766,7 +766,7 @@ def run_child_joint(initial,workspace,native_evaluator,*,ranker=None,native_budg
     return dict(candidate=best,native=cache[best.signature],initial_selected=initial_selected,native_calls=calls,
         states=states,shakes=shakes,stop=stop,counts={k:dict(v) for k,v in workspace.counts.items()},
         visited_states=tuple(visited),
-        runtime_objective='learned same-state B32 preference versus no-op' if ranker is not None else 'no-GNN native control',
+        runtime_objective='learned same-state NATIVE preference versus no-op' if ranker is not None else 'no-GNN native control',
         route_cache_hits=workspace.route_cache_hits,route_cache_builds=workspace.route_cache_builds)
 
 
@@ -1371,7 +1371,7 @@ def select_routeaware_bottleneck(current, directions, schedule, blockers, config
             if len(selected)<q:
                 selected.extend(p for p in sorted(contribution) if p not in selected)
                 selected=selected[:q]
-            return _remove_parent_set(current,selected),dict(source='LoadFirst B32 P/M/critical WAIT',
+            return _remove_parent_set(current,selected),dict(source='LoadFirst NATIVE P/M/critical WAIT',
                 critical_robot=critical,processing_peak_robot=peak,
                 anchors=list(dict.fromkeys(anchors)),feedback=feedback)
         anchors.append(min(critical_parents,key=lambda p:(-feedback['parent_costs'][p][critical],p)))
@@ -1400,7 +1400,7 @@ def select_routeaware_bottleneck(current, directions, schedule, blockers, config
         selected.extend(p for p in sorted(b.parent_id for b in current.parents) if p not in selected)
         selected=selected[:q]
     return _remove_parent_set(current,selected), dict(
-        source='B32 critical/WAIT + directed MOVE' if feedback is not None else
+        source='NATIVE critical/WAIT + directed MOVE' if feedback is not None else
                'historical timeline missing; directed MOVE only',
         critical_robot=critical,anchors=list(dict.fromkeys(anchors)),
         feedback=feedback)
@@ -1907,7 +1907,7 @@ def oriented_time_score(state: OrientedRouteState) -> tuple[float, float]:
     """Construction proxy only: maximum P+M, then total P+M.
 
     Rounding below a microsecond gives the secondary term a stable numerical
-    tie break. Actual acceptance remains entirely based on B32 Cmax.
+    tie break. Actual acceptance remains entirely based on NATIVE Cmax.
     """
     estimated = tuple(p + sum(arcs) for p, arcs in zip(state.loads, state.arc_costs))
     return round(max(estimated, default=0.0), 8), sum(estimated)
@@ -1917,7 +1917,7 @@ def oriented_route_lower_bound(state: OrientedRouteState) -> float:
     """Unrounded P+MOVE bound for these exact routes and directions.
 
     Routes start at their first weld and do not return home. Processing includes
-    SETUP/WELD/POST through config.process_time; B32 can only add nonnegative
+    SETUP/WELD/POST through config.process_time; NATIVE can only add nonnegative
     coordination waits. The rounded construction score is deliberately unused.
     """
     return max((p + sum(arcs) for p, arcs in zip(state.loads, state.arc_costs)), default=0.0)
@@ -2241,7 +2241,7 @@ def prefer_joint_legal_starts(variants, blocks, config):
 
 
 def select_feedback_child(current, feedback, config, *, seed=None):
-    """A movable block on the actual B32 bottleneck, without sibling removal."""
+    """A movable block on the actual NATIVE bottleneck, without sibling removal."""
     blocks = block_map(current, config)
     patterns = {p.parent_id: p for p in current.patterns}
     critical = max(range(4), key=lambda r: (feedback['completion'][r], -r))
@@ -3015,7 +3015,7 @@ def build_crrr_candidate(
     *, attempt_index: int, insertion_limit: int = 8,
     max_insertion_evaluations: int = 4096,
 ) -> RepairResult:
-    """Build one joint reassignment/reordering without direction or B32 access."""
+    """Build one joint reassignment/reordering without direction or NATIVE access."""
     region = identify_crrr_region(current, schedule, config, attempt_index=attempt_index)
     if region is None:
         return RepairResult(None, 0, "CRRR_NO_REGION")

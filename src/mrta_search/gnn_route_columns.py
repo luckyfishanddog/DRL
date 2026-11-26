@@ -27,7 +27,7 @@ from torch.nn import functional as F
 from mrta_baselines.hga import (_HGAWorkspace, _greedy_route_directions,
     _oriented_route_cost, _repair_oriented_first)
 from mrta_reference.model import OperationKind, ScientificConfig
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_search.gnn_constructor import VNextGNN, complete_parent_space
 from mrta_search.initialization import _construct_rail_monotone_balanced_bootstrap
@@ -41,7 +41,7 @@ class RCGConfig:
     columns_per_robot_round: int = 4
     pool_per_robot: int = 80
     empty_rounds: int = 2
-    final_b32_budget: int = 2
+    final_coordination_budget: int = 2
     mip_seconds: float = 5.
 
 
@@ -432,7 +432,7 @@ def _completion_label(context, dual, robot, prefix, prefix_bits, selected, first
 
 
 def fit_pricing_head(policy, training_layouts, *, epochs=6, progress_callback=None):
-    """TRAIN-only LP/completion labels; zero native/B32/HGA/WAG evaluations."""
+    """TRAIN-only LP/completion labels; zero native/NATIVE/HGA/WAG evaluations."""
     started = time.perf_counter()
     groups, labels, lp_calls, completions = [], [], 0, 0
     for name, parents in training_layouts:
@@ -461,7 +461,7 @@ def fit_pricing_head(policy, training_layouts, *, epochs=6, progress_callback=No
                     ranking = sorted(range(len(ns)), key=lambda i: (rc[i], int(ns[i]), int(ds[i])))
                     # Four alternatives from the same state: best, two near
                     # competitors and a separated alternative, not outcome-
-                    # selected samples or B32 counterfactuals.
+                    # selected samples or NATIVE counterfactuals.
                     chosen = sorted(set(ranking[i] for i in (0, 1, min(5, len(ranking)-1), len(ranking)//2)))
                     ys = [_completion_label(greedy, dual, robot, prefix, vector, selected,
                         (int(ns[i]), int(ds[i])), max(original.cost, context.scale)) for i in chosen]
@@ -505,7 +505,7 @@ def fit_pricing_head(policy, training_layouts, *, epochs=6, progress_callback=No
             wins += int((((prediction[a]-prediction[b])*(target[a]-target[b]) > 0)&valid).sum())
     policy.eval()
     return dict(layouts=[name for name, _ in training_layouts], epochs=epochs, groups=len(groups),
-        complete_route_labels=completions, lp_calls=lp_calls, b32_calls=0, native_calls=0,
+        complete_route_labels=completions, lp_calls=lp_calls, coordination_calls=0, native_calls=0,
         loss=losses, final_head_gradient_norm=gradient_norm, training_rank_pairs=pairs,
         training_rank_accuracy=wins/pairs if pairs else None, runtime_s=time.perf_counter()-started,
         target='full_route_reduced_cost_from_current_LP', frozen_encoder=True)
@@ -530,7 +530,7 @@ def optimize_route_columns(parents, initial, *, policy=None, settings=None,
     """Both arms use the SAME in-run initial result and identical master/budgets.
 
     Each arm's full cost includes that shared initialization once. Actual batch
-    cost counts it only once. The cached initial B32 object is never reevaluated.
+    cost counts it only once. The cached initial NATIVE object is never reevaluated.
     """
     settings = settings or RCGConfig()
     started = time.perf_counter()
@@ -538,8 +538,8 @@ def optimize_route_columns(parents, initial, *, policy=None, settings=None,
     a = dict(initialization_s=init_s, initial_cmax_s=initial.cmax, rounds=0,
         lp_calls=0, milp_calls=0, master_s=0., column_generation_s=0.,
         proposed_columns=0, added_columns=0, negative_columns=0, companion_columns=0,
-        construction_failures=0, duplicate_columns=0, final_b32_calls=0, final_b32_s=0.,
-        initial_b32_calls=initial.accounting['b32_calls'], b32_calls=initial.accounting['b32_calls'],
+        construction_failures=0, duplicate_columns=0, final_coordination_calls=0, final_coordination_s=0.,
+        initial_coordination_calls=initial.accounting['coordination_calls'], coordination_calls=initial.accounting['coordination_calls'],
         native_calls=initial.accounting['native_calls'], search_complete=False,
         gnn_score_batches=0, gnn_scored_actions=0, gnn_top_choice_differences=0)
     if initial.status != 'FEASIBLE' or initial.schedule is None:
@@ -606,28 +606,28 @@ def optimize_route_columns(parents, initial, *, policy=None, settings=None,
     # Obtain a distinct second complete route combination with the same master.
     # Excluding columns of one bundle changes no geometry or scheduling model.
     best = min(candidates.values(), key=lambda b: (b.period, b.key))
-    if a['added_columns'] and settings.final_b32_budget > 1:
+    if a['added_columns'] and settings.final_coordination_budget > 1:
         t = time.perf_counter(); master = RestrictedMaster(w, pools)
         mip, item = master.solve_integer(settings.mip_seconds, excluded=(best,)); a['milp_calls'] += 1
         a['master_s'] += time.perf_counter()-t
         if item is not None:
             candidates[item.key] = item
     selected = sorted((b for b in candidates.values() if b.key != original.key and b.period < initial.cmax-1.e-7),
-        key=lambda b: (b.period, b.key))[:settings.final_b32_budget]
+        key=lambda b: (b.period, b.key))[:settings.final_coordination_budget]
     solution, directions, schedule, returned = initial.solution, initial.directions, initial.schedule, original
     for item in selected:
         trial_solution, trial_bits = export_bundle(w, item)
         t = time.perf_counter()
-        trial = reference_schedule_formal(trial_solution, w.config, scope=FORMAL_SCOPE_V2,
+        trial = native_schedule(trial_solution, w.config, scope=FORMAL_SCOPE_V2,
             orientations=dict(enumerate(trial_bits)))
         elapsed = time.perf_counter()-t
-        a['final_b32_calls'] += 1; a['b32_calls'] += 1; a['final_b32_s'] += elapsed
+        a['final_coordination_calls'] += 1; a['coordination_calls'] += 1; a['final_coordination_s'] += elapsed
         final_rows.append(dict(status=trial.status.value, cmax_s=trial.cmax if trial.feasible else None,
-            route_period_s=item.period, b32_s=elapsed, solution=solution_record(trial_solution, trial_bits),
+            route_period_s=item.period, coordination_s=elapsed, solution=solution_record(trial_solution, trial_bits),
             diagnostic=' | '.join(trial.diagnostics[:2])))
         if trial.feasible and trial.cmax < schedule.cmax-1.e-7:
             if trial.directions != trial_bits:
-                raise RuntimeError('B32 changed explicit column directions')
+                raise RuntimeError('NATIVE changed explicit column directions')
             solution, directions, schedule, returned = trial_solution, trial_bits, trial, item
     rr = [np.array(c.nodes, np.int64) for c in returned.columns]
     dd = [np.array(c.directions, np.int64) for c in returned.columns]

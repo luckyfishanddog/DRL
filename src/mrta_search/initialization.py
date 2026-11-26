@@ -1807,7 +1807,7 @@ def build_initial_solution(
                 attempts[attempt_index] = replace(
                     old_attempt,
                     diagnostics=old_attempt.diagnostics
-                    + ("B32 reference evaluation exceeded run deadline",),
+                    + ("NATIVE reference evaluation exceeded run deadline",),
                 )
                 break
         attempt = InitializationAttempt(

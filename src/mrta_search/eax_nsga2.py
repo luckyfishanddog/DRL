@@ -3,7 +3,7 @@
 This is the explicitly documented line-weld adaptation of Gao et al. section
 4.4 and Fig. 9, not AB-cycle EAX or an exact clone of its two-robot point model.
 Robot ownership is decided anew at every directed insertion. No local search,
-route direction postprocessing or B32 call occurs during evolution.
+route direction postprocessing or NATIVE call occurs during evolution.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from numba import njit
 from mrta_baselines.hga import _HGAWorkspace, _numeric_edges, initialize_hga_region_seed
 from mrta_baselines.wag_vns import _priority_arrays
 from mrta_reference.model import OperationKind, ScientificConfig
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_search.saeax import Individual, SAEAXResult, complete_identity, validate_individual, _route_statistics
 
@@ -326,9 +326,9 @@ def run_eax_nsga2(parents, config=None, settings=None, *, seed=20261110,
     config,settings = config or ScientificConfig(),settings or EAXNSGAConfig()
     started,rng = time.perf_counter(),random.Random(seed)
     w = _HGAWorkspace(parents,config,scope)
-    accounting = dict(native_calls=0,b32_calls=0,initialization_evaluations=0,
+    accounting = dict(native_calls=0,coordination_calls=0,initialization_evaluations=0,
         initialization_attempts=0,construction_attempts=0,duplicate_children=0,invalid_children=0,
-        native_feasible_children=0,crossover_s=0.,native_s=0.,population_s=0.,b32_s=0.,
+        native_feasible_children=0,crossover_s=0.,native_s=0.,population_s=0.,coordination_s=0.,
         best_improvements=0,inherited_edges=0,new_edges=0,mutation_entries=0,
         threshold_adjacency_entries=0,threshold_excluded_entries=0,parental_adjacency_entries=0,few_neighbour_choices=0,
         nearest_fallbacks=0,deferred_nodes=0,owner_changes_vs_first=0,owner_changes_vs_second=0,
@@ -459,11 +459,11 @@ def run_eax_nsga2(parents, config=None, settings=None, *, seed=20261110,
     vectors = tuple(tuple(int(d) for d in row) for row in final.directions)
     accounting['search_s'] = time.perf_counter()-started
     t = time.perf_counter()
-    accounting['b32_calls'] = 1
-    schedule = reference_schedule_formal(solution,config,scope=scope,orientations=dict(enumerate(vectors)))
-    accounting['b32_s'] = time.perf_counter()-t
+    accounting['coordination_calls'] = 1
+    schedule = native_schedule(solution,config,scope=scope,orientations=dict(enumerate(vectors)))
+    accounting['coordination_s'] = time.perf_counter()-t
     if schedule.feasible and schedule.directions!=vectors:
-        raise RuntimeError('B32 changed explicit directions')
+        raise RuntimeError('NATIVE changed explicit directions')
     native = final.native_cmax if math.isfinite(final.native_cmax) else None
     accounting.update(native_best_cmax_s=native,processing_s=[float(p) for p in final.processing],
         move_s=float(sum(final.costs-final.processing)),
@@ -471,7 +471,7 @@ def run_eax_nsga2(parents, config=None, settings=None, *, seed=20261110,
         wait_is_partial=not schedule.feasible,
         final_selection='NATIVE_PMAX_MOVE_LEXICOGRAPHIC_NONDOMINATED_POINT')
     final_rows = [dict(rank=1,native_cmax_s=native,status=schedule.status.value,
-        cmax_s=schedule.cmax if schedule.feasible else None,b32_s=accounting['b32_s'],
+        cmax_s=schedule.cmax if schedule.feasible else None,coordination_s=accounting['coordination_s'],
         max_processing_s=float(max(final.processing)),move_s=accounting['move_s'],wait_s=accounting['wait_s'],
         diagnostic=' | '.join(schedule.diagnostics[:2]))]
     return SAEAXResult(schedule.status.value,schedule.cmax if schedule.feasible else None,

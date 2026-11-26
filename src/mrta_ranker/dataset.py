@@ -12,7 +12,7 @@ from mrta_reference.model import CanonicalSolution,ScientificConfig,ScheduleStat
 from mrta_reference.geometry import build_legal_pattern_catalog
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.provenance import SourceProvenance,REPOSITORY_ID,compute_source_tree_hash
-from mrta_reference.scheduler import FormalReferenceEvaluator
+from mrta_reference.scheduler import NativeReferenceEvaluator
 from mrta_reference.certifier import certify_schedule
 from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
 from mrta_data.phase3_split import assert_v2_solver_access_allowed
@@ -528,7 +528,7 @@ def generate_state_pool(db,state,config=None):
 
 
 def label_candidate(candidate,context,cheap_rank,config=None):
-    """One real direction DP and at most one B32 reference evaluation."""
+    """One real direction DP and at most one NATIVE reference evaluation."""
     config=CONFIG if config is None else config
     start=time.perf_counter();direction=optimize_directions_with_initial_feasibility(candidate.solution,config)
     dp_seconds=time.perf_counter()-start;cmax=None;ref_seconds=0.0;c4=None
@@ -538,7 +538,7 @@ def label_candidate(candidate,context,cheap_rank,config=None):
         c4_features=extract_c4_features(context['solution'],context['directions'],context['metrics'].cmax,candidate,config,direction=direction,cheap_rank=cheap_rank)
         c4=feature_blob(c4_features)
         start=time.perf_counter()
-        schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(candidate.solution,config,orientations={r:direction.directions[r] for r in range(4)})
+        schedule=NativeReferenceEvaluator(FORMAL_SCOPE_V2)(candidate.solution,config,orientations={r:direction.directions[r] for r in range(4)})
         ref_seconds=time.perf_counter()-start;status=schedule.status.value
         if status=='FEASIBLE':
             certification=certify_schedule(candidate.solution,schedule,config,scope=FORMAL_SCOPE_V2)

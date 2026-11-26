@@ -42,7 +42,7 @@ def experiment_job(job):
         final_candidates=result.final_candidates,
         threshold_rule='Q75_OF_ACTIVE_PARENTAL_DIRECTED_MOVE_DISTANCES',
         adjacency_filter_rule='GAO_4_4_SHORT_SIDE_UNLESS_BOTH_LONG',
-        final_b32_policy='ONE_CANDIDATE_ONE_CALL_NO_FALLBACK')
+        final_coordination_policy='ONE_CANDIDATE_ONE_CALL_NO_FALLBACK')
     if result.solution is not None:
         detail['solution'] = dict(patterns=[dict(parent_id=p.parent_id,kind=p.kind.value,t=p.t,
             point_id=p.point_id,rail=p.rail.value if p.rail else None) for p in result.solution.patterns],
@@ -51,7 +51,7 @@ def experiment_job(job):
     row = dict(stage=stage,layout_id=name,parent_count=len(parents),seed=seed,status=result.status,
         cmax_s=result.cmax,native_cmax_s=result.native_cmax,runtime_s=result.runtime,
         generations=result.generations,valid_children=result.valid_children,native_calls=a['native_calls'],
-        b32_calls=a['b32_calls'],termination_reason=result.termination_reason,
+        coordination_calls=a['coordination_calls'],termination_reason=result.termination_reason,
         max_processing_s=max(loads) if loads else None,move_s=a.get('move_s'),wait_s=a.get('wait_s'),
         source=SOURCE,diagnostic=json.dumps(detail,ensure_ascii=False,allow_nan=False))
     if loads:row.update({f'processing_r{r}_s':p for r,p in enumerate(loads)})
@@ -109,7 +109,7 @@ def summarize(stage):
         cmax_mean_s=mean(float(r['cmax_s']) for r in feasible) if feasible else None,
         runtime_median_s=median(float(r['runtime_s']) for r in rows),
         runtime_mean_s=mean(float(r['runtime_s']) for r in rows),
-        search_median_s=timings('search_s'),b32_median_s=timings('b32_s'),
+        search_median_s=timings('search_s'),coordination_median_s=timings('coordination_s'),
         SAEAX=paired_summary(rows,saeax_rows(stage)))
     for method in ('WAG+VNS','HGA'):summary[method] = paired_summary(rows,baseline_rows(method))
     if stage=='pilot':summary['decision'] = pilot_decision()
@@ -118,7 +118,7 @@ def summarize(stage):
     for r,a in sorted(zip(rows,accounts),key=lambda ra:(ra[0]['layout_id'],ra[0]['seed'])):
         print('EAX_ROW',json.dumps({k:r[k] for k in ('layout_id','seed','status','cmax_s',
             'max_processing_s','move_s','wait_s','runtime_s','generations','valid_children',
-            'native_calls','b32_calls','termination_reason')},ensure_ascii=False),flush=True)
+            'native_calls','coordination_calls','termination_reason')},ensure_ascii=False),flush=True)
     return summary
 
 

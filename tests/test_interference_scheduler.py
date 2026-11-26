@@ -33,7 +33,7 @@ from mrta_reference.scheduler import (
     build_robot_routes,
     earliest_safe_start,
     reference_schedule,
-    reference_schedule_formal,
+    native_schedule,
     reference_schedule_from_templates,
     wait_for_cycles,
 )
@@ -45,13 +45,13 @@ CONFIG = ScientificConfig()
 
 def test_formal_task_horizon_empty_initial_post_and_same_rail_release():
     from mrta_reference.model import FORMAL_SCOPE_V1_1
-    from mrta_reference.scheduler import reference_schedule_formal, reference_schedule_slow
+    from mrta_reference.scheduler import native_schedule, reference_schedule_slow
     cfg = ScientificConfig(weld_speed=1, empty_speed=1, t_pre=1, t_post=1)
     parents = (ParentWeld("left", (2, 10), (3, 10)),
                ParentWeld("right", (10, 10), (1, 10)))
     solution = canonicalize(parents, tuple(SplitPattern(p.parent_id, SplitKind.WHOLE) for p in parents),
                             {0: ("left::whole",), 1: ("right::whole",)}, cfg)
-    schedule = reference_schedule_formal(solution, cfg, scope=FORMAL_SCOPE_V1_1, orientations={0: (0,), 1: (0,)})
+    schedule = native_schedule(solution, cfg, scope=FORMAL_SCOPE_V1_1, orientations={0: (0,), 1: (0,)})
     assert schedule.feasible
     assert schedule.canonical_json() == reference_schedule_slow(
         solution, cfg, orientations={0: (0,), 1: (0,)}).canonical_json()
@@ -71,25 +71,25 @@ def test_formal_task_horizon_empty_initial_post_and_same_rail_release():
     touching = Operation("touch", 1, OperationKind.WAIT, 3, 3, (3, 10), (3, 10), 0)
     assert operations_conflict(post, touching, cfg)  # closed final POST endpoint
     empty = canonicalize((), (), {}, cfg)
-    result = reference_schedule_formal(empty, cfg, scope=FORMAL_SCOPE_V1_1)
+    result = native_schedule(empty, cfg, scope=FORMAL_SCOPE_V1_1)
     assert result.operations == () and result.cmax == 0
     assert certify_schedule(empty, result, cfg, scope=FORMAL_SCOPE_V1_1).certified
     wrong_order = canonicalize(parents, solution.patterns,
                               {1: ("left::whole",), 0: ("right::whole",)}, cfg)
-    assert reference_schedule_formal(wrong_order, cfg, scope=FORMAL_SCOPE_V1_1, orientations={0: (0,), 1: (0,)}).status is ScheduleStatus.INFEASIBLE
+    assert native_schedule(wrong_order, cfg, scope=FORMAL_SCOPE_V1_1, orientations={0: (0,), 1: (0,)}).status is ScheduleStatus.INFEASIBLE
     single = canonicalize(parents[:1], solution.patterns[:1], {1: ("left::whole",)}, cfg)
-    result = reference_schedule_formal(single, cfg, scope=FORMAL_SCOPE_V1_1)
+    result = native_schedule(single, cfg, scope=FORMAL_SCOPE_V1_1)
     assert result.feasible and result.robot_completion[0] == 0
     assert certify_schedule(single, result, cfg, scope=FORMAL_SCOPE_V1_1).certified
 
 
 def test_formal_x_excluded_even_with_valid_legacy_validator():
     from mrta_reference.model import CanonicalSolution, Route, FORMAL_SCOPE_V1_1
-    from mrta_reference.scheduler import reference_schedule_formal
+    from mrta_reference.scheduler import native_schedule
     parent = ParentWeld("x", (1, 8), (5, 8))
     pattern = SplitPattern("x", SplitKind.X_SPLIT, 0.5, "explicit-x", rail=Rail.UPPER)
     solution = CanonicalSolution((parent,), (pattern,), (Route(0, ("x::0",)), Route(1, ("x::1",)), Route(2, ()), Route(3, ())))
-    formal = reference_schedule_formal(solution, CONFIG, scope=FORMAL_SCOPE_V1_1)
+    formal = native_schedule(solution, CONFIG, scope=FORMAL_SCOPE_V1_1)
     assert formal.status is ScheduleStatus.INFEASIBLE
     assert "EXCLUDED" in formal.diagnostics[0]
     fake = replace(formal, status=ScheduleStatus.FEASIBLE, cmax=0)
@@ -112,7 +112,7 @@ def test_experimental_x_scope_certifies_processing_and_shared_point_wait() -> No
         CONFIG,
         x_split_validator=validator,
     )
-    schedule = reference_schedule_formal(
+    schedule = native_schedule(
         solution,
         CONFIG,
         scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
@@ -135,7 +135,7 @@ def test_experimental_x_scope_certifies_processing_and_shared_point_wait() -> No
     )
     assert split_process == pytest.approx(CONFIG.process_time(parent.length) + CONFIG.t_pre + CONFIG.t_post)
     assert any(op.kind is OperationKind.WAIT and op.duration > 0.0 for op in schedule.operations)
-    rejected = reference_schedule_formal(solution, CONFIG, scope=FORMAL_SCOPE_V1_1)
+    rejected = native_schedule(solution, CONFIG, scope=FORMAL_SCOPE_V1_1)
     assert rejected.status is ScheduleStatus.INFEASIBLE
     assert "EXCLUDED" in rejected.diagnostics[0]
 
@@ -154,7 +154,7 @@ def test_v2_x_processing_shared_point_and_no_x_differential_compatibility() -> N
         CONFIG,
         scope=FORMAL_SCOPE_V2,
     )
-    split_schedule = reference_schedule_formal(
+    split_schedule = native_schedule(
         split,
         CONFIG,
         scope=FORMAL_SCOPE_V2,
@@ -182,10 +182,10 @@ def test_v2_x_processing_shared_point_and_no_x_differential_compatibility() -> N
         (parent,), (whole_pattern,), {0: ("v2-x::whole",)}, CONFIG
     )
     directions = {0: (0,), 1: (), 2: (), 3: ()}
-    old = reference_schedule_formal(
+    old = native_schedule(
         whole, CONFIG, scope=FORMAL_SCOPE_V1_1, orientations=directions
     )
-    new = reference_schedule_formal(
+    new = native_schedule(
         whole, CONFIG, scope=FORMAL_SCOPE_V2, orientations=directions
     )
     assert old.status is new.status is ScheduleStatus.FEASIBLE
@@ -231,10 +231,10 @@ def test_phase3x_controlled_fixtures_f1_to_f8() -> None:
     # F2/F3: a sub-10m parent can benefit from finite X load sharing.
     short_parent, short_whole, short_split = whole_and_x(8.0)
     assert short_parent.length < 10.0 and short_split is not None
-    whole_schedule = reference_schedule_formal(
+    whole_schedule = native_schedule(
         short_whole, CONFIG, scope=FORMAL_SCOPE_V1_1
     )
-    outward = reference_schedule_formal(
+    outward = native_schedule(
         short_split,
         CONFIG,
         scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
@@ -245,19 +245,19 @@ def test_phase3x_controlled_fixtures_f1_to_f8() -> None:
     # F4: minimum-size children plus coordination can make X no better.
     _, tiny_whole, tiny_split = whole_and_x(0.4)
     assert tiny_split is not None
-    tiny_x = reference_schedule_formal(
+    tiny_x = native_schedule(
         tiny_split,
         CONFIG,
         scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
         orientations={0: (0,), 1: (0,), 2: (), 3: ()},
     )
-    assert reference_schedule_formal(tiny_whole, CONFIG, scope=FORMAL_SCOPE_V1_1).feasible
+    assert native_schedule(tiny_whole, CONFIG, scope=FORMAL_SCOPE_V1_1).feasible
     assert not tiny_x.feasible
 
     # F5/F6: the shared point is checked; direction changes WAIT without changing legality.
     _, _, medium_split = whole_and_x(4.0)
     assert medium_split is not None
-    inward = reference_schedule_formal(
+    inward = native_schedule(
         medium_split,
         CONFIG,
         scope=EXPERIMENTAL_X_SPLIT_SCOPE_V1,
@@ -276,7 +276,7 @@ def test_phase3x_controlled_fixtures_f1_to_f8() -> None:
         {0: ("ind-left::whole",), 1: ("ind-right::whole",)},
         CONFIG,
     )
-    aligned_without_x = reference_schedule_formal(
+    aligned_without_x = native_schedule(
         independent,
         CONFIG,
         scope=FORMAL_SCOPE_V1_1,

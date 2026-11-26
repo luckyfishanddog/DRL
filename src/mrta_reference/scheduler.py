@@ -31,10 +31,6 @@ from .model import (
     ACTIVE_FORMAL_SCOPE,
     SplitKind,
 )
-from .scope import (
-    FORMAL_BOUNDED_DISPATCH_POLICY_V1,
-    FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
-)
 from .dispatch_recovery import (
     DispatchChoice,
     DispatchChoiceSet,
@@ -42,7 +38,6 @@ from .dispatch_recovery import (
     ForcedDispatchDecision,
     RolloutOutcome,
     RolloutTrace,
-    limited_discrepancy_recovery,
     run_dispatch_rollout,
 )
 from .solution import block_map, canonicalize
@@ -81,7 +76,6 @@ class SchedulerProfile:
     operation_template_time: float = 0.0
     scheduler_main_loop_time: float = 0.0
     baseline_dispatch_time: float = 0.0
-    recovery_time: float = 0.0
     ess_time: float = 0.0
     forbidden_interval_time: float = 0.0
     interval_sort_sweep_time: float = 0.0
@@ -99,17 +93,11 @@ class SchedulerProfile:
     conflict_cache_misses: int = 0
     ess_cache_hits: int = 0
     ess_cache_misses: int = 0
-    recovery_rollout_time: float = 0.0
-    recovery_rollout_count: int = 0
     branch_trace_time: float = 0.0
     branch_snapshot_preparation_time: float = 0.0
     state_identity_time: float = 0.0
-    frontier_time: float = 0.0
-    dedup_time: float = 0.0
-    peak_branch_states: int = 0
     peak_index_snapshots: int = 0
     peak_operation_nodes: int = 0
-    peak_dedup_entries: int = 0
 
     @property
     def conflict_time(self) -> float:
@@ -146,7 +134,6 @@ class SchedulerProfile:
             "operation_template": self.operation_template_time,
             "scheduler_main_loop": self.scheduler_main_loop_time,
             "baseline_dispatch": self.baseline_dispatch_time,
-            "recovery": self.recovery_time,
             "ESS": self.ess_time,
             "forbidden_interval": self.forbidden_interval_time,
             "interval_sort_sweep": self.interval_sort_sweep_time,
@@ -163,17 +150,11 @@ class SchedulerProfile:
             "conflict_cache_misses": self.conflict_cache_misses,
             "ESS_cache_hits": self.ess_cache_hits,
             "ESS_cache_misses": self.ess_cache_misses,
-            "recovery_rollout_time": self.recovery_rollout_time,
-            "recovery_rollout_count": self.recovery_rollout_count,
             "branch_trace": self.branch_trace_time,
             "branch_snapshot_preparation": self.branch_snapshot_preparation_time,
             "state_identity": self.state_identity_time,
-            "frontier": self.frontier_time,
-            "dedup": self.dedup_time,
-            "peak_branch_states": self.peak_branch_states,
             "peak_index_snapshots": self.peak_index_snapshots,
             "peak_operation_nodes": self.peak_operation_nodes,
-            "peak_dedup_entries": self.peak_dedup_entries,
             "other": self.other_time,
         }
 
@@ -990,7 +971,7 @@ def prepare_dispatch_problem(
 
 
 class _OptimizedDispatchKernel:
-    """Scientific dispatch kernel shared by baseline and recovery rollouts."""
+    """Independent Python dispatch kernel for geometric tools and tests."""
 
     def __init__(
         self,
@@ -1481,7 +1462,7 @@ def reference_schedule(
     x_split_validator: XSplitValidator | None = None,
     profile: SchedulerProfile | None = None,
 ) -> ScheduleResult:
-    """Production reference evaluator; scientifically identical optimized path."""
+    """Independent Python reference tool; current experiments use native_schedule."""
     return reference_schedule_optimized(
         solution,
         config,
@@ -1503,398 +1484,19 @@ def _operation_sort_key(operation: Operation):
     )
 
 
-def _bounded_dispatch_recovery(
-    templates_by_robot: Mapping[int, Sequence[Operation]],
-    config: ScientificConfig,
-    baseline: ScheduleResult,
-    *,
-    state_budget: int,
-    profile: SchedulerProfile | None = None,
-) -> ScheduleResult:
-    """DFS over finite ESS dispatch choices; one popped prefix is one state.
-
-    The baseline priority child is visited first. This is a bounded policy, not
-    an infeasibility proof or an exact optimization procedure. No incumbent from
-    an algorithm, time limit, RNG, or cross-call state participates.
-    """
-    if state_budget < 1:
-        raise ValueError("deadlock state budget must be positive")
-    if baseline.status is not ScheduleStatus.DEADLOCK:
-        return baseline
-    templates, invalid = _validated_reference_templates(templates_by_robot, config)
-    if invalid is not None:
-        return invalid
-    suffix = _remaining_processing_suffix(templates)
-    # next indices, completion, committed operations, per-robot WAIT counters.
-    stack = [((0, 0, 0, 0), (0.0, 0.0, 0.0, 0.0), (), (0, 0, 0, 0))]
-    expanded = 0
-    best = None
-    try:
-        while stack and expanded < state_budget:
-            indices, completion, fixed, waits = stack.pop()
-            expanded += 1
-            if all(indices[r] == len(templates[r]) for r in range(4)):
-                candidate = ScheduleResult(
-                    ScheduleStatus.FEASIBLE,
-                    tuple(sorted(fixed, key=_operation_sort_key)),
-                    max(completion), completion, directions=baseline.directions,
-                )
-                if best is None or (candidate.cmax, candidate.canonical_json()) < (
-                    best.cmax, best.canonical_json()
-                ):
-                    best = candidate
-                continue
-            choices = []
-            for robot in range(4):
-                if indices[robot] == len(templates[robot]):
-                    continue
-                template = templates[robot][indices[robot]]
-                relevant = relevant_fixed_operations(fixed, robot, completion[robot], config)
-                start, _, _ = earliest_safe_start_optimized(
-                    template, completion[robot], relevant, config, profile=profile
-                )
-                if math.isfinite(start):
-                    choices.append((start, -suffix[robot][indices[robot]],
-                                    -completion[robot], robot, template))
-            for start, _, _, robot, template in sorted(
-                choices, key=lambda choice: choice[:4], reverse=True
-            ):
-                new_indices, new_completion, new_waits = list(indices), list(completion), list(waits)
-                operations = fixed
-                if start > completion[robot]:
-                    point = (templates[robot][indices[robot] - 1].end
-                             if indices[robot] else template.start)
-                    operations += (Operation(
-                        f"R{robot}:WAIT:{waits[robot]}", robot, OperationKind.WAIT,
-                        completion[robot], start, point, point,
-                        template.sequence_index, template.block_id,
-                    ),)
-                    new_waits[robot] += 1
-                operation = _at_start(template, start)
-                operations += (operation,)
-                new_indices[robot] += 1
-                new_completion[robot] = operation.end_time
-                stack.append((tuple(new_indices), tuple(new_completion), operations, tuple(new_waits)))
-    except (ValueError, ArithmeticError, OverflowError) as error:
-        return replace(baseline, status=ScheduleStatus.NUMERIC_FAILURE,
-                       diagnostics=baseline.diagnostics + (f"bounded recovery numeric failure: {error}",),
-                       baseline_deadlock=True, expanded_states=expanded, state_budget=state_budget)
-    diagnostics = baseline.diagnostics + (
-        "baseline DEADLOCK", f"expanded_states={expanded}", f"budget={state_budget}",
-        f"recovery_exhausted={bool(stack)}", f"frontier_exhausted={not stack}",
-    )
-    return replace(
-        best if best is not None else baseline,
-        source="BOUNDED_DEADLOCK_RECOVERY" if best is not None else "BASELINE",
-        diagnostics=diagnostics, baseline_deadlock=True, expanded_states=expanded,
-        state_budget=state_budget, recovery_exhausted=bool(stack), frontier_exhausted=not stack,
-    )
 
 
-def _limited_discrepancy_dispatch_recovery_slow(
-    templates_by_robot: Mapping[int, Sequence[Operation]],
-    config: ScientificConfig,
-    baseline: RolloutOutcome,
-    *,
-    rollout_budget: int,
-    profile: SchedulerProfile | None = None,
-) -> ScheduleResult:
-    """Bound complete alternative continuations, independent of template depth."""
-    if baseline.result.status is not ScheduleStatus.DEADLOCK:
-        return baseline.result
-
-    def rollout_from_snapshot(
-        state: DispatchState,
-        decision: ForcedDispatchDecision,
-        causal_blocker_operation_ids: tuple[str, ...],
-    ) -> RolloutOutcome:
-        blockers = frozenset(causal_blocker_operation_ids)
-
-        def causal_selector(_state, choices):
-            if blockers and choices[0].operation_id in blockers and len(choices) >= 2:
-                return 1
-            return 0
-
-        return _optimized_dispatch_outcome(
-            templates_by_robot,
-            config,
-            directions=baseline.result.directions,
-            profile=profile,
-            initial_state=state,
-            forced_decisions=(decision,),
-            collect_trace=True,
-            choice_selector=causal_selector if blockers else None,
-        )
-
-    summary = limited_discrepancy_recovery(
-        baseline,
-        rollout_budget=rollout_budget,
-        rollout_from_snapshot=rollout_from_snapshot,
-        profile=profile,
-    )
-    numeric = summary.result.status is ScheduleStatus.NUMERIC_FAILURE
-    recovered = summary.result.status is ScheduleStatus.FEASIBLE
-    diagnostics = baseline.result.diagnostics + (
-        "baseline DEADLOCK",
-        f"recovery_rollouts={summary.recovery_rollouts}",
-        f"rollout_budget={summary.rollout_budget}",
-        f"max_discrepancies_used={summary.max_discrepancies_used}",
-        f"branch_points_considered={summary.branch_points_considered}",
-        f"recovery_exhausted={not summary.frontier_exhausted}",
-        f"frontier_exhausted={summary.frontier_exhausted}",
-    )
-    if numeric:
-        diagnostics += tuple(
-            item
-            for item in summary.result.diagnostics
-            if item not in diagnostics
-        )
-    return replace(
-        summary.result,
-        source="LIMITED_DISCREPANCY_RECOVERY" if recovered else "BASELINE",
-        diagnostics=diagnostics,
-        baseline_deadlock=True,
-        recovery_exhausted=not summary.frontier_exhausted,
-        frontier_exhausted=summary.frontier_exhausted,
-        recovery_rollouts=summary.recovery_rollouts,
-        rollout_budget=summary.rollout_budget,
-        max_discrepancies_used=summary.max_discrepancies_used,
-        branch_points_considered=summary.branch_points_considered,
-        deadlock_blockages=(summary.last_deadlock.deadlock_blockages
-            if summary.result.status is ScheduleStatus.DEADLOCK and summary.last_deadlock is not None
-            else summary.result.deadlock_blockages),
-        deadlock_evidence_source=('last recovery deadlock' if summary.result.status is ScheduleStatus.DEADLOCK
-            and summary.recovery_rollouts else summary.result.deadlock_evidence_source),
-    )
 
 
-def _limited_discrepancy_dispatch_recovery_optimized(
-    prepared: PreparedDispatchProblem,
-    baseline: RolloutOutcome,
-    *,
-    rollout_budget: int,
-    profile: SchedulerProfile | None = None,
-) -> ScheduleResult:
-    """Semantics-identical V1.1 recovery using shared exact call-local caches."""
-    if baseline.result.status is not ScheduleStatus.DEADLOCK:
-        return baseline.result
-
-    def rollout_from_snapshot(
-        state: DispatchState,
-        decision: ForcedDispatchDecision,
-        causal_blocker_operation_ids: tuple[str, ...],
-    ) -> RolloutOutcome:
-        blockers = frozenset(causal_blocker_operation_ids)
-
-        def causal_selector(_state, choices):
-            if blockers and choices[0].operation_id in blockers and len(choices) >= 2:
-                return 1
-            return 0
-
-        started = time.perf_counter()
-        outcome = _prepared_dispatch_outcome(
-            prepared,
-            profile=profile,
-            initial_state=state,
-            forced_decisions=(decision,),
-            collect_trace=True,
-            choice_selector=causal_selector if blockers else None,
-        )
-        if profile is not None:
-            profile.recovery_rollout_count += 1
-            profile.recovery_rollout_time += time.perf_counter() - started
-        return outcome
-
-    summary = limited_discrepancy_recovery(
-        baseline,
-        rollout_budget=rollout_budget,
-        rollout_from_snapshot=rollout_from_snapshot,
-        profile=profile,
-    )
-    if profile is not None:
-        profile.peak_branch_states = max(
-            profile.peak_branch_states, summary.branch_points_considered
-        )
-        profile.peak_dedup_entries = max(
-            profile.peak_dedup_entries, summary.branch_points_considered
-        )
-    numeric = summary.result.status is ScheduleStatus.NUMERIC_FAILURE
-    recovered = summary.result.status is ScheduleStatus.FEASIBLE
-    diagnostics = baseline.result.diagnostics + (
-        "baseline DEADLOCK",
-        f"recovery_rollouts={summary.recovery_rollouts}",
-        f"rollout_budget={summary.rollout_budget}",
-        f"max_discrepancies_used={summary.max_discrepancies_used}",
-        f"branch_points_considered={summary.branch_points_considered}",
-        f"recovery_exhausted={not summary.frontier_exhausted}",
-        f"frontier_exhausted={summary.frontier_exhausted}",
-    )
-    if numeric:
-        diagnostics += tuple(
-            item for item in summary.result.diagnostics if item not in diagnostics
-        )
-    return replace(
-        summary.result,
-        source="LIMITED_DISCREPANCY_RECOVERY" if recovered else "BASELINE",
-        diagnostics=diagnostics,
-        baseline_deadlock=True,
-        recovery_exhausted=not summary.frontier_exhausted,
-        frontier_exhausted=summary.frontier_exhausted,
-        recovery_rollouts=summary.recovery_rollouts,
-        rollout_budget=summary.rollout_budget,
-        max_discrepancies_used=summary.max_discrepancies_used,
-        branch_points_considered=summary.branch_points_considered,
-        deadlock_blockages=(summary.last_deadlock.deadlock_blockages
-            if summary.result.status is ScheduleStatus.DEADLOCK and summary.last_deadlock is not None
-            else summary.result.deadlock_blockages),
-        deadlock_evidence_source=('last recovery deadlock' if summary.result.status is ScheduleStatus.DEADLOCK
-            and summary.recovery_rollouts else summary.result.deadlock_evidence_source),
-    )
 
 
 # Compatibility name now denotes the production optimized implementation only
 # when supplied a prepared problem through the formal path. Direct historical
 # callers keep using the explicit slow oracle signature below.
-_limited_discrepancy_dispatch_recovery = _limited_discrepancy_dispatch_recovery_slow
 
 
-def reference_schedule_from_templates_formal(
-    templates_by_robot, config: ScientificConfig, *, scope: FormalScope = ACTIVE_FORMAL_SCOPE,
-    directions=((), (), (), ()), profile: SchedulerProfile | None = None,
-    feasible_dispatch_observer=None,
-) -> ScheduleResult:
-    """Formal dispatch policy for operation fixtures; no parent-coverage claim."""
-    scope.validate_implemented()
-    if scope.deadlock_policy_id == FORMAL_BOUNDED_DISPATCH_POLICY_V1:
-        if scope.deadlock_state_budget is None:
-            raise ValueError("V1 bounded dispatch policy requires a state budget")
-        baseline = reference_schedule_from_templates_optimized(
-            templates_by_robot, config, directions=directions, profile=profile
-        )
-        result = _bounded_dispatch_recovery(
-            templates_by_robot, config, baseline,
-            state_budget=scope.deadlock_state_budget, profile=profile,
-        ) if baseline.status is ScheduleStatus.DEADLOCK else baseline
-        return replace(
-            result,
-            reference_policy_id=scope.reference_scheduler_policy_id,
-            scope_id=scope.scope_id,
-            scope_hash=scope.scope_hash,
-            state_budget=scope.deadlock_state_budget,
-        )
-    if scope.deadlock_policy_id == FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1:
-        if scope.deadlock_rollout_budget is None:
-            raise ValueError("V1.1 limited-discrepancy policy requires a rollout budget")
-        prepared = prepare_dispatch_problem(
-            templates_by_robot,
-            config,
-            directions=directions,
-            profile=profile,
-        )
-        prepared.feasible_dispatch_observer=feasible_dispatch_observer
-        baseline_started = time.perf_counter()
-        baseline_outcome = _prepared_dispatch_outcome(
-            prepared, profile=profile, collect_trace=True
-        )
-        if profile is not None:
-            profile.baseline_dispatch_time += time.perf_counter() - baseline_started
-        if baseline_outcome.result.status is ScheduleStatus.DEADLOCK:
-            recovery_started = time.perf_counter()
-            result = _limited_discrepancy_dispatch_recovery_optimized(
-                prepared,
-                baseline_outcome,
-                rollout_budget=scope.deadlock_rollout_budget,
-                profile=profile,
-            )
-            if profile is not None:
-                profile.recovery_time += time.perf_counter() - recovery_started
-        else:
-            result = baseline_outcome.result
-        return replace(
-            result,
-            reference_policy_id=scope.reference_scheduler_policy_id,
-            scope_id=scope.scope_id,
-            scope_hash=scope.scope_hash,
-            rollout_budget=scope.deadlock_rollout_budget,
-        )
-    raise ValueError(f"unsupported formal deadlock policy: {scope.deadlock_policy_id}")
 
 
-def reference_schedule_formal(
-    solution: CanonicalSolution, config: ScientificConfig, *,
-    scope: FormalScope = ACTIVE_FORMAL_SCOPE,
-    orientations: Mapping[int, Sequence[int]] | None = None,
-    profile: SchedulerProfile | None = None,
-    feasible_dispatch_observer=None,
-) -> ScheduleResult:
-    """The common formal evaluator. Development callbacks/X providers are absent."""
-    scope.validate_implemented()
-    has_x = any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
-    if has_x and scope.optional_x_split_policy == "EXCLUDED":
-        result = _infeasible(f"{scope.scope_id}: optional X_SPLIT is EXCLUDED")
-        return replace(
-            result,
-            reference_policy_id=scope.reference_scheduler_policy_id,
-            scope_id=scope.scope_id,
-            scope_hash=scope.scope_hash,
-            state_budget=scope.deadlock_state_budget or 0,
-            rollout_budget=scope.deadlock_rollout_budget or 0,
-        )
-    try:
-        normalized = canonicalize(
-            solution.parents,
-            solution.patterns,
-            solution.routes,
-            config,
-            revision=solution.revision,
-            scope=scope,
-        )
-    except (ArithmeticError, ValueError) as error:
-        result = _infeasible(f"{scope.scope_id}: formal solution validation failed: {error}")
-        return replace(
-            result,
-            reference_policy_id=scope.reference_scheduler_policy_id,
-            scope_id=scope.scope_id,
-            scope_hash=scope.scope_hash,
-            state_budget=scope.deadlock_state_budget or 0,
-            rollout_budget=scope.deadlock_rollout_budget or 0,
-        )
-    if normalized.canonical_hash != solution.canonical_hash:
-        result = _infeasible(f"{scope.scope_id}: solution is not canonical")
-        return replace(
-            result,
-            reference_policy_id=scope.reference_scheduler_policy_id,
-            scope_id=scope.scope_id,
-            scope_hash=scope.scope_hash,
-            state_budget=scope.deadlock_state_budget or 0,
-            rollout_budget=scope.deadlock_rollout_budget or 0,
-        )
-    x_validator = (
-        finite_x_split_validator(solution.parents, config)
-        if has_x
-        else None
-    )
-    def dispatch(templates, cfg, *, directions, profile):
-        return reference_schedule_from_templates_formal(
-            templates, cfg, scope=scope, directions=directions, profile=profile,
-            **({'feasible_dispatch_observer':feasible_dispatch_observer} if feasible_dispatch_observer is not None else {})
-        )
-    result = _reference_schedule_with(
-        solution,
-        config,
-        dispatch,
-        orientations=orientations,
-        x_split_validator=x_validator,
-        profile=profile,
-    )
-    return replace(
-        result,
-        reference_policy_id=scope.reference_scheduler_policy_id,
-        scope_id=scope.scope_id,
-        scope_hash=scope.scope_hash,
-        state_budget=scope.deadlock_state_budget or 0,
-        rollout_budget=scope.deadlock_rollout_budget or 0,
-    )
 
 
 @dataclass(frozen=True)
@@ -1908,75 +1510,87 @@ class ScheduleWaitBlockers:
 
 
 def selected_schedule_wait_blockers(solution, directions, schedule, commit_order, config):
-    """Recompute ESS only on exact selected commit prefixes; no rollout/search.
+    """Geometric evidence on the selected timeline, never another dispatch.
 
-    The optional observer captures each feasible rollout's commit order. The
-    caller must select the order whose operations equal the returned B32 result.
-    MOVE and WAIT-before-MOVE map to that template's destination weld block.
+    Native timelines have no Python ESS commit tree. Intervals identify actual
+    spatial obstructions during a WAIT, not a counterfactual priority cause.
     """
-    if not schedule.feasible or tuple(sorted(commit_order,key=_operation_sort_key))!=schedule.operations:
-        raise ValueError('blocker extraction requires the final selected feasible commit order')
-    routes=build_robot_routes(solution,config,{r:ds for r,ds in enumerate(directions)},
-                              x_split_validator=finite_x_split_validator(solution.parents,config)
-                              if any(p.kind is SplitKind.X_SPLIT for p in solution.patterns) else None)
-    templates={}
-    task_blocks={}
-    for route in routes:
-        for op in build_operation_templates(route,config):
-            templates[op.operation_id]=op
-            block_index=int(op.operation_id.split(':B',1)[1].split(':',1)[0])
-            task_blocks[op.robot_id,op.sequence_index]=route.blocks[block_index].block_id
-    index=_RelevantFixedIndex();events=[]
-    for position,op in enumerate(commit_order):
-        if op.kind is OperationKind.WAIT and op.duration>config.numeric_epsilon:
-            delayed=commit_order[position+1]
-            if delayed.robot_id!=op.robot_id or delayed.sequence_index!=op.sequence_index:
-                raise ValueError('selected WAIT is not followed by its delayed operation')
-            template=templates[delayed.operation_id]
-            relevant=index.relevant(op.robot_id,op.start_time,config)
-            start,_,ids=earliest_safe_start_optimized(template,op.start_time,relevant,config)
-            if start!=delayed.start_time or start!=op.end_time:
-                raise ValueError('selected WAIT ESS does not reproduce its actual start time')
-            by_id={fixed.operation_id:fixed for fixed in relevant}
+    if (not schedule.feasible or tuple(sorted(commit_order,key=_operation_sort_key))
+            !=tuple(sorted(schedule.operations,key=_operation_sort_key))):
+        raise ValueError('blocker extraction requires the final selected feasible timeline')
+    by_robot={r:sorted((op for op in schedule.operations if op.robot_id==r),
+                      key=lambda op:(op.start_time,op.end_time,op.sequence_index,op.operation_id)) for r in range(4)}
+    block_ids={}
+    for owned in by_robot.values():
+        following=None
+        for op in reversed(owned):
+            if op.block_id is not None:following=op.block_id
+            block_ids[op.operation_id]=op.block_id or following
+    events=[]
+    for owned in by_robot.values():
+        for position,waiting in enumerate(owned[:-1]):
+            if waiting.kind is not OperationKind.WAIT or waiting.duration<=config.numeric_epsilon:continue
+            delayed=owned[position+1]
+            destination=block_ids.get(delayed.operation_id)
+            if destination is None:continue
             blockers=[]
-            for operation_id in ids:
-                fixed=by_id[operation_id]
-                intervals=forbidden_start_intervals(template.robot_id,template.duration,
-                    template.start,template.end,fixed,op.start_time,config)
-                clipped=tuple((max(lo,op.start_time),min(hi,start)) for lo,hi in intervals
-                              if max(lo,op.start_time)<=min(hi,start))
-                block_id=task_blocks.get((fixed.robot_id,fixed.sequence_index))
-                if block_id is not None:
-                    blockers.append((operation_id,block_id,clipped))
-            events.append(ScheduleWaitBlockers(op,delayed,task_blocks[op.robot_id,op.sequence_index],tuple(blockers)))
-        index.add(op)
+            for fixed in schedule.operations:
+                if fixed.robot_id==waiting.robot_id or fixed.end_time<waiting.start_time:continue
+                intervals=forbidden_start_intervals(delayed.robot_id,delayed.duration,delayed.start,delayed.end,
+                                                   fixed,waiting.start_time,config)
+                clipped=tuple((max(lo,waiting.start_time),min(hi,delayed.start_time)) for lo,hi in intervals
+                              if max(lo,waiting.start_time)<=min(hi,delayed.start_time))
+                identifier=block_ids.get(fixed.operation_id)
+                if clipped and identifier is not None:blockers.append((fixed.operation_id,identifier,clipped))
+            events.append(ScheduleWaitBlockers(waiting,delayed,destination,tuple(blockers)))
     return tuple(sorted(events,key=lambda event:_operation_sort_key(event.waiting)))
 
 
+
+
+def native_schedule(solution, config, *, scope=ACTIVE_FORMAL_SCOPE, orientations=None,
+                    profile=None, feasible_dispatch_observer=None):
+    """Current objective: one invocation of the existing Numba priority kernel.
+
+    DEADLOCK means that this fixed dispatch rule did not finish, not that the
+    physical task is impossible. The Python reference scheduler is not called.
+    """
+    from mrta_baselines.wag_vns import priority_schedule
+    started = time.perf_counter()
+    try:
+        if scope is not None:
+            scope.validate_implemented()
+        normalized = canonicalize(solution.parents, solution.patterns, solution.routes,
+                                  config, revision=solution.revision, scope=scope)
+        if normalized.canonical_payload() != solution.canonical_payload():
+            result = _infeasible('native schedule requires canonical merged routes')
+        else:
+            directions = None if orientations is None else tuple(tuple(orientations.get(r, ())) for r in range(4))
+            result = priority_schedule(solution, config, directions=directions)
+    except (OverflowError, ArithmeticError) as error:
+        result = ScheduleResult(ScheduleStatus.NUMERIC_FAILURE, diagnostics=(str(error),))
+    except (ValueError, KeyError, IndexError) as error:
+        result = _infeasible(str(error))
+    if scope is not None:
+        result = replace(result, scope_id=scope.scope_id, scope_hash=scope.scope_hash,
+                         reference_policy_id=scope.reference_scheduler_policy_id)
+    if profile is not None:
+        profile.total_time += time.perf_counter()-started
+        profile.number_of_operations = len(result.operations)
+    if feasible_dispatch_observer is not None and result.feasible:
+        feasible_dispatch_observer(result, result.operations)
+    return result
+
+
 @dataclass(frozen=True)
-class FormalReferenceEvaluator:
+class NativeReferenceEvaluator:
     scope: FormalScope = ACTIVE_FORMAL_SCOPE
     deadlock_observer: DeadlockObserver | None = None
 
     def __call__(self, solution, config, *, orientations=None):
-        result = reference_schedule_formal(
-            solution, config, scope=self.scope, orientations=orientations
-        )
-        if self.deadlock_observer is not None and result.baseline_deadlock:
-            explicit = tuple(tuple(values) for values in result.directions)
-            baseline = reference_schedule_optimized(
-                solution,
-                config,
-                orientations={robot: explicit[robot] for robot in range(4)},
-                x_split_validator=(
-                    finite_x_split_validator(solution.parents, config)
-                    if any(pattern.kind is SplitKind.X_SPLIT for pattern in solution.patterns)
-                    else None
-                ),
-            )
-            if baseline.status is not ScheduleStatus.DEADLOCK:
-                raise RuntimeError("formal baseline_deadlock provenance could not be replayed")
-            self.deadlock_observer(solution, config, explicit, baseline)
+        result = native_schedule(solution, config, scope=self.scope, orientations=orientations)
+        if self.deadlock_observer is not None and result.status is ScheduleStatus.DEADLOCK:
+            self.deadlock_observer(solution, config, result.directions, result)
         return result
 
 
@@ -1989,7 +1603,7 @@ class ReferenceWorkerFailure(ValueError):
 
 
 def _hard_deadline_reference_worker(connection, evaluator) -> None:
-    """Serve every B32 call for one solver run in one spawned process."""
+    """Serve every NATIVE call for one solver run in one spawned process."""
     try:
         connection.send(("READY", None))
         while True:
@@ -2010,7 +1624,7 @@ def _hard_deadline_reference_worker(connection, evaluator) -> None:
 
 
 class HardDeadlineReferenceEvaluator:
-    """One Windows-spawned B32 worker shared by all calls in a solver run.
+    """One Windows-spawned NATIVE worker shared by all calls in a solver run.
 
     Process start-up and IPC consume the same absolute wall-clock budget.  A
     timed-out result is never reclassified as DEADLOCK or FEASIBLE; the parent
@@ -2032,7 +1646,7 @@ class HardDeadlineReferenceEvaluator:
         self._process = ctx.Process(
             target=_hard_deadline_reference_worker,
             args=(child, evaluator),
-            name="grc-b32-reference",
+            name="grc-coordination-reference",
             daemon=True,
         )
         self._process.start()
@@ -2066,12 +1680,12 @@ class HardDeadlineReferenceEvaluator:
         remaining = self._remaining()
         if remaining <= 0.0 or not self._connection.poll(remaining):
             self._terminate_for_deadline()
-            raise ReferenceDeadlineExceeded("B32 reference evaluation exceeded run deadline")
+            raise ReferenceDeadlineExceeded("NATIVE reference evaluation exceeded run deadline")
         try:
             return self._connection.recv()
         except (EOFError, BrokenPipeError, OSError) as error:
             self.close()
-            raise ReferenceWorkerFailure(f"B32 reference worker failed: {error}") from error
+            raise ReferenceWorkerFailure(f"NATIVE reference worker failed: {error}") from error
 
     def _ensure_ready(self) -> None:
         if self._ready:
@@ -2080,7 +1694,7 @@ class HardDeadlineReferenceEvaluator:
         if kind != "READY":
             self.close()
             raise ReferenceWorkerFailure(
-                f"B32 reference worker did not initialize: {kind}: {payload}"
+                f"NATIVE reference worker did not initialize: {kind}: {payload}"
             )
         self._ready = True
         self.ready_at = time.perf_counter()
@@ -2088,18 +1702,18 @@ class HardDeadlineReferenceEvaluator:
     def __call__(self, solution, config, *, orientations=None):
         if self._closed or self._remaining() <= 0.0:
             self._terminate_for_deadline()
-            raise ReferenceDeadlineExceeded("B32 reference evaluation started after run deadline")
+            raise ReferenceDeadlineExceeded("NATIVE reference evaluation started after run deadline")
         self._ensure_ready()
         try:
             self._connection.send((solution, config, orientations))
         except (BrokenPipeError, EOFError, OSError) as error:
             self.close()
-            raise ReferenceWorkerFailure(f"B32 reference worker send failed: {error}") from error
+            raise ReferenceWorkerFailure(f"NATIVE reference worker send failed: {error}") from error
         kind, payload = self._receive_before_deadline()
         if kind == "RESULT":
             return payload
         self.close()
-        raise ReferenceWorkerFailure(f"B32 reference worker error: {payload}")
+        raise ReferenceWorkerFailure(f"NATIVE reference worker error: {payload}")
 
     def close(self) -> None:
         if self._closed:
@@ -2122,14 +1736,12 @@ class HardDeadlineReferenceEvaluator:
 
 def resolve_reference_evaluator(scope: FormalScope | None, evaluator=None):
     if scope is None:
-        if isinstance(evaluator, FormalReferenceEvaluator) or evaluator is reference_schedule_formal:
-            raise ValueError("formal evaluator requires explicit scope")
-        return reference_schedule if evaluator is None else evaluator
+        return native_schedule if evaluator is None else evaluator
     scope.validate_implemented()
-    if evaluator is None or evaluator is reference_schedule_formal:
-        return FormalReferenceEvaluator(scope)
-    if isinstance(evaluator, FormalReferenceEvaluator) and evaluator.scope == scope:
+    if evaluator is None or evaluator is native_schedule:
+        return NativeReferenceEvaluator(scope)
+    if isinstance(evaluator, NativeReferenceEvaluator) and evaluator.scope == scope:
         return evaluator
     if isinstance(evaluator, HardDeadlineReferenceEvaluator) and evaluator.scope == scope:
         return evaluator
-    raise ValueError("formal run requires the matching formal evaluator; development callbacks are unsupported")
+    raise ValueError("current algorithms require the matching native evaluator; development callbacks are unsupported")

@@ -1,4 +1,4 @@
-"""Deterministic dispatch traces and complete-rollout discrepancy recovery.
+"""Generic deterministic dispatch traces for the independent Python tools.
 
 This module owns search bookkeeping only.  Scientific timing, ESS, WAIT, and
 conflict semantics stay in :mod:`mrta_reference.scheduler` and are supplied by
@@ -6,9 +6,8 @@ the scheduler kernel used by ``run_dispatch_rollout``.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import hashlib
-import heapq
 import json
 import time
 from collections.abc import Callable
@@ -261,189 +260,7 @@ def run_dispatch_rollout(
         state = kernel.commit(state, choices[chosen_rank], runtime)
 
 
-@dataclass(order=True)
-class _FrontierItem:
-    priority: tuple[object, ...]
-    branch_point: BranchPoint = field(compare=False)
-    alternative_rank: int = field(compare=False)
-    discrepancy_count: int = field(compare=False)
-    plan: tuple[ForcedDispatchDecision, ...] = field(compare=False)
-    causal_blocker_operation_ids: tuple[str, ...] = field(
-        compare=False, default=()
-    )
 
 
-@dataclass(frozen=True)
-class RecoverySummary:
-    result: ScheduleResult
-    recovery_rollouts: int
-    rollout_budget: int
-    max_discrepancies_used: int
-    branch_points_considered: int
-    frontier_exhausted: bool
-    best_plan: tuple[ForcedDispatchDecision, ...] = ()
-    last_deadlock: ScheduleResult | None = None
 
 
-def limited_discrepancy_recovery(
-    baseline: RolloutOutcome,
-    *,
-    rollout_budget: int,
-    rollout_from_snapshot,
-    profile=None,
-) -> RecoverySummary:
-    """Search deterministic complete continuations with a rollout-count budget."""
-    if rollout_budget < 1:
-        raise ValueError("deadlock rollout budget must be positive")
-    if baseline.result.status is not ScheduleStatus.DEADLOCK:
-        return RecoverySummary(baseline.result, 0, rollout_budget, 0, 0, True)
-
-    frontier: list[_FrontierItem] = []
-    enqueued: set[tuple[str, str, tuple[str, ...]]] = set()
-    considered: set[str] = set()
-
-    def enqueue_trace(
-        trace: RolloutTrace,
-        discrepancy_count: int,
-        prefix_plan: tuple[ForcedDispatchDecision, ...],
-        *,
-        after_depth: int,
-    ) -> None:
-        enqueue_started = time.perf_counter()
-        eligible = tuple(
-            point for point in trace.branch_points if point.depth > after_depth
-        )
-        terminal_blockers = set(trace.terminal_blocker_operation_ids)
-        causal = tuple(
-            point
-            for point in eligible
-            if point.ordered_choices[point.chosen_choice_rank].operation_id
-            in terminal_blockers
-        )
-        branch_points = sorted(
-            causal if causal else eligible,
-            key=lambda point: (-point.depth, point.ordinal, point.identity),
-        )
-        for point in branch_points:
-            considered.add(point.identity)
-            for rank in range(1, len(point.ordered_choices)):
-                choice = point.ordered_choices[rank]
-                decision = ForcedDispatchDecision(point.state.identity, choice.identity)
-                dedup_key = (*decision.key, ())
-                if dedup_key in enqueued:
-                    continue
-                enqueued.add(dedup_key)
-                plan = prefix_plan + (decision,)
-                plan_key = tuple(item.key for item in plan)
-                heapq.heappush(
-                    frontier,
-                    _FrontierItem(
-                        (
-                            discrepancy_count,
-                            -point.depth,
-                            rank,
-                            plan_key,
-                        ),
-                        point,
-                        rank,
-                        discrepancy_count,
-                        plan,
-                    ),
-                )
-        if profile is not None:
-            elapsed = time.perf_counter() - enqueue_started
-            profile.frontier_time += elapsed
-            profile.dedup_time += elapsed
-            profile.peak_branch_states = max(
-                profile.peak_branch_states, len(frontier)
-            )
-            profile.peak_dedup_entries = max(
-                profile.peak_dedup_entries, len(enqueued)
-            )
-
-    # The baseline root has depth -1 for filtering so every branch is eligible.
-    enqueue_trace(baseline.trace, 1, (), after_depth=-1)
-    rollouts = 0
-    max_discrepancies = 0
-    best: ScheduleResult | None = None
-    best_plan: tuple[ForcedDispatchDecision, ...] = ()
-    last_deadlock = baseline.result
-
-    while frontier and rollouts < rollout_budget:
-        frontier_started = time.perf_counter()
-        item = heapq.heappop(frontier)
-        if profile is not None:
-            profile.frontier_time += time.perf_counter() - frontier_started
-        point = item.branch_point
-        choice = point.ordered_choices[item.alternative_rank]
-        decision = ForcedDispatchDecision(point.state.identity, choice.identity)
-        outcome = rollout_from_snapshot(
-            point.state, decision, item.causal_blocker_operation_ids
-        )
-        rollouts += 1
-        actual_discrepancies = sum(
-            branch.chosen_choice_rank != 0 for branch in outcome.trace.branch_points
-        )
-        max_discrepancies = max(
-            max_discrepancies, item.discrepancy_count, actual_discrepancies
-        )
-
-        if outcome.result.status is ScheduleStatus.NUMERIC_FAILURE:
-            return RecoverySummary(
-                outcome.result,
-                rollouts,
-                rollout_budget,
-                max_discrepancies,
-                len(considered),
-                not frontier,
-                (),
-            )
-        if outcome.result.status is ScheduleStatus.FEASIBLE:
-            candidate_key = (outcome.result.cmax, outcome.result.canonical_json())
-            if best is None or candidate_key < (best.cmax, best.canonical_json()):
-                best = outcome.result
-                best_plan = item.plan
-        elif outcome.result.status is ScheduleStatus.DEADLOCK:
-            last_deadlock = outcome.result
-
-        if (
-            outcome.result.status is ScheduleStatus.DEADLOCK
-            and not item.causal_blocker_operation_ids
-            and outcome.trace.terminal_blocker_operation_ids
-        ):
-            # After the complete single-discrepancy layer, one causal chain
-            # suppresses the operations that directly caused that rollout's
-            # terminal DEADLOCK. The selector is derived only from the
-            # rollout's wait-for evidence; it has no instance-specific cases.
-            blockers = outcome.trace.terminal_blocker_operation_ids
-            chain_key = (*decision.key, blockers)
-            if chain_key not in enqueued:
-                enqueued.add(chain_key)
-                plan_key = tuple(entry.key for entry in item.plan)
-                heapq.heappush(
-                    frontier,
-                    _FrontierItem(
-                        (
-                            item.discrepancy_count + 1,
-                            -point.depth,
-                            item.alternative_rank,
-                            plan_key,
-                        ),
-                        point,
-                        item.alternative_rank,
-                        item.discrepancy_count + 1,
-                        item.plan,
-                        blockers,
-                    ),
-                )
-
-    return RecoverySummary(
-        baseline.result if best is None else best,
-        rollouts,
-        rollout_budget,
-        max_discrepancies,
-        len(considered),
-        not frontier,
-        best_plan,
-        last_deadlock=last_deadlock,
-    )

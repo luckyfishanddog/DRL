@@ -29,8 +29,8 @@ from mrta_reference.geometry import build_legal_pattern_catalog
 from mrta_reference.model import ParentWeld, ScheduleStatus
 from mrta_reference.scope import FORMAL_SCOPE_V2
 
-CSV = ROOT / 'results/gnn_initial_mode_new.csv'
-REPORT = ROOT / 'docs/GNN_INITIAL_MODE_NEW_EXPERIMENT.md'
+CSV = ROOT / 'results/native_priority/gnn_initial_mode_new.csv'
+REPORT = ROOT / 'docs/NATIVE_GNN_INITIAL_MODE_NEW_EXPERIMENT.md'
 CHECKPOINT = ROOT / 'models/gnn_coordination_constructor_05.pt'
 SEEDS = (20261901, 20261902, 20261903, 20261904, 20261905)
 METHODS = ('RULE', 'OLD_GNN_PORTFOLIO', 'NEW_GNN_PORTFOLIO')
@@ -38,10 +38,10 @@ TIERS = ('SMALL', 'MEDIUM', 'LARGE', 'HIGH_WORKLOAD')
 FIELDS = (
     'phase', 'instance', 'tier', 'N', 'geometry_seed', 'workbook', 'sheet',
     'solver_seed', 'method', 'budget', 'status', 'initial_cmax', 'final_cmax',
-    'initialization_seconds', 'actual_runtime', 'b32_calls', 'iterations',
-    'accepted', 'mode_accepted', 'model_load_seconds', 'initial_b32_calls',
-    'search_b32_calls', 'initial_found_seconds', 'last_improvement_seconds',
-    'late_b32_calls', 'initial_attempts', 'error',
+    'initialization_seconds', 'actual_runtime', 'coordination_calls', 'iterations',
+    'accepted', 'mode_accepted', 'model_load_seconds', 'initial_coordination_calls',
+    'search_coordination_calls', 'initial_found_seconds', 'last_improvement_seconds',
+    'late_coordination_calls', 'initial_attempts', 'error',
 )
 
 
@@ -142,9 +142,9 @@ def run_job(job):
     budget = 60.0
     row = dict(phase=phase, **{k: entry[k] for k in ('instance', 'tier', 'N', 'geometry_seed', 'workbook', 'sheet')},
                solver_seed=seed, method=method, budget=budget, status='ERROR', initial_cmax=None, final_cmax=None,
-               initialization_seconds=0., actual_runtime=0., b32_calls=0, iterations=0, accepted=0, mode_accepted=0,
-               model_load_seconds=0., initial_b32_calls=0, search_b32_calls=0, initial_found_seconds=None,
-               last_improvement_seconds=None, late_b32_calls=0, initial_attempts=[], error='')
+               initialization_seconds=0., actual_runtime=0., coordination_calls=0, iterations=0, accepted=0, mode_accepted=0,
+               model_load_seconds=0., initial_coordination_calls=0, search_coordination_calls=0, initial_found_seconds=None,
+               last_improvement_seconds=None, late_coordination_calls=0, initial_attempts=[], error='')
     started = time.perf_counter()
     deadline = started + budget
     attempts = []
@@ -171,15 +171,15 @@ def run_job(job):
             initial, info = shared.neural_initial_portfolio(
                 parents, previous, new, CONFIG_05, old_sampling=method == 'OLD_GNN_PORTFOLIO',
                 seed=seed, reference_calls=3, use_learned_modes=False, certify=False, deadline=deadline)
-            attempts, calls = info['attempts'], info['b32_calls']
+            attempts, calls = info['attempts'], info['coordination_calls']
             if info['selected_seconds'] is not None:
                 row['initial_found_seconds'] = portfolio_started - started + info['selected_seconds']
-            row['late_b32_calls'] = sum(a['b32_calls'] for a in attempts if a.get('late'))
+            row['late_coordination_calls'] = sum(a['coordination_calls'] for a in attempts if a.get('late'))
         else:
             raise ValueError(method)
         row['initialization_seconds'] = time.perf_counter() - started
         row['initial_attempts'] = attempts
-        row['b32_calls'] = row['initial_b32_calls'] = calls
+        row['coordination_calls'] = row['initial_coordination_calls'] = calls
         if initial is None:
             row['status'] = ('INITIALIZATION_TIMEOUT' if time.perf_counter() > deadline else 'INITIALIZATION_FAILED')
             # In particular, do not pass None to _mode_search: that interface
@@ -190,12 +190,12 @@ def run_job(job):
                                   max_iterations=1_000_000, config=CONFIG_05, certify=False,
                                   common_initial=initial, initial_seconds=time.perf_counter() - started,
                                   initial_attempts=attempts)
-            row.update(status=result['status'], final_cmax=result['cmax'], b32_calls=result['reference_calls'],
+            row.update(status=result['status'], final_cmax=result['cmax'], coordination_calls=result['reference_calls'],
                        iterations=result['iterations'], accepted=result['accepted'], mode_accepted=result['mode_accepted'])
-            row['search_b32_calls'] = result['reference_calls'] - calls
+            row['search_coordination_calls'] = result['reference_calls'] - calls
             row['last_improvement_seconds'] = (result['best_events'][-1][0] if result['accepted']
                                                 else row['initial_found_seconds'])
-            row['late_b32_calls'] += sum(item.get('late', False) for item in result['trace'])
+            row['late_coordination_calls'] += sum(item.get('late', False) for item in result['trace'])
     except Exception:
         row.update(status='ERROR', error=traceback.format_exc())
         row['initial_attempts'] = attempts
@@ -247,7 +247,7 @@ def run_phase(entries, phase, workers):
             append_row(row)
             print(f"{phase} {index}/{len(jobs)} {row['instance']} seed={row['solver_seed']} {row['method']} "
                   f"{row['status']} initial={row['initial_cmax']} final={row['final_cmax']} "
-                  f"runtime={row['actual_runtime']:.3f} B32={row['b32_calls']}", flush=True)
+                  f"runtime={row['actual_runtime']:.3f} NATIVE={row['coordination_calls']}", flush=True)
 
 
 def number(row, field):
@@ -306,10 +306,10 @@ def summarize(entries, audit):
         lines.append(f"|{e['instance']}|{e['tier']}|{e['workbook']} / {e['sheet']}|{e['N']}|"
                      f"{e['geometry_seed']}|{e['total_length']:.3f}|")
     lines += ['', '## 执行口径', '',
-              '固定CONFIG_05、FORMAL_SCOPE_V2、B32和原MODE_NEW。无训练、权重修改、方向/WAIT独立阶段。',
+              '固定CONFIG_05、FORMAL_SCOPE_V2、NATIVE和原MODE_NEW。无训练、权重修改、方向/WAIT独立阶段。',
               'RULE使用common_initial_beam；OLD为旧模型greedy/sample(seed)/sample(seed+1)；'
-              'NEW只将第三候选换成新模型固定模式greedy。两个GNN臂各最多3次初始B32，均certify=False。',
-              '每次60秒包括本次模型文件读取、两模型实例化、初始化和B32；模块导入、静态Excel读取与CSV写入在计时外。'
+              'NEW只将第三候选换成新模型固定模式greedy。两个GNN臂各最多3次初始NATIVE，均certify=False。',
+              '每次60秒包括本次模型文件读取、两模型实例化、初始化和NATIVE；模块导入、静态Excel读取与CSV写入在计时外。'
               '4个spawn工作进程，PyTorch及BLAS单线程，方法次序循环交替。',
               '首次冒烟批次在保存首条结果时遭沙箱拒绝写CSV，未留存结果；修复写入权限后重新执行，'
               '现存9条冒烟才是接口验证记录。正式300条没有因此重跑，既有375次实验没有重跑。',
@@ -320,7 +320,7 @@ def summarize(entries, audit):
               '没有有效Cmax的几何配对不比较；部分种子失败的几何仍用有效种子中位数，以下逐几何表显示样本量。'
               '相对改善=(对照−NEW)/对照，正值为NEW更好；胜平负容差1e−8个百分点。', '',
               '## 方法汇总', '',
-              '|组别|方法|运行数|初始可行|最终可行|初始几何中位数均值/s|最终几何中位数均值/s|平均运行/s|平均B32|',
+              '|组别|方法|运行数|初始可行|最终可行|初始几何中位数均值/s|最终几何中位数均值/s|平均运行/s|平均NATIVE|',
               '|---|---|---:|---:|---:|---:|---:|---:|---:|']
     for tier in ('ALL',) + TIERS:
         selected = [r for r in formal if tier == 'ALL' or r['tier'] == tier]
@@ -334,7 +334,7 @@ def summarize(entries, audit):
                          f"{_format(statistics.fmean(initial) if initial else None)}|"
                          f"{_format(statistics.fmean(final) if final else None)}|"
                          f"{_format(statistics.fmean(float(r['actual_runtime']) for r in arm) if arm else None)}|"
-                         f"{_format(statistics.fmean(int(r['b32_calls']) for r in arm) if arm else None)}|")
+                         f"{_format(statistics.fmean(int(r['coordination_calls']) for r in arm) if arm else None)}|")
     lines += ['', '## NEW的几何配对', '', '|组别|阶段|对照|有效几何配对|胜/平/负|中位相对改善/%|',
               '|---|---|---|---:|---|---:|']
     for tier in ('ALL',) + TIERS:
@@ -359,7 +359,7 @@ def summarize(entries, audit):
     lines += ['', '## 时间和失败记录', '',
               f'实际返回耗时>60s：{len(late)}/{len(formal)}；最大耗时：'
               f"{_format(max((float(r['actual_runtime']) for r in formal),default=None))}s。"
-              f"跨截止B32调用：{sum(int(r['late_b32_calls']) for r in formal)}。",
+              f"跨截止NATIVE调用：{sum(int(r['late_coordination_calls']) for r in formal)}。",
               '失败分布：' + json.dumps({f'{k[0]} / {k[1]}': v for k, v in failures.items()}, ensure_ascii=False),
               f'代码异常行：{len(errors)}。所有失败原始行保留在CSV。', '']
     if formal:

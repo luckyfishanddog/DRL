@@ -52,11 +52,11 @@ from mrta_search.vns import (
 
 
 MODEL_PATH = ROOT / "models" / "gnn_constructor_v1.pt"
-REPORT_PATH = ROOT / "docs" / "GNN_CONSTRUCT_VNS_PILOT.md"
+REPORT_PATH = ROOT / "docs" / "NATIVE_GNN_CONSTRUCT_VNS_PILOT.md"
 EXPERT_DATA_PATH = ROOT / "data" / "development" / "gnn_experts_fixed_split_v2.json"
 INITIAL_STUDY_MODEL_PATH = ROOT / "models" / "gnn_initial_solution_study_v2.pt"
-INITIAL_STUDY_CSV_PATH = ROOT / "results" / "gnn_initial_solution_study_v2.csv"
-INITIAL_STUDY_REPORT_PATH = ROOT / "docs" / "GNN_INITIAL_SOLUTION_STUDY_V2.md"
+INITIAL_STUDY_CSV_PATH = ROOT / "results/native_priority" / "gnn_initial_solution_study_v2.csv"
+INITIAL_STUDY_REPORT_PATH = ROOT / "docs" / "NATIVE_GNN_INITIAL_SOLUTION_STUDY_V2.md"
 TRAINING_SEED = 20261022
 PILOT_SEEDS = (20261022, 20261023)
 
@@ -527,7 +527,7 @@ def run_end_to_end(entry, construction_kind, seed, config, budget):
     """Run one complete solver call under one wall-clock deadline.
 
     Workbook loading is intentionally outside the measured region. Model loading,
-    construction, initial evaluation/repair, VNS, B32 and certification are inside.
+    construction, initial evaluation/repair, VNS, NATIVE and certification are inside.
     """
     parents = ranker_dataset.load_parents(entry)
     started = time.perf_counter()
@@ -942,7 +942,7 @@ def write_report(training, train_diag, dev_diag, pilot, wag_rows, pilot_entries,
         "",
         "图节点是固定拆分后实际焊接块与四个机器人；边为四近邻、同轨潜在干涉关系和块—合法机器人关系。网络是两层、4 头、hidden=64 的 GAT；静态图每个实例只编码一次，策略头结合机器人累计加工负载、任务数、轨道负载差、同轨邻机负载、最后位置和路线左右边界逐块选择机器人。非法机器人在 softmax/argmax 前置为负无穷。所有方法共用确定性的同轨同向 X 递增路线排序，以及完全相同的有限空间边界 ±1/±2 和路线重排修复。",
         "",
-        "VNS 只有 N1 跨机器人迁移、N2 合法交换、N3 单路线 2-opt/重插入。廉价路线代价只用于邻居排序；接受必须依次通过方向 DP、既有 B32 和独立 certifier，且严格降低 Cmax。",
+        "VNS 只有 N1 跨机器人迁移、N2 合法交换、N3 单路线 2-opt/重插入。廉价路线代价只用于邻居排序；接受必须依次通过方向 DP、既有 NATIVE 和独立 certifier，且严格降低 Cmax。",
         "",
         "## 训练",
         "",
@@ -1093,7 +1093,7 @@ def write_report(training, train_diag, dev_diag, pilot, wag_rows, pilot_entries,
         "",
         "## 未解决问题与阶段判断",
         "",
-        "B32 的 DEADLOCK 仍只表示固定预算调度未找到方案，不是数学不可行证明。首轮数据量只有 17/6 workbook，且专家本身来自短预算 RULE+VNS，存在明显的小样本和教师上限风险。当前网络只决定机器人归属；拆分点、方向和调度语义均未学习或改变。",
+        "NATIVE 的 DEADLOCK 仍只表示固定预算调度未找到方案，不是数学不可行证明。首轮数据量只有 17/6 workbook，且专家本身来自短预算 RULE+VNS，存在明显的小样本和教师上限风险。当前网络只决定机器人归属；拆分点、方向和调度语义均未学习或改变。",
         "",
     ]
     effective = initial_delta is not None and initial_delta < 0 and summaries["GNN"]["success"] >= summaries["RULE"]["success"]
@@ -1440,7 +1440,7 @@ def _evaluate_direct_initial(entry, method, construction, config, budget):
         "robot_task_counts": ";".join(map(str, counts)),
         "construction_seconds": construction.inference_seconds,
         "direction_dp_seconds": evaluator.accounting.direction_time,
-        "b32_seconds": evaluator.accounting.scheduler_time,
+        "coordination_seconds": evaluator.accounting.scheduler_time,
         "certifier_seconds": evaluator.accounting.certifier_time,
         "evaluation_seconds": candidate.completed_at,
         "end_to_end_seconds": construction.inference_seconds + candidate.completed_at,
@@ -1512,13 +1512,13 @@ def _write_initial_study_outputs(rows, histories, audit_rows, config, *, extra_n
         "",
         "## A. 实际完成了什么",
         "",
-        "在既有两层、4 头、hidden=64 GAT 上增加一个轻量排序头；归属头继续使用合法机器人掩码。排序训练只使用同机器人任务对，按路线归一化；推理通过全局拓扑追加序列构造四条路线。固定拆分中的 mandatory Y 两个子块是可并行覆盖任务，当前科学模型没有额外的父子时间边；若传入显式前驱，构造器只从前驱已完成集合选取，因此显式前驱边和四条路线边均沿同一全局序列，不会形成跨机器人环。方向仍由原 DP 决定，随后运行原 B32 和独立 certifier。",
+        "在既有两层、4 头、hidden=64 GAT 上增加一个轻量排序头；归属头继续使用合法机器人掩码。排序训练只使用同机器人任务对，按路线归一化；推理通过全局拓扑追加序列构造四条路线。固定拆分中的 mandatory Y 两个子块是可并行覆盖任务，当前科学模型没有额外的父子时间边；若传入显式前驱，构造器只从前驱已完成集合选取，因此显式前驱边和四条路线边均沿同一全局序列，不会形成跨机器人环。方向仍由原 DP 决定，随后运行原 NATIVE 和独立 certifier。",
         "",
         "旧 `gnn_constructor_v1.pt`、VNS N1/N2/N3、C2/C4、SA、旧 GAT 排序器及科学参数均未修改。新联合 GNN、MLP、去焊缝边 GNN 使用相同 17 个已保存 TRAIN 专家、相同固定 seed、相同 epoch 和损失定义；checkpoint 固定取最后 epoch，未根据 DEV 结果选择。",
         "",
         "## 专家排序可学习性检查",
         "",
-        f"17/17 专家通过覆盖、唯一归属、合法机器人和固定拆分核对；17/17 当前路线都与简单 X 升序不同。总同机器人对 {sum(row['pairs'] for row in audit_rows)}，其中逆序 {sum(row['x_inversions'] for row in audit_rows)}（{100*sum(row['x_inversions'] for row in audit_rows)/max(1,sum(row['pairs'] for row in audit_rows)):.2f}%）；改变路线 {sum(row['changed_routes'] for row in audit_rows)}/68。全部 17 条专家解已在当前代码中重放并经方向 DP、B32 与 certifier 认证。",
+        f"17/17 专家通过覆盖、唯一归属、合法机器人和固定拆分核对；17/17 当前路线都与简单 X 升序不同。总同机器人对 {sum(row['pairs'] for row in audit_rows)}，其中逆序 {sum(row['x_inversions'] for row in audit_rows)}（{100*sum(row['x_inversions'] for row in audit_rows)/max(1,sum(row['pairs'] for row in audit_rows)):.2f}%）；改变路线 {sum(row['changed_routes'] for row in audit_rows)}/68。全部 17 条专家解已在当前代码中重放并经方向 DP、NATIVE 与 certifier 认证。",
         "",
         "## B. 核心实验结果（无 VNS、无回退）",
         "",
@@ -1589,7 +1589,7 @@ def _write_initial_study_outputs(rows, histories, audit_rows, config, *, extra_n
         "",
         f"联合归属的主要失败证据更直接：D 相对 RULE 改变 3–7 个块，并在 {joint_worse_loads}/6 个 DEV 实例上都扩大了四机器人加工负载极差；因此排序头还承受了训练时专家归属与推理时新归属的分布偏移。D 的收益不能归因于工程认证问题，因为其已认证实例中仍为 1 胜 4 负。",
         "",
-        "MLP 与去边 GNN 也没有稳定改善，无法仅凭完整 GNN 的中位退化略小就宣称图关系有效。直接构造失败与 B32 DEADLOCK 均保留为失败，不解释成数学不可行，也未用修复器或 VNS 掩盖。",
+        "MLP 与去边 GNN 也没有稳定改善，无法仅凭完整 GNN 的中位退化略小就宣称图关系有效。直接构造失败与 NATIVE DEADLOCK 均保留为失败，不解释成数学不可行，也未用修复器或 VNS 掩盖。",
         "",
         "## E. 下一步判断",
         "",
@@ -1600,7 +1600,7 @@ def _write_initial_study_outputs(rows, histories, audit_rows, config, *, extra_n
         "",
         extra_note,
         "",
-        "完整逐实例负载、空行程、等待、任务数、方向/B32/certifier 时间和失败诊断见 CSV。",
+        "完整逐实例负载、空行程、等待、任务数、方向/NATIVE/certifier 时间和失败诊断见 CSV。",
     ]
     INITIAL_STUDY_REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

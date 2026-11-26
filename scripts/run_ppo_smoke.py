@@ -65,11 +65,6 @@ def _run(
         "Nref": result.stats.nref,
         "init_reference_calls": result.stats.init_reference_calls,
         "total_reference_calls": len(records),
-        "baseline_DEADLOCK": sum(bool(item["baseline_deadlock"]) for item in records),
-        "recovered": sum(
-            bool(item["baseline_deadlock"]) and item["status"] == "FEASIBLE"
-            for item in records
-        ),
         "remaining_DEADLOCK": sum(item["status"] == "DEADLOCK" for item in records),
         "actual_runtime_s": result.runtime,
         "overshoot_s": result.stats.overshoot,
@@ -240,7 +235,7 @@ def _range_write(report, payload):
         "读取前检查既有数据角色，不访问 validation、ORACLE 或 sealed ID_TEST。"
         "seeds=20261081、20261082，实例与顺序在求解前固定。\n\n"
         "SA_OI_ALNS_V2；M192=144 atomic+48 LNS；Kdp8/Kref2/Kref_total4；heuristic C2/C4；"
-        "TWO_OPT_STAR OFF；B32、SA、direction 与候选生成器其余设置一致。"
+        "TWO_OPT_STAR OFF；NATIVE、SA、direction 与候选生成器其余设置一致。"
         "初始化复用此前 construction_budget=5 / kinit_ref=5 / bootstrap=1。"
         "每 run 墙钟 60 s，四个 worker 各绑定一个物理核的一个逻辑线程，A/D 轮换顺序。"
         "特征/选择/观察记录耗时计入预算。Cmax@60 使用原生 anytime，绝不用 overshoot final_cmax 决胜。"
@@ -576,7 +571,7 @@ def _small30_i3(root,ppo):
     from mrta_reference.certifier import certify_schedule
     from mrta_reference.geometry import build_legal_pattern_catalog
     from mrta_reference.scope import FORMAL_SCOPE_V2
-    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scheduler import NativeReferenceEvaluator
     from mrta_reference.solution import canonicalize,official_metrics
     from mrta_search.pipeline import run_sa_oi_alns_v2
     entry=next(e for e in _range_entries(root) if e['selection_ordinal']==3)
@@ -608,7 +603,7 @@ def _small30_i3(root,ppo):
         try:
             solution=canonicalize(parents,mapped,old.best_solution.routes,cfg,scope=FORMAL_SCOPE_V2)
             # A catalog check alone is insufficient: perform one normal reference evaluation.
-            schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(solution,cfg,
+            schedule=NativeReferenceEvaluator(FORMAL_SCOPE_V2)(solution,cfg,
                 orientations={r:old.best_directions[r] for r in range(4)})
             certification=certify_schedule(solution,schedule,cfg,scope=FORMAL_SCOPE_V2)
             check.update(status=schedule.status.value,certified=certification.certified,
@@ -641,7 +636,7 @@ def _small30_write(report,data):
          f"{e['x_patterns']}/{e['y_patterns']}",'/'.join(str(e[k]) for k in ('upper_only','lower_only','both','mandatory_y')),
          e['cross_y6'],f"{e['x_up']:.4f}/{e['x_low']:.4f}"] for e in data['entries']])
     text+=('\n\nA=0.2/0.2，D=0.5/0.5；seeds 20261081/20261082/20261083。其余沿用SA_OI_ALNS_V2、M192=144+48、Kdp8/Kref2/Kref_total4、'
-           'heuristic C2/C4、TWO_OPT_STAR OFF、construction5/kinit5/bootstrap1、B32与既有certifier。18个真实60秒wall-clock run；'
+           'heuristic C2/C4、TWO_OPT_STAR OFF、construction5/kinit5/bootstrap1、NATIVE与既有certifier。18个真实60秒wall-clock run；'
            'worker各绑定独立物理核，A/D顺序交替。观察记录开销计入预算。@60独立认证，绝不以overshoot final Cmax补填。\n\n'
            'first_certified_initial为初始化中首个通过独立认证的reference结果；chosen_initial为初始化完成后实际选中的解。'
            'iterations/accepted/valid/funnel取60秒内完成的最后一个iteration boundary；reference_status_counts_at60按实际认证完成时刻≤60计数，可能包含尚未完成的最后一轮ref。'
@@ -811,14 +806,14 @@ def _init_screening_label(job):
     import pickle,time
     from mrta_search.direction import optimize_directions_with_initial_feasibility
     from mrta_search.pipeline import decision_family
-    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scheduler import NativeReferenceEvaluator
     from mrta_reference.certifier import certify_schedule
     from mrta_reference.scope import FORMAL_SCOPE_V2
     state_id,context_blob,pool_blob,c2,c4=job
     context=pickle.loads(context_blob);pool=pickle.loads(pool_blob);cfg=_range_config('D')
     state_cert=certify_schedule(context['solution'],context['schedule'],cfg,scope=FORMAL_SCOPE_V2)
     if not state_cert.certified: raise ValueError(state_cert.errors)
-    evaluator=FormalReferenceEvaluator(FORMAL_SCOPE_V2);rows=[];started=time.perf_counter();calls=0
+    evaluator=NativeReferenceEvaluator(FORMAL_SCOPE_V2);rows=[];started=time.perf_counter();calls=0
     for index,candidate in enumerate(pool):
         sol=candidate.solution;identity=sol.canonical_hash
         tick=time.perf_counter();direction=optimize_directions_with_initial_feasibility(sol,cfg)
@@ -938,7 +933,7 @@ def _init_screening_report(root,db):
         '- 在既有第五个RAIL_MONOTONE_BALANCED构造内加入可选空间分界：若存在满足左右任务X包络间距≥interference_dx的非空分区，选择其中加工负载最均衡者；否则沿用原分界。共享焊缝上下轨分配、WHOLE/mandatory Y选择及方向算法均保持原规则。',
         '- `SearchConfig.initialization_clearance_aware=False`为默认；显式True才启用CLEARANCE_BALANCED_BOOTSTRAP。保留原版消融。没有第六个正常构造，没有额外reference上限。',
         '- 复用run_ppo_smoke.py的`--init-screening capture/label/init/run/report`入口；固定状态、完整候选、标签、零搜索结果保存在唯一SQLite。未新建runner、protocol、manifest或hash系统。',
-        '- 全部采用delta_x=delta_y=0.50、最短子段0.20、干涉距离0.50；M192=144+48、Kdp8/Kref2/Kref_total4、原SA、原family policy、TWO_OPT_STAR OFF、B32及独立certifier。共享覆盖[5.5,6.5]仍是任务层假设，未进行URDF/IK验证。','',
+        '- 全部采用delta_x=delta_y=0.50、最短子段0.20、干涉距离0.50；M192=144+48、Kdp8/Kref2/Kref_total4、原SA、原family policy、TWO_OPT_STAR OFF、NATIVE及独立certifier。共享覆盖[5.5,6.5]仍是任务层假设，未进行URDF/IK验证。','',
         '## 固定实例与状态规则','',
         '全部经既有角色清单检查，仅使用V2_MODEL_DEVELOPMENT_CONSUMED。物理目录名ID_TEST不代表角色为封存测试；S1/S2所在workbook在清单中的角色确实为已消耗development。N55按既有静态选择序号最小的MEDIUM固定，未读取Cmax挑选。','',
         '|实例|实际N|workbook|sheet|','|---|---:|---|---|']
@@ -954,7 +949,7 @@ def _init_screening_report(root,db):
         lines.append(f"|{ctx['seed']}|{ctx['iteration']}|{ctx['elapsed']:.3f}|{q['current_cmax']:.2f}|{q['pool']['count']}|{gain(q['pool']['best_gain'])}|{gain(q['c2']['best_gain'])}|{q['direction']['count']}/8|{gain(q['direction']['best_gain'])}|{gain(q['c4']['best_gain'])}|{q['pool']['material_count']}/{q['c2']['material_count']}/{q['c4']['material_count']}|")
     total=Counter(r['status'] for r in labels);c2=[r for r in labels if r['c2']];c4=[r for r in labels if r['c4']]
     lines += ['', '## S1各阶段的真实损失','',
-        'material improvement严格按该current accepted state的(Cs−Cc)/Cs≥0.005，未混用global-best。全池上限是当前direction+B32产生并独立认证的上限，不是数学最优；DEADLOCK仅表示该有界调度没有找到解。','',
+        'material improvement严格按该current accepted state的(Cs−Cc)/Cs≥0.005，未混用global-best。全池上限是当前direction+NATIVE产生并独立认证的上限，不是数学最优；DEADLOCK仅表示该有界调度没有找到解。','',
         '|阶段|候选数|认证FEASIBLE|DEADLOCK|direction-infeasible|INFEASIBLE|NUMERIC_FAILURE|material|',
         '|---|---:|---:|---:|---:|---:|---:|---:|']
     for name,rows in [('完整valid unique pool',labels),('C2 Top8',c2),('direction-feasible C2',[r for r in c2 if r['direction_feasible']]),('C4 Top2',c4)]:
@@ -965,7 +960,7 @@ def _init_screening_report(root,db):
         '- C2：44个material仅保留3个，漏掉41个（93.18%）。20261081两个状态全部漏掉；20261083两个状态保留了全池最优候选。按候选数量capture为6.82%，这与按最佳改善幅度衡量的capture不同。',
         '- Direction：32个C2候选中29个通过，3个direction-infeasible不进入C4。C2认证候选的改善上限与direction-feasible C2上限相同；这3个不能记为C4排序损失。',
         '- C4：C2保留的3个material只选中1个。20261083早期状态丢掉2个，包括全池最佳10.13%改善；中期状态保住11.96%改善。其余两个状态C2已经没有material，不向C4归责。按条件候选数量capture为33.33%。',
-        '- Reference：direction-feasible全池297/422认证（70.38%），C2中5/29（17.24%），C4中1/8（12.50%）；C4其余7个均DEADLOCK。这说明筛选后的集合强烈偏向当前B32难以排出的候选，不是整个池都没有可行改善。C2的24个DEADLOCK诊断共出现31条同轨机器人阻塞关系；常涉及WELD/POST停留及MOVE冲突，没有把DEADLOCK称为绝对不可行，也未修改调度器。',
+        '- Reference：direction-feasible全池297/422认证（70.38%），C2中5/29（17.24%），C4中1/8（12.50%）；C4其余7个均DEADLOCK。这说明筛选后的集合强烈偏向当前NATIVE难以排出的候选，不是整个池都没有可行改善。C2的24个DEADLOCK诊断共出现31条同轨机器人阻塞关系；常涉及WELD/POST停留及MOVE冲突，没有把DEADLOCK称为绝对不可行，也未修改调度器。',
         '- 结构：C2的DEADLOCK含16个STRUCTURAL、4个TARGET_Y、3个TARGET_WHOLE、1个TARGET_X；C4的DEADLOCK含4个STRUCTURAL、2个TARGET_WHOLE、1个TARGET_X。损失不限于新增外侧拆分。',
         '- 四个池的8个C4候选在线与离线状态、Cmax逐项完全一致。离线原始标签独立计时/计数，未使用旧0.2域标签。','',
         '|固定状态|离线reference calls|离线wall-clock s（各工作进程）|', '|---|---:|---:|']
@@ -976,8 +971,8 @@ def _init_screening_report(root,db):
     for r in trajectories:lines.append(f"|{r['seed']}|{r['cmax_at60']:.2f}|{r['runtime']:.3f}|{max(0,r['runtime']-60):.3f}|{r['iterations']}|{r['online_reference_calls']}|")
     lines += ['', '## 初始化：实际失败原因与零搜索比较','',
         '另有4次原版零搜索失败原因诊断，合计24次初始化reference，独立保存在results/initial_failure；不混入422次全池离线标注、8次初始化对比或16次60秒配对的计数。',
-        '原版I3：LOAD_FIRST、X_ORDER_AWARE及RAIL_MONOTONE均被B32判DEADLOCK；RAIL_BALANCED/SPATIAL_SPREAD在首任务同轨顺序检查失败。单调构造下轨左右X包络重叠0.712m，方向备用尝试仍失败，最后R0/R2串行fallback认证。S1也有首任务顺序失败与同轨阻塞；仅按四机器人加工负载平衡不足以保证有可排出的路线。','',
-        '每个variant仍最多5个正常构造，Kinit_ref=5；唯一第五构造DEADLOCK时仍最多4次原有有界方向reference尝试，串行fallback仍最多1次。所以“5”不是总reference硬上限；原规则总上界是5+4+1。此次没有增加任何上限，失败构造/重复构造按原规则跳过。所有接受解经过canonicalization、direction、B32及独立certifier。零搜索使用同一组实例和固定seed20261101（构造不读取seed），初始化耗时来自原计时器，首认证时间从run开始计。','',
+        '原版I3：LOAD_FIRST、X_ORDER_AWARE及RAIL_MONOTONE均被NATIVE判DEADLOCK；RAIL_BALANCED/SPATIAL_SPREAD在首任务同轨顺序检查失败。单调构造下轨左右X包络重叠0.712m，方向备用尝试仍失败，最后R0/R2串行fallback认证。S1也有首任务顺序失败与同轨阻塞；仅按四机器人加工负载平衡不足以保证有可排出的路线。','',
+        '每个variant仍最多5个正常构造，Kinit_ref=5；唯一第五构造DEADLOCK时仍最多4次原有有界方向reference尝试，串行fallback仍最多1次。所以“5”不是总reference硬上限；原规则总上界是5+4+1。此次没有增加任何上限，失败构造/重复构造按原规则跳过。所有接受解经过canonicalization、direction、NATIVE及独立certifier。零搜索使用同一组实例和固定seed20261101（构造不读取seed），初始化耗时来自原计时器，首认证时间从run开始计。','',
         '|实例|variant|认证|选中Cmax|四机器人process load s|负载差s|串行fallback|reference calls|首认证s|初始化s|总runtime s|',
         '|---|---|---|---:|---|---:|---|---:|---:|---:|---:|']
     for r in initial:
@@ -1293,9 +1288,9 @@ def _c2_report(root,db,entries):
             ))
 
     lines=['# Coordination-aware C2 screening (0.50 m development study)','',
-        '本报告只使用 `V2_MODEL_DEVELOPMENT_CONSUMED`，当前任务域为 `delta_x=delta_y=0.50 m`。物理目录名不定义数据角色；访问由既有角色清单检查。没有访问 V2_VALIDATION、ORACLE_DEV_CONSUMED 或 ID_TEST_SEALED。生产初始化、M192、Kdp8、Kref2/Kref_total4、原 C4、方向 DP、B32 和 certifier 均未改变。','',
+        '本报告只使用 `V2_MODEL_DEVELOPMENT_CONSUMED`，当前任务域为 `delta_x=delta_y=0.50 m`。物理目录名不定义数据角色；访问由既有角色清单检查。没有访问 V2_VALIDATION、ORACLE_DEV_CONSUMED 或 ID_TEST_SEALED。生产初始化、M192、Kdp8、Kref2/Kref_total4、原 C4、方向 DP、NATIVE 和 certifier 均未改变。','',
         '## 实际代码改动','',
-        '- 新增纯 C2 几何代理：同轨左右机器人焊缝 X 占据区间（含 `interference_dx/2` 缓冲）的并集交叠长度，以及两侧首任务的左右次序超限量。它们只表示静态协调风险，不判 candidate 非法。','- `COORDINATION_AWARE_C2` 先保留每个非空 decision family 的原启发式最佳候选，再保留原 cheap-score 候选，使最多 2 个名额用于风险候选。风险候选必须不超过原 cheap Top8 的 projected-process-makespan 上限，并在加工负载/交叠/首任务风险上 Pareto 非劣；不足按原 cheap score 补齐。','- `BASELINE_C2` 仍是默认，C4 family explore/exploit 完全不变。指标不调用 direction、B32、certifier，不改 solution，也不消耗随机数。','',
+        '- 新增纯 C2 几何代理：同轨左右机器人焊缝 X 占据区间（含 `interference_dx/2` 缓冲）的并集交叠长度，以及两侧首任务的左右次序超限量。它们只表示静态协调风险，不判 candidate 非法。','- `COORDINATION_AWARE_C2` 先保留每个非空 decision family 的原启发式最佳候选，再保留原 cheap-score 候选，使最多 2 个名额用于风险候选。风险候选必须不超过原 cheap Top8 的 projected-process-makespan 上限，并在加工负载/交叠/首任务风险上 Pareto 非劣；不足按原 cheap score 补齐。','- `BASELINE_C2` 仍是默认，C4 family explore/exploit 完全不变。指标不调用 direction、NATIVE、certifier，不改 solution，也不消耗随机数。','',
         '## S1 的 443 个既有标签：指标是否有区分能力','',
         '| 类别 | n | overlap p25 | p50 | p75 | p90 | first-order p50 | p90 |','|---|---:|---:|---:|---:|---:|---:|---:|']
     for row in feature_table:
@@ -1323,7 +1318,7 @@ def _c2_report(root,db,entries):
     for entry in entries:
         row=trajectory[entry['label']]
         lines.append(f"| {entry['label']} | {row['actual_N']} | `{entry['relative_path']}` / `{entry['sheet_name']}` | {row['captured_iterations']} | {row['missing_iterations']} | {row['cmax_at60']:.3f} |")
-    lines += ['',f"离线标注 {len(extra)} 个状态、{sum(r['offline_reference_calls'] for r in labels)} 次 B32 reference，用时 {sum(r['offline_elapsed_s'] for r in labels):.2f} s；它们与在线 60 秒调用分表统计。",'',
+    lines += ['',f"离线标注 {len(extra)} 个状态、{sum(r['offline_reference_calls'] for r in labels)} 次 NATIVE reference，用时 {sum(r['offline_elapsed_s'] for r in labels):.2f} s；它们与在线 60 秒调用分表统计。",'',
         '| tier | 状态/material状态 | pool material | Baseline C2 feas/material/dead | New C2 feas/material/dead | C2 zero B→C | C4 material B→C | C4 zero B→C |','|---|---:|---:|---:|---:|---:|---:|---:|']
     for tier in ('N35','N55','N85','ALL'):
         rows=[r for r in extra if tier=='ALL' or r['state_id'].startswith(tier)]

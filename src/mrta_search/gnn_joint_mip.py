@@ -1,11 +1,11 @@
-"""Joint parent-set selection and directed arc MILP, with B32-only acceptance.
+"""Joint parent-set selection and directed arc MILP, with NATIVE-only acceptance.
 
 This model contains task/direction vertices, not routes/columns. Each robot has
 one source-to-sink path. Unselected tasks are mandatory fixed-direction vertices
 whose original relative order is imposed. Selected tasks have optional vertices
 for every legal mode, eligible robot and direction. Mode-linked degree rows,
 MTZ positions and fixed-task order rows enforce exact coverage and connectivity.
-Only the route-period proxy is optimized; the original B32 decides acceptance.
+Only the route-period proxy is optimized; the original NATIVE decides acceptance.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from mrta_baselines.hga import _HGAWorkspace
 from mrta_reference.model import ScientificConfig, OperationKind
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map
-from mrta_reference.scheduler import reference_schedule_formal, selected_schedule_wait_blockers
+from mrta_reference.scheduler import native_schedule, selected_schedule_wait_blockers
 from mrta_search import saeax
 from mrta_search.saeax import _heads_legal, _route_statistics, complete_identity, validate_individual
 from mrta_search.gnn_constructor import VNextGNN, joint_graph, build_block_robot_graph
@@ -39,7 +39,7 @@ class JNConfig:
     sets_per_round: int = 2
     pool_size: int = 12
     mip_seconds: float = 5.
-    final_b32_budget: int = 4
+    final_coordination_budget: int = 4
     training_sets: int = 4
     training_epochs: int = 6
 
@@ -89,20 +89,20 @@ def plan_from_initial(w, initial, blockers=()):
 
 
 def initialize(parents, seed=20261110, progress_callback=None):
-    """Observe the SAME SAEAX B32 calls, never replay its selected initial plan.
+    """Observe the SAME SAEAX NATIVE calls, never replay its selected initial plan.
 
-    The existing SAEAX interface has no B32-observer parameter. A temporary
+    The existing SAEAX interface has no NATIVE-observer parameter. A temporary
     single-process observer adapter forwards each original call unchanged and
     is restored immediately. No scheduler/core file is modified.
     """
     started = time.perf_counter()
-    original = saeax.reference_schedule_formal
+    original = saeax.native_schedule
     orders = {}
     def observe(*args, **kwargs):
         def capture(candidate, order):
             orders[candidate.operations] = tuple(order)
         return original(*args, **kwargs, feasible_dispatch_observer=capture)
-    with patch.object(saeax, 'reference_schedule_formal', observe):
+    with patch.object(saeax, 'native_schedule', observe):
         result = saeax.run_saeax(parents, seed=seed, progress_callback=progress_callback)
     blockers = ()
     if result.status == 'FEASIBLE':
@@ -304,13 +304,13 @@ def solve_joint(w, current, parents, seconds=5.):
 def evaluate_plan(plan, w):
     orders = {}
     started = time.perf_counter()
-    schedule = reference_schedule_formal(plan.solution, w.config, scope=FORMAL_SCOPE_V2,
+    schedule = native_schedule(plan.solution, w.config, scope=FORMAL_SCOPE_V2,
         orientations=dict(enumerate(plan.directions)),
         feasible_dispatch_observer=lambda candidate, order: orders.setdefault(candidate.operations, tuple(order)))
     elapsed = time.perf_counter()-started
     plan.schedule = schedule
     if schedule.feasible:
-        if schedule.directions != plan.directions: raise ValueError('B32 changed joint directions')
+        if schedule.directions != plan.directions: raise ValueError('NATIVE changed joint directions')
         plan.blockers = selected_schedule_wait_blockers(plan.solution, plan.directions,
             schedule, orders[schedule.operations], w.config)
     return elapsed
@@ -343,7 +343,7 @@ def load_selector(checkpoint, seed=20261110):
 
 
 class SelectionContext:
-    """Only BEFORE-neighborhood state and observed selected B32 timeline."""
+    """Only BEFORE-neighborhood state and observed selected NATIVE timeline."""
     def __init__(self, w, current, selector=None):
         self.w, self.current, self.selector = w, current, selector
         self.critical = int(np.argmax(current.costs))
@@ -460,7 +460,7 @@ def solution_record(plan):
 
 def trial(w, current, parents, cache, settings):
     candidate, record = solve_joint(w, current, parents, settings.mip_seconds)
-    record.update(b32_called=False, b32_s=0., b32_status=None, b32_cmax_s=None,
+    record.update(coordination_called=False, coordination_s=0., coordination_status=None, coordination_cmax_s=None,
         old_cmax_s=current.schedule.cmax, actual_gain_s=None)
     if candidate is None: return None, record
     record['changes'] = changes(w, current, candidate)
@@ -468,10 +468,10 @@ def trial(w, current, parents, cache, settings):
         cached = cache[candidate.key]
         candidate.schedule, candidate.blockers = cached.schedule, cached.blockers
     else:
-        record['b32_s'] = evaluate_plan(candidate, w); record['b32_called'] = True
+        record['coordination_s'] = evaluate_plan(candidate, w); record['coordination_called'] = True
         cache[candidate.key] = candidate
-    record.update(b32_status=candidate.schedule.status.value,
-        b32_cmax_s=candidate.schedule.cmax if candidate.schedule.feasible else None,
+    record.update(coordination_status=candidate.schedule.status.value,
+        coordination_cmax_s=candidate.schedule.cmax if candidate.schedule.feasible else None,
         actual_gain_s=current.schedule.cmax-candidate.schedule.cmax if candidate.schedule.feasible else None,
         solution=solution_record(candidate))
     return candidate, record
@@ -490,7 +490,7 @@ def collect_labels(w, current, selector, settings=None):
 
 
 def fit_selector(selector, groups, epochs=6):
-    """Only actual MILP+B32 gains determine preferences; no proxy labels."""
+    """Only actual MILP+NATIVE gains determine preferences; no proxy labels."""
     started = time.perf_counter()
     positives = sum(r.get('actual_gain_s') is not None and r['actual_gain_s'] > 1.e-6 for _, records in groups for r in records)
     pairs = []
@@ -498,11 +498,11 @@ def fit_selector(selector, groups, epochs=6):
         for i in range(len(records)):
             for j in range(i+1, len(records)):
                 a, b = records[i], records[j]
-                if a.get('b32_status') != 'FEASIBLE' or b.get('b32_status') != 'FEASIBLE': continue
+                if a.get('coordination_status') != 'FEASIBLE' or b.get('coordination_status') != 'FEASIBLE': continue
                 delta = a['actual_gain_s']-b['actual_gain_s']
                 if abs(delta) > 1.e-6: pairs.append((x[i], x[j], 1. if delta > 0 else -1.))
     if not positives or not pairs:
-        return dict(trained=False, reason='NO_POSITIVE_B32_RECONSTRUCTION' if not positives else 'NO_NONFLAT_B32_PREFERENCES',
+        return dict(trained=False, reason='NO_POSITIVE_NATIVE_RECONSTRUCTION' if not positives else 'NO_NONFLAT_NATIVE_PREFERENCES',
             positive_labels=positives, preference_pairs=len(pairs), epochs=0, runtime_s=time.perf_counter()-started)
     a = torch.stack([p[0] for p in pairs]); b = torch.stack([p[1] for p in pairs]); sign = torch.tensor([p[2] for p in pairs])
     optimizer = torch.optim.Adam(selector.head.parameters(), lr=.003)
@@ -516,7 +516,7 @@ def fit_selector(selector, groups, epochs=6):
     selector.eval()
     return dict(trained=True, positive_labels=positives, preference_pairs=len(pairs), epochs=epochs,
         loss=losses, head_gradient_norm=gradient, training_rank_accuracy=accuracy,
-        runtime_s=time.perf_counter()-started, target='actual_B32_Cmax_improvement_after_joint_MILP')
+        runtime_s=time.perf_counter()-started, target='actual_NATIVE_Cmax_improvement_after_joint_MILP')
 
 
 @dataclass
@@ -532,7 +532,7 @@ def optimize(w, initial_plan, initialization_s, *, selector=None, settings=None,
     settings = settings or JNConfig()
     started = time.perf_counter()
     current, records, cache, solved = initial_plan, [], {initial_plan.key: initial_plan}, set()
-    a = dict(rounds=0, milp_calls=0, b32_calls=0, accepted=0, gnn_scored_sets=0,
+    a = dict(rounds=0, milp_calls=0, coordination_calls=0, accepted=0, gnn_scored_sets=0,
         gnn_choice_differences=0, initialization_s=initialization_s,
         initial_cmax_s=initial_plan.schedule.cmax, initial_route_period_s=initial_plan.period)
     reason = 'ROUND_LIMIT'
@@ -550,20 +550,20 @@ def optimize(w, initial_plan, initialization_s, *, selector=None, settings=None,
         if not pool: reason = 'NO_NEW_PARENT_SETS'; break
         best = current
         for i in order[:settings.sets_per_round]:
-            if a['b32_calls'] >= settings.final_b32_budget: reason = 'B32_BUDGET'; break
+            if a['coordination_calls'] >= settings.final_coordination_budget: reason = 'NATIVE_BUDGET'; break
             parents = pool[i]; solved.add((current.key, parents))
             candidate, record = trial(w, current, parents, cache, settings)
-            a['milp_calls'] += 1; a['b32_calls'] += int(record['b32_called'])
+            a['milp_calls'] += 1; a['coordination_calls'] += int(record['coordination_called'])
             record['iteration'] = iteration+1; records.append(record)
             if candidate is not None and candidate.schedule.feasible and candidate.schedule.cmax < best.schedule.cmax-1.e-6:
                 best = candidate
             if progress_callback:
                 progress_callback({k: v for k, v in record.items() if k != 'solution'})
-        if best.key == current.key: reason = 'NO_B32_IMPROVEMENT'; break
+        if best.key == current.key: reason = 'NO_NATIVE_IMPROVEMENT'; break
         current = best; a['accepted'] += 1
-        if a['b32_calls'] >= settings.final_b32_budget: reason = 'B32_BUDGET'; break
+        if a['coordination_calls'] >= settings.final_coordination_budget: reason = 'NATIVE_BUDGET'; break
     a.update(final_cmax_s=current.schedule.cmax, final_route_period_s=current.period,
         returned_initial=current.key == initial_plan.key, changes=changes(w, initial_plan, current),
         search_complete=True, new_mip_build_s=sum(r['build_s'] for r in records),
-        new_mip_s=sum(r['solve_s'] for r in records), new_b32_s=sum(r['b32_s'] for r in records))
+        new_mip_s=sum(r['solve_s'] for r in records), new_coordination_s=sum(r['coordination_s'] for r in records))
     return JNResult(current, initialization_s+time.perf_counter()-started, reason, a, records)

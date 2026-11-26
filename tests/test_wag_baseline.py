@@ -569,14 +569,14 @@ def test_lns_fixes_every_retained_task_owner_and_repairs_only_destroyed_tasks(wi
                     assert owner[pattern.parent_id + '::1'] == first + 1
 
 
-def test_native_wag_completes_500_rounds_without_calling_b32_or_certifier(monkeypatch):
+def test_native_wag_completes_500_rounds_without_calling_coordination_or_certifier(monkeypatch):
     import math
     from mrta_baselines import common, wag_vns as w
     config = ScientificConfig()
     parents = (ParentWeld('left', (1., 9.), (2., 9.)), ParentWeld('right', (8., 9.), (9., 9.)))
     def forbidden(*args, **kwargs):
-        raise AssertionError('B32/certifier called inside native WAG search')
-    monkeypatch.setattr(common.FormalReferenceEvaluator, '__call__', forbidden)
+        raise AssertionError('NATIVE/certifier called inside native WAG search')
+    monkeypatch.setattr(common.NativeReferenceEvaluator, '__call__', forbidden)
     monkeypatch.setattr(common, 'certify_schedule', forbidden)
     result = w.run_adapted_wag_vns_v2(parents, config, AdaptedWAGConfig(), seed=20261110,
                                      time_limit=math.inf, checkpoints=(), certify=False,

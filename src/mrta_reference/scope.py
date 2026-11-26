@@ -12,14 +12,7 @@ if TYPE_CHECKING:
     from .model import ScientificConfig
 
 DEVELOPMENT_NO_REPAIR_V1 = "DEVELOPMENT_NO_REPAIR_V1"
-FORMAL_BOUNDED_DISPATCH_POLICY_V1 = "FORMAL_BOUNDED_DISPATCH_POLICY_V1"
-FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1 = (
-    "FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1"
-)
-COMPLETE_ALTERNATIVE_ROLLOUTS = "COMPLETE_ALTERNATIVE_ROLLOUTS"
-LIMITED_DISCREPANCY_RECENT_BRANCH_FIRST_V1 = (
-    "LIMITED_DISCREPANCY_RECENT_BRANCH_FIRST_V1"
-)
+NATIVE_PRIORITY_POLICY_ID = "NATIVE_PRIORITY_FOUR_ROBOTS"
 
 
 @dataclass(frozen=True)
@@ -32,19 +25,12 @@ class FormalScope:
     terminal_policy: str = "TASK_HORIZON_RELEASE_V1"
     empty_route_policy: str = "UNDEPLOYED_NO_OCCUPANCY_COMPLETION_ZERO_V1"
     initial_deployment_policy: str = "FREE_FIRST_WELD_START_ALL_ACTIVE_LEGAL_AT_ZERO_V1"
-    deadlock_policy_id: str = FORMAL_BOUNDED_DISPATCH_POLICY_V1
-    deadlock_state_budget: int | None = 16
-    deadlock_budget_unit: str | None = None
-    deadlock_rollout_budget: int | None = None
-    dispatch_recovery_order_id: str | None = None
-    reference_scheduler_policy_id: str = FORMAL_BOUNDED_DISPATCH_POLICY_V1
+    reference_scheduler_policy_id: str = NATIVE_PRIORITY_POLICY_ID
     open_route_policy_id: str = "NO_HOME_FIRST_NO_RETURN_HOME_V1"
     objective_policy_id: str = "CMAX_OPTIONAL_SPLITS_PROCESS_SPREAD_EMPTY_WAIT_ID_V1"
     certifier_policy_id: str = "INDEPENDENT_CONTINUOUS_TASK_HORIZON_V1"
     interference_policy_id: str = "CLOSED_CONTINUOUS_TCP_AND_SAME_RAIL_ORDER_V1"
-    dispatch_order_id: str = "DFS_ESS_REMAINING_PROCESS_COMPLETION_ROBOT_V1"
-    recovery_selection_id: str = "CMAX_THEN_CANONICAL_SCHEDULE_JSON_V1"
-    state_count_policy_id: str = "POPPED_PREFIX_INCLUDING_ROOT_AND_COMPLETE_V1"
+    dispatch_order_id: str = "NATIVE_TWO_PRIORITY_SAME_RAIL_THEN_CROSS_RAIL_V1"
     x_split_rule_id: str | None = None
     x_split_assignment_policy_id: str | None = None
     x_split_processing_policy_id: str | None = None
@@ -54,7 +40,7 @@ class FormalScope:
     @property
     def canonical_json(self) -> str:
         # Optional V1.1 fields are absent, rather than null, in the historical
-        # V1 payload.  This preserves the published FORMAL_SCOPE_V1 hash.
+        # V1 payload. Historical artifacts retain their recorded policy hashes.
         payload = {key: value for key, value in asdict(self).items() if value is not None}
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -77,13 +63,6 @@ FORMAL_SCOPE_V1 = FormalScope()
 FORMAL_SCOPE_V1_1 = replace(
     FORMAL_SCOPE_V1,
     scope_id="FORMAL_SCOPE_V1_1",
-    deadlock_policy_id=FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
-    deadlock_state_budget=None,
-    deadlock_budget_unit=COMPLETE_ALTERNATIVE_ROLLOUTS,
-    deadlock_rollout_budget=32,
-    dispatch_recovery_order_id=LIMITED_DISCREPANCY_RECENT_BRANCH_FIRST_V1,
-    reference_scheduler_policy_id=FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
-    state_count_policy_id="COMPLETE_ALTERNATIVE_ROLLOUTS_V1",
 )
 
 EXPERIMENTAL_X_SPLIT_SCOPE_V1 = replace(
@@ -106,7 +85,7 @@ FORMAL_SCOPE_V2 = replace(
 )
 
 # FixedTaskset/FIXED owns the immutable task domain. These historical scope
-# fields are retained for the existing B32 policy and validation machinery;
+# fields retain geometric validation semantics with the native priority policy;
 # ACTIVE_FORMAL_SCOPE does not authorize search-time pattern changes.
 ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V2
 

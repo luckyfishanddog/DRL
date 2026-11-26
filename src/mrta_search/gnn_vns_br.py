@@ -21,9 +21,9 @@ from mrta_baselines.hga import (
     _materialize_segments, _merge_fixed_arrays, _move_segments,
     _oriented_route_cost, _put_oriented, _repair_oriented_first,
 )
-from mrta_baselines.wag_vns import _priority_arrays
+from mrta_baselines.wag_vns import _priority_arrays, _schedule_from_arrays
 from mrta_reference.fixed_taskset import FixedTaskset
-from mrta_reference.model import ScientificConfig
+from mrta_reference.model import ScientificConfig, ScheduleStatus
 from mrta_reference.scope import FORMAL_SCOPE_V2
 
 
@@ -59,6 +59,12 @@ class State:
     @property
     def feasible(self):
         return math.isfinite(self.value)
+
+    @property
+    def status(self):
+        if math.isnan(self.value):
+            return ScheduleStatus.NUMERIC_FAILURE
+        return ScheduleStatus.FEASIBLE if self.feasible else ScheduleStatus.DEADLOCK
 
     @property
     def bottleneck(self):
@@ -232,6 +238,11 @@ class FixedWorkspace:
 
     def solution(self, state):
         return self.numeric.solution(state.routes, self.numeric.initial_selected)
+
+    def schedule_result(self, state):
+        """Package the already computed arrays; do not invoke the kernel again."""
+        return _schedule_from_arrays(state.value, state.bits, state.operations, state.completion,
+                                     self.numeric.ids, 'NATIVE_PRIORITY_FOUR_ROBOTS_EXPLICIT_DIRECTIONS')
 
     def validate(self, routes, bits):
         w = self.numeric
@@ -593,9 +604,10 @@ def local_graph(workspace, state, actions):
 
 
 def ranking_pairs(values, rng, limit=256):
-    """Actual feasible Cmax ranks ahead of every infeasible candidate."""
+    """Finite native Cmax ranks ahead of DEADLOCK; exclude numeric failures."""
     possible = [(i, j) for i in range(len(values)) for j in range(i + 1, len(values))
-                if (math.isfinite(values[i]) or math.isfinite(values[j]))
+                if not (math.isnan(values[i]) or math.isnan(values[j]))
+                and (math.isfinite(values[i]) or math.isfinite(values[j]))
                 and not (math.isfinite(values[i]) and math.isfinite(values[j])
                          and abs(values[i] - values[j]) <= 1.e-7)]
     if len(possible) > limit:
@@ -653,8 +665,8 @@ def train_ranker(examples, *, seed=20261126, epochs=24, learning_rate=3.e-4,
 def run_gnn_vns_br(taskset, model, *, seed, settings=BRConfig(), config=ScientificConfig(), progress=None):
     """Independent initialization, bottleneck VNS and bounded guided shaking.
 
-    Returns the best native-feasible state. The experiment entry point makes
-    the sole final B32 call and includes it in the reported online time.
+    Returns the best native-feasible state with its cached native timeline.
+    The experiment entry point packages these arrays without rescheduling.
     """
     started = time.perf_counter()
     deadline = started + settings.time_limit

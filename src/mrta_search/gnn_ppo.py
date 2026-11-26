@@ -1,7 +1,7 @@
 """Historical failed GNN-PPO experiment; excluded from the current route.
 
 BC replays complete TRAIN teacher assignments, merged job order and directions.
-PPO receives exactly one terminal reward from the existing formal B32 Cmax.
+PPO receives exactly one terminal reward from the existing formal NATIVE Cmax.
 There is no split head, old checkpoint, CEM, VNS or direction postprocessor.
 """
 from __future__ import annotations
@@ -27,13 +27,13 @@ from mrta_reference.fixed_taskset import expand_routes, job_span
 from mrta_reference.model import ScientificConfig
 from mrta_reference.solution import canonicalize, block_map
 from mrta_reference.scope import FORMAL_SCOPE_V2
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 
 NODE_DIM = 33
 RELATIONS = ('self','continuous_sibling','geometric_neighbor','eligible_robot','owner','route_successor')
 CONFIG = ScientificConfig()
 TRAIN_FIELDS = ('stage','update','bc_loss','policy_loss','value_loss','entropy','grad_norm',
-                'mean_reward','b32_calls','runtime_s','validation','settings','diagnostic')
+                'mean_reward','coordination_calls','runtime_s','validation','settings','diagnostic')
 
 
 @dataclass(frozen=True)
@@ -192,7 +192,7 @@ class ConstructState:
             point = block.end if d else block.start
             if self.heads[r] is not None or self.first_legal(r,point): legal.append((j,r,d))
         # Immediate first-position masks need not admit a complete future.
-        # Always finish the original full coverage, then let the real B32
+        # Always finish the original full coverage, then let the real NATIVE
         # report any infeasibility; no hidden restart/repair/teacher fallback.
         return legal or all_actions
 
@@ -276,7 +276,7 @@ def teacher_actions(graph,payload):
             if k < len(payload['routes'][r]):
                 action = (ids[payload['routes'][r][k]],r,int(payload['directions'][r][k]))
                 if action not in state.actions():
-                    raise ValueError('B32-feasible teacher trajectory excluded by action mask')
+                    raise ValueError('NATIVE-feasible teacher trajectory excluded by action mask')
                 actions.append(action); state.step(action)
     if not state.done or len(actions) != graph.n+len(state.jobs):
         raise ValueError('teacher trajectory lacks route/direction coverage')
@@ -296,7 +296,7 @@ def formal_episode(model,graph,seed,*,greedy=False):
             state.step(action)
     solution = state.solution()
     directions = tuple(tuple(bits) for bits in state.directions)
-    schedule = reference_schedule_formal(solution,CONFIG,scope=FORMAL_SCOPE_V2,orientations=dict(enumerate(directions)))
+    schedule = native_schedule(solution,CONFIG,scope=FORMAL_SCOPE_V2,orientations=dict(enumerate(directions)))
     return dict(graph=graph,actions=actions,old_log=logs,old_value=values,solution=solution,
                 directions=directions,schedule=schedule)
 
@@ -377,14 +377,14 @@ def train_experiment(api,settings=PPOSettings()):
             if row['split'] != 'train' or row['status'] != 'FEASIBLE': continue
             name = row['layout_id']; old = teachers.get(name)
             if old is None or float(row['cmax_s']) < float(old['cmax_s']): teachers[name] = row
-    if not teachers: raise RuntimeError('no B32-feasible TRAIN teacher; retain failed instances and diagnose')
+    if not teachers: raise RuntimeError('no NATIVE-feasible TRAIN teacher; retain failed instances and diagnose')
     references = {name:float(teachers[name]['cmax_s']) if name in teachers else graph.scale for name,graph in train}
     examples = [(name,g,teacher_actions(g,json.loads(teachers[name]['solution']))) for name,g in train if name in teachers]
     model = FixedActorCritic(settings)
     optimizer = torch.optim.Adam(model.parameters(),lr=settings.learning_rate)
     metadata = dict(teacher_layout_count=len(examples),train_layout_count=len(train),
-                    teacher_source='best B32-feasible WAG/HGA TRAIN record per layout',
-                    references=references,reference_sources={name:'B32 teacher Cmax' if name in teachers
+                    teacher_source='best NATIVE-feasible WAG/HGA TRAIN record per layout',
+                    references=references,reference_sources={name:'NATIVE teacher Cmax' if name in teachers
                         else 'processing Cmax lower bound; no feasible BC label' for name,_ in train},
                     random_initialization=True)
     print('FIXED_BC_START',api.json_text(dict(settings=asdict(settings),**metadata)),flush=True)
@@ -413,7 +413,7 @@ def train_experiment(api,settings=PPOSettings()):
                 best_score,best_state,best_epoch = score,copy.deepcopy(model.state_dict()),epoch
                 save_weights(api,bc_path,model,settings,stage='BC',selected_epoch=epoch,training_complete=False,**metadata)
         row = dict(stage='BC',update=epoch,bc_loss=float(np.mean(losses)),value_loss=float(np.mean(value_losses)),
-                   grad_norm=float(np.mean(norms)),b32_calls=len(val_rows),runtime_s=time.perf_counter()-started,
+                   grad_norm=float(np.mean(norms)),coordination_calls=len(val_rows),runtime_s=time.perf_counter()-started,
                    validation=api.json_text(val_rows),settings=api.json_text(asdict(settings)),diagnostic=api.json_text(metadata))
         append_training(api,row); print('FIXED_BC_UPDATE',api.json_text(row),flush=True)
     model.load_state_dict(best_state)
@@ -467,7 +467,7 @@ def train_experiment(api,settings=PPOSettings()):
                      last_trained_state=model.state_dict(),training_complete=update == settings.ppo_updates,**metadata)
         row = dict(stage='PPO',update=update,policy_loss=float(np.mean(policies)),value_loss=float(np.mean(values)),
                    entropy=float(np.mean(entropies)),grad_norm=float(np.mean(norms)),mean_reward=float(np.mean([e['reward'] for e in episodes])),
-                   b32_calls=len(episodes)+len(val_rows),runtime_s=time.perf_counter()-started,validation=api.json_text(val_rows),
+                   coordination_calls=len(episodes)+len(val_rows),runtime_s=time.perf_counter()-started,validation=api.json_text(val_rows),
                    settings=api.json_text(asdict(settings)),diagnostic=api.json_text(dict(feasible_rollouts=sum(e['schedule'].feasible for e in episodes),
                          selected_validation_failures=ppo_best_score[0],selected_validation_mean_cmax=None if not math.isfinite(ppo_best_score[1]) else ppo_best_score[1])))
         append_training(api,row); print('FIXED_PPO_UPDATE',api.json_text(row),flush=True)
@@ -495,10 +495,10 @@ def compare_experiment(api):
             schedule = episode['schedule']
             row = dict(split=split,layout_id=name,seed=seed,method='gnn_ppo',status=schedule.status.value,
                        cmax_s=schedule.cmax if schedule.feasible else None,runtime_s=time.perf_counter()-started,
-                       iterations=len(episode['actions']),termination_reason='COMPLETE_CONSTRUCTION',b32_calls=1,
+                       iterations=len(episode['actions']),termination_reason='COMPLETE_CONSTRUCTION',coordination_calls=1,
                        parameters=api.json_text(asdict(settings)),diagnostic=api.json_text(dict(diagnostics=schedule.diagnostics,
                        selected_ppo_update=checkpoint.get('selected_update'),selected_bc_epoch=checkpoint.get('selected_bc_epoch'),
-                       inference='one joint policy construction per seed; frozen weights; original B32')),
+                       inference='one joint policy construction per seed; frozen weights; original NATIVE')),
                        solution=api.json_text(api.solution_record(episode['solution'],episode['directions'])))
             api.append_row('gnn_ppo',row); api.update_report()
             print('FIXED_GNN_RESULT',api.json_text({k:v for k,v in row.items() if k not in ('solution','diagnostic')}),flush=True)

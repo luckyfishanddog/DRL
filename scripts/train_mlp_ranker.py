@@ -15,7 +15,7 @@ from mrta_ranker.model import CandidateMLP,fit_scaler,transform,predict_scores,m
 import torch
 from torch import nn
 MODELS=ROOT/'models'
-REPORT=ROOT/'docs/PHASE4_1B_MLP_CANDIDATE_RANKER_20261007.md'
+REPORT=ROOT/'docs/NATIVE_PHASE4_1B_MLP_CANDIDATE_RANKER_20261007.md'
 VARIANTS=('BASELINE','MLP-C2','MLP-C4','MLP-BOTH')
 SMOKE_SEEDS=(20261201,20261202,20261203)
 
@@ -545,7 +545,7 @@ def finish():
     for role,s in result['dataset'].items():
         counts=s['status_counts'];lines.append(f"| {role} | {s['states']} | {s['candidates']} | {counts.get('FEASIBLE_CERTIFIED',0)} | {counts.get('DEADLOCK',0)} | {counts.get('DIRECTION_INFEASIBLE',0)} | {counts.get('INFEASIBLE',0)} |")
     lines.extend(['',
-        f"Numeric failure=0；无未标注candidate、无C4 direction-infeasible row、无不可行样本的改善回归标签；全部C4记录的前87维与生成时C2记录逐字节一致，存储往返未改变公共特征。原生trajectory actual runtime median/max={result['trajectory_summary']['runtime_median']:.2f}/{result['trajectory_summary']['runtime_max']:.2f}s。每个状态只生成一次144 atomic+48 LNS attempt pool，所有valid unique candidate做direction，direction-feasible才做B32 reference与认证。",'',
+        f"Numeric failure=0；无未标注candidate、无C4 direction-infeasible row、无不可行样本的改善回归标签；全部C4记录的前87维与生成时C2记录逐字节一致，存储往返未改变公共特征。原生trajectory actual runtime median/max={result['trajectory_summary']['runtime_median']:.2f}/{result['trajectory_summary']['runtime_max']:.2f}s。每个状态只生成一次144 atomic+48 LNS attempt pool，所有valid unique candidate做direction，direction-feasible才做NATIVE reference与认证。",'',
         '采集错误如实保留：首批提交46条，采集器因缺EARLY抛错，shutdown等待其余任务却未收集结果，仅4条落盘；42条未保存的运行被重新执行。修复后每条worker独立事务落盘，已存4条复用。首批丢失结果未用于任何模型选择，未按质量选择性重试；实际 invocation 数因此超过46。', '',
         '## 模型、特征与选择','',
         '独立 C2(87)→128→64 和 C4(130)→128→64 ReLU MLP，各有feasibility logit和normalized improvement两个head。C2使用全部valid unique候选；C4使用整个pool的全部direction-feasible候选，未限制为baseline Top8。',
@@ -605,7 +605,7 @@ def finish():
         ('离线及真实搜索显示收益，下一阶段独立验证固定ranker；本轮development不能作为最终泛化结果。' if improved else
          '尚未证明可推荐的在线MLP收益。保留两个模型用于消融复查，生产继续heuristic。固定逐candidate BCE+SmoothL1并不直接优化Top-K capture，training loss下降不等于ranking有效。当前结果不足以断言特征缺失或标签错误；先检查目标与Top-K指标、负gain/尺度及score分布，不直接跳到GAT。'),'',
         f"下一步：{result['next_step']}",'',
-        '没有修改M192、Kdp/Kref、科学scope、X/Y、scheduler/B32或算子；没有访问真正最终测试、训练GAT或重新划分workbook。', '',
+        '没有修改M192、Kdp/Kref、科学scope、X/Y、scheduler/NATIVE或算子；没有访问真正最终测试、训练GAT或重新划分workbook。', '',
         ])
     lines.extend(diagnostic_report_lines(result))
     replay=result.get('regression',{}).get('actual_model_api_replay',{})
@@ -618,7 +618,7 @@ def finish():
 
 
 RANK_RESULT=ROOT/'data/development/phase4_1c_mlp_results.json'
-RANK_REPORT=ROOT/'docs/PHASE4_1C_MLP_TOPK_RANKER_20261008.md'
+RANK_REPORT=ROOT/'docs/NATIVE_PHASE4_1C_MLP_TOPK_RANKER_20261008.md'
 OBJECTIVES={'V2':'material_v2','V3':'rank_v2'}
 
 
@@ -926,7 +926,7 @@ def rank_finish():
         for group,g in native['paired_summary'].items():lines.append(f"| {group} | {g['pairs']} | {g['Cmax_ratio_median']:.6f} | {g['wins']}/{g['ties']}/{g['losses']} |")
     lines+=['',result.get('verification',{}).get('pytest','pytest PENDING'),
         '',f"真实model API重放36 states × 2 objectives × 3 variants = {replay.get('comparisons',0)}次比较，mismatch=0，新增reference/direction=0；禁用scheduler与trajectory入口执行重放。必要回归包括0.499%/0.500%边界、pairwise优化方向、C4 subset包含Top8并排除direction-infeasible、material score不受feasibility负gain交互影响、family coverage/rotation、Kdp/Kref预算、推理不调用scheduler、workbook隔离。",'',
-        '没有生成新candidate dataset、trajectory或label，没有新protocol/hash/scope/manifest，没有改M/Kdp/Kref、X/Y、scheduler/B32、SA、operator或production默认。历史Phase4-1B FAIL、0 MLP smoke runs、旧模型/scaler/核心报告和JSON保持不变。四个新checkpoint直接保存最佳epoch，无临时checkpoint或cache，清理删除0文件。仅新增已确认的4个模型、1个结果JSON和本报告。','']
+        '没有生成新candidate dataset、trajectory或label，没有新protocol/hash/scope/manifest，没有改M/Kdp/Kref、X/Y、scheduler/NATIVE、SA、operator或production默认。历史Phase4-1B FAIL、0 MLP smoke runs、旧模型/scaler/核心报告和JSON保持不变。四个新checkpoint直接保存最佳epoch，无临时checkpoint或cache，清理删除0文件。仅新增已确认的4个模型、1个结果JSON和本报告。','']
     RANK_REPORT.write_text('\n'.join(lines),encoding='utf-8')
     print(f"Phase4-1C: {result['phase_status']}\nBest offline variant: {o} / NEW-{v}\nBaseline C4 capture: {pc(base['C4']['ALL']['capture_median'])}\nNew C4 capture: {pc(best['C4']['ALL']['capture_median'])}\nBaseline zero capture: {pc(base['C4']['ALL']['zero_capture'])}\nNew zero capture: {pc(best['C4']['ALL']['zero_capture'])}\nLARGE: {result['large_assessment']} (ranking failure persists)\nOffline gate: {'PASS' if result['offline_ranking_improved'] else 'FAIL'}\n60s smoke: {native.get('status')}\n60s Cmax result: {native.get('paired_summary',{}).get('ALL',{}).get('Cmax_ratio_median','N/A')}\nProduction ranker: HEURISTIC\nGAT: NOT YET\nNext: {result['next_step']}",flush=True)
 
@@ -1315,7 +1315,7 @@ def grc_v2_report():
         f"- V06 对 heuristic：ALL {v06['ALL']['wins']}/{v06['ALL']['ties']}/{v06['ALL']['losses']}，median {pc(v06['ALL']['median_delta'])}；N35 {v06['N35']['wins']}/{v06['N35']['ties']}/{v06['N35']['losses']}，N55 {v06['N55']['wins']}/{v06['N55']['ties']}/{v06['N55']['losses']}，N85 {v06['N85']['wins']}/{v06['N85']['ties']}/{v06['N85']['losses']}。没有N35或N85全体系统性恶化，但各自都有大幅反向个例。",
         '- V06 C4认证率提高，但其material capture和Top8→Top2保留率没有超过V05；当前主要阻碍是C4目标与在线轨迹收益仍不一致，而不是功能、认证或缓存错误。',
         '- V05批量实现的评分加速值得保留。V06可进入下一轮更大development对比，但不应设为production或宣称图关系已被证明。下一步最小工作应聚焦C4监督/校准，而非扩大网络或打开ID_TEST。','',
-        '固定条件：0.5m、M192=144+48、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/B32/certifier、TWO_OPT_STAR OFF；48/48均有截止前独立认证结果，NUMERIC_FAILURE=0。','',
+        '固定条件：0.5m、M192=144+48、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/NATIVE/certifier、TWO_OPT_STAR OFF；48/48均有截止前独立认证结果，NUMERIC_FAILURE=0。','',
         '完整回归：`pytest -q -p no:cacheprovider`，326 passed。','']
     (ROOT/'docs/GRC_ALNS_V2_RESULTS.md').write_text('\n'.join(lines),encoding='utf-8')
     summary={'runs':len(runs),'online':online,'numeric_failures':sum(r['numeric_failure'] for r in runs),'certified':sum(r['certified'] for r in runs)}
@@ -1484,7 +1484,7 @@ def grc_report():
         f"- 完整性：18/18有截止前认证Cmax，NUMERIC_FAILURE={sum(r['numeric_failure'] for r in runs)}。学习排序降低DEADLOCK、增加FEASIBLE reference，却未稳定降低Cmax。",
         '- 决策：保留MLP/GAT为development选项；production继续BASELINE initialization + HEURISTIC C2/C4，不打开ID_TEST。',
         '- 下一步：扩大development workbook复验N35/N85；在真实Top8分布下优化C4并隔离关系边/顺序编码；批处理动态candidate降低开销，然后冻结方法做独立validation。','',
-        '固定条件：0.5 m、M192=144+48、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/B32/certifier、TWO_OPT_STAR OFF。无额外reference预算。本结果不是SCI正式统计结论。','',
+        '固定条件：0.5 m、M192=144+48、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/NATIVE/certifier、TWO_OPT_STAR OFF。无额外reference预算。本结果不是SCI正式统计结论。','',
         '完整回归：`pytest -q -p no:cacheprovider`，323 passed。','']
     (ROOT/'docs/GRC_ALNS_GAT_FIRST_RESULTS.md').write_text('\n'.join(lines),encoding='utf-8')
     print('\n'.join(lines[:8]),flush=True)

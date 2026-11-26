@@ -21,7 +21,7 @@ from mrta_baselines.hga import (
 )
 from mrta_baselines.wag_vns import _priority_arrays
 from mrta_reference.model import OperationKind, ScheduleStatus, ScientificConfig
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_search.lns import _remove_parent_set, repair_partial_state_oriented
 
@@ -541,9 +541,9 @@ def run_saeax(parents, config=None, settings=None, *, seed=20261110,
     started = time.perf_counter()
     rng = random.Random(seed)
     workspace = _HGAWorkspace(parents,config,scope)
-    accounting = dict(native_calls=0,b32_calls=0,duplicate_children=0,invalid_children=0,
+    accounting = dict(native_calls=0,coordination_calls=0,duplicate_children=0,invalid_children=0,
         construction_attempts=0,initialization_evaluations=0,native_feasible_children=0,
-        crossover_s=0.,native_s=0.,population_s=0.,b32_s=0.,initialization_s=0.,
+        crossover_s=0.,native_s=0.,population_s=0.,coordination_s=0.,initialization_s=0.,
         inherited_edges=0,new_edges=0,best_improvements=0)
     if bottleneck_reinsertion:
         accounting.update(reinsertion_attempts=0,reinsertion_successes=0,reinsertion_fallbacks=0,
@@ -573,7 +573,7 @@ def run_saeax(parents, config=None, settings=None, *, seed=20261110,
         return item
 
     # Only a basic geometric seed is reused. No WAG search, HGA VND, saved
-    # solutions, learned model, or B32 result enters the initial population.
+    # solutions, learned model, or NATIVE result enters the initial population.
     reference = initialize_hga_region_seed(parents,config,scope=scope)
     selected = np.array([workspace.patterns.index(p) for p in reference.patterns],np.int64)
     routes = workspace.encode(reference)
@@ -680,20 +680,20 @@ def run_saeax(parents, config=None, settings=None, *, seed=20261110,
             raise RuntimeError('canonicalization changed the directed individual')
         vectors = tuple(tuple(int(d) for d in bits) for bits in item.directions)
         t = time.perf_counter()
-        accounting['b32_calls'] += 1
-        schedule = reference_schedule_formal(solution,config,scope=scope,orientations=dict(enumerate(vectors)))
+        accounting['coordination_calls'] += 1
+        schedule = native_schedule(solution,config,scope=scope,orientations=dict(enumerate(vectors)))
         if fallback is None:
             fallback = (solution,vectors,item,schedule)
         elapsed = time.perf_counter()-t
-        accounting['b32_s'] += elapsed
+        accounting['coordination_s'] += elapsed
         final_rows.append(dict(rank=len(final_rows)+1,native_cmax_s=item.native_cmax if math.isfinite(item.native_cmax) else None,
-            status=schedule.status.value,cmax_s=schedule.cmax if schedule.feasible else None,b32_s=elapsed,
+            status=schedule.status.value,cmax_s=schedule.cmax if schedule.feasible else None,coordination_s=elapsed,
             max_processing_s=float(max(item.processing)),move_s=float(sum(item.costs-item.processing)),
             wait_s=sum(op.duration for op in schedule.operations if op.kind is OperationKind.WAIT),
             diagnostic=' | '.join(schedule.diagnostics[:2])))
         if schedule.feasible and (final is None or schedule.cmax < final.cmax):
             if schedule.directions != vectors:
-                raise RuntimeError('B32 changed explicit directions')
+                raise RuntimeError('NATIVE changed explicit directions')
             final, selected_final = schedule,(solution,vectors,item)
     accounting['native_best_cmax_s'] = best.native_cmax if math.isfinite(best.native_cmax) else None
     if selected_final is None:

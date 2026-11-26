@@ -1,8 +1,8 @@
 """Bottleneck/conflict-aware ejection chains after an in-run SAEAX seed.
 
 Only the unchanged SAEAX initializer and one selected improvement can call
-B32. Chain construction uses the existing numeric directed insertion kernel;
-the initial feasible B32 result remains an in-memory fallback throughout.
+NATIVE. Chain construction uses the existing numeric directed insertion kernel;
+the initial feasible NATIVE result remains an in-memory fallback throughout.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from numba import njit
 from mrta_baselines.hga import _HGAWorkspace
 from mrta_baselines.wag_vns import _priority_arrays
 from mrta_reference.model import OperationKind, ScientificConfig
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import block_map
 from mrta_search.lns import (_remove_parent_set, schedule_feedback_summary,
@@ -258,10 +258,10 @@ def run_bc_ecs(parents, config=None, settings=None, *, seed=20261110,
     initial = run_saeax(parents,config,seed=seed,scope=scope,progress_callback=initial_progress)
     initialization_s = time.perf_counter()-started
     accounting = dict(initialization_s=initialization_s,initial_saeax_runtime_s=initial.runtime,
-        initial_native_calls=initial.accounting['native_calls'],initial_b32_calls=initial.accounting['b32_calls'],
-        native_calls=initial.accounting['native_calls'],b32_calls=initial.accounting['b32_calls'],
-        initial_b32_s=initial.accounting['b32_s'],b32_s=initial.accounting['b32_s'],
-        bc_native_calls=0,final_b32_calls=0,final_b32_s=0.,bc_native_s=0.,chain_search_s=0.,
+        initial_native_calls=initial.accounting['native_calls'],initial_coordination_calls=initial.accounting['coordination_calls'],
+        native_calls=initial.accounting['native_calls'],coordination_calls=initial.accounting['coordination_calls'],
+        initial_coordination_s=initial.accounting['coordination_s'],coordination_s=initial.accounting['coordination_s'],
+        bc_native_calls=0,final_coordination_calls=0,final_coordination_s=0.,bc_native_s=0.,chain_search_s=0.,
         chain_plans=0,assignment_combinations=0,processing_pruned=0,route_bound_pruned=0,
         construction_rejected=0,complete_constructed=0,duplicate_candidates=0,
         native_feasible_candidates=0,native_nonfinite_candidates=0,numeric_failures=0,
@@ -269,7 +269,7 @@ def run_bc_ecs(parents, config=None, settings=None, *, seed=20261110,
         single_transfer_evaluations=0,exchange_evaluations=0,three_robot_evaluations=0,
         initial_cmax_s=initial.cmax,final_fallback=False)
     if initial.status!='FEASIBLE' or initial.schedule is None:
-        accounting.update(search_complete=False,return_reason='INITIAL_SAEAX_NOT_B32_FEASIBLE')
+        accounting.update(search_complete=False,return_reason='INITIAL_SAEAX_NOT_NATIVE_FEASIBLE')
         return BCECSResult(initial.status,None,initial.solution,initial.directions,initial.schedule,
             initial.native_cmax,time.perf_counter()-started,'INITIALIZATION_FAILED',accounting,initial)
     chain_started = time.perf_counter()
@@ -285,7 +285,7 @@ def run_bc_ecs(parents, config=None, settings=None, *, seed=20261110,
     initial_identity,best_solution = identity,initial.solution
     feedback = schedule_feedback_summary(initial.solution,initial.schedule,(),config)
     waits = np.array([feedback['parent_wait'].get(p.parent_id,0.) for p in workspace.parents])
-    accounting['initial_observed_b32_wait_s'] = float(sum(waits))
+    accounting['initial_observed_coordination_wait_s'] = float(sum(waits))
     seen,rng,progress,accepted = {identity:native},random.Random(seed),[],[]
     stale,termination = 0,'CHAIN_PLANS_EXHAUSTED'
 
@@ -303,7 +303,7 @@ def run_bc_ecs(parents, config=None, settings=None, *, seed=20261110,
     while not stop:
         improved = False
         # Strict native acceptance is the search objective. The same exact
-        # physical bounds also exclude candidates unable to beat initial B32.
+        # physical bounds also exclude candidates unable to beat initial NATIVE.
         target = min(best.native_cmax,initial.cmax)
         for rr,dd,cc,pp,key,detail in chain_candidates(best,best_solution,workspace,waits,rng,target,accounting):
             if key in seen:
@@ -359,29 +359,29 @@ def run_bc_ecs(parents, config=None, settings=None, *, seed=20261110,
     if best.identity!=initial_identity and best.native_cmax<native-1.e-8:
         vectors = tuple(tuple(int(d) for d in row) for row in best.directions)
         t = time.perf_counter()
-        schedule = reference_schedule_formal(best_solution,config,scope=scope,orientations=dict(enumerate(vectors)))
+        schedule = native_schedule(best_solution,config,scope=scope,orientations=dict(enumerate(vectors)))
         elapsed = time.perf_counter()-t
-        accounting.update(final_b32_calls=1,final_b32_s=elapsed,
-            b32_calls=accounting['b32_calls']+1,b32_s=accounting['b32_s']+elapsed)
+        accounting.update(final_coordination_calls=1,final_coordination_s=elapsed,
+            coordination_calls=accounting['coordination_calls']+1,coordination_s=accounting['coordination_s']+elapsed)
         final_record = dict(status=schedule.status.value,cmax_s=schedule.cmax if schedule.feasible else None,
             native_cmax_s=best.native_cmax,max_processing_s=float(max(best.processing)),
             processing_s=best.processing.tolist(),move_s=float(sum(best.costs-best.processing)),
             wait_s=sum(op.duration for op in schedule.operations if op.kind is OperationKind.WAIT),
-            wait_is_partial=not schedule.feasible,b32_s=elapsed,
+            wait_is_partial=not schedule.feasible,coordination_s=elapsed,
             diagnostic=' | '.join(schedule.diagnostics[:2]))
         final_record['solution'] = dict(patterns=[dict(parent_id=p.parent_id,kind=p.kind.value,t=p.t,
             point_id=p.point_id,rail=p.rail.value if p.rail else None) for p in best_solution.patterns],
             routes=[list(r.block_ids) for r in best_solution.routes],directions=vectors)
         if schedule.feasible and schedule.cmax<initial.cmax-1.e-8:
-            if schedule.directions!=vectors:raise RuntimeError('B32 changed explicit chain directions')
-            accounting['return_reason'] = 'IMPROVED_B32'
+            if schedule.directions!=vectors:raise RuntimeError('NATIVE changed explicit chain directions')
+            accounting['return_reason'] = 'IMPROVED_NATIVE'
             accounting.update(processing_s=best.processing.tolist(),move_s=final_record['move_s'],wait_s=final_record['wait_s'])
             accounting.update(search_complete=termination!='NATIVE_NUMERIC_FAILURE',
                 search_s=initial.accounting['search_s']+accounting['chain_search_s'])
             return BCECSResult('FEASIBLE',schedule.cmax,best_solution,vectors,schedule,best.native_cmax,
                 time.perf_counter()-started,termination,accounting,initial,progress,accepted,final_record)
         accounting['final_fallback'] = True
-        accounting['return_reason'] = 'FINAL_B32_FAILED' if not schedule.feasible else 'INITIAL_B32_BETTER_OR_EQUAL'
+        accounting['return_reason'] = 'FINAL_NATIVE_FAILED' if not schedule.feasible else 'INITIAL_NATIVE_BETTER_OR_EQUAL'
     else:accounting['return_reason'] = 'NO_NATIVE_IMPROVEMENT'
     accounting.update(processing_s=list(initial.accounting['processing_s']),
         move_s=initial.accounting['move_s'],wait_s=initial.accounting['wait_s'],
@@ -450,7 +450,7 @@ def experiment_job(job):
     # generations/offspring and both phases' calls remain explicit above.
     row = dict(stage=stage,layout_id=name,parent_count=len(parents),seed=seed,status=result.status,
         cmax_s=result.cmax,native_cmax_s=result.native_cmax,runtime_s=result.runtime,generations='',
-        valid_children=a['bc_native_calls'],native_calls=a['native_calls'],b32_calls=a['b32_calls'],
+        valid_children=a['bc_native_calls'],native_calls=a['native_calls'],coordination_calls=a['coordination_calls'],
         termination_reason=result.termination_reason,max_processing_s=max(loads) if loads else None,
         move_s=a.get('move_s'),wait_s=a.get('wait_s'),source=SOURCE,
         diagnostic=json.dumps(detail,ensure_ascii=False,allow_nan=False))
@@ -510,7 +510,7 @@ def summarize(stage):
         runtime_median_s=median(float(r['runtime_s']) for r in rows),
         runtime_mean_s=mean(float(r['runtime_s']) for r in rows),
         initialization_median_s=timing('initialization_s'),chain_search_median_s=timing('chain_search_s'),
-        search_median_s=timing('search_s'),b32_median_s=timing('b32_s'),
+        search_median_s=timing('search_s'),coordination_median_s=timing('coordination_s'),
         final_fallbacks=sum(a.get('final_fallback',False) for a in accounts),
         SAEAX=paired_summary(rows,saeax_rows(stage)))
     for method in ('WAG+VNS','HGA'):summary[method] = paired_summary(rows,baseline_rows(method))
@@ -520,7 +520,7 @@ def summarize(stage):
         print('BC_ROW',json.dumps(dict(layout_id=r['layout_id'],seed=r['seed'],status=r['status'],
             cmax_s=r['cmax_s'],max_processing_s=r['max_processing_s'],move_s=r['move_s'],wait_s=r['wait_s'],
             runtime_s=r['runtime_s'],bc_native_calls=a.get('bc_native_calls'),
-            initial_native_calls=a.get('initial_native_calls'),b32_calls=r['b32_calls'],
+            initial_native_calls=a.get('initial_native_calls'),coordination_calls=r['coordination_calls'],
             chain_search_s=a.get('chain_search_s'),termination_reason=r['termination_reason'],
             return_reason=a.get('return_reason')),ensure_ascii=False),flush=True)
     return summary

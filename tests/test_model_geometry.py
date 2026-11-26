@@ -44,12 +44,12 @@ def test_fixed_y_maximin_double_threshold_and_both_rails():
         generate_taskset((ParentWeld('impossible',(1.,5.98),(1.,6.02)),),ScientificConfig(delta_y=.01))
 
 
-def test_fixed_merges_owned_runs_before_ordering_and_b32_counts_setup_once():
+def test_fixed_merges_owned_runs_before_ordering_and_coordination_counts_setup_once():
     import pytest
     from mrta_reference.fixed_taskset import generate_taskset
     from mrta_reference.model import ParentWeld, ScientificConfig, OperationKind
     from mrta_reference.solution import canonicalize, block_map
-    from mrta_reference.scheduler import reference_schedule_formal
+    from mrta_reference.scheduler import native_schedule
     from mrta_reference.scope import FORMAL_SCOPE_V2
     c = ScientificConfig()
     ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(9.,9.),(10.,9.))))
@@ -59,7 +59,7 @@ def test_fixed_merges_owned_runs_before_ordering_and_b32_counts_setup_once():
     assert s.routes[0].block_ids == ('p::job_000_006','q::seg_000')
     blocks = block_map(s,c,scope=FORMAL_SCOPE_V2)
     assert blocks['p::job_000_006'].length == pytest.approx(6.6)
-    result = reference_schedule_formal(s,c,scope=FORMAL_SCOPE_V2,orientations={0:(0,0),1:(),2:(),3:()})
+    result = native_schedule(s,c,scope=FORMAL_SCOPE_V2,orientations={0:(0,0),1:(),2:(),3:()})
     assert result.feasible
     assert sum(o.kind is OperationKind.SETUP for o in result.operations) == 2
     assert sum(o.kind is OperationKind.POST for o in result.operations) == 2
@@ -89,27 +89,25 @@ def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
     )
     from mrta_reference.provenance import SourceProvenance
     scope = FORMAL_SCOPE_V1
-    assert scope.scope_hash == "8c8c056c5d22a4f706d62b4b7ce6ae1f522fc67105975fff346b93ede1f344f9"
-    assert FORMAL_SCOPE_V1_1.scope_hash == "5d3323e4445675af362cf6816e46c2f3bb092a28fcfd1d08741ca47c021bd0dc"
-    assert FORMAL_SCOPE_V2.scope_hash == "16f6110a7384d585fa539777b059e0a297da4fa394a3b4b545ebe967ece54599"
+    assert scope.reference_scheduler_policy_id == 'NATIVE_PRIORITY_FOUR_ROBOTS'
+    assert len({FORMAL_SCOPE_V1.scope_hash,FORMAL_SCOPE_V1_1.scope_hash,FORMAL_SCOPE_V2.scope_hash}) == 3
     assert scope.scope_hash == FormalScope().scope_hash
     assert scope.scope_hash == hashlib.sha256(scope.canonical_json.encode()).hexdigest()
     for change in (
         {"optional_x_split_policy": "INCLUDED"}, {"pattern_domain": ("WHOLE",)},
         {"terminal_policy": "OCCUPY_TO_CMAX"}, {"empty_route_policy": "PARK"},
-        {"initial_deployment_policy": "PAID"}, {"deadlock_policy_id": "OTHER"},
-        {"deadlock_state_budget": 32}, {"reference_scheduler_policy_id": "OTHER"},
+        {"initial_deployment_policy": "PAID"},
+        {"reference_scheduler_policy_id": "OTHER"},
     ):
         mutated = replace(scope, **change)
         assert mutated.scope_hash != scope.scope_hash
         with pytest.raises(ValueError, match="unsupported"):
             mutated.validate_implemented()
     with pytest.raises(FrozenInstanceError):
-        scope.deadlock_state_budget = 32
+        scope.terminal_policy = 'OTHER'
     assert ACTIVE_FORMAL_SCOPE is FORMAL_SCOPE_V2
     assert FORMAL_SCOPE_V1_1.scope_hash != FORMAL_SCOPE_V1.scope_hash
-    assert FORMAL_SCOPE_V1_1.deadlock_budget_unit == "COMPLETE_ALTERNATIVE_ROLLOUTS"
-    assert FORMAL_SCOPE_V1_1.deadlock_rollout_budget == 32
+    assert not any('budget' in name or 'recovery' in name for name in scope.__dataclass_fields__)
     for field in (
         "pattern_domain",
         "optional_x_split_policy",
@@ -604,13 +602,13 @@ def test_outer_x_canonical_catalog_and_fixed_robot_pair(rail,robots,y):
 def test_new_y_cut_is_canonical_and_independently_certified(point_id):
     from mrta_reference.solution import canonicalize
     from mrta_reference.scope import FORMAL_SCOPE_V2
-    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scheduler import NativeReferenceEvaluator
     from mrta_reference.certifier import certify_schedule
     from mrta_reference.model import ScheduleStatus
     parent=ParentWeld('p',(2.,4.),(2.,8.))
     pattern=next(p for p in generate_y_split_patterns(parent,CONFIG) if p.point_id==point_id)
     sol=canonicalize((parent,),(pattern,),{2:('p::0',),0:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
-    schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(1,),2:(0,)})
+    schedule=NativeReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(1,),2:(0,)})
     assert schedule.status is ScheduleStatus.FEASIBLE
     assert certify_schedule(sol,schedule,CONFIG,scope=FORMAL_SCOPE_V2).certified
     forged=replace(schedule,operations=())
@@ -621,12 +619,12 @@ def test_new_y_cut_is_canonical_and_independently_certified(point_id):
 def test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies(mid_y):
     from mrta_reference.solution import canonicalize
     from mrta_reference.scope import FORMAL_SCOPE_V2
-    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scheduler import NativeReferenceEvaluator
     from mrta_reference.certifier import certify_schedule
     parent=ParentWeld('p',(1.,mid_y-1.),(5.,mid_y+1.))
     pattern=next(p for p in generate_y_split_patterns(parent,CONFIG) if p.point_id=='MIDPOINT')
     sol=canonicalize((parent,),(pattern,),{2:('p::0',),0:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
-    schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(1,),2:(0,)})
+    schedule=NativeReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(1,),2:(0,)})
     report=certify_schedule(sol,schedule,CONFIG,scope=FORMAL_SCOPE_V2)
     assert report.certified,report.errors
 
@@ -634,13 +632,13 @@ def test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies(mid_y):
 def test_outer_x_shared_point_has_no_continuous_interference_exception():
     from mrta_reference.solution import canonicalize
     from mrta_reference.scope import FORMAL_SCOPE_V2
-    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scheduler import NativeReferenceEvaluator
     from mrta_reference.certifier import certify_schedule
     from mrta_reference.model import OperationKind,ScheduleStatus
     parent=ParentWeld('p',(1.,8.),(5.,8.))
     pattern=next(p for p in generate_x_split_patterns(parent,3.,CONFIG,rail=Rail.UPPER) if p.point_id=='BX_OUTER_LOWER')
     sol=canonicalize((parent,),(pattern,),{0:('p::0',),1:('p::1',)},CONFIG,scope=FORMAL_SCOPE_V2)
-    schedule=FormalReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(0,),1:(1,)})
+    schedule=NativeReferenceEvaluator(FORMAL_SCOPE_V2)(sol,CONFIG,orientations={0:(0,),1:(1,)})
     assert schedule.status is ScheduleStatus.FEASIBLE
     assert certify_schedule(sol,schedule,CONFIG,scope=FORMAL_SCOPE_V2).certified
     # Forge both children reaching the common cut simultaneously.
@@ -787,6 +785,9 @@ def test_br_shared_gat_pairwise_gradients_and_infeasible_label_order():
     pairs = ranking_pairs([3., float('inf'), 2., 3.], rng)
     assert len(pairs) == 5
     assert all(b != 2 for a, b in pairs.tolist())
+    assert not len(ranking_pairs([float('inf'),float('inf')],rng))
+    numeric = ranking_pairs([3.,float('nan'),2.,float('inf')],rng)
+    assert len(numeric)==3 and all(1 not in pair for pair in numeric.tolist())
     model = BottleneckGAT()
     scores = model(graph)
     loss = torch.nn.functional.softplus(scores[1:] - scores[0]).mean()
@@ -819,7 +820,7 @@ def test_br_search_is_independent_of_baseline_solvers_and_full_vnd(monkeypatch):
 
 @pytest.mark.parametrize('dataset,variant', [('original','full_gnn'),
     ('scale1000','full_gnn'),('scale1000','no_edge_gnn'),('scale1000','action_mlp')])
-def test_br_final_b32_is_called_once_with_serializable_direction_genes(monkeypatch,dataset,variant):
+def test_br_final_result_reuses_native_arrays_without_another_scheduler(monkeypatch,dataset,variant):
     import importlib
     import sys
     from pathlib import Path
@@ -827,23 +828,32 @@ def test_br_final_b32_is_called_once_with_serializable_direction_genes(monkeypat
     monkeypatch.syspath_prepend(str(scripts))
     runner = importlib.import_module('run_gnn_vns_br')
     w, state = _br_fixed_fixture()
-    calls = []
-    formal = runner.reference_schedule_formal
-    def checked(solution, config, **kwargs):
-        calls.append(kwargs['orientations'])
-        assert all(type(bit) is int for bits in kwargs['orientations'].values() for bit in bits)
-        result = formal(solution, config, **kwargs)
-        result.canonical_json()  # Exercises recovery's JSON tie-break boundary.
-        return result
-    monkeypatch.setattr(runner, 'reference_schedule_formal', checked)
+    from mrta_search import gnn_vns_br as br
+    from mrta_baselines import wag_vns
+    from mrta_reference import scheduler
+    def forbidden(*a, **k):
+        raise AssertionError('final result must package its saved native arrays')
+    monkeypatch.setattr(br, '_priority_arrays', forbidden)
+    monkeypatch.setattr(wag_vns, '_priority_arrays', forbidden)
+    monkeypatch.setattr(scheduler, 'reference_schedule_optimized', forbidden)
+    evaluations = w.evaluations
     monkeypatch.setattr(runner, 'run_gnn_vns_br', lambda *a, **k:
         (w, state, dict(rounds=0, termination_reason='SMOKE')))
     checkpoint = dict(settings=runner.asdict(runner.BRConfig()),
+                      node_features=runner.NODE_FEATURES,edge_features=runner.EDGE_FEATURES,
+                      action_features=runner.ACTION_FEATURES,
                       training=dict(learning=dict(selected_epoch=1), total_offline_s=1.))
     checkpoint['learning'] = {variant:dict(selected_epoch=1)}
     row = runner.run_one('train', 'toy', w.taskset, 17, model=object(), checkpoint=checkpoint,
                          dataset=dataset,variant=variant)
-    assert row['b32_calls'] == len(calls) == 1
+    import json
+    detail = json.loads(row['diagnostic'])
+    assert row['coordination_calls'] == w.evaluations == evaluations
+    assert detail['final_scheduler_extra_calls'] == 0 and detail['final_schedule_reused']
+    assert row['status'] == state.status.value
+    assert row['cmax_s'] == (state.value if state.feasible else None)
+    saved = json.loads(row['solution'])
+    assert all(type(bit) is int for bits in saved['directions'] for bit in bits)
 
 
 def test_br_m1_can_reassign_existing_end_atoms_inside_merged_jobs():
@@ -1051,12 +1061,12 @@ def test_br_supervision_uses_online_budgets_greedy_states_and_train_only(monkeyp
     w,state=_br_fixed_fixture()
     payload=runner.solution_record(w.solution(state),state.bits)
     teacher=dict(split='train',layout_id='train_A',status='FEASIBLE',termination_reason='ITERATION_LIMIT',
-                 b32_calls='1',cmax_s='100',solution=json.dumps(payload))
+                 native_cmax_s='100',solution=json.dumps(payload))
     forbidden=dict(teacher,split='validation',layout_id='validation_A',solution='must not parse')
     test=dict(teacher,split='test',layout_id='test_A',solution='must not parse')
     monkeypatch.setattr(runner,'load_tasksets',lambda:[('train','train_A',w.taskset),
         ('validation','validation_A',w.taskset),('test','test_A',w.taskset)])
-    monkeypatch.setattr(runner,'read_baselines',lambda method:[teacher,forbidden,test])
+    monkeypatch.setattr(runner,'read_baselines',lambda method,**kwargs:[teacher,forbidden,test])
     observed=[]
     def generate(workspace,current,settings,rng):
         observed.append((settings.alpha,settings.anchors,settings.candidates))
@@ -1162,6 +1172,29 @@ def test_br_validation_pairs_only_matching_feasible_runs_and_stops_test_on_failu
     runner.run_experiment('test')
 
 
+def test_br_resume_skips_complete_native_rows_with_multiple_evaluations(monkeypatch):
+    import importlib
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    w,_=_br_fixed_fixture()
+    rows=[]
+    for source in ('original','scale1000'):
+        for variant in (runner.MODEL_VARIANTS if source=='original' else ('full_gnn',)):
+            for seed in (runner.SEEDS if source=='original' else runner.SEEDS[:1]):
+                rows.append(dict(dataset=source,split='validation',layout_id='toy',seed=str(seed),variant=variant,
+                    trial='main',coordination_calls='42',solution='saved',status='DEADLOCK'))
+    monkeypatch.setattr(runner,'read_results',lambda *a:rows)
+    monkeypatch.setattr(runner,'load_model',lambda *a,**k:(object(),{}))
+    monkeypatch.setattr(runner,'iter_tasksets',lambda *a:[('toy',w.taskset)])
+    monkeypatch.setattr(runner,'update_scale_report',lambda **k:None)
+    monkeypatch.setattr(runner,'validation_admission',lambda rows:{'ready_for_test':False})
+    def forbidden(*a,**k):raise AssertionError('completed native record was rerun or written again')
+    monkeypatch.setattr(runner,'run_one',forbidden)
+    monkeypatch.setattr(runner,'append_result',forbidden)
+    runner.run_experiment('validation')
+
+
 def test_br_result_resume_discards_only_the_interrupted_csv_tail(monkeypatch):
     import importlib,io
     from contextlib import contextmanager
@@ -1170,6 +1203,9 @@ def test_br_result_resume_discards_only_the_interrupted_csv_tail(monkeypatch):
     runner=importlib.import_module('run_gnn_vns_br')
     class MemoryFile:
         data=b''
+        @property
+        def parent(self):return self
+        def mkdir(self,**kwargs):pass
         def exists(self):return bool(self.data)
         def read_bytes(self):return self.data
         def read_text(self,**kwargs):return self.data.decode('utf-8')

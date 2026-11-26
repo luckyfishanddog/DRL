@@ -487,7 +487,7 @@ def test_direct_schedule_rejects_missing_vectors_and_missing_welds(monkeypatch):
     def fake_schedule(solution, config, **kwargs):
         captured.append(kwargs["orientations"])
         return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=1, directions=directions)
-    monkeypatch.setitem(module["schedule_explicit"].__globals__, "reference_schedule_formal", fake_schedule)
+    monkeypatch.setitem(module["schedule_explicit"].__globals__, "native_schedule", fake_schedule)
     with pytest.raises(ValueError, match="omitted or repeated"):
         module["schedule_explicit"](solution, directions, FAST)
     assert captured == [{r: directions[r] for r in range(4)}]
@@ -699,8 +699,8 @@ def test_collapsed_mandatory_y_is_rejected_by_scientific_evaluator():
                             tuple(Route(r, ("c::0", "c::1") if r == 0 else ())
                                   for r in range(4)))
     assert reference_schedule(raw, FAST).status is ScheduleStatus.INFEASIBLE
-    from mrta_reference.scheduler import reference_schedule_formal
-    assert reference_schedule_formal(raw, FAST).status is ScheduleStatus.INFEASIBLE
+    from mrta_reference.scheduler import native_schedule
+    assert native_schedule(raw, FAST).status is ScheduleStatus.INFEASIBLE
 
 
 def _parents() -> tuple[ParentWeld, ...]:
@@ -993,7 +993,7 @@ def test_final_coordination_profiles_are_frozen_and_mutually_exclusive() -> None
     assert same.initialization_same_rail_boundary_rebalance
     assert not same.initialization_coordination_route_reorder
     for method in FINAL_COORDINATION_METHODS:
-        assert final_coordination_method_spec(method)["reference_recovery_rollouts"] == 32
+        assert final_coordination_method_spec(method)["reference_policy"] == 'NATIVE_PRIORITY_FOUR_ROBOTS'
 
 
 def test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal() -> None:

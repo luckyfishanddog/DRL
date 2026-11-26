@@ -1,7 +1,7 @@
 """Parent-level rail-conflict-aware iterated greedy, seeded by an in-run SAEAX.
 
 P+directed MOVE ranks repair choices only. Acceptance uses the unchanged native
-coordinator; only the best native improvement receives one final B32 attempt.
+coordinator; only the best native improvement receives one final NATIVE attempt.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from numba import njit
 from mrta_baselines.hga import _HGAWorkspace, _put_oriented
 from mrta_baselines.wag_vns import _priority_arrays
 from mrta_reference.model import OperationKind, ScientificConfig
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_search.lns import schedule_feedback_summary
 from mrta_search.saeax import (Individual, _heads_legal, _route_statistics,
@@ -286,17 +286,17 @@ def run_rc_ig(parents, config=None, settings=None, *, seed=20261110,
             progress_callback(dict(phase='SAEAX_INITIALIZATION', **row))
     initial = run_saeax(parents, config, seed=seed, scope=scope, progress_callback=initial_progress)
     a = dict(initialization_s=time.perf_counter()-started, initial_saeax_runtime_s=initial.runtime,
-        initial_native_calls=initial.accounting['native_calls'], initial_b32_calls=initial.accounting['b32_calls'],
-        native_calls=initial.accounting['native_calls'], b32_calls=initial.accounting['b32_calls'],
-        b32_s=initial.accounting['b32_s'], ig_native_calls=0, ig_native_s=0.,
-        final_b32_calls=0, final_b32_s=0., ig_search_s=0., iterations=0,
+        initial_native_calls=initial.accounting['native_calls'], initial_coordination_calls=initial.accounting['coordination_calls'],
+        native_calls=initial.accounting['native_calls'], coordination_calls=initial.accounting['coordination_calls'],
+        coordination_s=initial.accounting['coordination_s'], ig_native_calls=0, ig_native_s=0.,
+        final_coordination_calls=0, final_coordination_s=0., ig_search_s=0., iterations=0,
         construction_failures=0, duplicate_candidates=0, mode_trials=0, insertion_states=0,
         native_feasible_candidates=0, native_nonfinite_candidates=0, numeric_failures=0,
         accepted_improvements=0, accepted_equal=0, accepted_worse=0, best_improvements=0,
         mode_changed_candidates=0, mode_changed_acceptances=0, changed_parent_modes=0,
         initial_cmax_s=initial.cmax, final_fallback=False, search_complete=False)
     if initial.status != 'FEASIBLE' or initial.schedule is None:
-        a['return_reason'] = 'INITIAL_SAEAX_NOT_B32_FEASIBLE'
+        a['return_reason'] = 'INITIAL_SAEAX_NOT_NATIVE_FEASIBLE'
         return RCIGResult(initial.status, initial.cmax, initial.solution, initial.directions,
             initial.schedule, initial.native_cmax, time.perf_counter()-started, 0,
             'INITIALIZATION_FAILED', a, initial)
@@ -388,25 +388,25 @@ def run_rc_ig(parents, config=None, settings=None, *, seed=20261110,
             raise RuntimeError('canonicalization changed the directed RC-IG candidate')
         improved_bits = tuple(tuple(int(d) for d in row) for row in best.directions)
         t = time.perf_counter()
-        attempt = reference_schedule_formal(improved_solution, config, scope=scope,
+        attempt = native_schedule(improved_solution, config, scope=scope,
             orientations=dict(enumerate(improved_bits)))
         elapsed = time.perf_counter()-t
-        a.update(final_b32_calls=1, final_b32_s=elapsed, b32_calls=a['b32_calls']+1, b32_s=a['b32_s']+elapsed)
+        a.update(final_coordination_calls=1, final_coordination_s=elapsed, coordination_calls=a['coordination_calls']+1, coordination_s=a['coordination_s']+elapsed)
         final = dict(status=attempt.status.value, cmax_s=attempt.cmax if attempt.feasible else None,
             native_cmax_s=best.native_cmax, processing_s=best.processing.tolist(),
             move_s=float(sum(best.costs-best.processing)),
             wait_s=sum(op.duration for op in attempt.operations if op.kind is OperationKind.WAIT),
-            wait_is_partial=not attempt.feasible, b32_s=elapsed, diagnostic=list(attempt.diagnostics),
+            wait_is_partial=not attempt.feasible, coordination_s=elapsed, diagnostic=list(attempt.diagnostics),
             solution=solution_record(improved_solution, improved_bits))
         if attempt.feasible and attempt.cmax < initial.cmax-1.e-8:
             if attempt.directions != improved_bits:
-                raise RuntimeError('B32 changed explicit RC-IG directions')
+                raise RuntimeError('NATIVE changed explicit RC-IG directions')
             solution, vectors, schedule, native = improved_solution, improved_bits, attempt, best.native_cmax
-            a.update(return_reason='IMPROVED_B32', processing_s=best.processing.tolist(),
+            a.update(return_reason='IMPROVED_NATIVE', processing_s=best.processing.tolist(),
                 move_s=final['move_s'], wait_s=final['wait_s'])
         else:
-            a.update(final_fallback=True, return_reason='FINAL_B32_FAILED' if not attempt.feasible
-                     else 'INITIAL_B32_BETTER_OR_EQUAL')
+            a.update(final_fallback=True, return_reason='FINAL_NATIVE_FAILED' if not attempt.feasible
+                     else 'INITIAL_NATIVE_BETTER_OR_EQUAL')
     else:
         a['return_reason'] = 'NO_NATIVE_IMPROVEMENT'
     if schedule is initial.schedule:

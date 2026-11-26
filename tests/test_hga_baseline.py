@@ -465,7 +465,7 @@ def test_hga_first_task_repair_keeps_coverage_and_fixes_same_rail_order():
     assert optimize_directions_with_initial_feasibility(repaired, config).status is DirectionStatus.FEASIBLE
 
 
-def test_native_hga_retries_failed_child_without_spending_iteration_or_calling_b32(monkeypatch):
+def test_native_hga_retries_failed_child_without_spending_iteration_or_calling_coordination(monkeypatch):
     from dataclasses import replace
     import math
     from mrta_baselines import hga as h
@@ -480,9 +480,9 @@ def test_native_hga_retries_failed_child_without_spending_iteration_or_calling_b
             raise ValueError('deliberately rejected construction')
         return original(self, *args, **kwargs)
     def forbidden(*args, **kwargs):
-        raise AssertionError('B32/certifier called inside native HGA')
+        raise AssertionError('NATIVE/certifier called inside native HGA')
     monkeypatch.setattr(h._HGAWorkspace, 'repair', repair)
-    monkeypatch.setattr(common.FormalReferenceEvaluator, '__call__', forbidden)
+    monkeypatch.setattr(common.NativeReferenceEvaluator, '__call__', forbidden)
     monkeypatch.setattr(common, 'certify_schedule', forbidden)
     result = h.run_adapted_hga_v2(parents, ScientificConfig(),
                                   replace(AdaptedHGAConfig(), mu=2, lambda_size=1, max_iterations=3),
@@ -1012,9 +1012,9 @@ def test_route_cycle_children_use_one_native_evaluation_and_reuse_best_timeline(
         calls.append(result[0])
         return result
     def forbidden(*args, **kwargs):
-        raise AssertionError('B32/certifier called inside route-cycle HGA')
+        raise AssertionError('NATIVE/certifier called inside route-cycle HGA')
     monkeypatch.setattr(h, '_priority_arrays', observed)
-    monkeypatch.setattr(common.FormalReferenceEvaluator, '__call__', forbidden)
+    monkeypatch.setattr(common.NativeReferenceEvaluator, '__call__', forbidden)
     monkeypatch.setattr(common, 'certify_schedule', forbidden)
     settings = replace(AdaptedHGAConfig(), mu=3, lambda_size=2, max_iterations=4, vnd_objective='ROUTE_CYCLE')
     if fixed:
@@ -1177,14 +1177,14 @@ def test_oriented_repair_inherits_genes_and_preserves_all_legal_pattern_families
     assert families == {SplitKind.WHOLE, SplitKind.Y_SPLIT, SplitKind.X_SPLIT}
 
 
-def test_explicit_hga_keeps_existing_finite_budget_callers_without_internal_b32(monkeypatch):
+def test_explicit_hga_keeps_existing_finite_budget_callers_without_internal_coordination(monkeypatch):
     from dataclasses import replace
     from mrta_baselines import common, hga as h
     config = ScientificConfig()
     parents = (ParentWeld('a', (1., 9.), (2., 9.)), ParentWeld('b', (8., 9.), (9., 9.)))
     def forbidden(*args, **kwargs):
-        raise AssertionError('B32/certifier called inside explicit HGA')
-    monkeypatch.setattr(common.FormalReferenceEvaluator, '__call__', forbidden)
+        raise AssertionError('NATIVE/certifier called inside explicit HGA')
+    monkeypatch.setattr(common.NativeReferenceEvaluator, '__call__', forbidden)
     monkeypatch.setattr(common, 'certify_schedule', forbidden)
     settings = replace(AdaptedHGAConfig(), max_iterations=2)
     result = h.run_adapted_hga_v2(parents, config, settings, seed=731, time_limit=60., checkpoints=(60.,))
@@ -1313,19 +1313,19 @@ def test_saeax_survival_keeps_global_elite_despite_diversity():
 
 @pytest.mark.parametrize('maximum,minimum,stagnation,expected,reason',[
     (8,5,3,5,'STAGNATION'),(3,1,10,3,'MAX_GENERATIONS')])
-def test_saeax_natural_stop_accounting_and_b32_selection_are_separate(
+def test_saeax_natural_stop_accounting_and_coordination_selection_are_separate(
         monkeypatch,maximum,minimum,stagnation,expected,reason):
     from mrta_reference.model import ScheduleResult,ScheduleStatus
     s,w,_,_ = _saeax_fixture()
     calls,progress = [],[]
     monkeypatch.setattr(s,'_priority_arrays',lambda *args:(100.,None,None,None))
-    def b32(solution,config,*,scope,orientations):
+    def coordination(solution,config,*,scope,orientations):
         assert progress[-1]['generation']==expected
         calls.append((solution,orientations))
         directions = tuple(orientations[r] for r in range(4))
         return (ScheduleResult(ScheduleStatus.DEADLOCK,directions=directions) if len(calls)==1 else
                 ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.-100*len(calls),directions=directions))
-    monkeypatch.setattr(s,'reference_schedule_formal',b32)
+    monkeypatch.setattr(s,'native_schedule',coordination)
     settings = s.SAEAXConfig(population_size=4,offspring_per_generation=2,
         min_generations=minimum,max_generations=maximum,stagnation_generations=stagnation)
     parents = tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
@@ -1335,9 +1335,9 @@ def test_saeax_natural_stop_accounting_and_b32_selection_are_separate(
     assert result.accounting['native_calls']==result.accounting['initialization_evaluations']+2*expected
     assert result.accounting['native_best_cmax_s']==100.
     assert result.status=='FEASIBLE' and result.cmax==700. and result.native_cmax==100.
-    assert result.accounting['b32_calls']==len(calls)==3
+    assert result.accounting['coordination_calls']==len(calls)==3
     assert len({(x.canonical_json,tuple(d.items())) for x,d in calls})==3
-    assert result.runtime>=result.accounting['search_s']+result.accounting['b32_s']
+    assert result.runtime>=result.accounting['search_s']+result.accounting['coordination_s']
 
 
 def test_saeax_repeated_children_stop_with_bounded_retries_and_no_fake_cmax(monkeypatch):
@@ -1346,13 +1346,13 @@ def test_saeax_repeated_children_stop_with_bounded_retries_and_no_fake_cmax(monk
     monkeypatch.setattr(s,'_priority_arrays',lambda *args:(100.,None,None,None))
     monkeypatch.setattr(s,'adjacency_crossover',lambda a,*args:
         (a.routes,a.directions,a.selected,0,0))
-    monkeypatch.setattr(s,'reference_schedule_formal',lambda *args,**kwargs:ScheduleResult(ScheduleStatus.DEADLOCK))
+    monkeypatch.setattr(s,'native_schedule',lambda *args,**kwargs:ScheduleResult(ScheduleStatus.DEADLOCK))
     result = s.run_saeax(w.parents,settings=s.SAEAXConfig(population_size=2,
         offspring_per_generation=2,max_generations=80,min_generations=80,retries_per_child=2))
     assert result.generations==0 and result.valid_children==0
     assert result.termination_reason=='NOVEL_CHILD_RETRIES_EXHAUSTED'
     assert result.accounting['construction_attempts']==4
-    assert result.accounting['native_calls']==1 and result.accounting['b32_calls']==1
+    assert result.accounting['native_calls']==1 and result.accounting['coordination_calls']==1
     assert result.cmax is None and result.native_cmax==100. and result.status=='DEADLOCK'
     assert result.solution is not None and result.accounting['wait_is_partial'] is True
 
@@ -1411,12 +1411,12 @@ def test_vnd_teacher_trace_preserves_search_and_observed_actions():
     assert max(passes)==plain[4]+1
 
 
-def test_vnd_teacher_observer_is_optional_and_never_calls_b32(monkeypatch):
+def test_vnd_teacher_observer_is_optional_and_never_calls_coordination(monkeypatch):
     import numpy as np
     from dataclasses import replace
     from mrta_baselines import hga as h,common
-    def forbidden(*args,**kwargs):raise AssertionError('unexpected B32/certifier')
-    monkeypatch.setattr(common.FormalReferenceEvaluator,'__call__',forbidden)
+    def forbidden(*args,**kwargs):raise AssertionError('unexpected NATIVE/certifier')
+    monkeypatch.setattr(common.NativeReferenceEvaluator,'__call__',forbidden)
     monkeypatch.setattr(common,'certify_schedule',forbidden)
     class Observer:
         def __init__(self):self.calls=[]
@@ -1480,7 +1480,7 @@ def test_br_fixed_mode_adapter_reuses_joint_repair_without_scheduling(monkeypatc
     from mrta_search import saeax as s
     def forbidden(*args,**kwargs):raise AssertionError('repair must not schedule or use timeline selectors')
     monkeypatch.setattr(s,'_priority_arrays',forbidden)
-    monkeypatch.setattr(s,'reference_schedule_formal',forbidden)
+    monkeypatch.setattr(s,'native_schedule',forbidden)
     monkeypatch.setattr(lns,'build_crrr_candidate',forbidden)
     monkeypatch.setattr(lns,'select_bottleneck_parents',forbidden)
     parents = (ParentWeld('y',(3.,8.),(3.,4.)),ParentWeld('x',(1.,9.),(10.,9.)),
@@ -1541,10 +1541,10 @@ def test_br_one_effective_slot_per_generation_and_one_native_score(monkeypatch):
         return routes,bits
     monkeypatch.setattr(s,'bottleneck_reinsert',reinsertion)
     monkeypatch.setattr(s,'_priority_arrays',lambda *args:(100.,None,None,None))
-    def b32(solution,config,*,scope,orientations):
+    def coordination(solution,config,*,scope,orientations):
         assert progress[-1]['generation']==3
         return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,directions=tuple(orientations[r] for r in range(4)))
-    monkeypatch.setattr(s,'reference_schedule_formal',b32)
+    monkeypatch.setattr(s,'native_schedule',coordination)
     parents=tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
     result=s.run_saeax(parents,settings=s.SAEAXConfig(max_generations=3,min_generations=1,
         stagnation_generations=10),seed=987,bottleneck_reinsertion=True,progress_callback=progress.append)
@@ -1553,7 +1553,7 @@ def test_br_one_effective_slot_per_generation_and_one_native_score(monkeypatch):
     assert a['reinsertion_unique_children']==3
     assert a['native_calls']==a['initialization_evaluations']+12
     assert calls and min(calls)>0 and a['initialization_evaluations']==12
-    assert a['b32_calls']==3
+    assert a['coordination_calls']==3
 
 
 def test_br_paired_comparison_excludes_deadlock_and_pilot_requires_load_reduction(monkeypatch):
@@ -1695,7 +1695,7 @@ def test_eax_joint_construction_reallocates_and_preserves_all_split_rules(monkey
         monkeypatch.setattr(saeax,name,forbidden)
     monkeypatch.setattr(lns,'repair_partial_state_oriented',forbidden)
     monkeypatch.setattr(e,'_priority_arrays',forbidden)
-    monkeypatch.setattr(e,'reference_schedule_formal',forbidden)
+    monkeypatch.setattr(e,'native_schedule',forbidden)
     monkeypatch.setattr(w,'repair',forbidden)
     settings=e.EAXNSGAConfig(pattern_mutation_probability=0.)
     successes,changed,identities=0,False,set()
@@ -1755,7 +1755,7 @@ def test_eax_nsga_environment_retains_nondominated_tradeoffs_and_deduplicates():
 
 @pytest.mark.parametrize('maximum,minimum,stagnation,expected,reason',[
     (8,5,3,5,'STAGNATION'),(3,1,10,3,'MAX_GENERATIONS')])
-def test_eax_nsga_natural_stop_and_exactly_one_final_b32(monkeypatch,maximum,minimum,stagnation,expected,reason):
+def test_eax_nsga_natural_stop_and_exactly_one_final_coordination(monkeypatch,maximum,minimum,stagnation,expected,reason):
     from mrta_reference.model import ScheduleResult,ScheduleStatus
     from mrta_search import eax_nsga2 as e
     calls,native_calls,progress=[],[],[]
@@ -1763,11 +1763,11 @@ def test_eax_nsga_natural_stop_and_exactly_one_final_b32(monkeypatch,maximum,min
         native_calls.append(1)
         return 100.,None,None,None
     monkeypatch.setattr(e,'_priority_arrays',native)
-    def b32(solution,config,*,scope,orientations):
+    def coordination(solution,config,*,scope,orientations):
         assert progress[-1]['generation']==expected
         calls.append(solution)
         return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=777.,directions=tuple(orientations[r] for r in range(4)))
-    monkeypatch.setattr(e,'reference_schedule_formal',b32)
+    monkeypatch.setattr(e,'native_schedule',coordination)
     parents=tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
     settings=e.EAXNSGAConfig(population_size=6,offspring_per_generation=3,
         max_generations=maximum,min_generations=minimum,stagnation_generations=stagnation)
@@ -1775,25 +1775,25 @@ def test_eax_nsga_natural_stop_and_exactly_one_final_b32(monkeypatch,maximum,min
     assert result.generations==expected and result.valid_children==3*expected
     assert result.termination_reason==reason and result.accounting['search_complete']
     assert result.accounting['native_calls']==len(native_calls)==6+3*expected
-    assert result.accounting['b32_calls']==len(calls)==len(result.final_candidates)==1
+    assert result.accounting['coordination_calls']==len(calls)==len(result.final_candidates)==1
     assert result.cmax==777. and result.native_cmax==100.
-    assert result.runtime>=result.accounting['search_s']+result.accounting['b32_s']
+    assert result.runtime>=result.accounting['search_s']+result.accounting['coordination_s']
 
 
-def test_eax_final_b32_deadlock_is_kept_without_fallback(monkeypatch):
+def test_eax_final_coordination_deadlock_is_kept_without_fallback(monkeypatch):
     from mrta_reference.model import ScheduleResult,ScheduleStatus
     from mrta_search import eax_nsga2 as e
     monkeypatch.setattr(e,'_priority_arrays',lambda *args:(100.,None,None,None))
     calls=[]
-    def b32(*args,**kwargs):
+    def coordination(*args,**kwargs):
         calls.append(1)
         return ScheduleResult(ScheduleStatus.DEADLOCK)
-    monkeypatch.setattr(e,'reference_schedule_formal',b32)
+    monkeypatch.setattr(e,'native_schedule',coordination)
     parents=tuple(ParentWeld(f'p{i:02d}',(1.+i*1.1,9.),(1.7+i*1.1,9.)) for i in range(16))
     result=e.run_eax_nsga2(parents,settings=e.EAXNSGAConfig(population_size=4,offspring_per_generation=2,
         max_generations=1,min_generations=1),seed=987)
     assert result.status=='DEADLOCK' and result.cmax is None and result.native_cmax==100.
-    assert result.accounting['b32_calls']==len(calls)==1
+    assert result.accounting['coordination_calls']==len(calls)==1
     assert result.final_candidates[0]['cmax_s'] is None and result.accounting['wait_is_partial']
 
 
@@ -1811,7 +1811,7 @@ def test_eax_duplicate_child_retries_are_per_slot_and_do_not_complete_a_generati
         return item.routes,item.directions,item.selected.copy(),dict(detail)
     monkeypatch.setattr(e,'adjacency_crossover',crossed)
     monkeypatch.setattr(e,'_priority_arrays',lambda *args:(100.,None,None,None))
-    monkeypatch.setattr(e,'reference_schedule_formal',lambda *args,orientations,**kwargs:
+    monkeypatch.setattr(e,'native_schedule',lambda *args,orientations,**kwargs:
         ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,directions=tuple(orientations[r] for r in range(4))))
     result=e.run_eax_nsga2(w.parents,settings=e.EAXNSGAConfig(population_size=2,offspring_per_generation=2,
         max_generations=2,min_generations=1),seed=7)
@@ -1821,7 +1821,7 @@ def test_eax_duplicate_child_retries_are_per_slot_and_do_not_complete_a_generati
     assert not result.accounting['search_complete'] and result.accounting['native_calls']==2
 
 
-def test_eax_pilot_uses_b32_quality_and_time_with_pmax_diagnostic_only(monkeypatch):
+def test_eax_pilot_uses_coordination_quality_and_time_with_pmax_diagnostic_only(monkeypatch):
     import runpy,json
     from pathlib import Path
     m=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/run_eax_nsga2.py'))
@@ -1881,7 +1881,7 @@ def test_eax_initialization_exhaustion_preserves_actual_evaluation_counts(monkey
         'few_neighbour_choices','nearest_fallbacks','deferred_nodes','owner_changes_vs_first','owner_changes_vs_second'),0)
     monkeypatch.setattr(e,'adjacency_crossover',lambda *args:(a.routes,a.directions,a.selected.copy(),dict(detail)))
     monkeypatch.setattr(e,'_priority_arrays',lambda *args:(100.,None,None,None))
-    monkeypatch.setattr(e,'reference_schedule_formal',lambda *args,orientations,**kwargs:
+    monkeypatch.setattr(e,'native_schedule',lambda *args,orientations,**kwargs:
         ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,directions=tuple(orientations[r] for r in range(4))))
     result=e.run_eax_nsga2(w.parents,settings=e.EAXNSGAConfig(population_size=2,
         max_generations=1,min_generations=1),seed=7)
@@ -1889,7 +1889,7 @@ def test_eax_initialization_exhaustion_preserves_actual_evaluation_counts(monkey
     assert not result.accounting['search_complete']
     assert result.accounting['initialization_attempts']==13 and result.accounting['native_calls']==1
     assert result.accounting['initialization_evaluations']==1 and result.accounting['duplicate_children']==12
-    assert result.generations==result.valid_children==0 and result.accounting['b32_calls']==1
+    assert result.generations==result.valid_children==0 and result.accounting['coordination_calls']==1
 
 
 def test_eax_joint_position_processing_and_move_match_full_route_recomputation():
@@ -1940,7 +1940,7 @@ def _bc_initial_fixture():
     solution=w.solution(a.routes,a.selected)
     vectors=tuple(tuple(int(d) for d in row) for row in a.directions)
     schedule=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.,directions=vectors)
-    accounting=dict(native_calls=12,b32_calls=3,b32_s=0.,search_s=0.,
+    accounting=dict(native_calls=12,coordination_calls=3,coordination_s=0.,search_s=0.,
         processing_s=a.processing.tolist(),move_s=float(sum(a.costs-a.processing)),wait_s=0.)
     initial=SAEAXResult('FEASIBLE',1000.,solution,vectors,schedule,900.,0,0,'STAGNATION',0.,accounting)
     return c,w,a,b,initial
@@ -2062,9 +2062,9 @@ def test_bc_wait_feedback_uses_observed_native_wait_only():
 
 
 @pytest.mark.parametrize('status,cmax,reason',[
-    ('FEASIBLE',850.,'IMPROVED_B32'),('FEASIBLE',1100.,'INITIAL_B32_BETTER_OR_EQUAL'),
-    ('DEADLOCK',None,'FINAL_B32_FAILED')])
-def test_bc_one_in_run_seed_and_one_final_b32_with_cached_fallback(monkeypatch,status,cmax,reason):
+    ('FEASIBLE',850.,'IMPROVED_NATIVE'),('FEASIBLE',1100.,'INITIAL_NATIVE_BETTER_OR_EQUAL'),
+    ('DEADLOCK',None,'FINAL_NATIVE_FAILED')])
+def test_bc_one_in_run_seed_and_one_final_coordination_with_cached_fallback(monkeypatch,status,cmax,reason):
     from mrta_reference.model import ScheduleResult,ScheduleStatus
     c,w,a,_,initial=_bc_initial_fixture()
     seeds,finals,native=[],[],[]
@@ -2078,48 +2078,48 @@ def test_bc_one_in_run_seed_and_one_final_b32_with_cached_fallback(monkeypatch,s
         native.append(1)
         return 800.,None,[],None
     monkeypatch.setattr(c,'_priority_arrays',scored)
-    def b32(solution,config,*,scope,orientations):
+    def coordination(solution,config,*,scope,orientations):
         finals.append(solution)
         return ScheduleResult(ScheduleStatus(status),cmax=cmax,directions=tuple(orientations[r] for r in range(4)))
-    monkeypatch.setattr(c,'reference_schedule_formal',b32)
+    monkeypatch.setattr(c,'native_schedule',coordination)
     result=c.run_bc_ecs(w.parents,settings=c.BCECSConfig(max_candidates=1,stagnation_candidates=10),seed=99)
     assert len(seeds)==len(native)==len(finals)==1 and seeds[0]['seed']==99
     assert result.accounting['native_calls']==13 and result.accounting['bc_native_calls']==1
-    assert result.accounting['b32_calls']==4 and result.accounting['final_b32_calls']==1
+    assert result.accounting['coordination_calls']==4 and result.accounting['final_coordination_calls']==1
     assert result.accounting['return_reason']==reason and result.status=='FEASIBLE'
-    assert result.cmax==(850. if reason=='IMPROVED_B32' else 1000.)
-    if reason!='IMPROVED_B32':assert result.schedule is initial.schedule
+    assert result.cmax==(850. if reason=='IMPROVED_NATIVE' else 1000.)
+    if reason!='IMPROVED_NATIVE':assert result.schedule is initial.schedule
     if status=='DEADLOCK':assert result.final_candidate['cmax_s'] is None
-    assert result.runtime>=result.accounting['initialization_s']+result.accounting['chain_search_s']+result.accounting['final_b32_s']
+    assert result.runtime>=result.accounting['initialization_s']+result.accounting['chain_search_s']+result.accounting['final_coordination_s']
 
 
 @pytest.mark.parametrize('value',[950.,float('inf')])
-def test_bc_stagnation_counts_actual_evaluations_and_native_rejection_is_not_b32_deadlock(monkeypatch,value):
+def test_bc_stagnation_counts_actual_evaluations_and_native_rejection_is_not_coordination_deadlock(monkeypatch,value):
     c,w,_,_,initial=_bc_initial_fixture()
     monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
     monkeypatch.setattr(c,'chain_candidates',lambda item,solution,workspace,*args:
         _bc_fake_candidates(c,workspace,item,6))
     monkeypatch.setattr(c,'_priority_arrays',lambda *args:(value,None,[],None))
     def forbidden(*args,**kwargs):raise AssertionError('unimproved candidate or initial was scheduled again')
-    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    monkeypatch.setattr(c,'native_schedule',forbidden)
     result=c.run_bc_ecs(w.parents,settings=c.BCECSConfig(max_candidates=10,stagnation_candidates=3))
     assert result.termination_reason=='STAGNATION' and result.accounting['bc_native_calls']==3
-    assert result.accounting['stagnation_at_stop']==3 and result.accounting['b32_calls']==3
+    assert result.accounting['stagnation_at_stop']==3 and result.accounting['coordination_calls']==3
     assert result.cmax==1000. and result.schedule is initial.schedule
     assert result.accounting['native_nonfinite_candidates']==(3 if value==float('inf') else 0)
     assert result.final_candidate is None
 
 
-def test_bc_initialization_failure_does_not_run_a_chain_or_extra_b32(monkeypatch):
+def test_bc_initialization_failure_does_not_run_a_chain_or_extra_coordination(monkeypatch):
     c,w,_,_,initial=_bc_initial_fixture()
     initial.status='DEADLOCK';initial.cmax=None
     monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
     def forbidden(*args,**kwargs):raise AssertionError('search started without a feasible initial schedule')
     monkeypatch.setattr(c,'chain_candidates',forbidden)
-    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    monkeypatch.setattr(c,'native_schedule',forbidden)
     result=c.run_bc_ecs(w.parents)
     assert result.termination_reason=='INITIALIZATION_FAILED' and result.cmax is None
-    assert result.accounting['bc_native_calls']==0 and result.accounting['b32_calls']==3
+    assert result.accounting['bc_native_calls']==0 and result.accounting['coordination_calls']==3
 
 
 def _bc_candidate_counts():
@@ -2138,12 +2138,12 @@ def test_bc_processing_bound_prunes_before_construction_and_does_not_fake_evalua
     assert candidates==[] and counts['processing_pruned']>0 and counts['complete_constructed']==0
 
 
-def test_bc_complete_directed_route_bound_prunes_without_native_or_b32(monkeypatch):
+def test_bc_complete_directed_route_bound_prunes_without_native_or_coordination(monkeypatch):
     import numpy as np
     c,w,a,_,initial=_bc_initial_fixture()
     def forbidden(*args,**kwargs):raise AssertionError('complete-bound pruning called an evaluator')
     monkeypatch.setattr(c,'_priority_arrays',forbidden)
-    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    monkeypatch.setattr(c,'native_schedule',forbidden)
     counts=_bc_candidate_counts()
     target=float(max(a.processing))+1.
     candidates=list(c.chain_candidates(a,initial.solution,w,np.zeros(len(w.parents)),random.Random(3),target,counts))
@@ -2164,7 +2164,7 @@ def test_bc_real_complete_candidate_bounds_do_not_exceed_finite_native_cmax():
             assert max(pp)<=max(cc)+1e-7 and max(cc)<=native+1e-7
 
 
-def test_bc_entry_train_criteria_use_actual_b32_and_complete_time(monkeypatch):
+def test_bc_entry_train_criteria_use_actual_coordination_and_complete_time(monkeypatch):
     import json
     from mrta_search import bc_ecs as b
     old={(name,20261110):dict(status='FEASIBLE',cmax_s='100',runtime_s='20') for name in b.PILOTS}
@@ -2287,9 +2287,9 @@ def test_rcig_catalog_modes_parent_coverage_y_qualification_and_fixed_x():
 
 
 @pytest.mark.parametrize('status,cmax,reason', [
-    ('FEASIBLE', 850., 'IMPROVED_B32'), ('FEASIBLE', 1100., 'INITIAL_B32_BETTER_OR_EQUAL'),
-    ('DEADLOCK', None, 'FINAL_B32_FAILED')])
-def test_rcig_500_attempts_distinct_evaluations_one_b32_and_cached_fallback(monkeypatch,status,cmax,reason):
+    ('FEASIBLE', 850., 'IMPROVED_NATIVE'), ('FEASIBLE', 1100., 'INITIAL_NATIVE_BETTER_OR_EQUAL'),
+    ('DEADLOCK', None, 'FINAL_NATIVE_FAILED')])
+def test_rcig_500_attempts_distinct_evaluations_one_coordination_and_cached_fallback(monkeypatch,status,cmax,reason):
     from types import SimpleNamespace
     from mrta_search import rc_ig as c
     from mrta_reference.model import ScheduleResult, ScheduleStatus
@@ -2318,17 +2318,17 @@ def test_rcig_500_attempts_distinct_evaluations_one_b32_and_cached_fallback(monk
     monkeypatch.setattr(c,'run_saeax',seed)
     monkeypatch.setattr(c,'repair_parents',repair)
     monkeypatch.setattr(c,'_priority_arrays',score)
-    monkeypatch.setattr(c,'reference_schedule_formal',final)
+    monkeypatch.setattr(c,'native_schedule',final)
     result = c.run_rc_ig(w.parents,seed=99)
     a = result.accounting
     assert calls == dict(seed=1,repair=500,native=1,final=1)
     assert result.iterations == 500 and result.termination_reason == 'ITERATION_LIMIT'
     assert a['construction_failures'] == 250 and a['duplicate_candidates'] == 249
     assert a['native_calls'] == 13 and a['ig_native_calls'] == 1
-    assert a['b32_calls'] == 4 and a['final_b32_calls'] == 1
-    assert result.runtime > 90 and result.runtime >= a['initialization_s']+a['ig_search_s']+a['final_b32_s']
+    assert a['coordination_calls'] == 4 and a['final_coordination_calls'] == 1
+    assert result.runtime > 90 and result.runtime >= a['initialization_s']+a['ig_search_s']+a['final_coordination_s']
     assert a['return_reason'] == reason and a['search_complete']
-    if reason == 'IMPROVED_B32':
+    if reason == 'IMPROVED_NATIVE':
         assert result.cmax == 850. and result.native_cmax == 800.
     else:
         assert result.schedule is initial.schedule and result.cmax == initial.cmax
@@ -2353,7 +2353,7 @@ def test_rcig_annealing_accepts_worse_rejects_infeasible_and_returns_global_best
     monkeypatch.setattr(c,'destroy_parents',lambda *args:(0,1,2))
     monkeypatch.setattr(c,'repair_parents',repaired)
     monkeypatch.setattr(c,'_priority_arrays',lambda *args:(next(values),None,[],None))
-    monkeypatch.setattr(c,'reference_schedule_formal',lambda *args,orientations,**kwargs:
+    monkeypatch.setattr(c,'native_schedule',lambda *args,orientations,**kwargs:
         ScheduleResult(ScheduleStatus.FEASIBLE,cmax=900.,directions=tuple(orientations[r] for r in range(4))))
     result = c.run_rc_ig(w.parents,settings=c.RCIGConfig(max_iterations=3))
     assert result.accounting['accepted_improvements'] == 1
@@ -2371,10 +2371,10 @@ def test_rcig_no_global_native_improvement_never_reschedules_initial(monkeypatch
     monkeypatch.setattr(c,'run_saeax',lambda *args,**kwargs:initial)
     monkeypatch.setattr(c,'repair_parents',lambda *args:(f[0],f[1],item.selected.copy(),[]))
     monkeypatch.setattr(c,'_priority_arrays',lambda *args:(value,None,[],None))
-    def forbidden(*args,**kwargs):raise AssertionError('unexpected B32')
-    monkeypatch.setattr(c,'reference_schedule_formal',forbidden)
+    def forbidden(*args,**kwargs):raise AssertionError('unexpected NATIVE')
+    monkeypatch.setattr(c,'native_schedule',forbidden)
     result = c.run_rc_ig(w.parents,settings=c.RCIGConfig(max_iterations=2))
-    assert result.schedule is initial.schedule and result.accounting['final_b32_calls'] == 0
+    assert result.schedule is initial.schedule and result.accounting['final_coordination_calls'] == 0
     assert result.accounting['return_reason'] == 'NO_NATIVE_IMPROVEMENT'
 
 
@@ -2530,38 +2530,38 @@ def _crf_mock_search(monkeypatch, *, native=800., repeat=True):
 
 
 @pytest.mark.parametrize('status,cmax,reason', [
-    ('FEASIBLE', 850., 'IMPROVED_B32'), ('FEASIBLE', 1100., 'INITIAL_B32_BETTER_OR_EQUAL'),
-    ('DEADLOCK', None, 'FINAL_B32_FAILED')])
-def test_crf_best_improvement_one_final_b32_and_cached_initial_fallback(monkeypatch, status, cmax, reason):
+    ('FEASIBLE', 850., 'IMPROVED_NATIVE'), ('FEASIBLE', 1100., 'INITIAL_NATIVE_BETTER_OR_EQUAL'),
+    ('DEADLOCK', None, 'FINAL_NATIVE_FAILED')])
+def test_crf_best_improvement_one_final_coordination_and_cached_initial_fallback(monkeypatch, status, cmax, reason):
     from mrta_reference.model import ScheduleResult, ScheduleStatus
     c, w, initial, calls = _crf_mock_search(monkeypatch)
     def final(*args, orientations, **kwargs):
         calls['final'] += 1
         return ScheduleResult(ScheduleStatus(status), cmax=cmax,
             directions=tuple(orientations[r] for r in range(4)))
-    monkeypatch.setattr(c, 'reference_schedule_formal', final)
+    monkeypatch.setattr(c, 'native_schedule', final)
     result = c.run_crf_dp(w.parents)
     a = result.accounting
     assert (calls['seed'], calls['dp'], calls['native'], calls['final']) == (1, 12, 6, 1)
     assert a['duplicate_candidates'] == 6 and a['accepted_improvements'] == 1
-    assert a['native_calls'] == 18 and a['b32_calls'] == 4
+    assert a['native_calls'] == 18 and a['coordination_calls'] == 4
     assert a['return_reason'] == reason and a['search_complete']
     assert result.rounds == 2 and result.termination_reason == 'NO_IMPROVEMENT'
     assert calls['critical'] == [0, 1]  # Recomputed after the accepted best state.
-    assert result.native_cmax == 794. if reason == 'IMPROVED_B32' else result.schedule is initial.schedule
+    assert result.native_cmax == 794. if reason == 'IMPROVED_NATIVE' else result.schedule is initial.schedule
     if status == 'DEADLOCK':
         assert result.final_candidate['cmax_s'] is None
 
 
 @pytest.mark.parametrize('native', [float('inf'), float('nan'), 950.])
-def test_crf_no_native_improvement_has_no_extra_b32(monkeypatch, native):
+def test_crf_no_native_improvement_has_no_extra_coordination(monkeypatch, native):
     c, w, initial, calls = _crf_mock_search(monkeypatch, native=native)
     def forbidden(*args, **kwargs):
-        raise AssertionError('unexpected final B32')
-    monkeypatch.setattr(c, 'reference_schedule_formal', forbidden)
+        raise AssertionError('unexpected final NATIVE')
+    monkeypatch.setattr(c, 'native_schedule', forbidden)
     result = c.run_crf_dp(w.parents)
     assert result.schedule is initial.schedule and result.cmax == initial.cmax
-    assert result.accounting['final_b32_calls'] == 0
+    assert result.accounting['final_coordination_calls'] == 0
     assert result.accounting['native_nonfinite'] == (6 if native != 950. else 0)
     assert result.accounting['return_reason'] == 'NO_NATIVE_IMPROVEMENT'
 
@@ -2575,7 +2575,7 @@ def test_crf_native_budget_and_defaults_not_wall_clock(monkeypatch):
         clock[0] += 10.
         return clock[0]
     monkeypatch.setattr(c, 'time', SimpleNamespace(perf_counter=elapsed))
-    monkeypatch.setattr(c, 'reference_schedule_formal', lambda *args, orientations, **kwargs:
+    monkeypatch.setattr(c, 'native_schedule', lambda *args, orientations, **kwargs:
         ScheduleResult(ScheduleStatus.FEASIBLE, cmax=850., directions=tuple(orientations[r] for r in range(4))))
     result = c.run_crf_dp(w.parents)
     assert result.termination_reason == 'NATIVE_LIMIT' and result.rounds == 7
@@ -2596,7 +2596,7 @@ def test_crf_lower_bound_prunes_before_native_and_initial_failure_stops(monkeypa
     monkeypatch.setattr(c, 'reconstruct_fragment', bounded)
     result = c.run_crf_dp(w.parents)
     assert result.accounting['lower_bound_pruned'] == 6
-    assert calls['native'] == 0 and result.accounting['b32_calls'] == 3
+    assert calls['native'] == 0 and result.accounting['coordination_calls'] == 3
     initial.status, initial.cmax = 'DEADLOCK', None
     result = c.run_crf_dp(w.parents)
     assert result.termination_reason == 'INITIALIZATION_FAILED' and result.cmax is None
@@ -2750,7 +2750,7 @@ def test_rcg_gnn_scores_append_choices_and_changes_columns_without_local_operato
     c, w, initial, _ = _rcg_fixture()
     def forbidden(*args, **kwargs):
         raise AssertionError('pricing called a scheduler or old search')
-    monkeypatch.setattr(c, 'reference_schedule_formal', forbidden)
+    monkeypatch.setattr(c, 'native_schedule', forbidden)
     monkeypatch.setattr(c, 'run_saeax', forbidden)
     _, dual = c.RestrictedMaster(w, [[x] for x in initial.columns]).solve_lp()
     torch.manual_seed(7)
@@ -2769,8 +2769,8 @@ def test_rcg_new_pricing_head_trains_from_lp_completions_with_frozen_encoder(mon
     import torch
     c, w, initial, _ = _rcg_fixture()
     def forbidden(*args, **kwargs):
-        raise AssertionError('pricing labels used B32 or an old optimizer')
-    monkeypatch.setattr(c, 'reference_schedule_formal', forbidden)
+        raise AssertionError('pricing labels used NATIVE or an old optimizer')
+    monkeypatch.setattr(c, 'native_schedule', forbidden)
     monkeypatch.setattr(c, 'run_saeax', forbidden)
     monkeypatch.setattr(c, '_training_seed', lambda workspace: initial)
     torch.manual_seed(11); torch.set_num_threads(1)
@@ -2778,7 +2778,7 @@ def test_rcg_new_pricing_head_trains_from_lp_completions_with_frozen_encoder(mon
     old = {k: v.detach().clone() for k, v in policy.encoder.state_dict().items()}
     head = policy.head[0].weight.detach().clone()
     fit = c.fit_pricing_head(policy, [('toy_train', w.parents)], epochs=2)
-    assert fit['b32_calls'] == fit['native_calls'] == 0 and fit['lp_calls'] == 3
+    assert fit['coordination_calls'] == fit['native_calls'] == 0 and fit['lp_calls'] == 3
     assert fit['complete_route_labels'] > 0 and fit['training_rank_pairs'] > 0
     assert fit['final_head_gradient_norm'] > 0
     assert not torch.equal(head[:, :64], policy.head[0].weight[:, :64])
@@ -2787,7 +2787,7 @@ def test_rcg_new_pricing_head_trains_from_lp_completions_with_frozen_encoder(mon
 
 @pytest.mark.parametrize('status,score,improves', [('FEASIBLE', 1., True),
     ('FEASIBLE', 10000., False), ('DEADLOCK', None, False)])
-def test_rcg_final_b32_only_and_cached_same_run_initial_fallback(monkeypatch, status, score, improves):
+def test_rcg_final_coordination_only_and_cached_same_run_initial_fallback(monkeypatch, status, score, improves):
     from types import SimpleNamespace
     from mrta_reference.model import ScheduleResult, ScheduleStatus
     c, w, original, balanced = _rcg_fixture()
@@ -2795,18 +2795,18 @@ def test_rcg_final_b32_only_and_cached_same_run_initial_fallback(monkeypatch, st
     initial = SimpleNamespace(status='FEASIBLE', cmax=original.period+100., solution=solution,
         directions=directions, schedule=ScheduleResult(ScheduleStatus.FEASIBLE,
         cmax=original.period+100., directions=directions), runtime=3.,
-        native_cmax=original.period, accounting=dict(native_calls=12, b32_calls=3))
+        native_cmax=original.period, accounting=dict(native_calls=12, coordination_calls=3))
     calls = []
     monkeypatch.setattr(c, 'construct_bundle', lambda *args, **kwargs: balanced)
     def final(solution, config, *, scope, orientations):
         calls.append(solution)
         return ScheduleResult(ScheduleStatus(status), cmax=score,
             directions=tuple(orientations[r] for r in range(4)))
-    monkeypatch.setattr(c, 'reference_schedule_formal', final)
+    monkeypatch.setattr(c, 'native_schedule', final)
     monkeypatch.setattr(c, 'run_saeax', lambda *a, **k: pytest.fail('initialization repeated'))
     result = c.optimize_route_columns(w.parents, initial, settings=c.RCGConfig(max_rounds=3, mip_seconds=1.))
-    assert len(calls) == 1 and result.accounting['final_b32_calls'] == 1
-    assert result.accounting['b32_calls'] == 4 and result.accounting['native_calls'] == 12
+    assert len(calls) == 1 and result.accounting['final_coordination_calls'] == 1
+    assert result.accounting['coordination_calls'] == 4 and result.accounting['native_calls'] == 12
     assert result.accounting['search_complete'] and result.runtime >= 3.
     assert result.accounting['negative_columns'] > 0 and result.accounting['companion_columns'] > 0
     if improves:
@@ -2826,12 +2826,12 @@ def test_rcg_two_empty_rounds_stop_and_do_not_reevaluate_initial(monkeypatch):
     initial = SimpleNamespace(status='FEASIBLE', cmax=original.period, solution=solution,
         directions=directions, schedule=ScheduleResult(ScheduleStatus.FEASIBLE,
         cmax=original.period, directions=directions), runtime=2.,
-        accounting=dict(native_calls=10, b32_calls=1))
+        accounting=dict(native_calls=10, coordination_calls=1))
     monkeypatch.setattr(c, 'construct_bundle', lambda *a, **k: original)
-    monkeypatch.setattr(c, 'reference_schedule_formal', lambda *a, **k: pytest.fail('duplicate B32'))
+    monkeypatch.setattr(c, 'native_schedule', lambda *a, **k: pytest.fail('duplicate NATIVE'))
     result = c.optimize_route_columns(w.parents, initial)
     assert result.accounting['rounds'] == 2 and result.accounting['lp_calls'] == 2
-    assert result.accounting['milp_calls'] == 0 and result.accounting['final_b32_calls'] == 0
+    assert result.accounting['milp_calls'] == 0 and result.accounting['final_coordination_calls'] == 0
     assert result.schedule is initial.schedule
     assert result.termination_reason == 'NO_NEW_VALUABLE_COLUMNS'
 
@@ -2988,19 +2988,19 @@ def test_jnmip_parent_sets_have_multiple_robots_and_real_set_head_inputs():
     assert len(set(sets)) == len(sets)
 
 
-def test_jnmip_fit_stops_without_positive_b32_labels_and_uses_real_preferences():
+def test_jnmip_fit_stops_without_positive_coordination_labels_and_uses_real_preferences():
     import torch
     j, w, old = _jn_fixture()
     torch.manual_seed(17)
     selector = j.SetSelector()
     rows = j.SelectionContext(w, old, selector).rows(((0, 1, 2, 3), (0, 1, 2, 4))).detach()
     before = selector.head[0].weight.detach().clone()
-    no_gain = [dict(b32_status='FEASIBLE', actual_gain_s=0.), dict(b32_status='FEASIBLE', actual_gain_s=-10.)]
+    no_gain = [dict(coordination_status='FEASIBLE', actual_gain_s=0.), dict(coordination_status='FEASIBLE', actual_gain_s=-10.)]
     stopped = j.fit_selector(selector, [(rows, no_gain)])
     assert not stopped['trained'] and stopped['epochs'] == 0
     assert torch.equal(before, selector.head[0].weight)
     frozen = {k: v.detach().clone() for k, v in selector.encoder.state_dict().items()}
-    yes_gain = [dict(b32_status='FEASIBLE', actual_gain_s=10.), dict(b32_status='FEASIBLE', actual_gain_s=-10.)]
+    yes_gain = [dict(coordination_status='FEASIBLE', actual_gain_s=10.), dict(coordination_status='FEASIBLE', actual_gain_s=-10.)]
     fit = j.fit_selector(selector, [(rows, yes_gain)], epochs=2)
     assert fit['trained'] and fit['preference_pairs'] == 1 and fit['head_gradient_norm'] > 0
     assert not torch.equal(before[:, :64], selector.head[0].weight[:, :64])
@@ -3009,7 +3009,7 @@ def test_jnmip_fit_stops_without_positive_b32_labels_and_uses_real_preferences()
 
 @pytest.mark.parametrize('status,cmax,accept', [('FEASIBLE', 100., True),
     ('FEASIBLE', 10000., False), ('DEADLOCK', None, False)])
-def test_jnmip_acceptance_requires_actual_b32_not_better_route_proxy(monkeypatch, status, cmax, accept):
+def test_jnmip_acceptance_requires_actual_coordination_not_better_route_proxy(monkeypatch, status, cmax, accept):
     from mrta_reference.model import ScheduleResult, ScheduleStatus
     j, w, old = _jn_fixture()
     rr = [row.copy() for row in old.routes]; dd = [row.copy() for row in old.bits]
@@ -3028,20 +3028,20 @@ def test_jnmip_acceptance_requires_actual_b32_not_better_route_proxy(monkeypatch
         return 0.
     monkeypatch.setattr(j, 'evaluate_plan', evaluate)
     result = j.optimize(w, old, 2., settings=j.JNConfig(max_rounds=1))
-    assert len(count) == 1 and result.accounting['b32_calls'] == 1 and result.runtime >= 2.
+    assert len(count) == 1 and result.accounting['coordination_calls'] == 1 and result.runtime >= 2.
     assert bool(result.accounting['accepted']) == accept
     assert (result.plan.schedule.cmax == 100.) if accept else result.plan is old
-    if status == 'DEADLOCK': assert result.records[0]['b32_cmax_s'] is None
+    if status == 'DEADLOCK': assert result.records[0]['coordination_cmax_s'] is None
 
 
-def test_jnmip_unchanged_candidate_reuses_initial_b32(monkeypatch):
+def test_jnmip_unchanged_candidate_reuses_initial_coordination(monkeypatch):
     j, w, old = _jn_fixture()
     monkeypatch.setattr(j.SelectionContext, 'candidate_sets', lambda *a: [(0, 1, 2, 3)])
     monkeypatch.setattr(j, 'solve_joint', lambda *a, **k: (old, dict(build_s=0., solve_s=0., status=0)))
-    monkeypatch.setattr(j, 'evaluate_plan', lambda *a: pytest.fail('initial B32 repeated'))
+    monkeypatch.setattr(j, 'evaluate_plan', lambda *a: pytest.fail('initial NATIVE repeated'))
     result = j.optimize(w, old, 0.)
-    assert result.plan is old and result.accounting['b32_calls'] == 0
-    assert result.reason == 'NO_B32_IMPROVEMENT' and result.accounting['milp_calls'] == 1
+    assert result.plan is old and result.accounting['coordination_calls'] == 0
+    assert result.reason == 'NO_NATIVE_IMPROVEMENT' and result.accounting['milp_calls'] == 1
 
 
 def test_jnmip_initial_observer_forwards_once_and_restores_existing_saeax(monkeypatch):
@@ -3052,17 +3052,17 @@ def test_jnmip_initial_observer_forwards_once_and_restores_existing_saeax(monkey
         calls.append(solution)
         feasible_dispatch_observer(old.schedule, ())
         return old.schedule
-    monkeypatch.setattr(j.saeax, 'reference_schedule_formal', schedule)
+    monkeypatch.setattr(j.saeax, 'native_schedule', schedule)
     def initialize(*args, **kwargs):
-        result = j.saeax.reference_schedule_formal(old.solution, w.config)
+        result = j.saeax.native_schedule(old.solution, w.config)
         return SimpleNamespace(status='FEASIBLE', solution=old.solution, directions=old.directions, schedule=result)
     monkeypatch.setattr(j.saeax, 'run_saeax', initialize)
     result, blockers, elapsed = j.initialize(w.parents)
     assert result.schedule is old.schedule and len(calls) == 1 and elapsed >= 0
-    assert j.saeax.reference_schedule_formal is schedule
+    assert j.saeax.native_schedule is schedule
 
 
-def test_jnmip_pilot_needs_b32_gain_ablation_and_time(monkeypatch):
+def test_jnmip_pilot_needs_coordination_gain_ablation_and_time(monkeypatch):
     import json
     from pathlib import Path
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
@@ -3097,14 +3097,14 @@ def test_jnmip_retained_multiple_tasks_keep_relative_order_across_all_gaps():
         assert after == before
 
 
-def test_jnmip_real_b32_selected_rollout_observer_evaluates_once(monkeypatch):
+def test_jnmip_real_coordination_selected_rollout_observer_evaluates_once(monkeypatch):
     j, w, old = _jn_fixture()
-    original = j.reference_schedule_formal
+    original = j.native_schedule
     calls = []
     def counted(*args, **kwargs):
         calls.append(args[0])
         return original(*args, **kwargs)
-    monkeypatch.setattr(j, 'reference_schedule_formal', counted)
+    monkeypatch.setattr(j, 'native_schedule', counted)
     elapsed = j.evaluate_plan(old, w)
     assert len(calls) == 1 and elapsed >= 0 and old.schedule.feasible
     assert old.schedule.directions == old.directions
@@ -3119,7 +3119,7 @@ def test_jnmip_failed_shared_initialization_is_saved_without_search_or_rerun(mon
     import run_gnn_joint_mip as entry
     j, w, old = _jn_fixture()
     initial = SimpleNamespace(status='DEADLOCK', cmax=None, solution=old.solution,
-        directions=old.directions, accounting=dict(native_calls=20, b32_calls=3))
+        directions=old.directions, accounting=dict(native_calls=20, coordination_calls=3))
     calls, rows = [], []
     def failed(*args, **kwargs):
         calls.append('initial')

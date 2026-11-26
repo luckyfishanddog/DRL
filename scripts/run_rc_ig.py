@@ -90,7 +90,7 @@ def experiment_job(job):
             valid_children=initial.valid_children, termination_reason=initial.termination_reason,
             accounting=initial.accounting, progress=initial.progress, final_candidates=initial.final_candidates,
             solution=solution_record(initial.solution, initial.directions),
-            b32_result=(dict(status=initial_schedule.status.value, cmax_s=initial_schedule.cmax,
+            coordination_result=(dict(status=initial_schedule.status.value, cmax_s=initial_schedule.cmax,
                 robot_completion=initial_schedule.robot_completion, directions=initial_schedule.directions,
                 diagnostics=initial_schedule.diagnostics) if initial_schedule is not None else None)))
     loads = a.get('processing_s')
@@ -99,7 +99,7 @@ def experiment_job(job):
     row = dict(stage=stage, layout_id=name, parent_count=len(parents), seed=seed, status=result.status,
         cmax_s=result.cmax, native_cmax_s=result.native_cmax, runtime_s=result.runtime,
         generations='', valid_children=a['ig_native_calls'], native_calls=a['native_calls'],
-        b32_calls=a['b32_calls'], termination_reason=result.termination_reason,
+        coordination_calls=a['coordination_calls'], termination_reason=result.termination_reason,
         max_processing_s=max(loads) if loads else None, move_s=a.get('move_s'), wait_s=a.get('wait_s'),
         source=SOURCE, diagnostic=json.dumps(diagnostic, ensure_ascii=False, allow_nan=False))
     if loads:
@@ -131,7 +131,7 @@ def summarize(stage):
         print('RC_IG_ROW', json.dumps(dict(layout_id=r['layout_id'], seed=r['seed'], status=r['status'],
             cmax_s=r['cmax_s'], runtime_s=r['runtime_s'], initial_cmax_s=a.get('initial_cmax_s'),
             iterations=a.get('iterations'), ig_native_calls=a.get('ig_native_calls'),
-            initial_native_calls=a.get('initial_native_calls'), final_b32_calls=a.get('final_b32_calls'),
+            initial_native_calls=a.get('initial_native_calls'), final_coordination_calls=a.get('final_coordination_calls'),
             return_reason=a.get('return_reason')), ensure_ascii=False), flush=True)
     return summary
 

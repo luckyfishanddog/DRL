@@ -20,11 +20,11 @@ from scipy.stats import wilcoxon
 from mrta_search import gnn_cem as c
 import run_joint_oriented_repair_pilot as common
 
-RESULTS = ROOT/'results/new_dataset_final/gnn_cem.csv'
+RESULTS = ROOT/'results/native_priority/new_dataset_final/gnn_cem.csv'
 ENCODER = ROOT/'models/gnn_weld_layout_final.pt'
 PILOTS = ('train_12', 'train_05', 'train_07')
 FIELDS = ('layout_id', 'seed', 'status', 'initial_cmax', 'final_cmax', 'improvement_pct',
-    'runtime_s', 'generations', 'population_size', 'b32_calls', 'accepted_elites',
+    'runtime_s', 'generations', 'population_size', 'coordination_calls', 'accepted_elites',
     'termination_reason', 'stage', 'diagnostic', 'solution')
 EXPOSURE = ('The original geometry encoder has historical exposure to all 40 TRAIN layouts. '
     'These three layouts avoid recent algorithm pilots; they are not historically unseen GNN data. '
@@ -32,18 +32,18 @@ EXPOSURE = ('The original geometry encoder has historical exposure to all 40 TRA
 
 
 def fast_initial(parents, config, seed):
-    """Exactly one common RULE/BEAM B32 proposal; retain failures too."""
+    """Exactly one common RULE/BEAM NATIVE proposal; retain failures too."""
     started = time.perf_counter(); calls = []
-    original = common.reference_schedule_formal
+    original = common.native_schedule
     def observed(solution, cfg, *, orientations, **kwargs):
         item = SimpleNamespace(solution=solution, directions=tuple(tuple(orientations[r]) for r in range(4)), schedule=None)
         calls.append(item)
         item.schedule = original(solution, cfg, orientations=orientations, **kwargs)
         return item.schedule
-    with patch.object(common, 'reference_schedule_formal', observed):
+    with patch.object(common, 'native_schedule', observed):
         best, attempts = common.common_initial_beam(parents, config, seed=seed, max_reference_calls=1)
     selected = best or (calls[-1] if calls and calls[-1].schedule is not None else None)
-    return selected, dict(b32_calls=len(calls), runtime_s=time.perf_counter()-started,
+    return selected, dict(coordination_calls=len(calls), runtime_s=time.perf_counter()-started,
         attempts=attempts, source='COMMON_RULE_BEAM_FIRST_PROPOSAL', max_reference_calls=1)
 
 
@@ -63,7 +63,7 @@ def train_decision(rows=None):
     wins = sum(float(r['final_cmax']) < float(r['initial_cmax'])-1.e-6 for r in paired)
     runtime = median(float(r['runtime_s']) for r in rows) if rows else None
     accounts = [json.loads(r['diagnostic']).get('accounting', {}) for r in rows]
-    budgets = len(accounts) == 3 and all(a.get('search_complete') and a.get('new_b32_calls', 25) <= 24
+    budgets = len(accounts) == 3 and all(a.get('search_complete') and a.get('new_coordination_calls', 25) <= 24
         and a.get('sample_attempts', 25) <= 24 for a in accounts)
     passed = (complete and feasible == 3 and len(paired) == 3 and wins >= 2
         and median(gains) >= 1. and runtime <= 120. and budgets)
@@ -124,7 +124,7 @@ def job(stage, name, parents, seed):
             initial_cmax=initial_cmax, final_cmax=final_cmax,
             improvement_pct=100*(initial_cmax-final_cmax)/initial_cmax if initial_cmax is not None and final_cmax is not None else None,
             runtime_s=result.runtime, generations=result.generations, population_size=8,
-            b32_calls=accounting['b32_calls'], accepted_elites=accounting['accepted_elites'],
+            coordination_calls=accounting['coordination_calls'], accepted_elites=accounting['accepted_elites'],
             termination_reason=result.termination_reason, stage=stage,
             diagnostic=json.dumps(dict(settings=asdict(c.CEMConfig()), exposure=EXPOSURE,
                 parent_count=len(parents), accounting=accounting, progress=result.progress,
@@ -132,7 +132,7 @@ def job(stage, name, parents, seed):
             solution=json.dumps(c.solution_record(result.best), ensure_ascii=False, allow_nan=False))
     except Exception as error:
         row = dict(layout_id=name, seed=seed, status='ERROR', runtime_s=time.perf_counter()-started,
-            population_size=8, b32_calls=accounting.get('b32_calls'), accepted_elites=accounting.get('accepted_elites'),
+            population_size=8, coordination_calls=accounting.get('coordination_calls'), accepted_elites=accounting.get('accepted_elites'),
             termination_reason='ERROR', stage=stage,
             diagnostic=json.dumps(dict(error=f'{type(error).__name__}: {error}', accounting=accounting,
                 progress=progress, exposure=EXPOSURE), ensure_ascii=False, allow_nan=False))

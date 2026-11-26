@@ -2865,7 +2865,7 @@ def _run_hga_route_dp(parents, config, settings, *, seed, scope, checkpoints, me
                             iterations=iterations, initialization_time=initialization_time,
                             termination_reason='ITERATION_LIMIT', initial_candidate=initial_candidate,
                             initial_reference_calls=initial_calls,
-                            diagnostics=('full M1-M6 VND; native four-robot priority objective; no internal B32',))
+                            diagnostics=('full M1-M6 VND; native four-robot priority objective; no internal NATIVE',))
 
 
 def _oriented_identity(routes, directions):
@@ -2875,7 +2875,7 @@ def _oriented_identity(routes, directions):
 
 def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoints, method_id,
                              time_limit=math.inf, vnd_observer=None, fixed_taskset=None):
-    """Explicit oriented individuals; the final experiment wrapper runs B32."""
+    """Explicit oriented individuals; the final experiment wrapper runs NATIVE."""
     rng = random.Random(seed)
     evaluator = CommonBaselineEvaluator(parents, config, scope, time_limit=time_limit,
                                         checkpoints=checkpoints, certify=False, candidate_evaluator=priority_schedule)
@@ -3084,9 +3084,9 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
         initial_candidate=initial_candidate, initial_reference_calls=initial_calls,
         diagnostics=((
             'explicit oriented genes; complete route-cycle M1-M6 VND; native coordinated population selection',
-            'one fixed-gene native evaluation per complete individual; no internal B32') if route_objective else (
+            'one fixed-gene native evaluation per complete individual; no internal NATIVE') if route_objective else (
             'explicit oriented genes; complete M1-M6 VND; same fixed-gene native Cmax in VND and population',
-            'only native rejected-pair progress breaks nonfinite-Cmax ties; no internal B32')))
+            'only native rejected-pair progress breaks nonfinite-Cmax ties; no internal NATIVE')))
 
 
 def _run_hga_native(parents, config, settings, *, seed, scope, checkpoints, method_id):

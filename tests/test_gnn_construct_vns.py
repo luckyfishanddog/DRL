@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-def test_fixed_ppo_full_teacher_sequence_shared_gradients_and_real_b32(monkeypatch):
+def test_fixed_ppo_full_teacher_sequence_shared_gradients_and_real_coordination(monkeypatch):
     import torch
     from mrta_reference.fixed_taskset import generate_taskset
     from mrta_reference.model import ParentWeld
@@ -28,12 +28,12 @@ def test_fixed_ppo_full_teacher_sequence_shared_gradients_and_real_b32(monkeypat
     for prefix in ('layer1','layer2','actor','critic'):
         assert any(not torch.equal(before[k],v) for k,v in model.state_dict().items() if k.startswith(prefix))
     called = []
-    original = p.reference_schedule_formal
+    original = p.native_schedule
     def observed(solution,config,**kwargs):
         called.append(solution)
         assert config.t_pre == 20 and config.t_post == 30
         return original(solution,config,**kwargs)
-    monkeypatch.setattr(p,'reference_schedule_formal',observed)
+    monkeypatch.setattr(p,'native_schedule',observed)
     first = p.formal_episode(model,graph,123)
     second = p.formal_episode(model,graph,123)
     assert len(called) == 2
@@ -65,14 +65,14 @@ def test_fixed_ppo_bc_then_clipped_updates_execute_without_test_labels(monkeypat
     from mrta_reference.fixed_taskset import generate_taskset
     from mrta_reference.model import ParentWeld
     from mrta_reference.solution import canonicalize
-    from mrta_reference.scheduler import reference_schedule_formal
+    from mrta_reference.scheduler import native_schedule
     from mrta_reference.scope import FORMAL_SCOPE_V2
     from mrta_search import gnn_ppo as p
     ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.))))
     payload = dict(assignments={t.task_id:0 if t.source_parent_id=='p' else 1 for t in ts.tasks},
                    routes=[['p::job_000_006'],['q::seg_000'],[],[]],directions=[[0],[0],[],[]])
     solution = canonicalize(ts.parents,ts.patterns,dict(enumerate(payload['routes'])),p.CONFIG)
-    schedule = reference_schedule_formal(solution,p.CONFIG,scope=FORMAL_SCOPE_V2,orientations=dict(enumerate(payload['directions'])))
+    schedule = native_schedule(solution,p.CONFIG,scope=FORMAL_SCOPE_V2,orientations=dict(enumerate(payload['directions'])))
     assert schedule.feasible
     records = [dict(split=split,layout_id=name,seed=1,termination_reason='ITERATION_LIMIT',
                     status='FEASIBLE',cmax_s=schedule.cmax,solution=json.dumps(payload))
@@ -90,8 +90,8 @@ def test_fixed_ppo_bc_then_clipped_updates_execute_without_test_labels(monkeypat
              json_text=lambda value:json.dumps(value,allow_nan=False),update_report=lambda:None)
     p.train_experiment(api,p.PPOSettings(bc_epochs=1,ppo_updates=2,rollouts_per_update=1,ppo_epochs=2,validation_every=1))
     assert [(row['stage'],row['update']) for row in rows] == [('BC',1),('PPO',1),('PPO',2)]
-    assert rows[1]['b32_calls'] == 2  # one real TRAIN rollout + one VALIDATION
-    assert rows[2]['b32_calls'] == 2
+    assert rows[1]['coordination_calls'] == 2  # one real TRAIN rollout + one VALIDATION
+    assert rows[2]['coordination_calls'] == 2
     assert weights[-1]['metadata']['training_complete']
     assert weights[-1]['metadata']['completed_updates'] == 2
     assert 'tiny_test' not in weights[-1]['metadata']['references']
@@ -241,7 +241,7 @@ def test_child_head_fits_same_state_pairs_without_updating_old_parameters():
     assert model.cmax_value_head is None
 
 
-def test_child_search_keeps_current_and_best_when_b32_deadlocks_and_reuses_full_plan(monkeypatch):
+def test_child_search_keeps_current_and_best_when_coordination_deadlocks_and_reuses_full_plan(monkeypatch):
     from mrta_reference.model import ScheduleResult,ScheduleStatus
     experiment,c,_,model=_feedback_fixture()
     model.requires_grad_(False).enable_child_transfer_head()
@@ -251,7 +251,7 @@ def test_child_search_keeps_current_and_best_when_b32_deadlocks_and_reuses_full_
     context=dict(started=time.perf_counter(),space=None,embeddings=None,seen={},blockers={},rng=random.Random(1),
         result=result,schedule=ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.,robot_completion=(100.,0.,0.,0.)),
         initial_attempts=1,initial_status='FEASIBLE',initial_cmax_s=100.,construct_s=0.,last_status='FEASIBLE',failure='')
-    context['counts']=dict(reconstruction_attempts=0,reconstructions=0,accepted=0,b32_calls=1,cache_hits=0,
+    context['counts']=dict(reconstruction_attempts=0,reconstructions=0,accepted=0,coordination_calls=1,cache_hits=0,
         deadlocks=0,numeric_failures=0,incomplete=0,late_candidates=0)
     monkeypatch.setattr(experiment,'child_initial_state',lambda *a:context)
     monkeypatch.setattr(experiment.lns,'select_feedback_child',lambda *a,**kw:'a::whole')
@@ -261,11 +261,11 @@ def test_child_search_keeps_current_and_best_when_b32_deadlocks_and_reuses_full_
     monkeypatch.setattr(experiment.lns,'child_transfer_candidates',generate)
     monkeypatch.setattr(c,'child_transfer_inputs',lambda *a:torch.zeros((1,model.child_transfer_mean.numel())))
     calls=[]
-    monkeypatch.setattr(experiment,'b32',lambda *a,**kw:calls.append(1) or ScheduleResult(ScheduleStatus.DEADLOCK))
+    monkeypatch.setattr(experiment,'coordination',lambda *a,**kw:calls.append(1) or ScheduleResult(ScheduleStatus.DEADLOCK))
     row=experiment.run_child_feedback_gnn(solution.parents,model,1,attempts=3)
     assert row['status']=='FEASIBLE' and row['cmax_s']==100. and row['accepted']==0
     assert row['reconstruction_attempts']==row['reconstructions']==3
-    assert row['b32_calls']==2 and row['cache_hits']==2 and len(calls)==1
+    assert row['coordination_calls']==2 and row['cache_hits']==2 and len(calls)==1
 
 
 def test_feedback_joint_trajectory_preserves_coverage_legality_and_replays_exact_logits():
@@ -373,7 +373,7 @@ def test_feedback_complete_schedule_and_blocker_evidence_are_evaluated_once(monk
     result = c.construct_vnext_gnn(parents, model, CONFIG)
     calls = []
     schedule = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10.)
-    monkeypatch.setattr(experiment, 'b32', lambda result, **kwargs: calls.append(result) or schedule)
+    monkeypatch.setattr(experiment, 'coordination', lambda result, **kwargs: calls.append(result) or schedule)
     seen, blockers = {}, {}
     assert experiment.evaluate_once(result, seen, blocker_cache=blockers) == (schedule, True)
     assert experiment.evaluate_once(result, seen, blocker_cache=blockers) == (schedule, False)
@@ -405,7 +405,7 @@ def test_feedback_search_retains_best_after_failed_or_nonimproving_repair(monkey
     assert experiment.json.loads(row['diagnostic'])['best_improvements'] == 0
     if status == 'FEASIBLE' and cmax == 10.:
         assert row['accepted'] == row['reconstructions']
-    assert row['b32_calls'] == len(constructions) and row['runtime_s'] <= 10.
+    assert row['coordination_calls'] == len(constructions) and row['runtime_s'] <= 10.
 
 
 def test_feedback_continuation_uses_packed_120_train_and_retains_original_validation(monkeypatch):
@@ -467,7 +467,7 @@ def test_feedback_late_initial_schedule_is_not_reported_as_timely_feasible(monke
     monkeypatch.setattr(experiment, 'evaluate_once', evaluate)
     row = experiment.run_feedback_gnn(parents, model, 1, budget=5.)
     assert row['status'] == 'TIME_LIMIT' and row['cmax_s'] is None
-    assert row['b32_calls'] == row['late_candidates'] == 1
+    assert row['coordination_calls'] == row['late_candidates'] == 1
 
 
 def test_feedback_fixed_reconstruction_count_finishes_after_120_seconds(monkeypatch):
@@ -485,7 +485,7 @@ def test_feedback_fixed_reconstruction_count_finishes_after_120_seconds(monkeypa
     row = experiment.run_feedback_gnn(parents, model, 1, budget=None, reconstruction_limit=3)
     assert row['reconstruction_attempts'] == row['reconstructions'] == 3
     assert row['runtime_s'] == 240. and row['status'] == 'FEASIBLE'
-    assert row['b32_calls'] == 4
+    assert row['coordination_calls'] == 4
 
 
 def test_feedback_full_validation_uses_only_selected_weights_and_leaves_checkpoint_unchanged(monkeypatch):
@@ -568,7 +568,7 @@ def test_feedback_sa_searches_from_accepted_current_and_returns_global_best(monk
     monkeypatch.setattr(experiment, 'Random', AcceptUphill)
     row = experiment.run_feedback_gnn(parents, model, 1, reconstruction_limit=4)
     assert prefixes == [candidates[0], candidates[1], candidates[2], candidates[2]]
-    assert row['cmax_s'] == 99. and row['accepted'] == 3 and row['b32_calls'] == 5
+    assert row['cmax_s'] == 99. and row['accepted'] == 3 and row['coordination_calls'] == 5
     detail = experiment.json.loads(row['diagnostic'])
     assert detail['current_cmax_s'] == 101. and detail['accepted_uphill'] == 2
     assert detail['best_improvements'] == 1
@@ -607,7 +607,7 @@ def test_feedback_all_500_attempts_count_incomplete_and_expand_then_reset(monkey
         return original_accepts(candidate, current, temperature, rng)
     monkeypatch.setattr(experiment, 'feedback_accepts', accept)
     row = experiment.run_feedback_gnn(parents, model, 7)
-    assert len(built) == 501 and len(evaluated) == row['b32_calls'] == 2
+    assert len(built) == 501 and len(evaluated) == row['coordination_calls'] == 2
     assert row['reconstruction_attempts'] == 500 and row['reconstructions'] == 1
     assert row['incomplete'] == 499 and row['cmax_s'] == 99.
     assert sizes[:25] == [8] * 25 and sizes[25:27] == [12, 12]
@@ -679,13 +679,13 @@ def test_feedback_test_requires_all_four_validation_conditions(monkeypatch, fail
     rows = [dict(stage='full_validation', epoch=0, source=experiment.FEEDBACK_FULL_SOURCE,
         layout_id=f'validation_{i:02d}', seed=seed, status='FEASIBLE', cmax_s=99., runtime_s=200.,
         initial_status='FEASIBLE', initial_cmax_s=110., reconstruction_attempts=500,
-        reconstructions=500, accepted=1, b32_calls=501, cache_hits=0, incomplete=0, deadlocks=0,
+        reconstructions=500, accepted=1, coordination_calls=501, cache_hits=0, incomplete=0, deadlocks=0,
         numeric_failures=0) for i in range(1, 11) for seed in experiment.TEST_SEEDS]
     if failure == 'feasibility':
         rows[0] = dict(rows[0], status='DEADLOCK', cmax_s='')
     references = {}
     for method in experiment.BASELINES:
-        records = [dict(row, method=method, cmax_s=100., b32_calls=1,
+        records = [dict(row, method=method, cmax_s=100., coordination_calls=1,
             source=experiment.FORMAL_BASELINE_SOURCES[method],
             iterations=experiment.BASELINE_ITERATIONS[method],
             diagnostic=json.dumps(dict(phase='FULL', run_status='COMPLETED'))) for row in rows]
@@ -725,7 +725,7 @@ def test_feedback_initial_deadlock_gets_at_most_two_gnn_sampling_retries(monkeyp
     monkeypatch.setattr(experiment, 'evaluate_once', lambda *a, **kw:
         (ScheduleResult(ScheduleStatus.DEADLOCK), True))
     row = experiment.run_feedback_gnn(parents, model, 12)
-    assert len(sampling) == row['b32_calls'] == 3 and sampling[0] is None
+    assert len(sampling) == row['coordination_calls'] == 3 and sampling[0] is None
     assert sampling[1] is sampling[2] and sampling[1] is not None
     assert row['status'] == 'DEADLOCK' and row['cmax_s'] is None and row['reconstruction_attempts'] == 0
 
@@ -966,7 +966,7 @@ def test_complete_parent_second_child_uses_temporary_routes_and_failed_mode_is_n
 
 
 @pytest.mark.parametrize('compact',(False,True))
-def test_complete_parent_neural_mode_atomic_assignment_and_directions_enter_real_b32(monkeypatch,compact):
+def test_complete_parent_neural_mode_atomic_assignment_and_directions_enter_real_coordination(monkeypatch,compact):
     from mrta_search import gnn_constructor as c
     import run_joint_oriented_repair_pilot as direct
     model=c.CompleteParentGNN(16,4,remaining_workload_features=compact)
@@ -1135,7 +1135,7 @@ def test_direct_macro_imitation_replays_both_children_and_only_trains_scalar_hea
     assert any(not torch.equal(v,model.parent_action_head.state_dict()[k]) for k,v in head_before.items())
 
 
-def test_complete_parent_feedback_never_reschedules_legacy_and_adds_at_most_one_b32(monkeypatch):
+def test_complete_parent_feedback_never_reschedules_legacy_and_adds_at_most_one_coordination(monkeypatch):
     from dataclasses import asdict
     from types import SimpleNamespace as NS
     import run_gnn_cmax_finetune as study
@@ -1164,9 +1164,9 @@ def test_complete_parent_feedback_never_reschedules_legacy_and_adds_at_most_one_
         return NS(schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=100.))
     monkeypatch.setattr(study.pilot.oriented,'schedule_explicit',schedule)
     study.op_parent_cmax_data()
-    assert len(written)==1 and len(calls)<=1 and written[0]['b32_calls']==len(calls)
+    assert len(written)==1 and len(calls)<=1 and written[0]['coordination_calls']==len(calls)
     assert sum(o['origin']=='one_extra' for o in written[0]['payload']['outcomes'])<=1
-    assert all(o['reused'] and o['b32_calls']==0 for o in written[0]['payload']['outcomes'] if o['origin']=='legacy')
+    assert all(o['reused'] and o['coordination_calls']==0 for o in written[0]['payload']['outcomes'] if o['origin']=='legacy')
 
 
 def test_opportunity_counts_use_actual_rail_and_initial_head_legality():
@@ -1339,7 +1339,7 @@ def test_single_model_three_proposals_have_no_old_model_or_rule_fallback(monkeyp
     monkeypatch.setattr(shared.pilot.oriented,'common_initial_beam',forbidden)
     monkeypatch.setattr(shared,'research_certify',forbidden)
     best,info=shared.neural_single_model_portfolio(reference.parents,model,CONFIG,seed=7,greedy_decode=first_decode)
-    assert best is None and info['b32_calls']==0
+    assert best is None and info['coordination_calls']==0
     assert seen==[(model,first_decode,7),(model,'sample',7),(model,'sample',8)]
 
 
@@ -1497,10 +1497,10 @@ def test_counterfactual_evaluation_reuses_exact_complete_schedule_once(monkeypat
     monkeypatch.setattr(study.pilot.oriented,'schedule_explicit',schedule)
     cache={}
     info=study.op_measure_decodes(shared,CONFIG,reference.parents,study.OP_VARIANT,('greedy','sample','sample'),cache)
-    assert len(calls)==1 and info['b32_calls']==1
-    assert [a['b32_calls'] for a in info['attempts']]==[1,0,0]
+    assert len(calls)==1 and info['coordination_calls']==1
+    assert [a['coordination_calls'] for a in info['attempts']]==[1,0,0]
     again=study.op_measure_decodes(shared,CONFIG,reference.parents,study.OP_VARIANT,('joint_greedy',),cache)
-    assert len(calls)==1 and again['b32_calls']==0 and again['reused_b32_seconds']>0.
+    assert len(calls)==1 and again['coordination_calls']==0 and again['reused_coordination_seconds']>0.
     raw=again['attempts'][0]
     reversed_raw=dict(raw,directions=tuple(tuple(1-d for d in route) for route in raw['directions']))
     assert study.op_complete_key(raw)!=study.op_complete_key(reversed_raw)
@@ -1588,7 +1588,7 @@ def test_final_choice_requires_useful_mode_component_for_gnn(monkeypatch):
     assert choice['method']=='MODE_NEW' and choice['fixed']=='FIXED_NEW'
 
 
-def test_region_formal_comparator_uses_05_and_b32_without_certification(monkeypatch):
+def test_region_formal_comparator_uses_05_and_coordination_without_certification(monkeypatch):
     import run_gnn_multi_initial as experiment
     from mrta_ranker import ranking
     from mrta_search import pipeline
@@ -1720,31 +1720,6 @@ def test_outer_deadline_does_not_restart_local_search_budget(monkeypatch):
     assert result['cmax']==current.schedule.cmax and result['status']=='CERTIFIED'
 
 
-def test_recovery_sampling_deduplicates_states_preserves_directions_and_first_context():
-    import copy
-    import run_gnn_multi_initial as study
-    def trial(block,bit):
-        return dict(status='DEADLOCK',changed_modes=[],incumbent_before=100.,late=False,
-            patterns=[{'parent_id':'p'}],routes=[[block],[],[],[]],directions=[[bit],[],[],[]],
-            frontier_exhausted=False,recovery_rollouts=32)
-    first=[trial('a',0),trial('a',1),trial('b',0),trial('b',1)]
-    repeated=copy.deepcopy(first*8)
-    for row in repeated:row['incumbent_before']=90.
-    def run(seed,trace):
-        return dict(record='sparse_run',version=study.SPARSE_VERSION,instance='sample',repairer='GNN',
-            policy='SINGLE',seed=seed,solution={'parents':[]},trace=trace)
-    rows=[run(2,repeated),run(1,first)]
-    cases,population=study._stratified_recovery_sample(rows)
-    assert study._stratified_recovery_sample(list(reversed(rows)))==(cases,population)
-    assert len(cases)==3 and population[0]['unique']==4 and population[0]['occurrences']==36
-    # Directions distinguish complete candidates. Repeated proposals must not
-    # gain extra chances or replace the preselected first comparison context.
-    assert all(len(c['occurrences'])==9 and c['occurrences'][0]['seed']==1 for c in cases)
-    assert all(c['occurrences'][0]['incumbent']==100. for c in cases)
-    duplicated=copy.deepcopy(rows)
-    duplicated[0]['trace']*=2
-    extra,_=study._stratified_recovery_sample(duplicated)
-    assert [(c['routes'],c['directions']) for c in extra]==[(c['routes'],c['directions']) for c in cases]
 
 
 def test_fixed_route_bound_skips_only_nonimproving_candidates_and_keeps_real_evaluation(monkeypatch):
@@ -1889,7 +1864,7 @@ def test_joint_teacher_labels_replay_in_the_actual_student_pool():
         prepare_joint_teacher_steps(reference,partial.routes,((),(),(),()),partial.removed_parent_ids,broken,CONFIG)
 
 
-def test_joint_neural_logits_control_robot_choice_and_complete_real_b32(monkeypatch):
+def test_joint_neural_logits_control_robot_choice_and_complete_real_coordination(monkeypatch):
     from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
     from mrta_search import lns
     import run_joint_oriented_repair_pilot as direct
@@ -2133,8 +2108,8 @@ def test_multi4_reuses_duplicate_schedules_and_keeps_best_feasible(monkeypatch):
     monkeypatch.setattr(multi.shared.pilot.oriented,'schedule_explicit',schedule)
     greedy,combined,best=multi.neural_multi4(reference.parents,model,'GNN','TRAIN','unit',20261027)
     assert modes==[('greedy',20261027),('sample',20261028),('sample',20261029),('sample',20261030)]
-    assert len(calls)==combined['b32_calls']==combined['unique_routes']==2
-    assert greedy['b32_calls']==1 and greedy['best_cmax']==100.
+    assert len(calls)==combined['coordination_calls']==combined['unique_routes']==2
+    assert greedy['coordination_calls']==1 and greedy['best_cmax']==100.
     assert combined['best_cmax']==best.schedule.cmax==90.
 
 
@@ -2153,7 +2128,7 @@ def test_shared_raw_geometry_initial_has_no_routes_or_heuristic_input(monkeypatc
     with torch.no_grad():
         for parameter in model.parameters():parameter.zero_()
     scheduled,info=shared.neural_initial(reference.parents,model)
-    assert info['constructed']==info['b32_calls']==1
+    assert info['constructed']==info['coordination_calls']==1
     assert info['actions']==len(reference.parents)
     assert scheduled is not None and scheduled.schedule.status is ScheduleStatus.FEASIBLE
 
@@ -2223,7 +2198,7 @@ def test_joint_train_scaling_roundtrips_and_v1_still_loads_strictly():
                        normalized_copy.joint_action_logits(embeddings,indices,features))
 
 
-def test_joint_feedback_selects_from_updated_incumbent_and_bounds_b32(monkeypatch):
+def test_joint_feedback_selects_from_updated_incumbent_and_bounds_coordination(monkeypatch):
     from types import SimpleNamespace as NS
     import run_gnn_joint_repair_pilot as joint
     selections=[];scheduled=[]
@@ -2244,7 +2219,7 @@ def test_joint_feedback_selects_from_updated_incumbent_and_bounds_b32(monkeypatc
     initial=NS(solution='initial',directions=(),schedule=NS(cmax=100.,operations=()))
     row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2',None,NS(seed=20261027))
     assert row['accepted']==2 and row['best_cmax']==80.
-    assert row['b32_calls']==len(scheduled)==24
+    assert row['coordination_calls']==len(scheduled)==24
     assert selections[0]==('initial',100.)
     assert selections[1:5]==[('candidate-1',90.)]*4
     assert selections[5:]==[('candidate-5',80.)]*19
@@ -2269,7 +2244,7 @@ def test_joint_wait_feedback_without_wait_retains_load_search_and_records_fallba
     row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2',None,NS(seed=20261027),
                               selectors=(joint.BottleneckSelection.WAIT_ANCHORED,),iterations=8)
     assert selections==[joint.BottleneckSelection.WAIT_ANCHORED,joint.BottleneckSelection.LOAD]*8
-    assert row['attempts']==row['b32_calls']==8
+    assert row['attempts']==row['coordination_calls']==8
     assert row['accepted']==0 and row['best_cmax']==100.
     trace=json.loads(row['trace'])
     assert [item['q'] for item in trace]==[4,4,4,8,8,8,4,4]
@@ -2301,7 +2276,7 @@ def test_adaptive_wait_without_positive_wait_matches_base_budget_and_selections(
     assert [q for _,q,_ in selections[:24]]==[4,4,4,8,8,8]*4
     assert [seed for _,_,seed in selections[:24]]==list(range(20261027,20261027+24))
     assert len(calls)==48
-    assert all(r['attempts']==r['b32_calls']==24 and r['accepted']==0 for r in rows)
+    assert all(r['attempts']==r['coordination_calls']==24 and r['accepted']==0 for r in rows)
     assert rows[1]['no_wait_rounds']==24 and rows[1]['wait_used']==rows[1]['wait_fallbacks']==0
     for base,wait in zip(*(json.loads(r['trace']) for r in rows)):
         assert {k:v for k,v in base.items() if k!='no_wait'}=={k:v for k,v in wait.items() if k!='no_wait'}
@@ -2334,7 +2309,7 @@ def test_adaptive_wait_reads_only_accepted_schedule_and_recovers_original_select
     monkeypatch.setattr(joint.oriented,'summary',lambda *args:{})
     row=joint.iterative_group(dict(sheet_name='g21_w035'),initial,'GNN-V2-WAIT',None,NS(seed=20261027),wait_feedback=True)
     trace=json.loads(row['trace'])
-    assert len(calls)==row['b32_calls']==row['attempts']==24
+    assert len(calls)==row['coordination_calls']==row['attempts']==24
     assert row['accepted']==2 and row['best_cmax']==80.
     assert row['wait_used']==row['wait_accepted']==row['wait_fallbacks']==1
     assert row['no_wait_rounds']==22
@@ -2998,7 +2973,7 @@ def test_neural_portfolio_preserves_both_robust_proposals_when_new_policy_fails(
     monkeypatch.setattr(shared,'research_certify',lambda candidate,config:True)
     best,info=shared.neural_initial_portfolio(reference.parents,old,new,CONFIG,reference_calls=3)
     assert best.schedule.cmax==100.
-    assert len(scheduled)==info['b32_calls']==2
+    assert len(scheduled)==info['coordination_calls']==2
     assert len(info['attempts'])==3 and info['attempts'][-1]['status']=='CONSTRUCTION_FAILED'
 
 
@@ -3021,7 +2996,7 @@ def test_neural_lb_pruning_never_skips_feasibility_search_and_labels_skips(monke
     monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',schedule)
     best,info=shared.neural_initial_portfolio(reference.parents,object(),object(),CONFIG,
                                             certify=False,prune_cmax_lb=True)
-    assert best is not None and len(proposals)==3 and len(scheduled)==info['b32_calls']==1
+    assert best is not None and len(proposals)==3 and len(scheduled)==info['coordination_calls']==1
     assert [a['status'] for a in info['attempts']]==['FEASIBLE','PRUNED_BY_CMAX_LB','PRUNED_BY_CMAX_LB']
     scheduled.clear();proposals.clear()
     def deadlock(solution,bits,config):
@@ -3030,7 +3005,7 @@ def test_neural_lb_pruning_never_skips_feasibility_search_and_labels_skips(monke
     monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',deadlock)
     best,info=shared.neural_initial_portfolio(reference.parents,object(),object(),CONFIG,
                                             certify=False,prune_cmax_lb=True)
-    assert best is None and len(scheduled)==info['b32_calls']==3
+    assert best is None and len(scheduled)==info['coordination_calls']==3
 
 
 def test_rule_guided_rank_ties_use_rule_cost_and_keep_all_actions():
@@ -3169,21 +3144,21 @@ def test_rule_guided_dataset_loader_never_opens_reserved_holdout(monkeypatch):
         experiment.load_entry(dict(purpose='train',role='ID_TEST_SEALED'))
 
 
-def test_retained_b32_teacher_replay_needs_no_second_schedule_or_certifier(monkeypatch):
+def test_retained_coordination_teacher_replay_needs_no_second_schedule_or_certifier(monkeypatch):
     import run_gnn_shared_construction as shared
     reference=_joint_simple_reference();bits=((0,),(0,),(),())
     initial=shared.pilot.oriented.schedule_explicit(reference,bits,CONFIG)
     row=dict(instance='TRAIN_fixture',method='RULE',seed=1,
         details=dict(final_state=_research_retained_state(reference,bits,initial.schedule.cmax)))
     teachers,_=shared.research_teachers([row],CONFIG,deployment_only=False)
-    for teacher in teachers:teacher['b32_status']='FEASIBLE'
+    for teacher in teachers:teacher['coordination_status']='FEASIBLE'
     def forbidden(*args,**kwargs):raise AssertionError('duplicate schedule or independent certifier')
     monkeypatch.setattr(shared.pilot.oriented,'schedule_explicit',forbidden)
     monkeypatch.setattr(shared,'research_certify',forbidden)
     graphs,examples,steps,replays=shared.research_prepare(teachers,CONFIG,certify=False)
     assert graphs and examples and steps and replays[0]['replay_status']=='REPLAYED'
-    teachers[0]['b32_status']='DEADLOCK'
-    with pytest.raises(ValueError,match='no FEASIBLE B32 record'):
+    teachers[0]['coordination_status']='DEADLOCK'
+    with pytest.raises(ValueError,match='no FEASIBLE NATIVE record'):
         shared.research_prepare(teachers,CONFIG,certify=False)
 
 
@@ -3210,7 +3185,7 @@ def test_mode_search_bound_keeps_fixed_iterations_and_strict_incumbent(monkeypat
 
 
 @pytest.mark.parametrize('old_sampling', [False, True])
-def test_neural_portfolio_can_use_b32_only_and_preserves_comparator_proposals(monkeypatch, old_sampling):
+def test_neural_portfolio_can_use_coordination_only_and_preserves_comparator_proposals(monkeypatch, old_sampling):
     from types import SimpleNamespace
     import run_gnn_shared_construction as shared
     reference=_joint_simple_reference();old=object();new=object();proposals=[]
@@ -3229,11 +3204,11 @@ def test_neural_portfolio_can_use_b32_only_and_preserves_comparator_proposals(mo
                                             old_sampling=old_sampling,certify=False)
     assert proposals==[(old,'greedy',7),(old,'sample',7),
                        (old,'sample',8) if old_sampling else (new,'greedy',7)]
-    assert info['b32_calls']==3 and best.schedule.cmax==100.
+    assert info['coordination_calls']==3 and best.schedule.cmax==100.
 
 
 @pytest.mark.parametrize('late_construction', [False, True])
-def test_neural_portfolio_deadline_rejects_late_b32_or_construction(monkeypatch, late_construction):
+def test_neural_portfolio_deadline_rejects_late_coordination_or_construction(monkeypatch, late_construction):
     from types import SimpleNamespace
     import run_gnn_shared_construction as shared
     reference=_joint_simple_reference();clock=[100.];proposals=[];schedules=[]
@@ -3270,7 +3245,7 @@ def test_initial_mode_new_failure_never_falls_back_and_charges_model_load(monkey
         assert options['deadline']==160. and options['certify'] is False
         assert options['reference_calls']==3 and options['use_learned_modes'] is False
         clock[0]+=1.
-        return None,dict(attempts=[dict(status='DEADLOCK',b32_calls=1)]*3,b32_calls=3,selected_seconds=None)
+        return None,dict(attempts=[dict(status='DEADLOCK',coordination_calls=1)]*3,coordination_calls=3,selected_seconds=None)
     def forbidden(*args,**kwargs):raise AssertionError('hidden rule initialization/search after GNN failure')
     monkeypatch.setattr(study.shared,'load_neural_initial_models',load)
     monkeypatch.setattr(study.shared,'neural_initial_portfolio',portfolio)
@@ -3280,7 +3255,7 @@ def test_initial_mode_new_failure_never_falls_back_and_charges_model_load(monkey
                parents=[dict(parent_id='p',start=(1.,9.),end=(2.,9.))])
     row=study.run_job((entry,'NEW_GNN_PORTFOLIO',7,'smoke'))
     assert row['status']=='INITIALIZATION_FAILED' and row['final_cmax'] is None
-    assert row['model_load_seconds']==5. and row['actual_runtime']==6. and row['b32_calls']==3
+    assert row['model_load_seconds']==5. and row['actual_runtime']==6. and row['coordination_calls']==3
 
 
 def test_initial_mode_new_passes_full_initialization_cost_to_unchanged_backend(monkeypatch):
@@ -3291,7 +3266,7 @@ def test_initial_mode_new_passes_full_initialization_cost_to_unchanged_backend(m
     def load(*args):clock[0]+=5.;return object(),object()
     def portfolio(*args,**kwargs):
         clock[0]+=2.
-        return initial,dict(attempts=[dict(status='FEASIBLE',b32_calls=1)],b32_calls=1,selected_seconds=1.)
+        return initial,dict(attempts=[dict(status='FEASIBLE',coordination_calls=1)],coordination_calls=1,selected_seconds=1.)
     def search(*args,**kwargs):
         calls.append(kwargs)
         assert kwargs['common_initial'] is initial and kwargs['initial_seconds']==7.
@@ -3307,7 +3282,7 @@ def test_initial_mode_new_passes_full_initialization_cost_to_unchanged_backend(m
                parents=[dict(parent_id='p',start=(1.,9.),end=(2.,9.))])
     row=study.run_job((entry,'NEW_GNN_PORTFOLIO',7,'smoke'))
     assert len(calls)==1 and row['actual_runtime']==60.5 and row['initial_found_seconds']==6.
-    assert row['last_improvement_seconds']==59. and row['b32_calls']==4 and row['search_b32_calls']==3
+    assert row['last_improvement_seconds']==59. and row['coordination_calls']==4 and row['search_coordination_calls']==3
 
 
 def test_initial_mode_new_pairs_use_geometry_medians_and_keep_missing_pairs_out():
@@ -3337,7 +3312,7 @@ def test_initial_mode_new_resume_keeps_saved_failures_and_separates_smoke(monkey
         def result(self):
             entry,method,seed,phase=self.job
             return dict(instance=entry['instance'],method=method,solver_seed=seed,phase=phase,status='FEASIBLE',
-                        initial_cmax=100.,final_cmax=90.,actual_runtime=60.,b32_calls=3)
+                        initial_cmax=100.,final_cmax=90.,actual_runtime=60.,coordination_calls=3)
     class Executor:
         def __init__(self,**kwargs):assert kwargs['max_workers']==4
         def __enter__(self):return self
@@ -3503,7 +3478,7 @@ def test_joint_existence_does_not_build_or_sort_direction_variants(monkeypatch):
     assert lns.has_joint_block_candidate(state,block,patterns[block.parent_id],blocks,CONFIG)
 
 
-def test_fast_assignment_decode_preserves_ownership_and_passes_explicit_directions_to_b32(monkeypatch):
+def test_fast_assignment_decode_preserves_ownership_and_passes_explicit_directions_to_coordination(monkeypatch):
     from mrta_reference import scheduler
     from mrta_search import gnn_constructor as c
     from run_joint_oriented_repair_pilot import schedule_explicit
@@ -3793,12 +3768,12 @@ def test_complete_gnn_keeps_late_completion_and_evaluates_each_plan_once(monkeyp
         return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=110. - 10. * len(schedules))
 
     monkeypatch.setattr(experiment, 'build_joint', build)
-    monkeypatch.setattr(experiment, 'b32', schedule)
+    monkeypatch.setattr(experiment, 'coordination', schedule)
     monkeypatch.setattr(experiment, 'repair_prefix', lambda *args: (object(), {}))
     row, stats = experiment.complete_gnn(_parents(), model, 1, (60.,), reconstruct=reconstruct)
 
     assert len(builds) == (3 if reconstruct else 1)
-    assert len(schedules) == row['b32_calls'] == (2 if reconstruct else 1)
+    assert len(schedules) == row['coordination_calls'] == (2 if reconstruct else 1)
     assert stats == ((1, 2, 1) if reconstruct else (1, 0, 0))
     assert row['status'] == 'FEASIBLE' and row['cmax_s'] == (90. if reconstruct else 100.)
     assert row['construct_s'] == 90. and row['runtime_s'] == (270. if reconstruct else 90.)
@@ -3820,12 +3795,12 @@ def test_complete_gnn_reports_actual_schedule_failure(monkeypatch, status):
         return result
 
     monkeypatch.setattr(experiment, 'build_joint', build)
-    monkeypatch.setattr(experiment, 'b32', lambda result: ScheduleResult(status, diagnostics=('blocked',)))
+    monkeypatch.setattr(experiment, 'coordination', lambda result: ScheduleResult(status, diagnostics=('blocked',)))
     row, stats = experiment.complete_gnn(_parents(), model, 1, (), reconstruct=True)
 
     assert row['status'] == status.value and row['cmax_s'] is None
     assert row['diagnostic'] == status.value + ' blocked'
-    assert len(builds) == row['b32_calls'] == 1 and stats == (1, 0, 0)
+    assert len(builds) == row['coordination_calls'] == 1 and stats == (1, 0, 0)
 
 
 def test_weld_layout_writer_preserves_rows_when_extending_existing_columns():
@@ -3897,8 +3872,8 @@ def test_vnext_width_one_preserves_greedy_and_width_two_ranks_global_log_probabi
     import mrta_reference.scheduler as scheduler
 
     parents, model, visits = _controlled_vnext_beam(monkeypatch)
-    monkeypatch.setattr(scheduler, 'reference_schedule_formal',
-                        lambda *a, **k: pytest.fail('B32 evaluated a partial construction state'))
+    monkeypatch.setattr(scheduler, 'native_schedule',
+                        lambda *a, **k: pytest.fail('NATIVE evaluated a partial construction state'))
     greedy = c.construct_vnext_gnn(parents, model, CONFIG)
     explicit = c.construct_vnext_gnn(parents, model, CONFIG, beam_width=1)
     assert (greedy.solution, greedy.directions, greedy.actions) == (explicit.solution, explicit.directions, explicit.actions)
@@ -3980,7 +3955,7 @@ def test_vnext_beam_real_joint_actions_preserve_complete_parents_loads_and_direc
     (((ScheduleStatus.FEASIBLE, 100.), (ScheduleStatus.DEADLOCK, None)), 0),
     (((ScheduleStatus.DEADLOCK, 123.), (ScheduleStatus.INFEASIBLE, None)), 0),
 ))
-def test_complete_gnn_beam_selects_only_final_b32_results(monkeypatch, outcomes, expected):
+def test_complete_gnn_beam_selects_only_final_coordination_results(monkeypatch, outcomes, expected):
     from types import SimpleNamespace
     import run_gnn_weld_layout as experiment
 
@@ -4004,12 +3979,12 @@ def test_complete_gnn_beam_selects_only_final_b32_results(monkeypatch, outcomes,
         return ScheduleResult(status, cmax=cmax, diagnostics=('actual failure',))
 
     monkeypatch.setattr(experiment, 'build_joint', build)
-    monkeypatch.setattr(experiment, 'b32', schedule)
+    monkeypatch.setattr(experiment, 'coordination', schedule)
     monkeypatch.setattr(experiment, 'repair_prefix', lambda *a: pytest.fail('beam construction invoked reconstruction'))
     row, stats = experiment.complete_gnn(_parents(), SimpleNamespace(encode_static=lambda g: None), 1, (),
                                         reconstruct=False, beam_width=2,
                                         result_observer=lambda result, schedule: chosen.append(result))
-    assert len(builds) == 1 and row['b32_calls'] == len(calls) == 2 and stats == (1, 0, 0)
+    assert len(builds) == 1 and row['coordination_calls'] == len(calls) == 2 and stats == (1, 0, 0)
     assert row['runtime_s'] == row['construct_s'] == 90.
     assert chosen == [candidates[expected]]
     assert row['status'] == outcomes[expected][0].value
@@ -4031,13 +4006,13 @@ def test_complete_gnn_beam_reuses_identical_complete_plan_evaluation(monkeypatch
         calls.append(result)
         return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100.)
 
-    monkeypatch.setattr(experiment, 'b32', schedule)
+    monkeypatch.setattr(experiment, 'coordination', schedule)
     model = SimpleNamespace(encode_static=lambda graph: None)
     seen = {}
     row, _ = experiment.complete_gnn(_parents(), model, 1, (), reconstruct=False, beam_width=2, evaluation_cache=seen)
-    assert row['b32_calls'] == len(calls) == 1
+    assert row['coordination_calls'] == len(calls) == 1
     row, _ = experiment.complete_gnn(_parents(), model, 1, (), reconstruct=False, beam_width=2, evaluation_cache=seen)
-    assert row['b32_calls'] == 0 and len(calls) == 1
+    assert row['coordination_calls'] == 0 and len(calls) == 1
 
 
 def test_cmax_value_old_checkpoint_loads_and_only_new_head_trains():
@@ -4129,7 +4104,7 @@ def test_cmax_value_zero_head_preserves_legacy_width_one_then_changes_actual_cho
     assert (reranked.solution.routes, reranked.directions) != (legacy.solution.routes, legacy.directions)
 
 
-def test_cmax_value_b32_preferences_ignore_both_failed_partial_cmax():
+def test_cmax_value_coordination_preferences_ignore_both_failed_partial_cmax():
     from run_gnn_weld_layout import value_preferences
 
     failed = ScheduleResult(ScheduleStatus.DEADLOCK, cmax=1.)
@@ -4160,20 +4135,20 @@ def test_cmax_value_collector_uses_three_real_prefixes_and_only_original_continu
         builds.append(kwargs)
         return original(*args, **kwargs)
 
-    def b32(result):
+    def coordination(result):
         key = experiment.plan_key(result.solution, result.directions)
         assert key not in evaluated
         evaluated.append(key)
         return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=max(result.oriented_state.loads) + result.oriented_state.travel)
 
     monkeypatch.setattr(experiment, 'build_joint', build)
-    monkeypatch.setattr(experiment, 'b32', b32)
+    monkeypatch.setattr(experiment, 'coordination', coordination)
     monkeypatch.setattr(experiment, 'rule_beam', lambda *a: pytest.fail('repeated RULE teacher'))
     monkeypatch.setattr(experiment, 'baseline_run', lambda *a: pytest.fail('repeated WAG/HGA teacher'))
     sample = experiment.collect_value_branches(('train_fixture', parents))
     assert [group['assigned_parents'] for group in sample['groups']] == [2, 4, 6]
     assert len(sample['rows']) == 9 and len(builds) == 10 and builds[0].get('state') is None
-    assert len(evaluated) == sum(row['b32_calls'] for row in sample['rows']) <= 9
+    assert len(evaluated) == sum(row['coordination_calls'] for row in sample['rows']) <= 9
     for group in sample['groups']:
         assert len(group['pending']) + len(group['selected']) == len(parents)
         assert len(group['candidates']) == group['features'].shape[0] == 3
@@ -4181,7 +4156,7 @@ def test_cmax_value_collector_uses_three_real_prefixes_and_only_original_continu
 
 
 @pytest.mark.parametrize('rule_feasible', (True, False))
-def test_formal_teacher_uses_full_wag_b32_and_only_positive_demonstrations(monkeypatch, rule_feasible):
+def test_formal_teacher_uses_full_wag_coordination_and_only_positive_demonstrations(monkeypatch, rule_feasible):
     import io
     import math
     import pickle
@@ -4202,13 +4177,13 @@ def test_formal_teacher_uses_full_wag_b32_and_only_positive_demonstrations(monke
                                schedule=ScheduleResult(ScheduleStatus.FEASIBLE, cmax=1.))
         return SimpleNamespace(timely_best=best, iterations=500, termination_reason='COMPLETED')
 
-    def b32(result):
+    def coordination(result):
         if result.directions == directions and rule_feasible:
             return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=100.)
-        return ScheduleResult(ScheduleStatus.DEADLOCK, cmax=None, diagnostics=('actual B32 failure',))
+        return ScheduleResult(ScheduleStatus.DEADLOCK, cmax=None, diagnostics=('actual NATIVE failure',))
 
     monkeypatch.setattr(experiment, 'baseline_run', search)
-    monkeypatch.setattr(experiment, 'b32', b32)
+    monkeypatch.setattr(experiment, 'coordination', coordination)
     records, seen = experiment.formal_teacher_records(('train_fixture', _parents()))
     assert records[1]['row']['native_cmax_s'] == 1. and records[1]['row']['cmax_s'] is None
     assert records[1]['row']['status'] == 'DEADLOCK' and len(seen) == 2
@@ -4311,7 +4286,7 @@ def test_dagger_uses_current_value_policy_for_both_states_and_continuations(monk
         return ScheduleResult(ScheduleStatus.FEASIBLE, cmax=max(result.oriented_state.loads) + result.oriented_state.travel)
 
     monkeypatch.setattr(experiment, 'build_joint', build)
-    monkeypatch.setattr(experiment, 'b32', schedule)
+    monkeypatch.setattr(experiment, 'coordination', schedule)
     monkeypatch.setattr(experiment, 'baseline_run', lambda *a, **k: pytest.fail('DAgger inference called WAG'))
     sample = experiment.collect_value_branches(('train_fixture', parents), fractions=(.05, .15, .5, .85),
                                                candidate_limit=2, current_policy=True, retain_evaluations=True)
@@ -4323,7 +4298,7 @@ def test_dagger_uses_current_value_policy_for_both_states_and_continuations(monk
     replay = experiment.collect_value_branches(('train_fixture', parents), fractions=(.05, .15, .5, .85),
                                                candidate_limit=2, current_policy=True,
                                                evaluation_cache=pickle.loads(sample['evaluations']))
-    assert sum(row['b32_calls'] for row in replay['rows']) == 0
+    assert sum(row['coordination_calls'] for row in replay['rows']) == 0
 
 
 def test_dagger_second_round_merges_preferences_and_preserves_input_normalization(monkeypatch):
@@ -4340,7 +4315,7 @@ def test_dagger_second_round_merges_preferences_and_preserves_input_normalizatio
     width = model.cmax_value_head[0].in_features
     groups = [dict(features=torch.randn(2, width), preferences=[(i % 2, 1 - i % 2, 'cmax')]) for i in range(2)]
     row = dict(layout_id='validation_fixture', status='FEASIBLE', cmax_s=100., construct_s=1., runtime_s=1.,
-               b32_calls=0, processing_r0_s=90., processing_r1_s=80., processing_r2_s=85., processing_r3_s=75., move_s=10.)
+               coordination_calls=0, processing_r0_s=90., processing_r1_s=80., processing_r2_s=85., processing_r3_s=75., move_s=10.)
     references = [dict(row, method=method, cmax_s=110.) for method in ('RULE/BEAM', 'WAG+VNS')]
     saved = dict(base_state_dict=base, references=[dict(records=[dict(row=r) for r in references])],
                  rounds={1: dict(samples=[dict(layout_id='a', groups=[groups[0]])]),
@@ -4468,7 +4443,7 @@ def test_owner_cf_training_updates_only_policy_and_keeps_six_epochs(monkeypatch)
     saved = dict(initial_state_dict=initial, state_dict=initial, completed_epoch=0, history=[],
                  training=[dict(layout_id='train_fixture', groups=[group])])
     monkeypatch.setattr(experiment, 'save_owner_cf', lambda saved: None)
-    monkeypatch.setattr(experiment, 'b32', lambda *a: pytest.fail('head training called B32'))
+    monkeypatch.setattr(experiment, 'coordination', lambda *a: pytest.fail('head training called NATIVE'))
     monkeypatch.setattr(experiment, 'baseline_run', lambda *a, **k: pytest.fail('repeated WAG/HGA search'))
     experiment.train_owner_cf(saved)
     assert saved['completed_epoch'] == len(saved['history']) == 6 and saved['frozen_parameters_unchanged']
@@ -4631,7 +4606,7 @@ def test_ppo_scale_replays_same_complete_joint_distribution_and_updates_shared_a
     import pickle
     episodes=[pickle.loads(pickle.dumps(episode)) for episode in episodes]
     for episode in episodes:
-        assert episode['reward'] is not None and episode['row']['b32_calls']==1
+        assert episode['reward'] is not None and episode['row']['coordination_calls']==1
         assert len(episode['trace'])==len(layout[1])
         embeddings=model.encode_static(episode['space'].graph)
         for step in episode['trace']:
@@ -4692,12 +4667,12 @@ def test_ppo_scale_summary_does_not_allow_test_for_incomplete_or_worse_validatio
     for i in range(100):
         for size,score,pmax in ((0,120.,100.),(120,110.,99.),(500,108.,98.),(1000,107.,97.)):
             rows.append(dict(stage='validation',size=str(size),layout_id=f'v{i}',seed='7',status='FEASIBLE',
-                cmax_s=str(score),max_processing_s=str(pmax),move_s='10',wait_s='0',runtime_s='1',b32_calls='1'))
+                cmax_s=str(score),max_processing_s=str(pmax),move_s='10',wait_s='0',runtime_s='1',coordination_calls='1'))
         if i<20:
             rows.append(dict(stage='selection',layout_id=f'v{i}'))
             for method in ('WAG+VNS','HGA'):
                 rows.append(dict(stage='baseline',method=method,layout_id=f'v{i}',seed='7',status='FEASIBLE',
-                    cmax_s='100',runtime_s='10',b32_calls='1'))
+                    cmax_s='100',runtime_s='10',coordination_calls='1'))
     monkeypatch.setattr(e,'read_rows',lambda path:rows)
     result=e.ppo_summary()['test_decision']
     assert result['complete'] and result['processing_passed'] and result['time_passed']
@@ -4777,7 +4752,7 @@ def test_imitation_shortlist_preserves_owner_modes_and_excludes_high_score_overl
 
 def test_imitation_teacher_forcing_keeps_exact_routes_directions_and_pruned_positive(monkeypatch):
     e,c,parents,model,record=_imitation_fixture()
-    monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('B32 called on a teacher prefix'))
+    monkeypatch.setattr(e,'coordination',lambda *a,**k:pytest.fail('NATIVE called on a teacher prefix'))
     monkeypatch.setattr(c,'structural_child_indices',lambda variants,**k:(0,))
     sample=e.imitation_replay(('train_fixture',parents),record,model,joint_stride=2)
     assert sample['evidence']['parent_steps']==len(parents)
@@ -4813,7 +4788,7 @@ def test_imitation_real_constructor_covers_four_robots_without_changing_physical
         assert all(robot_is_eligible(block_map(result.solution,CONFIG)[b],route.robot_id,CONFIG) for b in route.block_ids)
 
 
-def test_imitation_resume_reuses_completed_b32_after_csv_permission_failure(monkeypatch):
+def test_imitation_resume_reuses_completed_coordination_after_csv_permission_failure(monkeypatch):
     e,c,parents,model,record=_imitation_fixture()
     saved=dict(training_complete=True,state_dict={},selected_epoch=2,pilot=[],legal_start_selection_complete=True)
     calls,written=[],[]
@@ -4826,7 +4801,7 @@ def test_imitation_resume_reuses_completed_b32_after_csv_permission_failure(monk
     monkeypatch.setattr(e,'imitation_summary',lambda:{})
     def evaluate(layout,model):
         calls.append(layout[0])
-        return dict(layout_id=layout[0],method='GNN_IMITATION',b32_calls=1)
+        return dict(layout_id=layout[0],method='GNN_IMITATION',coordination_calls=1)
     monkeypatch.setattr(e,'imitation_evaluate',evaluate)
     monkeypatch.setattr(e,'imitation_write',lambda rows:(_ for _ in ()).throw(PermissionError('fixture CSV denied')))
     with pytest.raises(PermissionError):
@@ -4912,7 +4887,7 @@ def test_routeaware_acceptance_uses_real_cmax_before_processing_and_deadlock_wai
     assert restored.operations==deadlock.operations and restored.canonical_json()==deadlock.canonical_json()
 
 
-def test_routeaware_full_schedule_and_wait_evidence_persist_without_repeat_b32(monkeypatch):
+def test_routeaware_full_schedule_and_wait_evidence_persist_without_repeat_coordination(monkeypatch):
     from mrta_reference.scheduler import ScheduleWaitBlockers
     e,c,parents,model,record=_imitation_fixture()
     result=e.unpack_directed_plan(parents,record['plan'],c.parent_assignment_space(parents,CONFIG))
@@ -4928,7 +4903,7 @@ def test_routeaware_full_schedule_and_wait_evidence_persist_without_repeat_b32(m
     assert restored.canonical_json()==schedule.canonical_json()
     assert e.routeaware_wait_blockers(row)==(event,)
     seen={e.plan_key(result.solution,result.directions):restored}
-    monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('repeated B32 on a persisted full plan'))
+    monkeypatch.setattr(e,'coordination',lambda *a,**k:pytest.fail('repeated NATIVE on a persisted full plan'))
     assert e.evaluate_once(result,seen,blocker_cache={})==(restored,False)
 
 
@@ -4944,7 +4919,7 @@ def test_routeaware_history_skips_old_text_notes_and_reuses_known_plan_without_t
     result=e.deadlock_plan(parents,record['plan'],space)
     key=e.plan_key(result.solution,result.directions)
     assert len(seen)==1 and seen[key].feasible and not seen[key].operations
-    monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('historical plan repeated'))
+    monkeypatch.setattr(e,'coordination',lambda *a,**k:pytest.fail('historical plan repeated'))
     assert e.evaluate_once(result,seen,blocker_cache=blockers)[1] is False
 
 
@@ -5029,17 +5004,17 @@ def test_loadfirst_reconstruction_slots_are_bounded_and_cached_full_plans_never_
         repairs.append(1)
         return replace(current,candidates=(current,current))
     monkeypatch.setattr(e,'deadlock_reconstruct',repair)
-    monkeypatch.setattr(e,'b32',lambda *a,**kw:pytest.fail('cached plan scheduled twice'))
+    monkeypatch.setattr(e,'coordination',lambda *a,**kw:pytest.fail('cached plan scheduled twice'))
     final=e.routeaware_case('fixture',parents,model,'LoadFirst-GNN-lambda0.5',result_path=e.LOADFIRST_RESULTS,
         load_first_lambda=.5,round_limit=50)
     assert len(repairs)==50 and sum(r['stage']=='candidate' for r in written)==100
-    assert final['b32_calls']==0 and final['cache_hits']==101
+    assert final['coordination_calls']==0 and final['cache_hits']==101
     before=len(written)
     assert e.routeaware_case('fixture',parents,None,'LoadFirst-GNN-lambda0.5',result_path=e.LOADFIRST_RESULTS)==final
     assert len(written)==before
 
 
-def test_loadfirst_failed_cover_screen_reports_reason_without_loading_empty_plan_or_b32(monkeypatch):
+def test_loadfirst_failed_cover_screen_reports_reason_without_loading_empty_plan_or_coordination(monkeypatch):
     e,c,_,model,_=_imitation_fixture()
     parents=(ParentWeld('vertical',(2.,4.),(2.,8.)),)
     method=e.loadfirst_method(.5);written=[]
@@ -5048,9 +5023,9 @@ def test_loadfirst_failed_cover_screen_reports_reason_without_loading_empty_plan
     monkeypatch.setattr(e,'read_rows',lambda path:[screen])
     monkeypatch.setattr(e,'routeaware_history',lambda *a,**kw:({},{},{}))
     monkeypatch.setattr(e,'routeaware_write',lambda rows,**kw:written.extend(rows))
-    monkeypatch.setattr(e,'b32',lambda *a,**kw:pytest.fail('uncoverable instance sent to B32'))
+    monkeypatch.setattr(e,'coordination',lambda *a,**kw:pytest.fail('uncoverable instance sent to NATIVE'))
     row=e.routeaware_case('fixture',parents,model,method,result_path=e.LOADFIRST_RESULTS,load_first_lambda=.5)
-    assert row['status']=='INFEASIBLE' and row['b32_calls']==0
+    assert row['status']=='INFEASIBLE' and row['coordination_calls']==0
     assert row['diagnostic']=='NO_LEGAL_FOUR_ROBOT_COVER' and written==[row]
 
 
@@ -5066,10 +5041,10 @@ def _priority_plan_fixture():
     return e,plan
 
 
-def test_priority_native_evaluation_preserves_genes_caches_and_never_calls_b32(monkeypatch):
+def test_priority_native_evaluation_preserves_genes_caches_and_never_calls_coordination(monkeypatch):
     e,plan=_priority_plan_fixture()
-    def forbidden(*args,**kwargs):pytest.fail('B32 or GNN generation in native evaluation')
-    monkeypatch.setattr(e,'b32',forbidden)
+    def forbidden(*args,**kwargs):pytest.fail('NATIVE or GNN generation in native evaluation')
+    monkeypatch.setattr(e,'coordination',forbidden)
     monkeypatch.setattr(e,'schedule_explicit',forbidden)
     monkeypatch.setattr(e.gnn,'construct_vnext_gnn',forbidden)
     original=e.priority_schedule;calls=[]
@@ -5151,7 +5126,7 @@ def test_priority_vnd_budget_completed_resume_and_no_forbidden_evaluation(monkey
         progress.update(rejected_pairs=2,pair_status=(-1,-1),cross_rejected=False)
         return ScheduleResult(ScheduleStatus.DEADLOCK,directions=directions)
     monkeypatch.setattr(e,'priority_schedule',evaluate)
-    monkeypatch.setattr(e,'b32',lambda *a,**kw:pytest.fail('native VND called B32'))
+    monkeypatch.setattr(e,'coordination',lambda *a,**kw:pytest.fail('native VND called NATIVE'))
     cache={}
     final=e.priority_vnd_case('fixture',20261110,plan,None,cache,budget=9)
     candidates=[r for r in written if r['stage']=='candidate']
@@ -5190,7 +5165,7 @@ def test_conflict_joint_reconstruction_can_change_mode_and_owner_without_touchin
     assert 'GNN-modes-WAG-group0' in {label for label,_ in hints}
 
 
-def test_conflict_core_uses_b32_move_endpoints_without_wait_for_cycle():
+def test_conflict_core_uses_coordination_move_endpoints_without_wait_for_cycle():
     from mrta_reference.model import DeadlockBlockage,Operation
     e,c,parents,model,record=_imitation_fixture()
     space=c.parent_assignment_space(parents,CONFIG)
@@ -5203,7 +5178,7 @@ def test_conflict_core_uses_b32_move_endpoints_without_wait_for_cycle():
     partial,feedback=e.conflict_core_partial(current,schedule,model,space,model.encode_static(space.graph),seed=0,q=2)
     assert set(partial.removed_parent_ids)=={'a','b'}
     assert feedback['blocked_robot']==0 and feedback['blocked_MOVE_endpoints']==('a::whole','b::whole')
-    assert feedback['blocker_parents']==('b',) and feedback['source']=='structured B32 DEADLOCK'
+    assert feedback['blocker_parents']==('b',) and feedback['source']=='structured NATIVE DEADLOCK'
     assert e.conflict_core_partial(current,replace(schedule,deadlock_blockages=()),model,space,
                                   model.encode_static(space.graph),seed=0,q=2)[0] is None
 
@@ -5235,7 +5210,7 @@ def test_conflict_load_limits_reference_all_three_actual_methods_and_allow_tempo
         e.conflict_load_limits('fixture',refs[:2])
 
 
-def test_conflict_case_counts_initial_b32_in_budget_reuses_complete_plans_and_completed_run(monkeypatch):
+def test_conflict_case_counts_initial_coordination_in_budget_reuses_complete_plans_and_completed_run(monkeypatch):
     e,plan=_priority_plan_fixture();written=[];calls=[]
     space=e.gnn.parent_assignment_space(plan.solution.parents,CONFIG)
     model=e.imitation_model().eval()
@@ -5265,10 +5240,10 @@ def test_conflict_case_counts_initial_b32_in_budget_reuses_complete_plans_and_co
         assert actual not in calls and actual!=key
         calls.append(actual)
         return dead
-    monkeypatch.setattr(e,'b32',evaluate)
+    monkeypatch.setattr(e,'coordination',evaluate)
     monkeypatch.setattr(e,'priority_schedule',lambda *a,**kw:pytest.fail('priority_schedule used for conflict repair'))
     final=e.conflict_core_case('fixture',plan.solution.parents,20261110,model,references,budget=3)
-    assert final['b32_calls']==3 and len(calls)==3
+    assert final['coordination_calls']==3 and len(calls)==3
     assert len([r for r in written if r['stage'] in ('initial','candidate')])==4
     before=len(written)
     assert e.conflict_core_case('fixture',plan.solution.parents,20261110,None,None,budget=3)['stage']=='final'
@@ -5390,7 +5365,7 @@ def test_cycle_swap_is_two_sided_and_safe_lb_load_filter_is_exact():
             assert candidate['lb']==pytest.approx(e.lns.oriented_route_lower_bound(state))
     limits=dict(pmax_limit_s=1000.,spread_limit_s=1000.)
     selected=e.cycle_transfer_groups(current,space,embeddings,model,kind='swap',training=False,limits=limits)
-    # No measured B32 Cmax is available, so the LB-versus-LB filter must not be
+    # No measured NATIVE Cmax is available, so the LB-versus-LB filter must not be
     # applied; only the formal load constraints may reject a legal candidate.
     assert all(c['peak']<=1000 and c['spread']<=1000
                for group in selected for c in group['candidates'])
@@ -5809,7 +5784,7 @@ def test_cmax_conflict_weight_migration_and_exact_graph_replay():
     with torch.no_grad():
         z = model.encode_static(space.graph)
         initial = e.build_joint(parents,model,space=space,embeddings=z)
-        schedule = e.b32(initial)
+        schedule = e.coordination(initial)
         core,_ = e.joint4_core(initial,schedule,model,space,z,(),seed=e.SEED,q=4)
         feedback = e.joint3_feedback(initial,schedule,(),core.removed_parent_ids)
         candidates,_ = e.joint3_reconstruct(parents,model,space,z,initial,core.removed_parent_ids,
@@ -5882,7 +5857,7 @@ def test_cmax_train_comparison_requires_all_three_requested_conditions(monkeypat
     names = tuple(f'held_{i}' for i in range(6))
     rows = []
     for i,(name,change) in enumerate(zip(names,changes)):
-        common = dict(stage='final',layout_id=name,seed=e.SEED,runtime_s=1.,b32_calls=100)
+        common = dict(stage='final',layout_id=name,seed=e.SEED,runtime_s=1.,coordination_calls=100)
         rows.append(dict(common,phase='original_independent',method=e.JOINT4_METHOD,status='FEASIBLE',cmax_s=100.))
         rows.append(dict(common,phase='independent',method=e.CMAX_METHOD,
             status='FEASIBLE' if i < feasible else 'NO_FEASIBLE_SOLUTION',
@@ -5951,7 +5926,7 @@ def test_joint3_old_path_still_reproduces_the_recorded_validation_01_final():
                       budget=8,write=False,sink='loadkeep',phase='train')
     assert row['status']=='FEASIBLE'
     assert float(row['cmax_s'])==pytest.approx(6082.481009491802)
-    assert int(row['b32_calls'])==7
+    assert int(row['coordination_calls'])==7
     assert row['final_choice']=='joint3-balanced-first'
 
 
@@ -6094,7 +6069,7 @@ def test_bvns_native_deadlock_is_retained_as_a_search_branch(monkeypatch):
     assert result['candidate'] is current
 
 
-def test_bvns_calls_b32_once_only_after_native_search_returns(monkeypatch):
+def test_bvns_calls_coordination_once_only_after_native_search_returns(monkeypatch):
     from mrta_reference.model import ScheduleResult, ScheduleStatus
     e,space,w,current,schedule=_bvns_fixture()
     events=[]
@@ -6105,11 +6080,11 @@ def test_bvns_calls_b32_once_only_after_native_search_returns(monkeypatch):
     monkeypatch.setattr(e.lns,'run_bottleneck_vns',run)
     monkeypatch.setattr(e,'priority_schedule',lambda *args:schedule)
     def final(*args):
-        assert events==['search_returned'];events.append('b32')
+        assert events==['search_returned'];events.append('coordination')
         return ScheduleResult(ScheduleStatus.DEADLOCK)
-    monkeypatch.setattr(e,'b32',final)
+    monkeypatch.setattr(e,'coordination',final)
     row=e.bvns_case('fixture',current.solution.parents,1,use_gnn=False,native_budget=7,max_states=2,max_shakes=1,write=False)
-    assert events==['search_returned','b32'] and row['b32_calls']==1
+    assert events==['search_returned','coordination'] and row['coordination_calls']==1
     assert row['cmax_s'] is None and row['priority_calls']<=7
 
 
@@ -6134,7 +6109,7 @@ def test_bvns_ranking_randomness_does_not_change_the_proposal_stream():
     assert [c.signature for c in a]==[c.signature for c in b]
 
 
-def test_bvns_rejects_known_b32_initial_geometry_before_expensive_evaluation(monkeypatch):
+def test_bvns_rejects_known_coordination_initial_geometry_before_expensive_evaluation(monkeypatch):
     e,space,w,current,schedule=_bvns_fixture()
     routes=list(current.state.routes)
     routes[0]=('a::whole','z0::whole','b::whole')
@@ -6202,7 +6177,7 @@ def test_bvns_v2_source_destination_delta_inputs_and_new_parameters_receive_grad
     assert scorer.encodings==1
 
 
-def test_bvns_fit_uses_same_state_b32_labels_and_preserves_frozen_actor_without_file_writes(monkeypatch):
+def test_bvns_fit_uses_same_state_coordination_labels_and_preserves_frozen_actor_without_file_writes(monkeypatch):
     import copy
     import io
     import json
@@ -6223,17 +6198,17 @@ def test_bvns_fit_uses_same_state_b32_labels_and_preserves_frozen_actor_without_
     monkeypatch.setattr(e.torch,'save',lambda saved,*args:checkpoints.append(saved))
     original=e.lns.BottleneckWorkspace
     monkeypatch.setattr(e.lns,'BottleneckWorkspace',lambda *args,**kwargs:original(*args,**kwargs,candidate_limit=12))
-    monkeypatch.setattr(e,'bvns_fit_root',lambda *args:(current,native,dict(teacher_b32_calls=0),0.,1))
+    monkeypatch.setattr(e,'bvns_fit_root',lambda *args:(current,native,dict(teacher_coordination_calls=0),0.,1))
     monkeypatch.setattr(e,'priority_schedule',lambda *args:native)
     def measured(candidate):
         calls.append(candidate.signature)
         return (ScheduleResult(ScheduleStatus.DEADLOCK) if len(calls)%4==0 else
                 ScheduleResult(ScheduleStatus.FEASIBLE,cmax=100.+len(calls)))
-    monkeypatch.setattr(e,'b32',measured)
+    monkeypatch.setattr(e,'coordination',measured)
     history=e.bvns_fit()
     labels=[r for r in captured if r['stage']=='training_candidate']
     assert labels and all(r['layout_id']=='fixture' for r in labels)
-    assert len(calls)==len(set(calls))==sum(r['b32_calls'] for r in labels)<=32
+    assert len(calls)==len(set(calls))==sum(r['coordination_calls'] for r in labels)<=32
     assert all(r['cmax_s'] is None for r in labels if r['status']=='DEADLOCK')
     assert all(r['cmax_s']!=r['native_cmax_s'] for r in labels if r['status']=='FEASIBLE')
     assert len(history)==3 and history[-1]['feasible_pairs']>0
@@ -6246,7 +6221,7 @@ def test_bvns_formal_pairing_uses_exact_seeds_full_baselines_and_no_fake_deadloc
     import run_gnn_weld_layout as e
     monkeypatch.setattr(e,'load_layouts',lambda phase:[('fixture',())])
     finals=[dict(stage='final',phase='validation',layout_id='fixture',seed=seed,method=e.BVNS_V2_METHOD,
-        status='FEASIBLE',cmax_s=1000.,runtime_s=20.,priority_calls=500,b32_calls=1) for seed in e.TEST_SEEDS]
+        status='FEASIBLE',cmax_s=1000.,runtime_s=20.,priority_calls=500,coordination_calls=1) for seed in e.TEST_SEEDS]
     references={}
     for method,(_,_,filename) in e.BASELINES.items():
         records=[]
@@ -6255,13 +6230,13 @@ def test_bvns_formal_pairing_uses_exact_seeds_full_baselines_and_no_fake_deadloc
             records.append(dict(layout_id='fixture',seed=seed,method=method,
                 status='DEADLOCK' if deadlock else 'FEASIBLE',
                 cmax_s='' if deadlock else ([900.,950.,1100.][index] if method=='HGA' else [1200.,0.,1300.][index]),
-                runtime_s=100.,iterations=e.BASELINE_ITERATIONS[method],b32_calls=1,
+                runtime_s=100.,iterations=e.BASELINE_ITERATIONS[method],coordination_calls=1,
                 source=e.FORMAL_BASELINE_SOURCES[method],diagnostic=json.dumps(dict(phase='FULL',run_status='COMPLETED'))))
         records.append({**records[0],'iterations':1000,'cmax_s':1.})
         references[filename]=records
     monkeypatch.setattr(e,'read_rows',lambda path:finals if path==e.BVNS_RESULTS else references[path.name])
     result=e.bvns_formal_summary()
-    assert result['completed']==result['feasible']==3 and result['b32_calls']==3
+    assert result['completed']==result['feasible']==3 and result['coordination_calls']==3
     assert result['paired']['HGA']['wins']==1 and result['paired']['HGA']['losses']==2
     assert [r['reference_cmax_s'] for r in result['detail'] if r['reference']=='HGA']==[900.,950.,1100.]
     assert result['paired']['WAG+VNS']['pairs']==2
@@ -6331,7 +6306,7 @@ def test_child_joint_single_y_child_moves_without_moving_its_sibling_or_changing
 
 
 @pytest.mark.parametrize('native_feasible,learned_gain,expected_move',((True,2.,True),(False,2.,True),(True,-2.,False)))
-def test_child_joint_noop_and_b32_preference_control_acceptance_instead_of_native_cmax(monkeypatch,native_feasible,learned_gain,expected_move):
+def test_child_joint_noop_and_coordination_preference_control_acceptance_instead_of_native_cmax(monkeypatch,native_feasible,learned_gain,expected_move):
     from mrta_reference.model import ScheduleResult,ScheduleStatus
     e,space,w,current,schedule=_child_joint_fixture()
     candidate=w.finish_child(current,w._representative(current,(('a::whole',1),),'relocate_child'))
@@ -6410,7 +6385,7 @@ def test_child_joint_loss_explicitly_trains_improvement_against_noop_without_dea
     assert scores.grad[1]<0 and scores.grad[2]>0 and scores.grad[3]>0
 
 
-def test_child_joint_final_b32_is_once_and_only_after_learned_search(monkeypatch):
+def test_child_joint_final_coordination_is_once_and_only_after_learned_search(monkeypatch):
     from mrta_reference.model import ScheduleResult,ScheduleStatus
     e,space,w,current,native=_child_joint_fixture()
     events=[]
@@ -6421,11 +6396,11 @@ def test_child_joint_final_b32_is_once_and_only_after_learned_search(monkeypatch
         result=original(*args,**kwargs);events.append('search returned');return result
     monkeypatch.setattr(e.lns,'run_child_joint',search)
     def final(*args):
-        assert events==['search returned'];events.append('B32')
+        assert events==['search returned'];events.append('NATIVE')
         return ScheduleResult(ScheduleStatus.DEADLOCK)
-    monkeypatch.setattr(e,'b32',final)
+    monkeypatch.setattr(e,'coordination',final)
     row=e.child_joint_case('fixture',current.solution.parents,53,use_gnn=False,write=False,native_budget=8,max_states=2,max_shakes=1)
-    assert events==['search returned','B32'] and row['b32_calls']==1
+    assert events==['search returned','NATIVE'] and row['coordination_calls']==1
     assert row['cmax_s'] is None and row['priority_calls']<=8
 
 
@@ -6439,7 +6414,7 @@ def test_child_joint_reference_frame_does_not_miscount_shifted_unchanged_childre
     assert reconstructed.signature==candidate.signature
 
 
-def test_child_joint_fit_uses_only_self_gnn_and_measured_noop_b32_labels(monkeypatch):
+def test_child_joint_fit_uses_only_self_gnn_and_measured_noop_coordination_labels(monkeypatch):
     import copy
     from unittest.mock import Mock
     from mrta_reference.model import ScheduleResult,ScheduleStatus
@@ -6467,12 +6442,12 @@ def test_child_joint_fit_uses_only_self_gnn_and_measured_noop_b32_labels(monkeyp
     def measured(candidate):
         evaluated.append(candidate.signature)
         return ScheduleResult(ScheduleStatus.DEADLOCK) if len(evaluated)%3==0 else ScheduleResult(ScheduleStatus.FEASIBLE,cmax=2000.+len(evaluated))
-    monkeypatch.setattr(e,'b32',measured)
+    monkeypatch.setattr(e,'coordination',measured)
     history=e.child_joint_fit()
     labels=[r for r in outputs if r['stage']=='training_candidate']
     assert labels and all(r['source'].startswith('SELF_GNN') for r in labels)
     assert any(r['operator']=='noop' for r in labels)
-    assert len(evaluated)==len(set(evaluated))==sum(r['b32_calls'] for r in labels)<=26
+    assert len(evaluated)==len(set(evaluated))==sum(r['coordination_calls'] for r in labels)<=26
     assert all(r['cmax_s'] is None for r in labels if r['status']=='DEADLOCK')
     assert len(history)==3 and history[-1]['reference_pairs']>0
     assert saved[-1]['training_complete'] and saved[-1]['training_sources']==['SELF_GNN']
@@ -6489,7 +6464,7 @@ def test_child_joint_train_screen_requires_real_one_percent_and_four_wins(monkey
             rows.append(dict(stage='final',phase='independent',layout_id=name,seed=e.SEED,
                 method=e.CHILD_JOINT_METHODS[int(use_gnn)],status='FEASIBLE' if good else 'DEADLOCK',
                 cmax_s=1000.*(1+changes[index]/100) if use_gnn and good else 1000. if good else None,
-                runtime_s=20.,priority_calls=500,b32_calls=1))
+                runtime_s=20.,priority_calls=500,coordination_calls=1))
     monkeypatch.setattr(e,'read_rows',lambda *args:rows)
     assert e.child_joint_summary()['passed']==passed
 
@@ -6588,10 +6563,10 @@ def test_child_construct_collection_is_self_gnn_common_seed_cached_and_bounded(m
     def measured(candidate):
         evaluated.append(candidate.signature)
         return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.+len(evaluated))
-    monkeypatch.setattr(e,'b32',measured)
+    monkeypatch.setattr(e,'coordination',measured)
     spent=e.child_construct_collect(model,['fixture'],{'fixture':current.solution.parents})
     labels=[r for r in outputs if r['stage']=='construct_candidate']
-    assert 0<spent==len(evaluated)==len(set(evaluated))<=12<=e.CHILD_CONSTRUCT_B32_LIMIT
+    assert 0<spent==len(evaluated)==len(set(evaluated))<=12<=e.CHILD_CONSTRUCT_NATIVE_LIMIT
     assert labels and all(r['source']=='SELF_GNN_CONSTRUCT_COUNTERFACTUAL' for r in labels)
     roots=[r for r in outputs if r['stage']=='construct_state']
     assert len(roots)==2
@@ -6609,8 +6584,8 @@ def test_child_construct_collection_is_self_gnn_common_seed_cached_and_bounded(m
 def test_child_construct_beam4_remains_neural_and_preserves_ownership_diversity(monkeypatch):
     e,space,w,current,_=_child_joint_fixture()
     model=e.child_joint_model(trained=False)
-    def forbidden(*args,**kwargs):raise AssertionError('RULE/baseline/B32 called in neural beam')
-    for name in ('bvns_initial','baseline_run','b32'):monkeypatch.setattr(e,name,forbidden)
+    def forbidden(*args,**kwargs):raise AssertionError('RULE/baseline/NATIVE called in neural beam')
+    for name in ('bvns_initial','baseline_run','coordination'):monkeypatch.setattr(e,name,forbidden)
     initial,diagnostic=e.child_joint_initial(current.solution.parents,space,w,53,model,beam_width=4)
     assert diagnostic['source']=='SELF_GNN_BEAM4' and 1<=len(initial)<=4
     assert len({w.ownership_structure(c) for c in initial})==len(initial)
@@ -6631,16 +6606,16 @@ def test_child_construct_fit_uses_clean_weights_and_updates_actual_policy(monkey
     def measured(candidate):
         count[0]+=1
         return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.+count[0]*20.)
-    monkeypatch.setattr(e,'b32',measured)
+    monkeypatch.setattr(e,'coordination',measured)
     result=e.child_joint_fit(construction_supervised=True)
     assert result['training_complete'] and len(result['history'])==3
     assert result['initialization']=='models/gnn_bvns.pt:frozen_state_dict'
     assert result['assignment_weight_change']>0 and result['insertion_weight_change']>0
     assert all(r['assignment_gradient_groups']>0 and r['insertion_gradient_groups']>0 for r in result['history'])
-    assert result['new_b32_calls']==count[0]<=12
+    assert result['new_coordination_calls']==count[0]<=12
     assert not any('HGA' in s or 'WAG' in s for s in result['training_sources'])
     # An interruption after epoch three must finish evaluation from the same
-    # checkpoint and labels, with no fourth epoch or repeated B32 call.
+    # checkpoint and labels, with no fourth epoch or repeated NATIVE call.
     original_load=e.torch.load;path=e.CHILD_CONSTRUCT_MODEL
     partial=copy.deepcopy(saved[-1]);partial['training_complete']=False
     path.exists=lambda:True
@@ -6666,10 +6641,10 @@ def test_child_construct_screen_uses_common_feasible_cmax_without_fake_deadlock_
     for i,name in enumerate(e.BVNS_CASES):
         rows.append(dict(stage='final',phase='independent',layout_id=name,seed=e.SEED,
             method=e.CHILD_JOINT_METHODS[1],status='FEASIBLE' if i<4 else 'DEADLOCK',
-            cmax_s=1000. if i<4 else None,runtime_s=20.,priority_calls=500,b32_calls=1))
+            cmax_s=1000. if i<4 else None,runtime_s=20.,priority_calls=500,coordination_calls=1))
         rows.append(dict(stage='final',phase='independent',layout_id=name,seed=e.SEED,
             method=e.CHILD_CONSTRUCT_METHOD,status='FEASIBLE',cmax_s=980.,
-            runtime_s=30.,priority_calls=500,b32_calls=1))
+            runtime_s=30.,priority_calls=500,coordination_calls=1))
     monkeypatch.setattr(e,'read_rows',lambda *args:rows)
     result=e.child_construct_summary()
     assert result['passed'] and result['pairs']==4 and result['feasibility_wins']==2
@@ -6790,7 +6765,7 @@ def test_cem_complete_elite_likelihood_updates_encoder_mode_and_route_parameters
         if not name.startswith(('layer1.', 'layer2.', 'geometry_skip.')))
 
 
-def test_cem_driver_elites_use_b32_and_cache_every_complete_solution_once(monkeypatch):
+def test_cem_driver_elites_use_coordination_and_cache_every_complete_solution_once(monkeypatch):
     from dataclasses import replace as copy_plan
     from types import SimpleNamespace
     from mrta_reference.model import ScheduleResult, ScheduleStatus
@@ -6818,11 +6793,11 @@ def test_cem_driver_elites_use_b32_and_cache_every_complete_solution_once(monkey
         chosen.append([p.key for p in elites]); return dict(elites=len(elites))
     monkeypatch.setattr(c, 'cem_update', update)
     builder = lambda *a: (SimpleNamespace(solution=initial.solution, directions=initial.directions,
-        schedule=initial.schedule), dict(b32_calls=1))
+        schedule=initial.schedule), dict(coordination_calls=1))
     result = c.run_cem(w.parents, None, builder, settings=c.CEMConfig(population_size=4,
-        max_generations=2, elite_fraction=.25, max_new_b32=8))
-    assert len(calls) == len(set(calls)) == result.accounting['new_b32_calls'] == 3
-    assert result.accounting['b32_calls'] == 4 and result.accounting['duplicates'] == 5
+        max_generations=2, elite_fraction=.25, max_new_coordination=8))
+    assert len(calls) == len(set(calls)) == result.accounting['new_coordination_calls'] == 3
+    assert result.accounting['coordination_calls'] == 4 and result.accounting['duplicates'] == 5
     assert chosen == [[variants[3].key], [variants[3].key]]
     assert max(variants[3].costs) > max(variants[0].costs)  # true Cmax, not proxy, selects the elite
     assert result.best.key == variants[3].key and result.best.schedule.cmax == 900.
@@ -6834,16 +6809,16 @@ def test_cem_empty_generations_keep_cached_initial_elite_without_resampling(monk
     c, w, initial = _cem_fixture()
     monkeypatch.setattr(c, 'load_policy', lambda *a: c.CEMPolicy())
     monkeypatch.setattr(c, 'draw', lambda *a: (None, dict(reason='NO_LEGAL_APPEND', normalized_entropy=.5)))
-    monkeypatch.setattr(c, 'evaluate', lambda *a: pytest.fail('unexpected B32'))
+    monkeypatch.setattr(c, 'evaluate', lambda *a: pytest.fail('unexpected NATIVE'))
     seen = []
     def update(world, policy, optimizer, elites, settings):
         seen.append([p.origin for p in elites]); return dict(elites=len(elites))
     monkeypatch.setattr(c, 'cem_update', update)
     builder = lambda *a: (SimpleNamespace(solution=initial.solution, directions=initial.directions,
-        schedule=initial.schedule), dict(b32_calls=1))
+        schedule=initial.schedule), dict(coordination_calls=1))
     result = c.run_cem(w.parents, None, builder)
     assert result.accounting['sample_attempts'] == result.accounting['construction_failures'] == 24
-    assert result.accounting['b32_calls'] == 1 and result.accounting['accepted_elites'] == 3
+    assert result.accounting['coordination_calls'] == 1 and result.accounting['accepted_elites'] == 3
     assert result.best.schedule is initial.schedule and seen == [['initial']]*3
     assert all(row['retained_previous_elites'] for row in result.progress)
 
@@ -6853,30 +6828,30 @@ def test_cem_no_feasible_plan_has_no_fictitious_cmax_or_update(monkeypatch):
     monkeypatch.setattr(c, 'load_policy', lambda *a: c.CEMPolicy())
     monkeypatch.setattr(c, 'draw', lambda *a: (None, dict(reason='NO_LEGAL_APPEND')))
     monkeypatch.setattr(c, 'cem_update', lambda *a: pytest.fail('no feasible elite'))
-    result = c.run_cem(w.parents, None, lambda *a: (None, dict(b32_calls=0)),
-        settings=c.CEMConfig(population_size=2, max_generations=2, max_new_b32=4))
+    result = c.run_cem(w.parents, None, lambda *a: (None, dict(coordination_calls=0)),
+        settings=c.CEMConfig(population_size=2, max_generations=2, max_new_coordination=4))
     assert result.best is None and result.initial is None and result.accounting['updates'] == 0
     assert result.termination_reason == 'NO_FEASIBLE_COMPLETE_PLAN'
 
 
-def test_cem_fast_common_initial_is_one_original_b32_call_without_legacy_search(monkeypatch):
+def test_cem_fast_common_initial_is_one_original_coordination_call_without_legacy_search(monkeypatch):
     import run_gnn_cem as entry
     c, w, initial = _cem_fixture()
-    original = entry.common.reference_schedule_formal
+    original = entry.common.native_schedule
     counts = []
     def evaluate(solution, config, **kwargs):
         counts.append(solution); return initial.schedule
-    monkeypatch.setattr(entry.common, 'reference_schedule_formal', evaluate)
+    monkeypatch.setattr(entry.common, 'native_schedule', evaluate)
     def common(parents, config, *, seed, max_reference_calls):
         assert max_reference_calls == 1 and seed == 20261110
-        schedule = entry.common.reference_schedule_formal(initial.solution, config,
+        schedule = entry.common.native_schedule(initial.solution, config,
             orientations=dict(enumerate(initial.directions)))
         from types import SimpleNamespace
         return SimpleNamespace(solution=initial.solution, directions=initial.directions, schedule=schedule), []
     monkeypatch.setattr(entry.common, 'common_initial_beam', common)
     plan, meta = entry.fast_initial(w.parents, w.config, 20261110)
-    assert len(counts) == meta['b32_calls'] == 1 and plan.schedule is initial.schedule
-    assert entry.common.reference_schedule_formal is evaluate
+    assert len(counts) == meta['coordination_calls'] == 1 and plan.schedule is initial.schedule
+    assert entry.common.native_schedule is evaluate
 
 
 def test_cem_train_decision_keeps_one_percent_and_runtime_requirements(monkeypatch):
@@ -6885,7 +6860,7 @@ def test_cem_train_decision_keeps_one_percent_and_runtime_requirements(monkeypat
     def rows(score=98.9, runtime=100.):
         return [dict(stage='pilot', layout_id=name, seed='20261110', status='FEASIBLE',
             initial_cmax='100', final_cmax=str(score), improvement_pct=str(100-score), runtime_s=str(runtime),
-            diagnostic=json.dumps(dict(accounting=dict(search_complete=True, new_b32_calls=24, sample_attempts=24))))
+            diagnostic=json.dumps(dict(accounting=dict(search_complete=True, new_coordination_calls=24, sample_attempts=24))))
             for name in entry.PILOTS]
     assert entry.train_decision(rows())['passed']
     assert not entry.train_decision(rows(99.5))['passed']

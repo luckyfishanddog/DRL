@@ -41,12 +41,12 @@ from run_joint_oriented_repair_pilot import initial_reference, schedule_explicit
 
 DATA = ROOT / 'data' / 'weld_layout'
 MODEL = ROOT / 'models' / 'gnn_weld_layout.pt'
-RESULTS = ROOT / 'results' / 'gnn_weld_layout_comparison.csv'
-FINAL_RESULTS = ROOT / 'results' / 'new_dataset_final'
+RESULTS = ROOT / 'results/native_priority' / 'gnn_weld_layout_comparison.csv'
+FINAL_RESULTS = ROOT / 'results/native_priority' / 'new_dataset_final'
 BEAM_VALIDATION_CSV = FINAL_RESULTS / 'gnn_beam2_validation.csv'
 BEAM_VALIDATION_FIELDS = ('layout_id', 'method', 'status', 'cmax_s',
                           'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
-                          'move_s', 'runtime_s', 'b32_calls', 'cmax_change_vs_width1_s',
+                          'move_s', 'runtime_s', 'coordination_calls', 'cmax_change_vs_width1_s',
                           'cmax_change_vs_width1_pct', 'diagnostic')
 CONFIG = ScientificConfig()
 SEED = 20261110
@@ -65,10 +65,10 @@ EQUAL_TIME_LIMIT = 120.
 RESULT_FIELDS = ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'runtime_s', 'construct_s',
                  'cmax_5_s', 'cmax_30_s', 'cmax_60_s', 'native_cmax_s', 'native_cmax_5_s',
                  'native_cmax_30_s', 'native_cmax_60_s', 'max_processing_s', 'move_s', 'wait_s',
-                 'b32_calls', 'diagnostic', 'source')
+                 'coordination_calls', 'diagnostic', 'source')
 OPTIMIZED_FIELDS = ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'native_cmax_s',
                     'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
-                    'move_s', 'wait_s', 'runtime_s', 'iterations', 'b32_calls', 'diagnostic', 'source')
+                    'move_s', 'wait_s', 'runtime_s', 'iterations', 'coordination_calls', 'diagnostic', 'source')
 BEAM_SEED = 202611041
 
 
@@ -79,7 +79,7 @@ def load_layouts(split):
 
 
 def rule_beam(parents):
-    """Use the existing RULE/BEAM first proposal, with no B32-based selection."""
+    """Use the existing RULE/BEAM first proposal, with no NATIVE-based selection."""
     started = time.perf_counter()
     failures = []
     beams = {}
@@ -107,7 +107,12 @@ def rule_beam(parents):
                                      rejection_reason='; '.join(failures) or 'EMPTY_BEAM')
 
 
-def b32(result, *, feasible_dispatch_observer=None):
+def coordination(result, *, feasible_dispatch_observer=None):
+    cached = getattr(result, 'schedule', None)
+    if cached is not None and cached.reference_policy_id.startswith('NATIVE_PRIORITY_'):
+        if cached.feasible and feasible_dispatch_observer is not None:
+            feasible_dispatch_observer(cached, cached.operations)
+        return cached
     return schedule_explicit(result.solution, result.directions, CONFIG,
                              feasible_dispatch_observer=feasible_dispatch_observer).schedule
 
@@ -203,9 +208,8 @@ def baseline_job(job, *, time_limit=None):
           accounting={key: value for key, value in result.accounting.items()
                       if value is None or isinstance(value, (int, float))})), flush=True)
     best = result.timely_best
-    b32_started = time.perf_counter()
-    schedule = schedule_explicit(best.solution, best.directions, CONFIG).schedule if best and complete else None
-    b32_runtime = time.perf_counter() - b32_started if schedule is not None else 0.
+    schedule = best.schedule if best and complete else None
+    coordination_runtime = 0.
     if schedule is None:
         diagnostic = f"Native deadlocks={result.accounting['remaining_deadlock']} | {result.termination_reason}"
     else:
@@ -214,7 +218,7 @@ def baseline_job(job, *, time_limit=None):
         diagnostic = json.dumps(dict(phase='EQUAL_TIME', run_status='COMPLETED',
             algorithm_source=FORMAL_BASELINE_SOURCES[method], time_limit_s=time_limit,
             search_runtime_s=result.actual_runtime, search_call_runtime_s=search_runtime,
-            initialization_s=result.initialization_time, b32_runtime_s=b32_runtime,
+            initialization_s=result.initialization_time, coordination_runtime_s=coordination_runtime,
             iterations=result.iterations, termination_reason=result.termination_reason,
             overshoot_s=result.overshoot, timely_best_completed_at_s=best.completed_at if best else None,
             late_best_updates=sum(event.elapsed > time_limit for event in result.best_events),
@@ -224,8 +228,8 @@ def baseline_job(job, *, time_limit=None):
             vnd_native_candidate_evaluations=result.accounting.get('vnd_native_candidate_evaluations'),
             vnd_pass_cap_hits=result.accounting.get('vnd_pass_cap_hits'),
             vnd_candidate_cap_hits=result.accounting.get('vnd_candidate_cap_hits'),
-            b32_status=schedule.status.value if schedule else 'NO_TIMELY_CANDIDATE',
-            b32_diagnostic=diagnostic))
+            coordination_status=schedule.status.value if schedule else 'NO_TIMELY_CANDIDATE',
+            coordination_diagnostic=diagnostic))
     elif method == 'HGA':
         diagnostic = json.dumps(dict(phase='FULL', run_status='COMPLETED' if complete else 'INCOMPLETE',
             search_runtime_s=search_runtime, initialization_s=result.initialization_time,
@@ -235,14 +239,14 @@ def baseline_job(job, *, time_limit=None):
             vnd_native_candidate_evaluations=result.accounting['vnd_native_candidate_evaluations'],
             vnd_pass_cap_hits=result.accounting['vnd_pass_cap_hits'],
             vnd_candidate_cap_hits=result.accounting['vnd_candidate_cap_hits'],
-            b32_runtime_s=b32_runtime, b32_diagnostic=diagnostic))
+            coordination_runtime_s=coordination_runtime, coordination_diagnostic=diagnostic))
     return dict(layout_id=name, seed=seed, method=method,
                 status=('INCOMPLETE' if not complete else
                         schedule.status.value if schedule else
                         'NO_TIMELY_CANDIDATE' if equal_time else 'NO_NATIVE_SOLUTION'),
                 cmax_s=schedule.cmax if schedule and schedule.feasible else None,
                 runtime_s=time.perf_counter() - started,
-                b32_calls=int(schedule is not None), diagnostic=diagnostic,
+                coordination_calls=result.reference_calls, diagnostic=diagnostic,
                 source=source, iterations=result.iterations,
                 native_cmax_s=best.schedule.cmax if best else None,
                 **baseline_metrics(best, schedule))
@@ -281,8 +285,8 @@ def hga_alpha_sensitivity(*, full_budget=False):
           'excluded from CSV and all measured runs', flush=True)
     del warm
     fields = ('layout_id', 'alpha', 'iterations', 'runtime_s', 'initial_native_cmax',
-              'final_native_cmax', 'b32_status', 'b32_cmax', 'vnd_unique_calls',
-              'vnd_cache_hits', 'vnd_native_candidate_evaluations', 'b32_runtime_s', 'run_status')
+              'final_native_cmax', 'coordination_status', 'coordination_cmax', 'vnd_unique_calls',
+              'vnd_cache_hits', 'vnd_native_candidate_evaluations', 'coordination_runtime_s', 'run_status')
     path = FINAL_RESULTS / 'hga_alpha_sensitivity.csv'
     rows = []
     with path.open('a' if full_budget else 'x', encoding='utf-8', newline='') as stream:
@@ -299,17 +303,16 @@ def hga_alpha_sensitivity(*, full_budget=False):
                     time_limit=math.inf, checkpoints=(), certify=False, candidate_evaluator=priority_schedule)
                 runtime = time.perf_counter() - started
                 best, initial = result.timely_best, result.initial_candidate
-                started = time.perf_counter()
-                schedule = schedule_explicit(best.solution, best.directions, CONFIG).schedule if best else None
-                b32_runtime = time.perf_counter() - started if best else 0.
+                schedule = best.schedule if best else None
+                coordination_runtime = 0.
                 row = dict(layout_id=name, alpha=alpha, iterations=result.iterations, runtime_s=runtime,
                     initial_native_cmax=initial.schedule.cmax if initial else None,
                     final_native_cmax=best.schedule.cmax if best else None,
-                    b32_status=schedule.status.value if schedule else 'NO_NATIVE_SOLUTION',
-                    b32_cmax=schedule.cmax if schedule is not None and schedule.feasible else None,
+                    coordination_status=schedule.status.value if schedule else 'NO_NATIVE_SOLUTION',
+                    coordination_cmax=schedule.cmax if schedule is not None and schedule.feasible else None,
                     **{key: result.accounting[key] for key in
                        ('vnd_unique_calls', 'vnd_cache_hits', 'vnd_native_candidate_evaluations')},
-                    b32_runtime_s=b32_runtime,
+                    coordination_runtime_s=coordination_runtime,
                     run_status='COMPLETED' if result.iterations == iterations else 'INCOMPLETE')
                 writer.writerow(row)
                 stream.flush()
@@ -318,7 +321,7 @@ def hga_alpha_sensitivity(*, full_budget=False):
     return rows
 
 
-def hga_route_vnd_job(name, parents, iterations, *, final_b32):
+def hga_route_vnd_job(name, parents, iterations, *, final_coordination):
     """One fixed-seed route-VND run; append to the existing HGA results."""
     settings = replace(AdaptedHGAConfig(), max_iterations=iterations, vnd_objective='ROUTE_CYCLE')
     print('HGA_ROUTE_START', name, 'parents', len(parents), settings, 'seed', SEED,
@@ -328,10 +331,9 @@ def hga_route_vnd_job(name, parents, iterations, *, final_b32):
                               checkpoints=(), certify=False, candidate_evaluator=priority_schedule)
     search_runtime = time.perf_counter() - started
     best = result.timely_best
-    b32_started = time.perf_counter()
-    schedule = schedule_explicit(best.solution, best.directions, CONFIG).schedule if final_b32 and best else None
-    b32_runtime = time.perf_counter() - b32_started if schedule is not None else 0.
-    stats = dict(phase='FULL' if final_b32 else 'PERFORMANCE_PILOT',
+    schedule = best.schedule if best else None
+    coordination_runtime = 0.
+    stats = dict(phase='FULL' if final_coordination else 'PERFORMANCE_PILOT',
         run_status='COMPLETED' if result.iterations == iterations else 'INCOMPLETE',
         search_runtime_s=search_runtime, initialization_s=result.initialization_time,
         vnd_s=result.accounting['local_search_time'], native_coordination_s=result.accounting['scheduler_time'],
@@ -340,15 +342,15 @@ def hga_route_vnd_job(name, parents, iterations, *, final_b32):
         vnd_unique_calls=result.accounting['vnd_unique_calls'], vnd_cache_hits=result.accounting['vnd_cache_hits'],
         vnd_native_candidate_evaluations=result.accounting['vnd_native_candidate_evaluations'],
         vnd_pass_cap_hits=result.accounting['vnd_pass_cap_hits'],
-        vnd_candidate_cap_hits=result.accounting['vnd_candidate_cap_hits'], b32_runtime_s=b32_runtime)
+        vnd_candidate_cap_hits=result.accounting['vnd_candidate_cap_hits'], coordination_runtime_s=coordination_runtime)
     if schedule is not None and not schedule.feasible:
-        stats['b32_diagnostic'] = ' | '.join(schedule.diagnostics[:2])
+        stats['coordination_diagnostic'] = ' | '.join(schedule.diagnostics[:2])
     row = dict(layout_id=name, seed=SEED, method='HGA', source=HGA_ROUTE_SOURCE,
         iterations=result.iterations, runtime_s=time.perf_counter() - started,
         native_cmax_s=best.schedule.cmax if best else None,
         status=schedule.status.value if schedule is not None else ('NATIVE_ONLY' if best else 'NO_NATIVE_SOLUTION'),
         cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-        b32_calls=int(schedule is not None), diagnostic=json.dumps(stats), **baseline_metrics(best, schedule))
+        coordination_calls=result.reference_calls, diagnostic=json.dumps(stats), **baseline_metrics(best, schedule))
     write_rows(FINAL_RESULTS / BASELINES['HGA'][2], [row], append=True)
     output = dict(**row, **stats)
     print('HGA_ROUTE_RESULT', json.dumps(output), flush=True)
@@ -368,7 +370,7 @@ def hga_route_vnd_experiment():
     print('HGA_ROUTE_WARMUP', warm.iterations, 'seconds', time.perf_counter() - started,
           'excluded from all measured runs and CSV', flush=True)
     del warm
-    rows = [hga_route_vnd_job('validation_07', layouts['validation_07'], 20000, final_b32=False)]
+    rows = [hga_route_vnd_job('validation_07', layouts['validation_07'], 20000, final_coordination=False)]
     pilot = rows[-1]
     if pilot['iterations'] != 20000 or pilot['search_runtime_s'] > 180.:
         print('HGA_ROUTE_STOP', 'pilot exceeds 180s or is incomplete; locate the measured bottleneck first', flush=True)
@@ -376,13 +378,13 @@ def hga_route_vnd_experiment():
     if pilot['search_runtime_s'] > 150.:
         print('HGA_ROUTE_CAUTION', '150-180s pilot; assess measured timings before launching full budget', flush=True)
         return rows
-    rows.append(hga_route_vnd_job('validation_07', layouts['validation_07'], 200000, final_b32=True))
+    rows.append(hga_route_vnd_job('validation_07', layouts['validation_07'], 200000, final_coordination=True))
     full = rows[-1]
     if full['iterations'] != 200000 or full['runtime_s'] > 1800. or full['status'] != 'FEASIBLE':
         print('HGA_ROUTE_STOP', 'validation_07 did not meet the full-budget time/feasibility target', flush=True)
         return rows
     for name in ('validation_03', 'validation_04'):
-        rows.append(hga_route_vnd_job(name, layouts[name], 200000, final_b32=True))
+        rows.append(hga_route_vnd_job(name, layouts[name], 200000, final_coordination=True))
     return rows
 
 
@@ -421,7 +423,7 @@ def retained_rows(method):
         loads = [float(row[f'processing_r{r}_s']) for r in range(4) if row[f'processing_r{r}_s']]
         for seed in TEST_SEEDS:
             yield dict(layout_id=row['layout_id'], method=method, seed=seed, status=row['status'], cmax_s=row['cmax_s'],
-                       construct_s=row['construct_s'], b32_calls=0, diagnostic=row['diagnostic'],
+                       construct_s=row['construct_s'], coordination_calls=0, diagnostic=row['diagnostic'],
                        max_processing_s=max(loads, default=None),
                        move_s=sum(float(row[f'move_r{r}_s']) for r in range(4)) if loads else None,
                        wait_s=sum(float(row[f'wait_r{r}_s']) for r in range(4)) if row['wait_r0_s'] else None,
@@ -429,12 +431,12 @@ def retained_rows(method):
 
 
 def completed_baseline_row(row):
-    """A completed formal search and its real final B32 evaluation."""
+    """A completed formal search and its real final NATIVE evaluation."""
     method = row.get('method')
     try:
         if (method not in FORMAL_BASELINE_SOURCES or row.get('source') != FORMAL_BASELINE_SOURCES[method]
                 or int(row['iterations']) != BASELINE_ITERATIONS[method]
-                or int(row['seed']) not in TEST_SEEDS or int(row['b32_calls']) != 1
+                or int(row['seed']) not in TEST_SEEDS or int(row['coordination_calls']) < 1
                 or row.get('status') not in {status.value for status in ScheduleStatus}):
             return False
         runtime = float(row['runtime_s'])
@@ -452,7 +454,7 @@ def completed_baseline_row(row):
 
 
 def completed_equal_time_row(row):
-    """Normal finite-budget returns count, including failed final B32 or no timely candidate."""
+    """Normal finite-budget returns count, including failed final NATIVE or no timely candidate."""
     method = row.get('method')
     try:
         if method not in BASELINES or row.get('source') != EQUAL_TIME_SOURCE or int(row['seed']) not in TEST_SEEDS:
@@ -467,12 +469,12 @@ def completed_equal_time_row(row):
         for value in (row['runtime_s'], detail['search_runtime_s']):
             if not math.isfinite(float(value)) or float(value) <= 0.:
                 return False
-        if not math.isfinite(detail['b32_runtime_s']) or detail['b32_runtime_s'] < 0.:
+        if not math.isfinite(detail['coordination_runtime_s']) or detail['coordination_runtime_s'] < 0.:
             return False
         if row['status'] == 'NO_TIMELY_CANDIDATE':
-            return (int(row['b32_calls']) == 0 and detail['timely_best_completed_at_s'] is None
-                    and detail['b32_runtime_s'] == 0. and not row.get('cmax_s') and not row.get('native_cmax_s'))
-        if (row['status'] not in {status.value for status in ScheduleStatus} or int(row['b32_calls']) != 1
+            return (int(row['coordination_calls']) >= 0 and detail['timely_best_completed_at_s'] is None
+                    and detail['coordination_runtime_s'] == 0. and not row.get('cmax_s') and not row.get('native_cmax_s'))
+        if (row['status'] not in {status.value for status in ScheduleStatus} or int(row['coordination_calls']) < 1
                 or not 0. <= detail['timely_best_completed_at_s'] <= EQUAL_TIME_LIMIT):
             return False
         if row['status'] == 'FEASIBLE':
@@ -492,14 +494,14 @@ def configure_baseline_worker(hga_warmup=None, wag_warmup=None):
         warm = baseline_run(hga_warmup, 'HGA', SEED, math.inf, (), iterations=10,
                             candidate_evaluator=priority_schedule, formal=True)
         print('BASELINE_HGA_WARMUP', warm.iterations, time.perf_counter() - started,
-              'excluded from measured jobs; no B32', flush=True)
+              'excluded from measured jobs; no NATIVE', flush=True)
     if wag_warmup is not None:
         started = time.perf_counter()
         warm = baseline_run(wag_warmup, 'WAG+VNS', SEED, math.inf, (), iterations=20,
                             candidate_evaluator=priority_schedule, formal=True)
         print('BASELINE_WAG_WARMUP', warm.iterations, time.perf_counter() - started,
               'Move/Swap/LNS', *(warm.accounting[key] for key in ('move_calls', 'swap_calls', 'lns_calls')),
-              'excluded from measured jobs; no B32', flush=True)
+              'excluded from measured jobs; no NATIVE', flush=True)
 
 
 def run_baselines(workers, only=None, *, split='validation', representative=False, time_limit=None):
@@ -560,7 +562,7 @@ def wag_deadlock_job(job):
     """Rebuild one current incumbent, then observe the existing dispatch kernel.
 
     Diagnostic rollouts happen only after the complete 500-round search. They
-    never provide feedback to that search and do not change the B32 policy.
+    never provide feedback to that search and do not change the NATIVE policy.
     """
     from collections import Counter
     from mrta_reference import scheduler as scheduler
@@ -576,7 +578,7 @@ def wag_deadlock_job(job):
                   iterations=result.iterations, search_rerun_iterations=result.iterations,
                   replay_mode='FULL_SEARCH', search_runtime_s=time.perf_counter() - started,
                   historical_native_cmax_s=float(historical['native_cmax_s']),
-                  historical_b32_status=historical['status'])
+                  historical_coordination_status=historical['status'])
     if best is None:
         record['reason'] = 'no native incumbent; diagnosis skipped'
         print('WAG_DEADLOCK_DIAGNOSIS', json.dumps(record), flush=True)
@@ -585,11 +587,11 @@ def wag_deadlock_job(job):
     formal = schedule_explicit(solution, directions, CONFIG).schedule
     delta = native.cmax - record['historical_native_cmax_s']
     record.update(native_cmax_s=native.cmax, native_cmax_delta_s=delta,
-                  b32_status=formal.status.value, b32_cmax_s=formal.cmax,
+                  coordination_status=formal.status.value, coordination_cmax_s=formal.cmax,
                   reproduced=(result.iterations == 500 and abs(delta) <= 1.e-6
                               and formal.status.value == historical['status']))
     if not record['reproduced']:
-        record['reason'] = 'budget, native Cmax or B32 status not reproduced; diagnosis skipped'
+        record['reason'] = 'budget, native Cmax or NATIVE status not reproduced; diagnosis skipped'
         print('WAG_DEADLOCK_DIAGNOSIS', json.dumps(record), flush=True)
         return record
     routes = scheduler.build_robot_routes(solution, CONFIG, dict(enumerate(directions)),
@@ -678,9 +680,9 @@ def wag_deadlock_job(job):
                           for a, b in zip(ops, ops[1:]))
         weld_order &= tuple(op.block_id for op in ops if op.kind is OperationKind.WELD) == solution.routes[r].block_ids
     record.update(
-        recovery_rollouts=formal.recovery_rollouts, rollout_budget=formal.rollout_budget,
-        frontier_exhausted=formal.frontier_exhausted, baseline_status=outcome.result.status.value,
-        baseline_matches_b32_failure=(not formal.feasible and outcome.result.operations == formal.operations),
+        native_waiting_s=formal.waiting_time, robot_completion=formal.robot_completion,
+        diagnostic_dispatch_status=outcome.result.status.value,
+        baseline_matches_coordination_failure=(not formal.feasible and outcome.result.operations == formal.operations),
         terminal_depth=state.depth, next_index=state.next_index,
         template_lengths=[len(templates[r]) for r in range(4)], completion_s=state.completion,
         wait_for_graph=outcome.result.wait_for_graph, wait_for_cycles=scheduler.wait_for_cycles(outcome.result.wait_for_graph),
@@ -710,11 +712,11 @@ def diagnose_wag_deadlocks(workers):
         records = list(executor.map(wag_deadlock_job, jobs))
     records.sort(key=lambda r: (r['layout_id'], r['seed']))
     lines = ['\n### 13.11 新版PARTIAL_LNS_V1的8次VALIDATION死锁诊断\n',
-             '使用当前代码、原始种子对CSV中PARTIAL_LNS_V1的8条失败记录逐条重新执行完整500轮搜索；不读取13.3节的旧路线快照，不修改搜索或B32。只有预算、原生Cmax（容差1e-6）和最终B32状态全部复现后才诊断；未复现者跳过归因。诊断只观察既有派工内核，不反馈搜索。\n',
-             '| 排样 | 种子 | 完成轮数 | 重现 | 原生 Cmax/s | 与CSV差值/s | B32 |',
+             '使用当前代码、原始种子对CSV中PARTIAL_LNS_V1的8条失败记录逐条重新执行完整500轮搜索；不读取13.3节的旧路线快照，不修改搜索或NATIVE。只有预算、原生Cmax（容差1e-6）和最终NATIVE状态全部复现后才诊断；未复现者跳过归因。诊断只观察既有派工内核，不反馈搜索。\n',
+             '| 排样 | 种子 | 完成轮数 | 重现 | 原生 Cmax/s | 与CSV差值/s | NATIVE |',
              '|---|---:|---:|---|---:|---:|---|']
     for r in records:
-        lines.append(f"| {r['layout_id']} | {r['seed']} | {r['iterations']} | {r['reproduced']} | {r.get('native_cmax_s')} | {r.get('native_cmax_delta_s')} | {r.get('b32_status')} |")
+        lines.append(f"| {r['layout_id']} | {r['seed']} | {r['iterations']} | {r['reproduced']} | {r.get('native_cmax_s')} | {r.get('native_cmax_delta_s')} | {r.get('coordination_status')} |")
     lines += ['\n逐例诊断（机器人与操作编号沿用代码的0起始编号）：\n']
     for r in records:
         lines.append(f"**{r['layout_id']} / {r['seed']}**：搜索{r['search_runtime_s']:.3f}s。")
@@ -729,8 +731,8 @@ def diagnose_wag_deadlocks(workers):
                     for b in r['terminal_blockers']]
         lines.append('终端阻塞：`' + json.dumps(terminal, ensure_ascii=False) + '`。')
         lines.append(f"阻塞边累计同轨/跨轨={r['blocked_edge_occurrences']['same']}/{r['blocked_edge_occurrences']['cross']}；延迟边累计同轨/跨轨={r['delayed_edge_occurrences']['same']}/{r['delayed_edge_occurrences']['cross']}；终端等待图={r['wait_for_graph']}，等待环={r['wait_for_cycles']}，中间完全阻塞等待环={r['intermediate_wait_cycles']}，含可延迟执行操作的关联环={r['all_reported_wait_cycles']}。")
-        lines.append(f"阻塞机器人是否完成={r['blocker_finished']}；B32恢复{r['recovery_rollouts']}/{r['rollout_budget']}，前沿耗尽={r['frontier_exhausted']}；诊断原始派工状态={r['baseline_status']}，失败操作时间线与最终B32一致={r['baseline_matches_b32_failure']}。\n")
-    lines += ['阻塞边累计是各派工状态返回的关联次数，不是独立冲突数或唯一因果。含可延迟执行操作的关联环不等同于真正等待环。B32失败仅表示该有限恢复策略未找到时间线，不构成数学不可行证明。完整路线快照未保存；13.3节历史11例及其旧快照保持原样。\n']
+        lines.append(f"阻塞机器人是否完成={r['blocker_finished']}；原生等待时间={r['native_waiting_s']}；独立诊断派工状态={r['diagnostic_dispatch_status']}。\n")
+    lines += ['阻塞边累计是各派工状态返回的关联次数，不是独立冲突数或唯一因果。含可延迟执行操作的关联环不等同于真正等待环。NATIVE失败仅表示该有限恢复策略未找到时间线，不构成数学不可行证明。完整路线快照未保存；13.3节历史11例及其旧快照保持原样。\n']
     with report.open('a', encoding='utf-8') as stream:
         stream.write('\n'.join(lines))
     print('WAG_DIAGNOSIS_REPORT', report, len(records), flush=True)
@@ -745,17 +747,17 @@ OWNER_CF_MODEL = ROOT / 'models' / 'gnn_weld_layout_owner_cf.pt'
 OWNER_CF_RESULTS = FINAL_RESULTS / 'gnn_owner_cf.csv'
 OWNER_CF_FIELDS = ('split', 'stage', 'layout_id', 'method', 'seed', 'parent_id', 'mode',
                    'assigned_parents', 'candidate', 'robot', 'winner', 'preference', 'status', 'cmax_s',
-                   'construct_s', 'runtime_s', 'b32_calls', 'processing_r0_s', 'processing_r1_s',
+                   'construct_s', 'runtime_s', 'coordination_calls', 'processing_r0_s', 'processing_r1_s',
                    'processing_r2_s', 'processing_r3_s', 'max_processing_s', 'move_s', 'diagnostic')
 EXPANDED_FIELDS = ('split', 'stage', 'round', 'epoch', 'layout_id', 'method', 'seed', 'status', 'cmax_s',
-                   'construct_s', 'runtime_s', 'b32_calls', 'iterations', 'native_cmax_s',
+                   'construct_s', 'runtime_s', 'coordination_calls', 'iterations', 'native_cmax_s',
                    'fraction', 'assigned_parents', 'candidate', 'parent_id', 'mode', 'robots',
                    'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
                    'max_processing_s', 'move_s', 'diagnostic')
 CMAX_VALUE_FIELDS = ('split', 'layout_id', 'method', 'epoch', 'fraction', 'assigned_parents', 'candidate',
                      'parent_id', 'mode', 'robots', 'status', 'cmax_s',
                      'processing_r0_s', 'processing_r1_s', 'processing_r2_s', 'processing_r3_s',
-                     'max_processing_s', 'move_s', 'runtime_s', 'b32_calls', 'diagnostic')
+                     'max_processing_s', 'move_s', 'runtime_s', 'coordination_calls', 'diagnostic')
 EPOCHS = 6
 VALIDATE_EPOCHS = (2, 4, 6)
 JOINT_METHODS = ('GNN_JOINT', 'GNN_JOINT_RECONSTRUCT')
@@ -880,10 +882,10 @@ def evaluate_once(result, seen, *, blocker_cache=None):
     if key in seen:
         return seen[key], False
     if blocker_cache is None:
-        schedule = b32(result)
+        schedule = coordination(result)
     else:
         orders = {}
-        schedule = b32(result, feasible_dispatch_observer=lambda candidate, order:
+        schedule = coordination(result, feasible_dispatch_observer=lambda candidate, order:
                        orders.setdefault(candidate.operations, order))
         events = ()
         if schedule.feasible and any(op.kind is OperationKind.WAIT for op in schedule.operations):
@@ -920,7 +922,7 @@ def unpack_directed_plan(parents, snapshot, space):
 
 
 def formal_teacher_records(layout):
-    """RULE and the current full-500 WAG; only their final B32 is a teacher label."""
+    """RULE and the current full-500 WAG; only their final NATIVE is a teacher label."""
     name, parents = layout
     records, seen = [], {}
     for method in ('RULE/BEAM', 'WAG+VNS'):
@@ -942,7 +944,7 @@ def formal_teacher_records(layout):
         schedule, called = evaluate_once(result, seen)
         row = dict(layout_id=name, method=method, seed=SEED, status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
                    cmax_s=schedule.cmax if schedule and schedule.feasible else None,
-                   construct_s=construct_s, runtime_s=time.perf_counter() - started, b32_calls=int(called),
+                   construct_s=construct_s, runtime_s=time.perf_counter() - started, coordination_calls=int(called),
                    iterations=iterations, native_cmax_s=native_cmax,
                    diagnostic=(' | '.join(schedule.diagnostics) if not schedule.feasible else '') if schedule else result.rejection_reason,
                    **beam_validation_metrics(result))
@@ -1014,7 +1016,7 @@ def collect_teachers(layout, *, records_only=False):
                                     candidate=len(results), parent_id=action.parent_id, mode=action.pattern.kind.value,
                                     robots=str(action.robots), status=outcome.status.value if outcome else 'NO_COMPLETE_SOLUTION',
                                     cmax_s=outcome.cmax if outcome and outcome.feasible else None,
-                                    construct_s=construct_s, runtime_s=time.perf_counter() - started, b32_calls=int(called),
+                                    construct_s=construct_s, runtime_s=time.perf_counter() - started, coordination_calls=int(called),
                                     diagnostic=(' | '.join(outcome.diagnostics) if not outcome.feasible else '') if outcome else result.rejection_reason,
                                     **beam_validation_metrics(result)))
         winner, kind = better_branch(*results)
@@ -1027,7 +1029,7 @@ def collect_teachers(layout, *, records_only=False):
         preference_types[kind] = preference_types.get(kind, 0) + 1
 
     evidence = dict(name=name, teachers={record['row']['method']: (record['row']['status'], record['row']['cmax_s']) for record in records},
-                    prefixes=len(prefixes), branches=branches, branch_b32=branch_calls, preferences=preference_types,
+                    prefixes=len(prefixes), branches=branches, branch_coordination=branch_calls, preferences=preference_types,
                     assignment_prefixes=len(assignment_steps), insertion_prefixes=len(insertion_steps))
     if records_only:
         return dict(layout_id=name, records=records, preferences=tuple(preferences), prefixes=prefix_records,
@@ -1147,7 +1149,7 @@ def complete_gnn(parents, model, seed, checkpoints, *, reconstruct, beam_width=1
         diagnostic += ' | candidates: ' + ' / '.join(failures)
     row = dict(status='FEASIBLE' if best_schedule else status,
                cmax_s=best_schedule.cmax if best_schedule else None, runtime_s=time.perf_counter() - started,
-               construct_s=initial_seconds, b32_calls=calls, diagnostic='' if best_schedule else diagnostic,
+               construct_s=initial_seconds, coordination_calls=calls, diagnostic='' if best_schedule else diagnostic,
                source=GNN_RESULT_SOURCE, **final_metrics(best_schedule))
     row.update({f'cmax_{int(t)}_s': min((c for elapsed, c in events if elapsed <= t), default=None)
                 for t in checkpoints})
@@ -1157,7 +1159,7 @@ def complete_gnn(parents, model, seed, checkpoints, *, reconstruct, beam_width=1
 
 
 def beam_validation_metrics(result):
-    """Full-plan processing and directed MOVE, also for B32 failures."""
+    """Full-plan processing and directed MOVE, also for NATIVE failures."""
     if result.solution is None:
         return {}
     state = result.oriented_state
@@ -1176,7 +1178,7 @@ def beam_validation_job(layout):
     rows.append(dict(layout_id=name, method='RULE/BEAM',
                      status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
                      cmax_s=schedule.cmax if schedule and schedule.feasible else None,
-                     runtime_s=time.perf_counter() - started, b32_calls=int(called),
+                     runtime_s=time.perf_counter() - started, coordination_calls=int(called),
                      diagnostic=(' | '.join(schedule.diagnostics) if not schedule.feasible else '')
                      if schedule else result.rejection_reason, **beam_validation_metrics(result)))
     for width in (1, 2):
@@ -1186,7 +1188,7 @@ def beam_validation_job(layout):
         row, _ = complete_gnn(parents, worker_model, SEED, (), reconstruct=False, beam_width=width,
                               evaluation_cache=seen, result_observer=retain)
         rows.append(dict(layout_id=name, method=f'GNN_WIDTH{width}',
-                         **{key: row[key] for key in ('status', 'cmax_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+                         **{key: row[key] for key in ('status', 'cmax_s', 'runtime_s', 'coordination_calls', 'diagnostic')},
                          **beam_validation_metrics(selected[width])))
     if rows[1]['cmax_s'] is not None and rows[2]['cmax_s'] is not None:
         delta = rows[2]['cmax_s'] - rows[1]['cmax_s']
@@ -1357,7 +1359,7 @@ def summarize_equal_time_baselines():
         cmax = [float(r['cmax_s']) for r in selected if r['status'] == 'FEASIBLE']
         times = [float(r['runtime_s']) for r in selected]
         search = [d['search_runtime_s'] for d in details]
-        b32_times = [d['b32_runtime_s'] for d in details]
+        coordination_times = [d['coordination_runtime_s'] for d in details]
         iterations = [int(r['iterations']) for r in selected]
         overshoot = [d['overshoot_s'] for d in details]
         summary = dict(split='test', method=method, source=EQUAL_TIME_SOURCE,
@@ -1369,13 +1371,13 @@ def summarize_equal_time_baselines():
             mean_cmax_s=average(cmax), median_cmax_s=median(cmax) if cmax else None,
             mean_runtime_s=average(times), median_runtime_s=median(times),
             mean_search_runtime_s=average(search), median_search_runtime_s=median(search), max_search_runtime_s=max(search),
-            mean_b32_runtime_s=average(b32_times), median_b32_runtime_s=median(b32_times),
+            mean_coordination_runtime_s=average(coordination_times), median_coordination_runtime_s=median(coordination_times),
             min_iterations=min(iterations), mean_iterations=average(iterations), median_iterations=median(iterations),
             max_iterations=max(iterations), iteration_limit_runs=sum(n == BASELINE_ITERATIONS[method] for n in iterations),
             time_limit_runs=sum(d['termination_reason'] == 'TIME_LIMIT' for d in details),
             mean_overshoot_s=average(overshoot), median_overshoot_s=median(overshoot), max_overshoot_s=max(overshoot),
             late_best_updates=sum(d['late_best_updates'] for d in details),
-            b32_calls=sum(int(r['b32_calls']) for r in selected))
+            coordination_calls=sum(int(r['coordination_calls']) for r in selected))
         print('BASELINE_EQUAL_TIME_SUMMARY', json.dumps(summary), flush=True)
         summaries.append(summary)
     by_method = {method: {(r['layout_id'], int(r['seed'])): r for r in rows if r['method'] == method}
@@ -1451,7 +1453,7 @@ def summarize_optimized_baselines(*, time_limit=None):
                            median_cmax_s=median(cmax) if cmax else None, mean_cmax_s=average(cmax),
                            mean_runtime_s=average(times), median_runtime_s=median(times), max_runtime_s=max(times),
                            iterations=sorted({int(r['iterations']) for r in selected}),
-                           b32_calls=sum(int(r['b32_calls']) for r in selected),
+                           coordination_calls=sum(int(r['coordination_calls']) for r in selected),
                            processing_mean_s=[average([float(r[f'processing_r{i}_s']) for r in feasible]) for i in range(4)],
                            move_mean_s=average([float(r['move_s']) for r in feasible]),
                            wait_mean_s=average([float(r['wait_s']) for r in feasible]))
@@ -1499,7 +1501,7 @@ def summarize_optimized_baselines(*, time_limit=None):
 
 
 def value_preferences(schedules):
-    """Reuse the existing B32 preference rule, only within one saved prefix."""
+    """Reuse the existing NATIVE preference rule, only within one saved prefix."""
     pairs = []
     for first in range(len(schedules)):
         for second in range(first + 1, len(schedules)):
@@ -1569,7 +1571,7 @@ def collect_value_branches(layout, *, fractions=(.25, .50, .75), candidate_limit
                        mode=assignment.pattern.kind.value, robots=str(assignment.robots),
                        status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
                        cmax_s=schedule.cmax if schedule and schedule.feasible else None,
-                       runtime_s=elapsed, b32_calls=int(called), diagnostic=diagnostic,
+                       runtime_s=elapsed, coordination_calls=int(called), diagnostic=diagnostic,
                        **beam_validation_metrics(result))
             if current_policy:
                 row['construct_s'] = construct_s
@@ -1640,7 +1642,7 @@ def value_validation_job(job):
     row, _ = complete_gnn(parents, worker_model, SEED, (), reconstruct=False, beam_width=1,
                           evaluation_cache=seen, result_observer=lambda result, schedule: chosen.append(result))
     row = dict(split=split, layout_id=name, method='GNN_CMAX_VALUE', epoch=epoch,
-               **{k: row[k] for k in ('status', 'cmax_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+               **{k: row[k] for k in ('status', 'cmax_s', 'runtime_s', 'coordination_calls', 'diagnostic')},
                **beam_validation_metrics(chosen[0]))
     print('CMAX_VALUE_EVAL', json.dumps(row), flush=True)
     return row, seen
@@ -1666,7 +1668,7 @@ def cmax_value_summary(rows, references):
             return max(float(row[f'processing_r{r}_s']) for r in range(4))
         return float(row['max_processing_s'])
 
-    summary = dict(feasible=len(feasible), runs=len(rows), b32_calls=sum(int(r['b32_calls']) for r in rows),
+    summary = dict(feasible=len(feasible), runs=len(rows), coordination_calls=sum(int(r['coordination_calls']) for r in rows),
                    median_cmax_s=median(float(r['cmax_s']) for r in feasible) if feasible else None,
                    median_runtime_s=median(float(r['runtime_s']) for r in rows),
                    median_max_processing_s=median(peak(r) for r in feasible) if feasible else None,
@@ -1714,13 +1716,13 @@ def cmax_value_experiment(workers):
                 saved['training'].append(sample)
                 save_cmax_value(saved)
                 print('CMAX_VALUE_TRAIN_DATA', sample['layout_id'], 'groups', len(sample['groups']),
-                      'branches', len(sample['rows']), 'B32', sum(r['b32_calls'] for r in sample['rows']),
+                      'branches', len(sample['rows']), 'NATIVE', sum(r['coordination_calls'] for r in sample['rows']),
                       'seconds', sample['runtime_s'], flush=True)
     samples = sorted(saved['training'], key=lambda s: s['layout_id'])
     groups = [group for sample in samples for group in sample['groups']]
     trainable = [group for group in groups if group['preferences']]
     if not trainable:
-        raise ValueError('no actual B32 preference pairs were obtained')
+        raise ValueError('no actual NATIVE preference pairs were obtained')
     torch.manual_seed(SEED)
     model = joint_model(saved['base_state_dict'])
     model.enable_cmax_value()
@@ -1857,7 +1859,7 @@ def expanded_teachers(workers):
 
 
 def expanded_training_layout(layout, record, model):
-    """Rebuild the existing demonstrations from saved, B32-feasible teachers."""
+    """Rebuild the existing demonstrations from saved, NATIVE-feasible teachers."""
     _, parents = layout
     space = gnn.parent_assignment_space(parents, CONFIG)
     feasible = [item for item in record['records'] if item['row']['status'] == 'FEASIBLE'
@@ -1903,7 +1905,7 @@ def expanded_validation_job(job):
                           evaluation_cache=seen, result_observer=lambda result, schedule: selected.append(result))
     row = dict(split='test' if stage == 'final_test' else 'validation_fresh', stage=stage, round=round_index, epoch=epoch, layout_id=layout[0],
                method='GNN_BASE' if worker_model.cmax_value_head is None else 'GNN_DAGGER', seed=SEED,
-               **{key: row[key] for key in ('status', 'cmax_s', 'construct_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+               **{key: row[key] for key in ('status', 'cmax_s', 'construct_s', 'runtime_s', 'coordination_calls', 'diagnostic')},
                **beam_validation_metrics(selected[0]), plan=pack_directed_plan(selected[0]))
     print('FRESH_GNN_RESULT', json.dumps({k: v for k, v in row.items() if k != 'plan'}), flush=True)
     return row, pickle.dumps(seen)
@@ -1933,7 +1935,7 @@ def expanded_summary(rows, references):
                    median_cmax_s=median(float(row['cmax_s']) for row in feasible) if feasible else None,
                    median_construct_s=median(float(row['construct_s']) for row in rows),
                    median_runtime_s=median(float(row['runtime_s']) for row in rows),
-                   b32_calls=sum(int(row['b32_calls']) for row in rows), paired={})
+                   coordination_calls=sum(int(row['coordination_calls']) for row in rows), paired={})
     for method in ('WAG+VNS', 'RULE/BEAM'):
         lookup = {row['layout_id']: row for row in references if row['method'] == method}
         pairs = [(row, lookup[row['layout_id']]) for row in feasible
@@ -2041,7 +2043,7 @@ def dagger_branch_job(job):
     for row in sample['rows']:
         row.update(split='train_expanded', stage='dagger_branch', round=round_index, method='GNN_DAGGER_BRANCH')
     print('DAGGER_BRANCH_RESULT', round_index, layout[0], 'prefixes', len(sample['groups']),
-          'branches', len(sample['rows']), 'B32', sum(r['b32_calls'] for r in sample['rows']),
+          'branches', len(sample['rows']), 'NATIVE', sum(r['coordination_calls'] for r in sample['rows']),
           'value_policy', sample['policy_has_value'], 'seconds', sample['runtime_s'], flush=True)
     return sample
 
@@ -2083,7 +2085,7 @@ def train_dagger_round(saved, round_index):
               for group in sample['groups']]
     trainable = [group for group in groups if group['preferences']]
     if not trainable:
-        raise ValueError(f'DAgger round {round_index} obtained no true B32 preferences')
+        raise ValueError(f'DAgger round {round_index} obtained no true NATIVE preferences')
     optimizer = torch.optim.AdamW(model.cmax_value_head.parameters(), lr=1e-3, weight_decay=1e-4)
     if data['completed_epoch']:
         model.load_state_dict(data['last_state_dict'])
@@ -2170,7 +2172,7 @@ def owner_cf_layouts(source, records):
     ordered = sorted((row for row in records if row['layout_id'] in teachers),
                      key=lambda row: (len(row['parents']), row['layout_id']))
     if len(ordered) < 40:
-        raise ValueError(f'only {len(ordered)} TRAIN layouts have saved B32-feasible teachers; need 40')
+        raise ValueError(f'only {len(ordered)} TRAIN layouts have saved NATIVE-feasible teachers; need 40')
     chosen, strata = [], []
     for weld_bin in range(4):
         group = sorted(ordered[len(ordered) * weld_bin // 4:len(ordered) * (weld_bin + 1) // 4],
@@ -2230,7 +2232,7 @@ def collect_owner_cf(job):
     full_blocks = {b.block_id: b for action in labels for b in space.children[action.pattern]}
     routes = tuple(route.block_ids for route in result.solution.routes)
     seen = pickle.loads(cached) if cached else {}
-    # These are previously measured B32 outcomes, not the WAG native schedule.
+    # These are previously measured NATIVE outcomes, not the WAG native schedule.
     for record in records:
         row = record['row']
         if record['plan'] is not None and row['status'] in ('FEASIBLE', 'DEADLOCK', 'INFEASIBLE'):
@@ -2278,7 +2280,7 @@ def collect_owner_cf(job):
             group_rows.append(dict(split='train_expanded', stage='owner_branch', layout_id=name,
                 method='FROZEN_BASE_OWNER_CF', seed=SEED, parent_id=action.parent_id, mode='WHOLE',
                 assigned_parents=depth, candidate='AB'[index], robot=action.robots[0],
-                construct_s=construct_s, runtime_s=construct_s, b32_calls=0,
+                construct_s=construct_s, runtime_s=construct_s, coordination_calls=0,
                 **beam_validation_metrics(completion)))
             descriptions.append(dict(assignment_index=plan.assignment_index, robot=action.robots[0],
                                      actions=[dict(block_id=a.block_id, robot=a.robot, position=a.position,
@@ -2294,7 +2296,7 @@ def collect_owner_cf(job):
             row.update(status=schedule.status.value if schedule else
                        ('NO_COMPLETE_SOLUTION' if completion.solution is None else 'SKIPPED_INCOMPLETE_PAIR'),
                        cmax_s=schedule.cmax if schedule and schedule.feasible else None,
-                       b32_calls=int(called), runtime_s=row['runtime_s'] + time.perf_counter() - evaluated,
+                       coordination_calls=int(called), runtime_s=row['runtime_s'] + time.perf_counter() - evaluated,
                        diagnostic=(' | '.join(schedule.diagnostics) if not schedule.feasible else '') if schedule else
                        (completion.rejection_reason or 'counterpart could not complete construction'))
         winner, kind = better_branch(*schedules)
@@ -2310,7 +2312,7 @@ def collect_owner_cf(job):
         print('OWNER_CF_PAIR', json.dumps(dict(layout_id=name, parent_id=assignment.parent_id, assigned=depth,
               robots=[row['robot'] for row in group_rows], status=[row['status'] for row in group_rows],
               cmax_s=[row['cmax_s'] for row in group_rows], winner=winner, preference=kind,
-              b32_calls=sum(row['b32_calls'] for row in group_rows))), flush=True)
+              coordination_calls=sum(row['coordination_calls'] for row in group_rows))), flush=True)
         if len(groups) == 3:
             break
     return dict(layout_id=name, teacher=teacher['row']['method'], groups=groups, rows=rows,
@@ -2344,7 +2346,7 @@ def train_owner_cf(saved):
     groups = [group for sample in sorted(saved['training'], key=lambda sample: sample['layout_id'])
               for group in sample['groups'] if group['preferences']]
     if not groups:
-        raise ValueError('WHOLE owner counterfactuals produced no true B32 preference; do not train')
+        raise ValueError('WHOLE owner counterfactuals produced no true NATIVE preference; do not train')
     optimizer = torch.optim.AdamW(model.policy.parameters(), lr=3e-4, weight_decay=1e-4)
     if saved['completed_epoch']:
         optimizer.load_state_dict(saved['optimizer_state_dict'])
@@ -2380,7 +2382,7 @@ def owner_cf_validation_job(job):
                           evaluation_cache=pickle.loads(cached) if cached else {},
                           result_observer=lambda result, schedule: selected.append(result))
     row = dict(split='validation_fresh', stage='owner_validation', layout_id=layout[0], method='GNN_OWNER_CF', seed=SEED,
-               **{key: row[key] for key in ('status', 'cmax_s', 'construct_s', 'runtime_s', 'b32_calls', 'diagnostic')},
+               **{key: row[key] for key in ('status', 'cmax_s', 'construct_s', 'runtime_s', 'coordination_calls', 'diagnostic')},
                **beam_validation_metrics(selected[0]), plan=pack_directed_plan(selected[0]))
     print('OWNER_CF_VALIDATION', json.dumps({key: value for key, value in row.items() if key != 'plan'}), flush=True)
     return row
@@ -2459,7 +2461,7 @@ FEEDBACK_RECONSTRUCTIONS = 500
 FEEDBACK_FULL_SOURCE = 'CMAX_FEEDBACK_ADAPTIVE_500'
 FEEDBACK_FIELDS = ('stage', 'epoch', 'layout_id', 'seed', 'method', 'status', 'cmax_s',
     'initial_status', 'initial_cmax_s', 'runtime_s', 'construct_s', 'reconstruction_attempts',
-    'reconstructions', 'accepted', 'b32_calls', 'cache_hits', 'deadlocks', 'numeric_failures',
+    'reconstructions', 'accepted', 'coordination_calls', 'cache_hits', 'deadlocks', 'numeric_failures',
     'incomplete', 'late_candidates', 'baseline_status', 'baseline_cmax_s', 'reward', 'advantage',
     'loss', 'steps', 'gradient_norm', 'max_processing_s', 'move_s', 'wait_s', 'diagnostic', 'source')
 
@@ -2549,7 +2551,7 @@ def run_feedback_gnn(parents, model, seed, *, budget=None, reconstruction_limit=
     space = gnn.parent_assignment_space(parents, CONFIG)
     embeddings = model.encode_static(space.graph)
     seen, blockers = {}, {}
-    counts = dict(reconstruction_attempts=0, reconstructions=0, accepted=0, b32_calls=0,
+    counts = dict(reconstruction_attempts=0, reconstructions=0, accepted=0, coordination_calls=0,
                   cache_hits=0, deadlocks=0, numeric_failures=0, incomplete=0, late_candidates=0)
     current_result = current_schedule = best_result = best_schedule = None
     initial_status, initial_cmax, diagnostic = 'NO_COMPLETE_SOLUTION', None, ''
@@ -2574,7 +2576,7 @@ def run_feedback_gnn(parents, model, seed, *, budget=None, reconstruction_limit=
         evaluation_started = time.perf_counter()
         schedule, called = evaluate_once(result, seen, blocker_cache=blockers)
         reserve = max(reserve, 1.5 * (time.perf_counter() - evaluation_started))
-        counts['b32_calls'] += int(called)
+        counts['coordination_calls'] += int(called)
         counts['cache_hits'] += int(not called)
         last_status = schedule.status.value
         counts['deadlocks'] += int(schedule.status is ScheduleStatus.DEADLOCK)
@@ -2610,7 +2612,7 @@ def run_feedback_gnn(parents, model, seed, *, budget=None, reconstruction_limit=
     parent_count = len(parents)
     q1 = min(parent_count - 1, max(8, math.ceil(.15 * parent_count)))
     q2 = min(parent_count - 1, max(12, math.ceil(.25 * parent_count)))
-    # No per-action B32, direction pass, literature initializer or fallback.
+    # No per-action NATIVE, direction pass, literature initializer or fallback.
     previous_repair_seconds = 0.
     while (current_schedule is not None
            and (reconstruction_limit is None or counts['reconstruction_attempts'] < reconstruction_limit)
@@ -2649,7 +2651,7 @@ def run_feedback_gnn(parents, model, seed, *, budget=None, reconstruction_limit=
         previous_repair_seconds = time.perf_counter() - repair_started
         if progress_observer is not None and counts['reconstruction_attempts'] % 100 == 0:
             progress_observer(dict(reconstruction_attempts=counts['reconstruction_attempts'],
-                reconstructions=counts['reconstructions'], b32_calls=counts['b32_calls'],
+                reconstructions=counts['reconstructions'], coordination_calls=counts['coordination_calls'],
                 best_cmax_s=best_schedule.cmax, current_cmax_s=current_schedule.cmax,
                 q=q, runtime_s=time.perf_counter() - started))
         if budget is not None and candidate.rejection_reason == 'TIME_LIMIT':
@@ -2711,7 +2713,7 @@ def feedback_train_layout(model, baseline, layout, epoch, optimizer, *, training
             baseline_status=base_schedule.status.value if base_schedule else 'CONSTRUCTION_FAILED',
             baseline_cmax_s=base_schedule.cmax if base_schedule is not None and base_schedule.feasible else None,
             initial_cmax_s=incumbent.cmax if incumbent else None, runtime_s=time.perf_counter() - started,
-            b32_calls=calls + base_calls, cache_hits=int(not calls and result.solution is not None),
+            coordination_calls=calls + base_calls, cache_hits=int(not calls and result.solution is not None),
             deadlocks=sum(s is not None and s.status is ScheduleStatus.DEADLOCK for s in (schedule, base_schedule)),
             numeric_failures=sum(s is not None and s.status is ScheduleStatus.NUMERIC_FAILURE for s in (schedule, base_schedule)),
             reward=reward, advantage=advantage, loss=loss, steps=len(trace), gradient_norm=norm,
@@ -2792,7 +2794,7 @@ def feedback_summary(rows):
         min_runtime_s=min((float(r['runtime_s']) for r in rows), default=None),
         max_runtime_s=max((float(r['runtime_s']) for r in rows), default=None),
         total_runtime_s=sum(float(r['runtime_s']) for r in rows),
-        b32_calls=sum(int(r.get('b32_calls') or 0) for r in rows))
+        coordination_calls=sum(int(r.get('coordination_calls') or 0) for r in rows))
 
 
 def feedback_paired(rows, reference):
@@ -2878,7 +2880,7 @@ def train_feedback(workers, rounds, *, expanded=False):
                                          training_stage='train_expanded' if expanded else 'train')
             feedback_write(FEEDBACK_TRAIN_CSV, rows)
             print(json.dumps(dict(epoch=epoch, trained=index + 1, layout_id=layout[0], updates=len(rows),
-                                  b32_calls=sum(r['b32_calls'] for r in rows)), ensure_ascii=False), flush=True)
+                                  coordination_calls=sum(r['coordination_calls'] for r in rows)), ensure_ascii=False), flush=True)
         model.eval()
         rows = feedback_evaluate(model, validation, epoch, workers)
         summary = feedback_summary(rows); previous = feedback_summary(selected_rows)
@@ -2948,7 +2950,7 @@ def summarize_feedback(*, split='test'):
             gains.append((float(row['cmax_s']) / before - 1.) * 100.)
     summary['search'] = dict(initial_greedy_feasible=sum(r['initial_status'] == 'FEASIBLE' for r in rows),
         gain_pairs=len(gains), median_cmax_change_from_first_incumbent_pct=median(gains) if gains else None,
-        b32_calls=sum(int(r['b32_calls']) for r in rows), cache_hits=sum(int(r['cache_hits']) for r in rows),
+        coordination_calls=sum(int(r['coordination_calls']) for r in rows), cache_hits=sum(int(r['cache_hits']) for r in rows),
         reconstruction_attempts=sum(int(r['reconstruction_attempts']) for r in rows),
         runs_reaching_500=sum(int(r['reconstruction_attempts']) == FEEDBACK_RECONSTRUCTIONS for r in rows),
         reconstructions=sum(int(r['reconstructions']) for r in rows), accepted=sum(int(r['accepted']) for r in rows),
@@ -2966,9 +2968,9 @@ def summarize_feedback(*, split='test'):
 
 
 CHILD_MODEL = ROOT / 'models' / 'gnn_child_level_feedback.pt'
-CHILD_TRAIN_SOURCE = 'CHILD_BLOCK_B32_PAIRWISE_TRAIN_V1'
-CHILD_PILOT_SOURCE = 'CHILD_BLOCK_B32_PAIRWISE_100_V1'
-CHILD_FULL_SOURCE = 'CHILD_BLOCK_B32_PAIRWISE_500_V1'
+CHILD_TRAIN_SOURCE = 'CHILD_BLOCK_NATIVE_PAIRWISE_TRAIN_V1'
+CHILD_PILOT_SOURCE = 'CHILD_BLOCK_NATIVE_PAIRWISE_100_V1'
+CHILD_FULL_SOURCE = 'CHILD_BLOCK_NATIVE_PAIRWISE_500_V1'
 CHILD_METHOD = 'GNN_CHILD_LEVEL_FEEDBACK'
 
 
@@ -2987,7 +2989,7 @@ def child_counted_evaluation(result, context):
         return None
     schedule, called = evaluate_once(result, context['seen'], blocker_cache=context['blockers'])
     counts = context['counts']
-    counts['b32_calls'] += int(called)
+    counts['coordination_calls'] += int(called)
     counts['cache_hits'] += int(not called)
     counts['deadlocks'] += int(schedule.status is ScheduleStatus.DEADLOCK)
     counts['numeric_failures'] += int(schedule.status is ScheduleStatus.NUMERIC_FAILURE)
@@ -3002,7 +3004,7 @@ def child_initial_state(parents, model, seed):
     context = dict(started=started, space=space, embeddings=model.encode_static(space.graph),
         seen={}, blockers={}, rng=Random(seed), result=None, schedule=None, initial_attempts=0,
         initial_status='NO_COMPLETE_SOLUTION', initial_cmax_s=None, failure='')
-    context['counts'] = dict(reconstruction_attempts=0, reconstructions=0, accepted=0, b32_calls=0,
+    context['counts'] = dict(reconstruction_attempts=0, reconstructions=0, accepted=0, coordination_calls=0,
         cache_hits=0, deadlocks=0, numeric_failures=0, incomplete=0, late_candidates=0)
     for attempt in range(3):
         context['initial_attempts'] += 1
@@ -3127,7 +3129,7 @@ def collect_child_preferences(workers):
                 data = json.loads(row['diagnostic'])
                 print(json.dumps(dict(event='child_collected',completed=len(retained),layout_id=row['layout_id'],
                     status=row['status'],candidates=len(data['candidates']),pairs=len(data['pairs']),
-                    b32_calls=row['b32_calls'],runtime_s=row['runtime_s'])),flush=True)
+                    coordination_calls=row['coordination_calls'],runtime_s=row['runtime_s'])),flush=True)
     return retained
 
 
@@ -3218,7 +3220,7 @@ def run_child_feedback_gnn(parents, model, seed, *, attempts=500, progress_obser
                     counts['accepted'] += 1
             if progress_observer is not None and (k + 1) % 25 == 0:
                 progress_observer(dict(attempts=k + 1,best_cmax_s=best_schedule.cmax,
-                    b32_calls=counts['b32_calls'],runtime_s=time.perf_counter()-context['started']))
+                    coordination_calls=counts['coordination_calls'],runtime_s=time.perf_counter()-context['started']))
     diagnostic = dict(initial_attempts=context['initial_attempts'],initial_incumbent_cmax_s=c0,
         best_improvements=improvements,accepted_uphill=uphill,accepted_equal=equal,
         current_cmax_s=current_schedule.cmax if current_schedule is not None else None,
@@ -3331,7 +3333,7 @@ PPO_SEED = 20261119
 PPO_OPTIONS = dict(epochs=3,rollout_batch=4,update_epochs=4,learning_rate=1e-4,
     gamma=1.,gae_lambda=.95,clip=.2,value_coefficient=.5,entropy_coefficient=.01,max_gradient_norm=.5)
 PPO_FIELDS = ('stage','size','epoch','index','layout_id','parent_count','seed','method','status',
-    'cmax_s','runtime_s','max_processing_s','move_s','wait_s','b32_calls','steps','reward',
+    'cmax_s','runtime_s','max_processing_s','move_s','wait_s','coordination_calls','steps','reward',
     'loss','gradient_norm','diagnostic','source')
 
 
@@ -3407,14 +3409,14 @@ def ppo_rollout(model,layout,seed):
                 rng=Random(seed),step_observer=observe_state,policy_observer=observe_policy)
         except ArithmeticError as error:
             return dict(space=space,trace=trace,reward=None,row=dict(layout_id=name,parent_count=len(parents),
-                seed=seed,status='NUMERIC_FAILURE',runtime_s=time.perf_counter()-started,b32_calls=0,
+                seed=seed,status='NUMERIC_FAILURE',runtime_s=time.perf_counter()-started,coordination_calls=0,
                 steps=len(trace),diagnostic=str(error)))
         schedule,called=evaluate_once(result,{})
     reward=feedback_reward(schedule,max(1.,sum(CONFIG.process_time(p.length) for p in parents)/4.))
     status=schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED'
     row=dict(layout_id=name,parent_count=len(parents),seed=seed,status=status,
         cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-        runtime_s=time.perf_counter()-started,b32_calls=int(called),steps=len(trace),reward=reward,
+        runtime_s=time.perf_counter()-started,coordination_calls=int(called),steps=len(trace),reward=reward,
         diagnostic=result.rejection_reason or (' | '.join(schedule.diagnostics) if schedule is not None and not schedule.feasible else ''),
         **final_metrics(schedule))
     if reward is not None and trace:
@@ -3464,10 +3466,10 @@ def ppo_update(model,episodes,optimizer):
             value_loss=F.mse_loss(values,torch.stack(targets))
             entropy=torch.stack(entropies).mean()
             loss=actor_loss+PPO_OPTIONS['value_coefficient']*value_loss-PPO_OPTIONS['entropy_coefficient']*entropy
-            if not torch.isfinite(loss):raise ArithmeticError('nonfinite PPO loss; not a B32 DEADLOCK')
+            if not torch.isfinite(loss):raise ArithmeticError('nonfinite PPO loss; not a NATIVE DEADLOCK')
             loss.backward()
             norm=torch.nn.utils.clip_grad_norm_(model.parameters(),PPO_OPTIONS['max_gradient_norm'])
-            if not torch.isfinite(norm):raise ArithmeticError('nonfinite PPO gradient; not a B32 DEADLOCK')
+            if not torch.isfinite(norm):raise ArithmeticError('nonfinite PPO gradient; not a NATIVE DEADLOCK')
             optimizer.step()
             measures.append((float(loss.detach()),float(norm),float(actor_loss.detach()),
                 float(value_loss.detach()),float(entropy.detach()),
@@ -3558,7 +3560,7 @@ def ppo_baseline_job(job):
     configure_cpu()
     layout,method=job
     row=baseline_job((layout,method,SEED))
-    output={k:row[k] for k in ('layout_id','seed','method','status','cmax_s','runtime_s','move_s','wait_s','b32_calls') if k in row}
+    output={k:row[k] for k in ('layout_id','seed','method','status','cmax_s','runtime_s','move_s','wait_s','coordination_calls') if k in row}
     loads=[row.get(f'processing_r{r}_s') for r in range(4)]
     output.update(stage='baseline',size=0,parent_count=len(layout[1]),
         max_processing_s=max(loads) if all(p is not None for p in loads) else None,
@@ -3603,7 +3605,7 @@ def ppo_inference_job(job):
     return dict(stage='validation',size=size,epoch=PPO_OPTIONS['epochs'] if size else 0,layout_id=name,
         parent_count=len(parents),seed=SEED,method='GNN_PPO' if size else 'GNN_INITIAL',status=status,
         cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-        runtime_s=time.perf_counter()-started,b32_calls=calls,
+        runtime_s=time.perf_counter()-started,coordination_calls=calls,
         diagnostic=json.dumps(dict(model_loading_s=model_loaded-started,attempts=attempt+1,
             deadlocks=deadlocks,numeric_failures=numeric,failures=failures,
             schedule_diagnostic=list(schedule.diagnostics) if schedule is not None else None,
@@ -3688,7 +3690,7 @@ IMITATION_CASES = ('scale_validation_0031','scale_validation_0095','scale_valida
 IMITATION_FIELDS = ('stage','layout_id','parent_count','seed','method','status','cmax_s',
     'robot_task_count_r0','robot_task_count_r1','robot_task_count_r2','robot_task_count_r3',
     'processing_r0_s','processing_r1_s','processing_r2_s','processing_r3_s','max_processing_s',
-    'move_s','wait_s','runtime_s','b32_calls','four_robot_cover_possible','wait_for_graph','diagnostic','source')
+    'move_s','wait_s','runtime_s','coordination_calls','four_robot_cover_possible','wait_for_graph','diagnostic','source')
 
 
 def imitation_model(weights=None, *, balance=True):
@@ -3758,11 +3760,11 @@ def imitation_hga_job(layout):
     best = result.timely_best
     plan = gnn.JointCompletionResult(best.solution if best else None,best.directions if best else None,(),
                                    time.perf_counter()-started)
-    schedule = b32(plan) if best is not None else None
+    schedule = coordination(plan) if best is not None else None
     row = dict(layout_id=name,method='HGA',seed=SEED,iterations=result.iterations,
                status=schedule.status.value if schedule else 'NO_COMPLETE_SOLUTION',
                cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-               runtime_s=time.perf_counter()-started,b32_calls=int(schedule is not None),
+               runtime_s=time.perf_counter()-started,coordination_calls=int(schedule is not None),
                diagnostic=list(schedule.diagnostics) if schedule is not None else [],
                wait_for_graph=schedule.wait_for_graph if schedule is not None else (),
                **baseline_metrics(best,schedule))
@@ -3808,8 +3810,8 @@ def imitation_evaluate(layout, model, *, method='GNN_IMITATION', seen=None):
     diagnostic = dict(coverage=space.coverage_diagnostic(),
         rejection=result.rejection_reason,solution=pack_directed_plan(result),
         schedule_diagnostic=list(schedule.diagnostics) if schedule is not None else [],
-        baseline_deadlock=schedule.baseline_deadlock if schedule is not None else None,
-        recovery_exhausted=schedule.recovery_exhausted if schedule is not None else None,
+        native_status=schedule.status.value if schedule is not None else None,
+        robot_completion=schedule.robot_completion if schedule is not None else (),
         wait_for_graph=schedule.wait_for_graph if schedule is not None else ())
     if forecast_trace:
         diagnostic['processing_forecast_trace']=forecast_trace
@@ -3820,7 +3822,7 @@ def imitation_evaluate(layout, model, *, method='GNN_IMITATION', seen=None):
                                                            result.directions[r]),CONFIG)]
         diagnostic['operation_templates']=[dict(id=op.operation_id,robot=op.robot_id,kind=op.kind.value,
             start=op.start,end=op.end,duration=op.duration) for op in templates]
-        diagnostic['wait_observation']='WAIT accumulated in the committed partial B32 timeline; full Cmax unavailable'
+        diagnostic['wait_observation']='WAIT accumulated in the committed partial NATIVE timeline; full Cmax unavailable'
         diagnostic['last_committed_operations']=[dict(id=op.operation_id,robot=op.robot_id,kind=op.kind.value,
             start=op.start,end=op.end,start_s=op.start_time,end_s=op.end_time)
             for r in range(4) for op in tuple(o for o in schedule.operations if o.robot_id==r)[-3:]]
@@ -3829,7 +3831,7 @@ def imitation_evaluate(layout, model, *, method='GNN_IMITATION', seen=None):
     return dict(layout_id=name,seed=SEED,method=method,parent_count=len(parents),
         status=schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED',
         cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-        runtime_s=time.perf_counter()-started,b32_calls=int(called),**counts,**metrics,
+        runtime_s=time.perf_counter()-started,coordination_calls=int(called),**counts,**metrics,
         four_robot_cover_possible=space.four_robot_cover_possible,
         max_processing_s=max(loads) if all(p is not None for p in loads) else None,
         wait_s=sum(op.duration for op in schedule.operations if op.kind is OperationKind.WAIT)
@@ -3855,7 +3857,7 @@ def imitation_replay(layout, record, model, *, joint_stride=8):
 
     Position enumeration is complete for the bounded coarse assignment pool.
     Structural sampling may bound negatives, but can never remove a positive.
-    No B32, native evaluation, or labels from another split are used here.
+    No NATIVE, native evaluation, or labels from another split are used here.
     """
     name,parents = layout
     space = gnn.parent_assignment_space(parents,CONFIG)
@@ -4096,7 +4098,7 @@ def imitation_write(rows):
 
 
 def imitation_references():
-    """Reuse the recorded PPO/classical B32 results; evaluate the raw GNN once."""
+    """Reuse the recorded PPO/classical NATIVE results; evaluate the raw GNN once."""
     layouts = dict(ppo_layouts('validation'))
     done = {(r['layout_id'],r['method']) for r in read_rows(IMITATION_RESULTS)}
     old = read_rows(PPO_RESULTS)
@@ -4121,8 +4123,8 @@ def imitation_references():
                 source = matches[0]
                 detail = json.loads(source['diagnostic'])
                 row = {k:source.get(k) for k in ('status','cmax_s','runtime_s','move_s','wait_s','max_processing_s')}
-                row.update(layout_id=name,parent_count=len(parents),seed=SEED,method=method,b32_calls=0,
-                           source='reused gnn_ppo_scale.csv; no repeated search or B32')
+                row.update(layout_id=name,parent_count=len(parents),seed=SEED,method=method,coordination_calls=0,
+                           source='reused gnn_ppo_scale.csv; no repeated search or NATIVE')
                 if method=='PPO_1000':
                     space = gnn.parent_assignment_space(parents,CONFIG) if space is None else space
                     plan = unpack_directed_plan(parents,detail['solution'],space)
@@ -4216,7 +4218,7 @@ DEADLOCK_FIELDS = ('stage','layout_id','parent_count','seed','repair_attempt','r
     'origin_attempt','neighbour_layers','removed_parent_ids','status','cmax_s',
     'robot_task_count_r0','robot_task_count_r1','robot_task_count_r2','robot_task_count_r3',
     'processing_r0_s','processing_r1_s','processing_r2_s','processing_r3_s','max_processing_s',
-    'same_rail_gap_01_s','same_rail_gap_23_s','move_s','wait_s','runtime_s','construct_s','b32_s','b32_calls',
+    'same_rail_gap_01_s','same_rail_gap_23_s','move_s','wait_s','runtime_s','construct_s','coordination_s','coordination_calls',
     'blocked_operation_count','wait_for_graph','deadlock_blockages','diagnostic','reconstruction_failure','solution')
 
 
@@ -4276,9 +4278,8 @@ def deadlock_result_row(name, result, schedule, **values):
         wait_for_graph=json.dumps(schedule.wait_for_graph),
         deadlock_blockages=json.dumps([asdict(item) for item in schedule.deadlock_blockages]),
         diagnostic=json.dumps(dict(schedule_diagnostics=schedule.diagnostics,
-            evidence_source=schedule.deadlock_evidence_source,baseline_deadlock=schedule.baseline_deadlock,
-            recovery_rollouts=schedule.recovery_rollouts,rollout_budget=schedule.rollout_budget,
-            recovery_exhausted=schedule.recovery_exhausted,frontier_exhausted=schedule.frontier_exhausted)),
+            evidence_source=schedule.deadlock_evidence_source,native_status=schedule.status.value,
+            robot_completion=schedule.robot_completion,waiting_s=schedule.waiting_time)),
         solution=json.dumps(pack_directed_plan(result)),**values)
 
 
@@ -4312,20 +4313,20 @@ def deadlock_reconstruct(current, partial, model, space, embeddings):
 def deadlock_initial(name, parents, original, space):
     result=deadlock_plan(parents,json.loads(original['diagnostic'])['solution'],space)
     if original['status']=='FEASIBLE':
-        # Reuse 0067 verbatim; no initial reconstruction and no repeated B32.
+        # Reuse 0067 verbatim; no initial reconstruction and no repeated NATIVE.
         row={k:original.get(k) for k in DEADLOCK_FIELDS}
         row.update(stage='initial',repair_attempt=0,repair_round=0,candidate_rank=0,seed=SEED,
-            b32_calls=0,runtime_s=0.,construct_s=0.,b32_s=0.,blocked_operation_count=0,
+            coordination_calls=0,runtime_s=0.,construct_s=0.,coordination_s=0.,blocked_operation_count=0,
             deadlock_blockages='[]',solution=json.dumps(pack_directed_plan(result)),
             diagnostic=json.dumps(dict(reused='gnn_imitation_balance_pilot.csv',schedule_diagnostics=[])))
         row['same_rail_gap_01_s']=abs(float(row['processing_r0_s'])-float(row['processing_r1_s']))
         row['same_rail_gap_23_s']=abs(float(row['processing_r2_s'])-float(row['processing_r3_s']))
         return row
     started=time.perf_counter()
-    schedule=b32(result)
+    schedule=coordination(result)
     elapsed=time.perf_counter()-started
     return deadlock_result_row(name,result,schedule,stage='initial',repair_attempt=0,repair_round=0,
-        candidate_rank=0,construct_s=0.,b32_s=elapsed,runtime_s=elapsed,b32_calls=1)
+        candidate_rank=0,construct_s=0.,coordination_s=elapsed,runtime_s=elapsed,coordination_calls=1)
 
 
 def deadlock_repair_case(name, parents, original, model, *, resume_unresolved=False):
@@ -4381,18 +4382,18 @@ def deadlock_repair_case(name, parents, original, model, *, resume_unresolved=Fa
                 break
             count+=1;new_count+=1
             evaluation=time.perf_counter()
-            outcome=b32(candidate)
+            outcome=coordination(candidate)
             evaluation=time.perf_counter()-evaluation
             row=deadlock_result_row(name,candidate,outcome,stage='candidate',repair_attempt=count,
                 repair_round=round_index,candidate_rank=rank,origin_attempt=int(best['repair_attempt']),
                 neighbour_layers=layers,removed_parent_ids=json.dumps(partial.removed_parent_ids),
-                construct_s=construction if new_count==1 else 0.,b32_s=evaluation,
-                runtime_s=(construction if new_count==1 else 0.)+evaluation,b32_calls=1)
+                construct_s=construction if new_count==1 else 0.,coordination_s=evaluation,
+                runtime_s=(construction if new_count==1 else 0.)+evaluation,coordination_calls=1)
             deadlock_write([row]);rows.append(row)
             print('DEADLOCK_CANDIDATE',name,count,outcome.status.value,'blocked',row['blocked_operation_count'],
                   'Pmax',row['max_processing_s'],'removed',len(partial.removed_parent_ids),flush=True)
             if outcome.feasible:
-                best=row;stop='B32 feasible';break
+                best=row;stop='NATIVE feasible';break
             if outcome.status is ScheduleStatus.DEADLOCK:
                 next_deadlocks.append(row)
         if best['status']=='FEASIBLE':
@@ -4405,12 +4406,12 @@ def deadlock_repair_case(name, parents, original, model, *, resume_unresolved=Fa
                                             'all complete candidates duplicate previous directed plans'))
         deadlock_write([dict(stage='failure',layout_id=name,seed=SEED,repair_attempt=count,repair_round=round_index,
             origin_attempt=best['repair_attempt'],neighbour_layers=layers,removed_parent_ids=json.dumps(partial.removed_parent_ids),
-            b32_calls=0,construct_s=construction if not new_count else 0.,reconstruction_failure=reason)])
+            coordination_calls=0,construct_s=construction if not new_count else 0.,reconstruction_failure=reason)])
         if layers==1:
             layers=2
         else:
             stop=reason;break
-    final=dict(best,stage='final',origin_attempt=best['repair_attempt'],repair_attempt=count,b32_calls=0,
+    final=dict(best,stage='final',origin_attempt=best['repair_attempt'],repair_attempt=count,coordination_calls=0,
                runtime_s=time.perf_counter()-started,reconstruction_failure=stop)
     deadlock_write([final])
     print('DEADLOCK_FINAL',json.dumps({k:v for k,v in final.items() if k not in
@@ -4422,7 +4423,7 @@ def deadlock_repair_case(name, parents, original, model, *, resume_unresolved=Fa
 def imitation_deadlock_pilot(*, resume_unresolved=False):
     configure_cpu()
     # Open the sole output before expensive evaluations; a denied file write
-    # must not consume an unrecorded B32 call or rerun the old initial GNN.
+    # must not consume an unrecorded NATIVE call or rerun the old initial GNN.
     deadlock_write([])
     saved=torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)
     model=imitation_model(saved['state_dict'],balance=True).eval()
@@ -4442,7 +4443,7 @@ ROUTEAWARE_FIELDS = ('stage','layout_id','parent_count','seed','method','round',
     *(f'{kind}_r{r}_s' for kind in ('processing','move','wait','completion') for r in range(4)),
     *(f'robot_task_count_r{r}' for r in range(4)),
     'max_processing_s','processing_spread_s','move_s','wait_s','partial_wait_s','metrics_missing_reason',
-    'runtime_s','construct_s','b32_s','b32_calls','cache_hits','blocked_operation_count',
+    'runtime_s','construct_s','coordination_s','coordination_calls','cache_hits','blocked_operation_count',
     'wait_for_graph','deadlock_blockages','solution','schedule','wait_blockers','feedback','diagnostic')
 
 
@@ -4482,7 +4483,7 @@ def routeaware_wait_blockers(row):
 
 
 def routeaware_metrics(result,schedule,*,historical=None):
-    """Full P/M from B32 templates; full W/C only from a feasible timeline."""
+    """Full P/M from NATIVE templates; full W/C only from a feasible timeline."""
     blocks=block_map(result.solution,CONFIG,scope=FORMAL_SCOPE_V2)
     processing=[0.]*4;move=[0.]*4;wait=[0.]*4
     for r,route in enumerate(result.solution.routes):
@@ -4502,10 +4503,10 @@ def routeaware_metrics(result,schedule,*,historical=None):
         # Ordinary data consistency check, never another scheduler or Cmax model.
         for r in range(4):
             if not math.isclose(processing[r]+move[r]+wait[r],schedule.robot_completion[r],abs_tol=1e-6):
-                raise ValueError('B32 timeline does not match complete P/M/W')
+                raise ValueError('NATIVE timeline does not match complete P/M/W')
     elif schedule.feasible:
         metrics.update(wait_s=(historical or {}).get('wait_s'),
-                       metrics_missing_reason='historical full timeline missing; per-robot WAIT/completion unavailable; no repeated B32')
+                       metrics_missing_reason='historical full timeline missing; per-robot WAIT/completion unavailable; no repeated NATIVE')
     else:
         metrics.update(partial_wait_s=sum(wait) if schedule.operations else
                        (historical or {}).get('partial_wait_s',(historical or {}).get('wait_s')),
@@ -4605,7 +4606,7 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
             construction=time.perf_counter()-construction
         if initial.solution is None:
             row=dict(stage='final',layout_id=name,method=method,seed=SEED,status='INFEASIBLE',
-                     b32_calls=0,cache_hits=0,runtime_s=time.perf_counter()-started,diagnostic=initial.rejection_reason)
+                     coordination_calls=0,cache_hits=0,runtime_s=time.perf_counter()-started,diagnostic=initial.rejection_reason)
             write([row]);return row
         if method=='GNN-Original':
             old=next(r for r in read_rows(IMITATION_RESULTS) if r['layout_id']==name and r['method']=='GNN_IMITATION')
@@ -4617,8 +4618,8 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
         schedule,called=evaluate_once(initial,seen,blocker_cache=blockers)
         elapsed=time.perf_counter()-evaluation
         initial_row=routeaware_result_row(name,method,initial,schedule,blockers.get(key,()),
-            historical=records.get(key),stage='initial',round=0,candidate_rank=0,b32_calls=int(called),
-            cache_hits=int(not called),construct_s=construction,b32_s=elapsed if called else 0.,
+            historical=records.get(key),stage='initial',round=0,candidate_rank=0,coordination_calls=int(called),
+            cache_hits=int(not called),construct_s=construction,coordination_s=elapsed if called else 0.,
             runtime_s=time.perf_counter()-started+(construction if screens else 0.))
         detail=json.loads(initial_row['diagnostic'])
         detail.update(checkpoint=str(IMITATION_MODEL.relative_to(ROOT)),seed=SEED,
@@ -4628,7 +4629,7 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
             original_full_plan_reproduced=method=='GNN-Original')
         initial_row['diagnostic']=json.dumps(detail,ensure_ascii=False)
         write([initial_row]);previous.append(initial_row);records[key]=initial_row
-        print('ROUTEAWARE_INITIAL',name,method,initial_row['status'],initial_row['cmax_s'],'new_B32',int(called),flush=True)
+        print('ROUTEAWARE_INITIAL',name,method,initial_row['status'],initial_row['cmax_s'],'new_NATIVE',int(called),flush=True)
     initial_key=plan_key(initial.solution,initial.directions)
     current=initial;current_row=initial_row;current_schedule=seen[initial_key]
     best=initial if current_schedule.feasible else None
@@ -4660,8 +4661,8 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
             partial=lns.select_deadlock_blocker_parents(current.solution,current_schedule,CONFIG,
                 **(dict(neighbour_layers=1,max_parents=max(4,q),seed=SEED+round_index)
                    if load_first_lambda is not None else dict(neighbour_layers=1 if round_index%2 else 2)))
-            feedback=dict(source='bounded structured B32 DEADLOCK blockers' if load_first_lambda is not None else
-                          'structured B32 DEADLOCK blockers',max_parents=q if load_first_lambda is not None else None)
+            feedback=dict(source='bounded structured NATIVE DEADLOCK blockers' if load_first_lambda is not None else
+                          'structured NATIVE DEADLOCK blockers',max_parents=q if load_first_lambda is not None else None)
         else:
             partial=None;feedback=dict(source='no valid feasible/deadlock origin')
         construction=time.perf_counter()
@@ -4677,7 +4678,7 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
             row=routeaware_result_row(name,method,candidate,schedule,blockers.get(candidate_key,()),
                 historical=records.get(candidate_key),stage='candidate',round=round_index,candidate_rank=rank,
                 origin_round=origin_round,removed_parent_ids=json.dumps(partial.removed_parent_ids),
-                b32_calls=int(called),cache_hits=int(not called),b32_s=elapsed if called else 0.,
+                coordination_calls=int(called),cache_hits=int(not called),coordination_s=elapsed if called else 0.,
                 runtime_s=elapsed,feedback=json.dumps(feedback))
             # A resumed unfinished round reuses its saved evaluation and row.
             saved=next((r for r in previous if r['stage']=='candidate' and int(r['round'])==round_index
@@ -4691,7 +4692,7 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
             if routeaware_improves(schedule,row,best_schedule,best_row):
                 best,best_schedule,best_row=candidate,schedule,row
             print('ROUTEAWARE_CANDIDATE',name,method,round_index,rank,schedule.status.value,schedule.cmax,
-                  'new_B32',int(called),'removed',len(partial.removed_parent_ids),flush=True)
+                  'new_NATIVE',int(called),'removed',len(partial.removed_parent_ids),flush=True)
         if best is not None:
             current,current_schedule,current_row=best,best_schedule,best_row
         else:
@@ -4699,8 +4700,8 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
             if deadlocks:
                 current,current_schedule,current_row=min(deadlocks,key=lambda entry:(
                     len(entry[1].deadlock_blockages),float(entry[2]['move_s']),float(entry[2]['processing_spread_s'])))
-        row=dict(current_row,stage='round',round=round_index,origin_round=origin_round,b32_calls=0,cache_hits=0,
-                 construct_s=construction,b32_s=0.,runtime_s=time.perf_counter()-round_started,
+        row=dict(current_row,stage='round',round=round_index,origin_round=origin_round,coordination_calls=0,cache_hits=0,
+                 construct_s=construction,coordination_s=0.,runtime_s=time.perf_counter()-round_started,
                  removed_parent_ids=json.dumps(partial.removed_parent_ids) if partial else '[]',
                  feedback=json.dumps(feedback))
         if not candidates:
@@ -4714,19 +4715,19 @@ def routeaware_case(name,parents,model,method,*,result_path=None,load_first_lamb
     row=dict(best_row if best is not None else current_row,stage='final',round=round_limit,
         runtime_s=sum(float(r.get('runtime_s') or 0) for r in previous if r['stage'] in ('initial','round')),
         construct_s=sum(float(r.get('construct_s') or 0) for r in previous if r['stage'] in ('initial','round')),
-        b32_s=sum(float(r.get('b32_s') or 0) for r in previous if r['stage'] in ('initial','candidate')),
-        b32_calls=sum(int(r.get('b32_calls') or 0) for r in previous if r['stage'] in ('initial','candidate')),
+        coordination_s=sum(float(r.get('coordination_s') or 0) for r in previous if r['stage'] in ('initial','candidate')),
+        coordination_calls=sum(int(r.get('coordination_calls') or 0) for r in previous if r['stage'] in ('initial','candidate')),
         cache_hits=sum(int(r.get('cache_hits') or 0) for r in previous if r['stage'] in ('initial','candidate')))
     write([row])
     print('ROUTEAWARE_FINAL',json.dumps({k:row.get(k) for k in ('layout_id','method','status','cmax_s','move_s',
-        'wait_s','runtime_s','b32_calls','cache_hits')}),flush=True)
+        'wait_s','runtime_s','coordination_calls','cache_hits')}),flush=True)
     return row
 
 
 def imitation_routeaware_pilot():
     configure_cpu()
     # The only new artifact was explicitly approved by the user. Opening it
-    # before B32 also makes a denied destination fail without losing a run.
+    # before NATIVE also makes a denied destination fail without losing a run.
     routeaware_write([])
     done={(r['layout_id'],r['method']) for r in read_rows(ROUTEAWARE_RESULTS) if r['stage']=='reference'}
     for old in read_rows(IMITATION_RESULTS):
@@ -4738,7 +4739,7 @@ def imitation_routeaware_pilot():
         if int(old['seed'])!=SEED or detail['iterations']!=BASELINE_ITERATIONS[old['method']]:
             raise ValueError('historical classical reference has a different seed/budget')
         loads=[float(old[f'processing_r{r}_s']) for r in range(4)]
-        row=dict(old,stage='reference',b32_calls=0,cache_hits=1,processing_spread_s=max(loads)-min(loads),
+        row=dict(old,stage='reference',coordination_calls=0,cache_hits=1,processing_spread_s=max(loads)-min(loads),
             metrics_missing_reason='historical baseline has no saved full routes/timeline; per-robot MOVE/WAIT/completion and task counts unavailable',
             diagnostic=json.dumps(dict(reference=detail,scientific_parameters=CONFIG.scientific_mapping(),
                 scope='FORMAL_SCOPE_V2',budget_note='historical WAG500/HGA200000; different from GNN 6x2; descriptive comparison only'),
@@ -4754,7 +4755,7 @@ def imitation_routeaware_pilot():
             finals.append(routeaware_case(name,layouts[name],model,method))
     print('ROUTEAWARE_SUMMARY',json.dumps({method:dict(
         feasible=sum(r['status']=='FEASIBLE' for r in finals if r['method']==method),
-        b32_calls=sum(int(r['b32_calls']) for r in finals if r['method']==method))
+        coordination_calls=sum(int(r['coordination_calls']) for r in finals if r['method']==method))
         for method in ('GNN-Original','GNN-RouteAware')}),flush=True)
     return finals
 
@@ -4775,9 +4776,9 @@ def loadfirst_references():
             continue
         if (old['layout_id'],old['method']) in existing:
             continue
-        row=dict(old,stage='reference',b32_calls=0,cache_hits=1)
+        row=dict(old,stage='reference',coordination_calls=0,cache_hits=1)
         detail=json.loads(row.get('diagnostic') or '{}')
-        detail['reused_from']='gnn_routeaware_pilot.csv; historical budget, no repeated B32'
+        detail['reused_from']='gnn_routeaware_pilot.csv; historical budget, no repeated NATIVE'
         row['diagnostic']=json.dumps(detail,ensure_ascii=False)
         routeaware_write([row],path=LOADFIRST_RESULTS)
         existing.add((old['layout_id'],old['method']))
@@ -4785,7 +4786,7 @@ def loadfirst_references():
 
 @torch.no_grad()
 def loadfirst_screen(model,layouts):
-    """Measure P/M before spending the B32 repair budget; save the initial plan."""
+    """Measure P/M before spending the NATIVE repair budget; save the initial plan."""
     rows=read_rows(LOADFIRST_RESULTS)
     done={(r['layout_id'],r['method']) for r in rows if r['stage']=='screen'}
     refs={(r['layout_id'],r['method']):r for r in rows if r['stage']=='reference'}
@@ -4810,19 +4811,19 @@ def loadfirst_screen(model,layouts):
             elapsed=time.perf_counter()-started
             if result.solution is None:
                 row=dict(stage='screen',layout_id=name,seed=SEED,method=method,status='CONSTRUCTION_FAILED',
-                    b32_calls=0,construct_s=elapsed,diagnostic=json.dumps(dict(rejection=result.rejection_reason)))
+                    coordination_calls=0,construct_s=elapsed,diagnostic=json.dumps(dict(rejection=result.rejection_reason)))
             else:
                 state=lns.oriented_route_state(tuple(r.block_ids for r in result.solution.routes),result.directions,
                     block_map(result.solution,CONFIG,scope=FORMAL_SCOPE_V2),CONFIG)
                 spread=max(state.loads)-min(state.loads)
                 row=dict(stage='screen',layout_id=name,parent_count=len(layouts[name]),seed=SEED,method=method,
-                    status='UNSCHEDULED',b32_calls=0,construct_s=elapsed,runtime_s=elapsed,
+                    status='UNSCHEDULED',coordination_calls=0,construct_s=elapsed,runtime_s=elapsed,
                     **{f'processing_r{r}_s':p for r,p in enumerate(state.loads)},
                     **{f'move_r{r}_s':sum(arcs) for r,arcs in enumerate(state.arc_costs)},
                     **{f'robot_task_count_r{r}':len(route) for r,route in enumerate(state.routes)},
                     max_processing_s=max(state.loads),processing_spread_s=spread,move_s=state.travel,
                     solution=json.dumps(pack_directed_plan(result)),
-                    metrics_missing_reason='screen only: B32 has not been called; WAIT/C unknown',
+                    metrics_missing_reason='screen only: NATIVE has not been called; WAIT/C unknown',
                     diagnostic=json.dumps(dict(load_first_lambda=penalty,steps=steps,j_band_violations=violations,
                         spread_change_vs_routeaware=spread-float(refs[name,'GNN-RouteAware']['processing_spread_s']),
                         move_change_vs_original=state.travel-float(refs[name,'GNN-Original']['move_s']),
@@ -4855,7 +4856,7 @@ def imitation_loadfirst_pilot(*,screen_only=False):
     selected=min(LOADFIRST_LAMBDAS,key=lambda p:(-summary[p]['feasible'],
         summary[p]['mean_feasible_cmax_s'] if summary[p]['mean_feasible_cmax_s'] is not None else math.inf,p))
     if not any(r['stage']=='selection' for r in read_rows(LOADFIRST_RESULTS)):
-        routeaware_write([dict(stage='selection',layout_id='',seed=SEED,method='LoadFirst-GNN',b32_calls=0,
+        routeaware_write([dict(stage='selection',layout_id='',seed=SEED,method='LoadFirst-GNN',coordination_calls=0,
             diagnostic=json.dumps(dict(selected_lambda=selected,summary=summary,
                 rule='maximum feasible cases, then minimum mean feasible Cmax, then smaller lambda')))],path=LOADFIRST_RESULTS)
         routeaware_write([dict(r,stage='selected_final') for r in finals if r['method']==loadfirst_method(selected)],
@@ -4866,7 +4867,7 @@ def imitation_loadfirst_pilot(*,screen_only=False):
 
 PRIORITY_RESULTS=FINAL_RESULTS/'gnn_priority_vnd_pilot.csv'
 PRIORITY_EVALUATOR='NATIVE_PRIORITY_FOUR_ROBOTS_EXPLICIT_DIRECTIONS'
-PRIORITY_FIELDS=('stage','layout_id','seed','method','lambda','evaluator','source_b32_status','source_b32_s',
+PRIORITY_FIELDS=('stage','layout_id','seed','method','lambda','evaluator','source_coordination_status','source_coordination_s',
     'status','cmax_s',*(f'{kind}_r{r}_s' for kind in ('processing','move','wait','completion') for r in range(4)),
     *(f'robot_task_count_r{r}' for r in range(4)),'max_processing_s','processing_spread_s','move_s','wait_s',
     'runtime_s','evaluation_s','native_calls','cache_hits','candidate_index','pass_index','move_id',
@@ -4914,7 +4915,7 @@ def priority_once(plan,cache):
 
 def priority_result_row(name,plan,schedule,progress,**values):
     metrics=routeaware_metrics(plan,schedule)
-    # Only the existing model/template costs are reused here, not its B32
+    # Only the existing model/template costs are reused here, not its NATIVE
     # evaluator or DEADLOCK metadata. Native failed timelines are unavailable.
     metrics={k:v for k,v in metrics.items() if k in PRIORITY_FIELDS}
     for kind in ('wait','completion'):
@@ -4929,7 +4930,7 @@ def priority_result_row(name,plan,schedule,progress,**values):
 
 
 def priority_history_diagnosis():
-    """Rescore saved complete LoadFirst genes; no GNN, B32 or certification."""
+    """Rescore saved complete LoadFirst genes; no GNN, NATIVE or certification."""
     configure_cpu();priority_write([])
     layouts=dict(ppo_layouts('validation'))
     spaces={n:gnn.parent_assignment_space(layouts[n],CONFIG) for n in IMITATION_CASES}
@@ -4950,7 +4951,7 @@ def priority_history_diagnosis():
                 if name not in catalog or old['stage'] not in ('initial','candidate') or not old.get('solution'):continue
                 plan=deadlock_plan(layouts[name],old['solution'],spaces[name]);key=plan_key(plan.solution,plan.directions)
                 if key not in catalog[name]:catalog[name][key]=(plan,old)
-                elif old['b32_calls']=='1':catalog[name][key]=(plan,old)
+                elif old['coordination_calls']=='1':catalog[name][key]=(plan,old)
     else:
         for old in read_rows(ROUTEAWARE_RESULTS):
             name=old['layout_id']
@@ -4964,7 +4965,7 @@ def priority_history_diagnosis():
             schedule,progress,called,elapsed=priority_once(plan,caches[name])
             priority_write([priority_result_row(name,plan,schedule,progress,stage='history',seed=SEED,
                 method='LoadFirst-history',**{'lambda':old['method'].split('lambda')[-1] if 'lambda' in old['method'] else ''},
-                source_b32_status=old['status'],source_b32_s=old.get('b32_s'),
+                source_coordination_status=old['status'],source_coordination_s=old.get('coordination_s'),
                 evaluation_s=elapsed,native_calls=int(called),cache_hits=int(not called),
                 diagnostic=json.dumps(dict(source_method=old['method'],source_round=old.get('round'))))])
             count+=1
@@ -4972,7 +4973,7 @@ def priority_history_diagnosis():
     history=[r for r in read_rows(PRIORITY_RESULTS) if r['stage']=='history']
     summary={name:dict(total=sum(r['layout_id']==name for r in history),
         feasible=sum(r['layout_id']==name and r['status']=='FEASIBLE' for r in history),
-        b32_deadlock_to_feasible=sum(r['layout_id']==name and r['source_b32_status']=='DEADLOCK' and r['status']=='FEASIBLE' for r in history))
+        coordination_deadlock_to_feasible=sum(r['layout_id']==name and r['source_coordination_status']=='DEADLOCK' and r['status']=='FEASIBLE' for r in history))
         for name in IMITATION_CASES}
     print('PRIORITY_HISTORY_SUMMARY',json.dumps(summary),flush=True)
     return history
@@ -5211,7 +5212,7 @@ def conflict_core_partial(current, schedule, model, space, embeddings, *, seed, 
             if operation is not None and set(parents)&known and set(event.blocked_parent_ids)&known:
                 pairs.append((event, operation, core))
     if not pairs:
-        return None, dict(source='B32 DEADLOCK', reason='no mapped direct blocker core')
+        return None, dict(source='NATIVE DEADLOCK', reason='no mapped direct blocker core')
     union = set().union(*(core for _, _, core in pairs))
     partial = lns._remove_parent_set(current.solution, union)
     patterns = {p.parent_id: p for p in current.solution.patterns if p.parent_id not in union}
@@ -5242,7 +5243,7 @@ def conflict_core_partial(current, schedule, model, space, embeddings, *, seed, 
         if len(removed) >= max(q, len(core)):
             break
         removed.add(parent)
-    return lns._remove_parent_set(current.solution, removed), dict(source='structured B32 DEADLOCK',
+    return lns._remove_parent_set(current.solution, removed), dict(source='structured NATIVE DEADLOCK',
         blocked_robot=event.robot_id, blocked_operation=asdict(event.blocked_operation),
         blocked_parents=event.blocked_parent_ids, blocked_MOVE_endpoints=event.blocked_block_ids,
         blocker_operation=asdict(operation), blocker_parents=next(parents for op, parents in
@@ -5343,7 +5344,7 @@ def cycle_transfer_groups(current, space, embeddings, model, *, kind, feedback=N
 
     def allowed_candidate(lb, peak, spread):
         # Safe pruning only: an exact directed route-cycle lower bound that already
-        # reaches the best measured B32 Cmax cannot improve that Cmax.  A candidate
+        # reaches the best measured NATIVE Cmax cannot improve that Cmax.  A candidate
         # is never rejected merely because its LB does not fall below the current
         # LB, because WAIT can shrink while the directed P+MOVE cycle does not.
         if limits is not None and limits.get('incumbent_cmax_s') is not None \
@@ -5496,7 +5497,7 @@ def imitation_cycle_train():
     training = dict(ppo_layouts('train'))
     # A fixed size-stratified set of existing TRAIN instances, not a new dataset
     # and never VALIDATION/TEST. It bounds ranking collection without changing
-    # the available legal receivers or using B32 labels.
+    # the available legal receivers or using NATIVE labels.
     teacher_names=sorted(teachers,key=lambda n:(len(training[n]),n))
     teacher_names=[teacher_names[round(i*(len(teacher_names)-1)/19)] for i in range(20)]
     prepared = []
@@ -5550,7 +5551,7 @@ def imitation_cycle_train():
                      last_state_dict=copy.deepcopy(model.state_dict()), optimizer_state_dict=optimizer.state_dict(),
                      completed_epoch=epoch, training_complete=epoch == 3, history=history,
                      training_split='TRAIN_ONLY', teacher_layouts=[name for name, _, _ in prepared],
-                     cycle_metric='max directed processing+MOVE; no WAIT; no B32 labels',
+                     cycle_metric='max directed processing+MOVE; no WAIT; no NATIVE labels',
                      network='unchanged VNextGNN assignment/joint/insertion scoring')
         torch.save(saved, CYCLE_MODEL)
         print('CYCLE_TRAIN_EPOCH', json.dumps(history[-1]), flush=True)
@@ -5594,7 +5595,7 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
     warm = next(r for r in read_rows(CONFLICT_LOAD_RESULTS)
                 if r['layout_id'] == name and r['stage'] == 'final' and int(r['seed']) == seed)
     original = deadlock_plan(parents, warm['solution'], space)
-    calls = sum(int(r.get('b32_calls') or 0) for r in saved if r['stage'] in ('initial', 'candidate'))
+    calls = sum(int(r.get('coordination_calls') or 0) for r in saved if r['stage'] in ('initial', 'candidate'))
     hits = 0
     attempts = sum(r['stage'] == 'round' for r in saved)
     visited, all_entries, failures = set(), [], Counter()
@@ -5624,8 +5625,8 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
             historical=records.get(key), stage=stage, candidate_id=candidate_id,
             origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
             removed_parent_ids=json.dumps(removed), feedback=json.dumps(feedback or {}),
-            construct_s=plan.inference_seconds, b32_s=elapsed if called else 0.,
-            runtime_s=plan.inference_seconds+elapsed, b32_calls=int(called), cache_hits=int(not called),
+            construct_s=plan.inference_seconds, coordination_s=elapsed if called else 0.,
+            runtime_s=plan.inference_seconds+elapsed, coordination_calls=int(called), cache_hits=int(not called),
             gnn_score=(construction or {}).get('gnn_score'), load_limits=json.dumps(limits),
             mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
             rebuild_actions=json.dumps((construction or {}).get('actions', [])),
@@ -5643,7 +5644,7 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
         entry = (plan, schedule, row)
         all_entries.append(entry)
         print('CYCLE_CANDIDATE', name, candidate_id, schedule.status.value, schedule.cmax,
-              'LB', round(lb, 3), 'B32', calls, 'load_ok', row['load_allowed'], flush=True)
+              'LB', round(lb, 3), 'NATIVE', calls, 'load_ok', row['load_allowed'], flush=True)
         return entry
 
     initial = evaluate(original, 'warm-start', stage='initial', operator='saved-load-compensation-best')
@@ -5670,7 +5671,7 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
         origin_key = plan_key(current.solution, current.directions)
         if (origin_key, kind) in exhausted:
             cycle_write([dict(stage='round', layout_id=name, seed=seed, method=CYCLE_METHOD,
-                round=attempts, b32_calls=0, cache_hits=0, runtime_s=time.perf_counter()-started,
+                round=attempts, coordination_calls=0, cache_hits=0, runtime_s=time.perf_counter()-started,
                 diagnostic=json.dumps(dict(skip='deterministic origin/kind already exhausted')))])
             continue
         feedback = cycle_origin_feedback(current, schedule, blockers.get(origin_key, ()))
@@ -5704,7 +5705,7 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
             exhausted.add((origin_key, kind))
         pool = conflict_pool(pool, new)
         cycle_write([dict(stage='round', layout_id=name, seed=seed, method=CYCLE_METHOD, round=attempts,
-            pool_ids=json.dumps([e[2]['candidate_id'] for e in pool]), b32_calls=0, cache_hits=0,
+            pool_ids=json.dumps([e[2]['candidate_id'] for e in pool]), coordination_calls=0, cache_hits=0,
             runtime_s=time.perf_counter()-started, diagnostic=json.dumps(dict(kind=kind,
                 candidates_after_lb=len(candidates), failures=failures)))])
     admissible = [e for e in all_entries if int(e[2]['load_allowed'])]
@@ -5716,18 +5717,18 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
     evaluated = [r for r in read_rows(CYCLE_RESULTS) if r['layout_id'] == name and int(r['seed']) == seed
                  and r['stage'] in ('initial', 'candidate')]
     minimum_lb = min(float(r['cycle_lb_s']) for r in evaluated)
-    final = dict(best[2], stage='final', runtime_s=time.perf_counter()-started, b32_calls=calls,
+    final = dict(best[2], stage='final', runtime_s=time.perf_counter()-started, coordination_calls=calls,
         cache_hits=hits, origin_id=best[2]['candidate_id'], mode_changes=json.dumps(modes),
         assignment_changes=json.dumps(owners), diagnostic=json.dumps(dict(
-            stop='B32 budget exhausted' if calls >= budget else '500 attempts/legal origin candidates exhausted',
+            stop='NATIVE budget exhausted' if calls >= budget else '500 attempts/legal origin candidates exhausted',
             attempts=attempts, unique_visited=len(visited), failures=failures,
             feasible_candidates=sum(e[1].feasible for e in all_entries), admissible_feasible=len(good),
             successful_transfers=sum(int(e[2].get('transfer_count') or 0) for e in all_entries),
             minimum_cycle_lb_s=minimum_lb, lb_below_hga=minimum_lb < baseline_hga-CYCLE_EPS,
-            evaluation='directed P+MOVE screening; original FORMAL_SCOPE_V2 B32; no priority_schedule', seed=seed)))
+            evaluation='directed P+MOVE screening; original FORMAL_SCOPE_V2 NATIVE; no priority_schedule', seed=seed)))
     cycle_write([final])
     print('CYCLE_FINAL', json.dumps({key: final.get(key) for key in
-        ('layout_id', 'status', 'cmax_s', 'cycle_lb_s', 'b32_calls', 'runtime_s')}), flush=True)
+        ('layout_id', 'status', 'cmax_s', 'cycle_lb_s', 'coordination_calls', 'runtime_s')}), flush=True)
     return final
 
 
@@ -5742,7 +5743,7 @@ def imitation_cycle_transfer_pilot():
     finals = [cycle_transfer_case(name, layouts[name], SEED, model, references) for name in IMITATION_CASES]
     feasible = sum(r['status'] == 'FEASIBLE' and int(r['load_allowed']) for r in finals)
     print('CYCLE_PHASE1_SUMMARY', json.dumps(dict(feasible=feasible, cases=6,
-        b32_calls=sum(int(r['b32_calls']) for r in finals),
+        coordination_calls=sum(int(r['coordination_calls']) for r in finals),
         lb_below_hga=sum(bool(json.loads(r['diagnostic']).get('lb_below_hga')) for r in finals))), flush=True)
     return finals
 
@@ -6055,7 +6056,7 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100, re
     embeddings = model.encode_static(space.graph)
     old = next(r for r in references if r['layout_id'] == name and r['method'] == 'GNN_IMITATION')
     original = deadlock_plan(parents, json.loads(old['diagnostic'])['solution'], space)
-    calls = sum(int(r.get('b32_calls') or 0) for r in saved if r['stage'] in ('initial', 'candidate'))
+    calls = sum(int(r.get('coordination_calls') or 0) for r in saved if r['stage'] in ('initial', 'candidate'))
     hits = 0
     visited, all_entries, failures = set(), [], Counter()
     saved_ids = {r['candidate_id']: r for r in saved if r['stage'] in ('initial', 'candidate')}
@@ -6081,8 +6082,8 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100, re
             historical=records.get(key), stage=stage, candidate_id=candidate_id,
             origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
             removed_parent_ids=json.dumps(removed), feedback=json.dumps(feedback or {}),
-            construct_s=plan.inference_seconds, b32_s=elapsed if called else 0.,
-            runtime_s=plan.inference_seconds+elapsed, b32_calls=int(called), cache_hits=int(not called),
+            construct_s=plan.inference_seconds, coordination_s=elapsed if called else 0.,
+            runtime_s=plan.inference_seconds+elapsed, coordination_calls=int(called), cache_hits=int(not called),
             gnn_score=(construction or {}).get('gnn_score'), load_limits=json.dumps(limits),
             mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
             rebuild_actions=json.dumps((construction or {}).get('actions', [])),
@@ -6102,7 +6103,7 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100, re
         all_entries.append(entry)
         print('CONFLICT_CANDIDATE', name, seed, candidate_id, schedule.status.value, schedule.cmax,
               'Pmax', round(float(row['max_processing_s']), 3), 'load_ok', row['load_allowed'],
-              'B32', calls, 'modes', len(modes), 'core', len(removed), flush=True)
+              'NATIVE', calls, 'modes', len(modes), 'core', len(removed), flush=True)
         return entry
 
     initial = evaluate(original, 'initial0', stage='initial', operator='saved-GNN-initial')
@@ -6122,7 +6123,7 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100, re
         else:
             failures[detail['reason']] += 1
     # At most eight initial plans. Their GNN construction scores choose the
-    # initial search origins; B32 feasibility/Cmax ranks the retained pool.
+    # initial search origins; NATIVE feasibility/Cmax ranks the retained pool.
     candidates.sort(key=lambda e: -float(e[2].get('gnn_score') or -1e9))
     pool = conflict_pool([], candidates)
     rounds = 0
@@ -6143,7 +6144,7 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100, re
                     blockers.get(plan_key(current.solution, current.directions), ()), CONFIG, q=q, seed=pick_seed,
                     assignment_space=space)
             else:
-                partial, feedback = None, dict(reason='no structured B32 feedback')
+                partial, feedback = None, dict(reason='no structured NATIVE feedback')
             if partial is None:
                 failures[feedback.get('reason', 'empty feedback core')] += 1
                 continue
@@ -6170,23 +6171,23 @@ def conflict_core_case(name, parents, seed, model, references, *, budget=100, re
             else: failures['duplicate complete plan'] += 1
         pool = conflict_pool(pool, new)
         write([dict(stage='round', layout_id=name, seed=seed, method=method, round=rounds,
-            pool_ids=json.dumps([e[2]['candidate_id'] for e in pool]), b32_calls=0, cache_hits=0,
+            pool_ids=json.dumps([e[2]['candidate_id'] for e in pool]), coordination_calls=0, cache_hits=0,
             runtime_s=time.perf_counter()-started, diagnostic=json.dumps(dict(failures=failures)))])
     admissible = [e for e in all_entries if conflict_load_allowed(e[2], limits)]
     good = [e for e in admissible if e[1].feasible]
     best = min(good, key=lambda e: e[1].cmax) if good else max(admissible or all_entries, key=conflict_deadlock_progress)
     modes, owners = conflict_changes(original, best[0], space.parent_ids)
-    final = dict(best[2], stage='final', runtime_s=time.perf_counter()-started, b32_calls=calls, cache_hits=hits,
+    final = dict(best[2], stage='final', runtime_s=time.perf_counter()-started, coordination_calls=calls, cache_hits=hits,
         origin_id=best[2]['candidate_id'], mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
-        diagnostic=json.dumps(dict(stop='B32 budget exhausted' if calls >= budget else '40 bounded candidate-pool rounds exhausted',
+        diagnostic=json.dumps(dict(stop='NATIVE budget exhausted' if calls >= budget else '40 bounded candidate-pool rounds exhausted',
             rounds=rounds, unique_visited=len(visited), failures=failures, initial_candidate='initial0',
             feasible_candidates=sum(e[1].feasible for e in all_entries), admissible_feasible=len(good),
             successful_local_repairs=[e[2]['candidate_id'] for e in all_entries if int(e[2]['successful_repair'])],
             successful_transfers=sum(int(e[2].get('transfer_count') or 0) for e in all_entries),
-            evaluation='original FORMAL_SCOPE_V2 B32; no priority_schedule', seed=seed)))
+            evaluation='original FORMAL_SCOPE_V2 NATIVE; no priority_schedule', seed=seed)))
     write([final])
     print('CONFLICT_FINAL', json.dumps({k: final.get(k) for k in
-        ('layout_id', 'seed', 'status', 'cmax_s', 'max_processing_s', 'processing_spread_s', 'b32_calls', 'runtime_s')}), flush=True)
+        ('layout_id', 'seed', 'status', 'cmax_s', 'max_processing_s', 'processing_spread_s', 'coordination_calls', 'runtime_s')}), flush=True)
     return final
 
 
@@ -6203,7 +6204,7 @@ def imitation_conflict_core_pilot():
     finals = [conflict_core_case(name, layouts[name], SEED, model, references) for name in IMITATION_CASES]
     feasible = sum(r['status'] == 'FEASIBLE' and int(r['load_allowed']) for r in finals)
     print('CONFLICT_PHASE1_SUMMARY', json.dumps(dict(feasible=feasible, cases=6,
-        target_met=feasible >= 5, b32_calls=sum(int(r['b32_calls']) for r in finals))), flush=True)
+        target_met=feasible >= 5, coordination_calls=sum(int(r['coordination_calls']) for r in finals))), flush=True)
     if feasible >= 5:
         for seed in TEST_SEEDS[1:]:
             finals.extend(conflict_core_case(name, layouts[name], seed, model, references) for name in IMITATION_CASES)
@@ -6224,13 +6225,13 @@ def imitation_conflict_load_pilot():
                                 load_compensation=True) for name in IMITATION_CASES]
     feasible = sum(r['status'] == 'FEASIBLE' and int(r['load_allowed']) for r in finals)
     print('CONFLICT_LOAD_PHASE1_SUMMARY', json.dumps(dict(feasible=feasible, cases=6,
-        b32_calls=sum(int(r['b32_calls']) for r in finals),
+        coordination_calls=sum(int(r['coordination_calls']) for r in finals),
         successful_transfers=sum(json.loads(r['diagnostic']).get('successful_transfers', 0) for r in finals))), flush=True)
     return finals
 
 
 # ---------------------------------------------------------------------------
-# Independent GNN main algorithm: B32-feedback-driven three-parent joint
+# Independent GNN main algorithm: NATIVE-feedback-driven three-parent joint
 # reconstruction.  Initialisation is the original GNN_VNEXT_WORKLOAD actor only;
 # no imitation/cycle checkpoint, no HGA/WAG teacher, hint, warm start or fallback.
 # The single move operator removes a measured core and lets the same joint actor
@@ -6240,7 +6241,7 @@ JOINT3_LAYOUTS = tuple(f'validation_{index:02d}' for index in range(1, 11))
 JOINT3_MODEL = ROOT/'models/gnn_weld_layout_joint3.pt'
 JOINT3_RESULTS = FINAL_RESULTS/'gnn_joint3_rebuild.csv'
 JOINT3_TRAINING_RESULTS = FINAL_RESULTS/'gnn_joint3_training.csv'
-JOINT3_METHOD = 'GNN-Joint3-B32-Feedback'
+JOINT3_METHOD = 'GNN-Joint3-NATIVE-Feedback'
 JOINT3_CORE = 3
 JOINT3_BEAM = 3
 JOINT3_TRAIN_BEAM = 4
@@ -6260,8 +6261,8 @@ JOINT3_WAG_SOURCE = BASELINE_SOURCES['WAG+VNS']
 JOINT3_FIELDS = (*CONFLICT_LOAD_FIELDS, 'beam_width', 'core_size', 'route_lb_s', 'incumbent_cmax_s',
                  'feedback_features', 'load_allowed_three_ref', 'load_limits_three_ref', 'run_id')
 JOINT3_TRAINING_FIELDS = ('stage', 'layout_id', 'parent_count', 'seed', 'method', 'epoch', 'loss',
-    'ranking_accuracy', 'pairs', 'updates', 'gradient_norm', 'learning_rate', 'candidates', 'b32_calls',
-    'construct_s', 'b32_s', 'runtime_s', 'diagnostic')
+    'ranking_accuracy', 'pairs', 'updates', 'gradient_norm', 'learning_rate', 'candidates', 'coordination_calls',
+    'construct_s', 'coordination_s', 'runtime_s', 'diagnostic')
 # Load-keeping / deadlock-repair stage: same operator, no new network, no new scheduler.
 JOINT3B_METHOD = 'GNN-Joint3-LoadKeep-Repair'
 JOINT3B_RESULTS = FINAL_RESULTS/'gnn_joint3_loadkeep.csv'
@@ -6277,7 +6278,7 @@ JOINT4_MODEL = ROOT/'models/gnn_weld_layout_joint4.pt'
 JOINT4_RESULTS = FINAL_RESULTS/'gnn_joint4_reassign.csv'
 JOINT4_CORE = 4
 JOINT4_BEAM = 4
-JOINT4_B32_PER_ROUND = 2
+JOINT4_NATIVE_PER_ROUND = 2
 JOINT4_EPOCHS = 3
 JOINT4_TRAIN_LAYOUTS = 20
 JOINT4_TRAIN_CORES = 4
@@ -6342,7 +6343,7 @@ def joint3_provenance():
                   inference_uses_same_feedback='joint3_feedback' in case and 'joint3_reconstruct' in case,
                   training_uses_same_feedback='joint3_feedback' in train and 'joint3_reconstruct' in train)
     if not all(shared.values()):
-        raise ValueError(f'joint3 B32 feedback is not shared by training and inference: {shared}')
+        raise ValueError(f'joint3 NATIVE feedback is not shared by training and inference: {shared}')
     source = torch.load(MODEL, map_location='cpu', weights_only=True)
     state = source['models']['GNN_VNEXT_WORKLOAD']['state_dict']
     return dict(algorithm=JOINT3_METHOD, initialization='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD',
@@ -6351,7 +6352,7 @@ def joint3_provenance():
         violations=violations, feedback_shared=shared,
         core='lns.select_routeaware_bottleneck (FEASIBLE) | conflict_core_partial (DEADLOCK)',
         reconstruction='gnn.vnext_joint_actions joint beam; mode+owner+position+order+direction together',
-        labels='real B32 feasibility/Cmax; no HGA/WAG teacher and no HGA/WAG candidate source',
+        labels='real NATIVE feasibility/Cmax; no HGA/WAG teacher and no HGA/WAG candidate source',
         load_rule='frozen HGA/WAG 1.05x ceiling; three-reference variant reported only')
 
 
@@ -6425,7 +6426,7 @@ def joint3_training_limits(state):
 
 
 def joint3_feedback(current, schedule, events, removed):
-    """Measured B32 evidence, identical in training and inference."""
+    """Measured NATIVE evidence, identical in training and inference."""
     removed = set(removed)
     observed_nodes = None
     pairs = []
@@ -6443,7 +6444,7 @@ def joint3_feedback(current, schedule, events, removed):
                                 for robot in range(4)])
     if schedule.feasible and schedule.operations:
         summary = lns.schedule_feedback_summary(current.solution, schedule, events, CONFIG)
-        return dict(source='B32 feasible WAIT/blocked intervals',
+        return dict(source='NATIVE feasible WAIT/blocked intervals',
             **temporal, critical_robot=int(summary['critical_robot']),
             parent_wait={p: float(w) for p, w in summary['parent_wait'].items()
                          if w > CONFIG.numeric_epsilon},
@@ -6461,7 +6462,7 @@ def joint3_feedback(current, schedule, events, removed):
             blocked[parent] += 1
         for parents in event.blocker_parent_ids:
             blocked.update(parents)
-    # Processing is geometry, not a B32 label, so the same parent work vector is
+    # Processing is geometry, not a NATIVE label, so the same parent work vector is
     # available on a DEADLOCK origin and keeps the blocked-work interaction real.
     blocks = block_map(current.solution, CONFIG, scope=FORMAL_SCOPE_V2)
     processing = {parent: [0.]*4 for parent in removed}
@@ -6470,13 +6471,13 @@ def joint3_feedback(current, schedule, events, removed):
             parent = block.split('::', 1)[0]
             if parent in processing:
                 processing[parent][robot] += CONFIG.process_time(blocks[block].length)
-    return dict(source='B32 DEADLOCK blocked/blocker evidence', **temporal, critical_robot=None, parent_wait={},
+    return dict(source='NATIVE DEADLOCK blocked/blocker evidence', **temporal, critical_robot=None, parent_wait={},
                 parent_blocked=dict(blocked), parent_critical_wait={}, parent_critical_blocked={},
                 parent_processing=processing)
 
 
 def joint3_feedback_features(current, solution, state, feedback, removed):
-    """Candidate-specific B32 feedback interactions, never all-zero during training."""
+    """Candidate-specific NATIVE feedback interactions, never all-zero during training."""
     removed = set(removed)
     critical = feedback.get('critical_robot')
     if critical is None:
@@ -6517,7 +6518,7 @@ def joint3_core(current, schedule, model, space, embeddings, blockers, *, seed, 
         partial, feedback = lns.select_routeaware_bottleneck(current.solution, current.directions, schedule,
             blockers, CONFIG, q=q, seed=seed, assignment_space=space)
         return partial, dict(feedback, operator='select_routeaware_bottleneck')
-    return None, dict(reason='B32 returned neither FEASIBLE nor DEADLOCK')
+    return None, dict(reason='NATIVE returned neither FEASIBLE nor DEADLOCK')
 
 
 def joint3_route_lb(plan):
@@ -6812,7 +6813,7 @@ def joint3b_pool(entries, latest, *, width=6, signature=joint3b_deadlock_signatu
 
 
 def joint3b_deadlock_choice(current, schedule, model, space, embeddings, *, seed, q):
-    """Rank real B32 blocked/blocker cores by measured coverage; the GNN only breaks ties."""
+    """Rank real NATIVE blocked/blocker cores by measured coverage; the GNN only breaks ties."""
     known = set(space.parent_ids)
     all_blocks = block_map(current.solution, CONFIG, scope=FORMAL_SCOPE_V2)
     records = []
@@ -6825,7 +6826,7 @@ def joint3b_deadlock_choice(current, schedule, model, space, embeddings, *, seed
             records.append(dict(event=event, operation=operation, core=blocked | blockers,
                                 blocked=blocked, blockers=blockers))
     if not records:
-        return None, dict(source='B32 DEADLOCK', reason='no mapped blocked/blocker parent core')
+        return None, dict(source='NATIVE DEADLOCK', reason='no mapped blocked/blocker parent core')
     union = set().union(*(record['core'] for record in records))
     partial = lns._remove_parent_set(current.solution, union)
     kept = {p.parent_id: p for p in current.solution.patterns if p.parent_id not in union}
@@ -6866,9 +6867,9 @@ def joint3b_deadlock_choice(current, schedule, model, space, embeddings, *, seed
             break
         removed.add(parent)
     if not removed:
-        return None, dict(source='B32 DEADLOCK', reason='empty measured deadlock core')
+        return None, dict(source='NATIVE DEADLOCK', reason='empty measured deadlock core')
     return lns._remove_parent_set(current.solution, removed), dict(
-        source='structured B32 DEADLOCK (blocked/blocker coverage first)',
+        source='structured NATIVE DEADLOCK (blocked/blocker coverage first)',
         operator='joint3b_deadlock_core', blocked_robot=chosen['event'].robot_id,
         blocked_operation=asdict(chosen['event'].blocked_operation),
         blocked_parents=sorted(chosen['blocked']), blocker_parents=sorted(chosen['blockers']),
@@ -6887,11 +6888,11 @@ def joint3b_core(current, schedule, model, space, embeddings, blockers, *, seed,
         return partial, dict(feedback, operator='select_routeaware_bottleneck')
     if schedule.status is ScheduleStatus.DEADLOCK:
         return joint3b_deadlock_choice(current, schedule, model, space, embeddings, seed=seed, q=q)
-    return None, dict(reason='B32 returned neither FEASIBLE nor DEADLOCK')
+    return None, dict(reason='NATIVE returned neither FEASIBLE nor DEADLOCK')
 
 
 def joint3b_select_final(entries, tolerance=JOINT3B_TOLERANCE):
-    """Return the true minimum feasible B32 Cmax; load is diagnostic only."""
+    """Return the true minimum feasible NATIVE Cmax; load is diagnostic only."""
     feasible = [entry for entry in entries if entry[1].feasible]
     balanced = [entry for entry in feasible if int(entry[2].get('load_allowed') or 0)]
     best_balanced = min(balanced, key=lambda entry: entry[1].cmax) if balanced else None
@@ -6932,10 +6933,10 @@ def joint3b_failure_final(name, parent_count, seed, entries, *, calls, started, 
     best = max(deadlocks, key=conflict_deadlock_progress) if deadlocks else None
     return dict(stage='final', layout_id=name, seed=seed, method=method, variant=variant,
         phase=phase, parent_count=parent_count, status='NO_FEASIBLE_SOLUTION', cmax_s=None,
-        load_allowed=0, load_allowed_three_ref=0, b32_calls=calls,
+        load_allowed=0, load_allowed_three_ref=0, coordination_calls=calls,
         runtime_s=time.perf_counter()-started, candidate_id='final', run_id=run,
         final_choice='none', removed_parent_ids='[]', feedback='{}',
-        diagnostic=json.dumps(dict(reason='no B32 FEASIBLE candidate inside the budget',
+        diagnostic=json.dumps(dict(reason='no NATIVE FEASIBLE candidate inside the budget',
             final_status='NO_FEASIBLE_SOLUTION', evaluated=len(entries),
             deadlock_candidates=len(deadlocks),
             best_deadlock=None if best is None else dict(
@@ -7021,7 +7022,7 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
     if initial.solution is None:
         final = dict(stage='final', layout_id=name, seed=seed, method=method,
             variant=variant, phase=phase, parent_count=len(parents), status='CONSTRUCTION_FAILED',
-            cmax_s=None, load_allowed=0, runtime_s=time.perf_counter()-started, b32_calls=0,
+            cmax_s=None, load_allowed=0, runtime_s=time.perf_counter()-started, coordination_calls=0,
             candidate_id='final', run_id=run,
             diagnostic=json.dumps(dict(reason=initial.rejection_reason, algorithm=method)))
         if write:
@@ -7060,8 +7061,8 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
             stage=stage, candidate_id=candidate_id,
             origin_id='' if origin is None else origin[2]['candidate_id'], operator=operator,
             removed_parent_ids=json.dumps(list(removed)), feedback=json.dumps(feedback or {}),
-            construct_s=result.inference_seconds, b32_s=elapsed if called else 0.,
-            runtime_s=time.perf_counter()-started, b32_calls=int(called),
+            construct_s=result.inference_seconds, coordination_s=elapsed if called else 0.,
+            runtime_s=time.perf_counter()-started, coordination_calls=int(called),
             gnn_score=(construction or {}).get('score'), load_limits=json.dumps(limits),
             mode_changes=json.dumps(modes), assignment_changes=json.dumps(owners),
             rebuild_actions=json.dumps((construction or {}).get('actions', [])),
@@ -7100,7 +7101,7 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
     if variant == 'joint4' and initial_entry is not None:
         native_cache[plan_key(initial.solution, initial.directions)] = initial_native[0]
     if initial_entry is None:
-        raise ValueError(f'{name}: the original GNN construction has no B32 schedule')
+        raise ValueError(f'{name}: the original GNN construction has no NATIVE schedule')
     print('JOINT3_INITIAL', json.dumps(dict(layout_id=name, seed=seed, status=initial_entry[1].status.value,
         cmax_s=initial_entry[1].cmax if initial_entry[1].feasible else None,
         pmax_s=float(initial_entry[2]['max_processing_s']),
@@ -7184,19 +7185,19 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
             continue
         incumbent = current_incumbent_cmax()
         # Safe pruning only: the exact route-cycle lower bound already reaches the
-        # best measured feasible B32 Cmax. No LB-versus-LB filter is applied.
+        # best measured feasible NATIVE Cmax. No LB-versus-LB filter is applied.
         admissible = [candidate for candidate in candidates
                       if not joint3_safe_prune(candidate['lb'], incumbent)
                       and plan_key(candidate['plan'].solution, candidate['plan'].directions) not in visited]
         admissible.sort(key=lambda candidate: (-candidate['score'], candidate['lb']))
         if variant == 'joint4' and not cmax_driven:
             # The existing native coordinator screens the GNN proposals; only the
-            # leading distinct structures spend one of the 100 B32 evaluations.
+            # leading distinct structures spend one of the 100 NATIVE evaluations.
             if origin_key not in native_cache:
                 native_cache[origin_key] = joint4_native_value(current)[0]
-            admissible = joint4_screen(admissible, native_cache[origin_key])[:JOINT4_B32_PER_ROUND]
+            admissible = joint4_screen(admissible, native_cache[origin_key])[:JOINT4_NATIVE_PER_ROUND]
         elif cmax_driven:
-            admissible = admissible[:JOINT4_B32_PER_ROUND]
+            admissible = admissible[:JOINT4_NATIVE_PER_ROUND]
         core_info = dict(transfer_robot=feedback.get('transfer_robot'),
                          receiver_robot=feedback.get('receiver_robot'),
                          core_kind=feedback.get('core_kind', feedback.get('operator')))
@@ -7223,7 +7224,7 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
             deadlock_repairs += sum(int(entry[2].get('successful_repair') or 0) for entry in new)
         print('JOINT3_ROUND', json.dumps(dict(layout_id=name, seed=seed, round=attempts,
             core=list(removed), core_size=len(removed), candidates=len(candidates),
-            admissible=len(admissible), b32_calls=calls, incumbent_s=None if not math.isfinite(incumbent) else incumbent,
+            admissible=len(admissible), coordination_calls=calls, incumbent_s=None if not math.isfinite(incumbent) else incumbent,
             pool=[entry[2]['candidate_id'] for entry in pool])), flush=True)
         flush()
     state = joint3b_select_final(entries, tolerance)
@@ -7236,7 +7237,7 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
             if write:
                 writer([final])
             print('JOINT3B_FINAL', json.dumps({key: final.get(key) for key in
-                ('layout_id', 'seed', 'status', 'cmax_s', 'b32_calls', 'runtime_s')}), flush=True)
+                ('layout_id', 'seed', 'status', 'cmax_s', 'coordination_calls', 'runtime_s')}), flush=True)
             return final
         best = state['chosen']
         operator = 'joint3b-final-'+str(state['choice'])
@@ -7254,8 +7255,8 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
     final = routeaware_result_row(name, method, best[0], best[1], blockers.get(best_key, ()),
         stage='final', candidate_id='final', origin_id=best[2]['candidate_id'],
         operator=operator, removed_parent_ids=best[2]['removed_parent_ids'],
-        feedback=best[2]['feedback'], construct_s=best[0].inference_seconds, b32_s=0.,
-        runtime_s=time.perf_counter()-started, b32_calls=calls, gnn_score=best[2]['gnn_score'],
+        feedback=best[2]['feedback'], construct_s=best[0].inference_seconds, coordination_s=0.,
+        runtime_s=time.perf_counter()-started, coordination_calls=calls, gnn_score=best[2]['gnn_score'],
         load_limits=json.dumps(limits), mode_changes=json.dumps(modes),
         assignment_changes=json.dumps(owners), rebuild_actions=best[2]['rebuild_actions'],
         route_lb_s=best[2]['route_lb_s'], incumbent_cmax_s=best[2]['incumbent_cmax_s'],
@@ -7280,9 +7281,9 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
     balanced_exists = state['best_balanced'] is not None
     final['diagnostic'] = json.dumps(dict(algorithm=method, run_id=run, variant=variant, budget=budget,
         max_attempts=max_attempts, attempts=attempts,
-        stop='B32 budget exhausted' if calls >= budget else
+        stop='NATIVE budget exhausted' if calls >= budget else
              'outer attempts exhausted' if attempts >= max_attempts else 'no new legal core candidate',
-        evaluated=evaluated, unique_plans=len(visited), b32_calls=calls,
+        evaluated=evaluated, unique_plans=len(visited), coordination_calls=calls,
         deadlock_candidates=deadlocks, deadlock_rate=deadlocks/max(1, evaluated),
         feasible_candidates=feasible, feasible_rate=feasible/max(1, evaluated),
         load_allowed_candidates=load_allowed, load_allowed_rate=load_allowed/max(1, evaluated),
@@ -7302,13 +7303,13 @@ def joint3_case(name, parents, seed, model, references, *, budget=JOINT3_BUDGET,
         final_feedback_features=json.loads(final['feedback_features'] or 'null'),
         final_max_p_plus_move_s=final['route_lb_s'], gnn_reference_peak_s=gnn_peak,
         load_rule=limits['rule'], load_rule_three_ref=limits['three_reference']['rule'],
-        evaluation='original FORMAL_SCOPE_V2 B32; no priority_schedule; no HGA/WAG candidate source',
+        evaluation='original FORMAL_SCOPE_V2 NATIVE; no priority_schedule; no HGA/WAG candidate source',
         construction_source='original GNN_VNEXT_WORKLOAD'), ensure_ascii=False)
     if write:
         writer([final])
     print('JOINT3_FINAL', json.dumps({key: final.get(key) for key in
         ('layout_id', 'seed', 'method', 'status', 'cmax_s', 'max_processing_s', 'load_allowed',
-         'load_allowed_three_ref', 'final_choice', 'r_c_pct', 'b32_calls', 'runtime_s')}), flush=True)
+         'load_allowed_three_ref', 'final_choice', 'r_c_pct', 'coordination_calls', 'runtime_s')}), flush=True)
     return final
 
 
@@ -7335,7 +7336,7 @@ def joint3_group_loss(scores, ranks):
 
 
 def joint3_train():
-    """TRAIN-only pairwise ranking on the existing joint head, labelled by real B32."""
+    """TRAIN-only pairwise ranking on the existing joint head, labelled by real NATIVE."""
     configure_cpu()
     torch.manual_seed(SEED)
     if JOINT3_MODEL.exists():
@@ -7353,7 +7354,7 @@ def joint3_train():
              for index in range(JOINT3_TRAIN_LAYOUTS)]
     training_started = time.perf_counter()
     prepared, groups, calls = [], 0, 0
-    construct_s = b32_s = 0.
+    construct_s = coordination_s = 0.
     with torch.no_grad():
         for name in names:
             parents = training[name]
@@ -7368,11 +7369,11 @@ def joint3_train():
             seen, blockers = {}, {}
             evaluation = time.perf_counter()
             schedule, called = evaluate_once(initial, seen, blocker_cache=blockers)
-            b32_s += time.perf_counter()-evaluation
+            coordination_s += time.perf_counter()-evaluation
             calls += int(called)
 
             def collect(origin, origin_schedule, stage, limit=JOINT3_TRAIN_CORES):
-                nonlocal calls, b32_s, groups
+                nonlocal calls, coordination_s, groups
                 state = cycle_route_state(origin)
                 limits = joint3_training_limits(state)
                 key = plan_key(origin.solution, origin.directions)
@@ -7399,7 +7400,7 @@ def joint3_train():
                             continue
                         evaluation = time.perf_counter()
                         candidate_schedule, called = evaluate_once(candidate['plan'], seen, blocker_cache=blockers)
-                        b32_s += time.perf_counter()-evaluation
+                        coordination_s += time.perf_counter()-evaluation
                         calls += int(called)
                         row = routeaware_result_row(name, JOINT3_METHOD, candidate['plan'], candidate_schedule,
                             blockers.get(candidate_key, ()))
@@ -7429,7 +7430,7 @@ def joint3_train():
             if best is not None:
                 collect(best[0], best[1], 'repaired')
     if not prepared:
-        raise ValueError('no usable real-B32 ranking preference in TRAIN')
+        raise ValueError('no usable real-NATIVE ranking preference in TRAIN')
     history = []
     for epoch in range(1, JOINT3_EPOCHS+1):
         started = time.perf_counter()
@@ -7459,21 +7460,21 @@ def joint3_train():
             loss=sum(epoch_loss)/max(1, len(epoch_loss)), ranking_accuracy=epoch_correct/max(1, epoch_pairs),
             pairs=epoch_pairs, updates=updates, gradient_norm=max(gradients, default=0.),
             learning_rate=JOINT3_LEARNING_RATE, candidates=sum(len(labelled) for _, labelled in prepared),
-            b32_calls=calls, construct_s=construct_s, b32_s=b32_s,
+            coordination_calls=calls, construct_s=construct_s, coordination_s=coordination_s,
             runtime_s=time.perf_counter()-training_started,
             parent_count=len(names), diagnostic=json.dumps(dict(training_split='TRAIN_ONLY',
                 groups=groups, layouts=len(names), feedback_outcomes=True,
-                label='load-qualified FEASIBLE > FEASIBLE by real B32 Cmax > DEADLOCK')))
+                label='load-qualified FEASIBLE > FEASIBLE by real NATIVE Cmax > DEADLOCK')))
         history.append(record)
         joint3_training_write([record])
         torch.save(dict(seed=SEED, initialization='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD',
             state_dict=copy.deepcopy(model.state_dict()), initial_state_dict=initial_state,
             optimizer_state_dict=optimizer.state_dict(), completed_epoch=epoch,
             training_complete=epoch == JOINT3_EPOCHS, history=history, training_split='TRAIN_ONLY',
-            training_layouts=names, feedback_outcomes=True, b32_calls=calls,
-            construct_s=construct_s, b32_s=b32_s), JOINT3_MODEL)
+            training_layouts=names, feedback_outcomes=True, coordination_calls=calls,
+            construct_s=construct_s, coordination_s=coordination_s), JOINT3_MODEL)
         print('JOINT3_TRAIN_EPOCH', json.dumps({key: record[key] for key in
-            ('epoch', 'loss', 'ranking_accuracy', 'pairs', 'updates', 'b32_calls', 'runtime_s')}), flush=True)
+            ('epoch', 'loss', 'ranking_accuracy', 'pairs', 'updates', 'coordination_calls', 'runtime_s')}), flush=True)
     return torch.load(JOINT3_MODEL, map_location='cpu', weights_only=True)
 
 
@@ -7561,7 +7562,7 @@ def joint3b_validation(workers=4, seeds=JOINT3_SEEDS):
 
 
 def joint4_deadlock_signature(entry):
-    """Full B32 deadlock identity: blocked/blocker parents, robots, operations and MOVE endpoints."""
+    """Full NATIVE deadlock identity: blocked/blocker parents, robots, operations and MOVE endpoints."""
     parts = []
     for event in entry[1].deadlock_blockages:
         blocked = event.blocked_operation
@@ -7678,7 +7679,7 @@ def joint4_bottleneck_core(current, schedule, summary, space, state, *, seed, q)
         return None, dict(reason='fewer than three reconstructable parents')
     robots = sorted({r for r in range(4) for p in removed if p in routes[r]})
     return lns._remove_parent_set(current.solution, removed), dict(
-        source='B32 critical completion, route contributions, MOVE and blocked/blocker evidence',
+        source='NATIVE critical completion, route contributions, MOVE and blocked/blocker evidence',
         operator='joint4_bottleneck_core', transfer_robot=critical,
         receiver_robots=[r for r in robots if r != critical], involved_robots=robots,
         transfer_parents=[p for p in removed if p in routes[critical]],
@@ -7694,7 +7695,7 @@ def joint4_core(current, schedule, model, space, embeddings, blockers, *, seed, 
     if schedule.status is ScheduleStatus.DEADLOCK:
         return joint3b_core(current, schedule, model, space, embeddings, blockers, seed=seed, q=q)
     if schedule.status is not ScheduleStatus.FEASIBLE:
-        return None, dict(reason='B32 returned neither FEASIBLE nor DEADLOCK')
+        return None, dict(reason='NATIVE returned neither FEASIBLE nor DEADLOCK')
     summary = lns.schedule_feedback_summary(current.solution, schedule, blockers, CONFIG)
     state = cycle_route_state(current)
     partial, feedback = joint4_bottleneck_core(current, schedule, summary, space, state, seed=seed, q=q)
@@ -7707,10 +7708,10 @@ def joint4_core(current, schedule, model, space, embeddings, blockers, *, seed, 
 
 
 def joint4_screen(candidates, origin_native):
-    """Reserve one B32 slot for the GNN choice when native and GNN disagree.
+    """Reserve one NATIVE slot for the GNN choice when native and GNN disagree.
 
-    The native priority scheduler can report DEADLOCK for plans accepted by B32.
-    Since the caller evaluates only the first two candidates with B32, blindly
+    The native priority scheduler can report DEADLOCK for plans accepted by NATIVE.
+    Since the caller evaluates only the first two candidates with NATIVE, blindly
     ranking every native-feasible candidate first can discard a valid GNN choice.
     This retains all candidates and does not use native as a feasibility filter.
     """
@@ -7730,7 +7731,7 @@ def joint4_screen(candidates, origin_native):
         native_order = sorted(candidates, key=lambda candidate: (
             candidate['native_cmax'] is None, -candidate['score']))
     gnn_order = sorted(candidates, key=lambda candidate: (-candidate['score'], candidate['lb']))
-    # First B32 slot: native-ranked best. Second: the distinct top GNN choice.
+    # First NATIVE slot: native-ranked best. Second: the distinct top GNN choice.
     # If both rankings agree, use the next GNN candidate instead of a duplicate.
     selected = [native_order[0]]
     second = next((item for item in gnn_order if item is not selected[0]), None)
@@ -7748,7 +7749,7 @@ def joint4_native_value(plan):
 
 
 def joint4_training_rank(row, initial_peak, initial_spread):
-    """Feasibility class and actual B32 Cmax, without a load objective."""
+    """Feasibility class and actual NATIVE Cmax, without a load objective."""
     if row['status'] != 'FEASIBLE' or row.get('cmax_s') in (None, ''):
         return (1, 0.0, None)
     return (0, 0.0, float(row['cmax_s']))
@@ -7804,7 +7805,7 @@ def cmax_write(rows):
 
 
 def cmax_limits():
-    rule = 'minimize actual feasible B32 Cmax; no processing-load hard constraints'
+    rule = 'minimize actual feasible NATIVE Cmax; no processing-load hard constraints'
     diagnostic = dict(objective='Cmax', pmax_limit_s=None, spread_limit_s=None,
                       temporary_pmax_limit_s=None, rule=rule)
     return dict(diagnostic, three_reference=dict(diagnostic))
@@ -7846,7 +7847,7 @@ def joint3b_summary(phase='train'):
             deadlock_repairs=sum(int(row.get('successful_repair') or 0) for row in rebuilt),
             median_cmax_s=median([float(row['cmax_s']) for row in feasible]) if feasible else None,
             median_runtime_s=median([float(row['runtime_s']) for row in chosen]) if chosen else None,
-            median_b32_calls=median([int(row['b32_calls']) for row in chosen]) if chosen else None)
+            median_coordination_calls=median([int(row['coordination_calls']) for row in chosen]) if chosen else None)
     deltas = []
     for name, seed in cases:
         old = finals.get((name, seed, 'joint3'))
@@ -7997,7 +7998,7 @@ def joint4_summary(phase='train'):
             median_move_s=median([float(row['move_s']) for row in feasible]) if feasible else None,
             median_wait_s=median([float(row['wait_s']) for row in feasible]) if feasible else None,
             median_runtime_s=median([float(row['runtime_s']) for row in chosen]) if chosen else None,
-            median_b32_calls=median([int(row['b32_calls']) for row in chosen]) if chosen else None)
+            median_coordination_calls=median([int(row['coordination_calls']) for row in chosen]) if chosen else None)
     deltas = []
     for name, seed in sorted({(key[0], key[1]) for key in finals}):
         old = finals.get((name, seed, 'joint3b'))
@@ -8078,7 +8079,7 @@ def joint4_fit(workers=1, *, cmax_driven=False):
         print('CMAX_FIXED_SPLIT', json.dumps(dict(training=names, independent=holdout)), flush=True)
     started = time.perf_counter()
     prepared, calls, good_total, feasible_total = [], 0, 0, 0
-    groups, construct_s, b32_s = 0, 0., 0.
+    groups, construct_s, coordination_s = 0, 0., 0.
     label_rows = []
     with torch.no_grad():
         for name in names:
@@ -8096,17 +8097,17 @@ def joint4_fit(workers=1, *, cmax_driven=False):
             seen, blockers = {}, {}
             clock = time.perf_counter()
             schedule, called = evaluate_once(initial, seen, blocker_cache=blockers)
-            b32_s += time.perf_counter()-clock
+            coordination_s += time.perf_counter()-clock
             calls += int(called)
 
             if cmax_driven:
                 writer([routeaware_result_row(name, CMAX_METHOD, initial, schedule,
                     blockers.get(plan_key(initial.solution,initial.directions),()),
-                    stage='training_initial', phase='fit_origin_nodes', b32_calls=int(called),
+                    stage='training_initial', phase='fit_origin_nodes', coordination_calls=int(called),
                     runtime_s=time.perf_counter()-started)])
 
             def collect(origin, origin_schedule, limit):
-                nonlocal calls, b32_s, groups, good_total, feasible_total
+                nonlocal calls, coordination_s, groups, good_total, feasible_total
                 key = plan_key(origin.solution, origin.directions)
                 cores = []
                 for index in range(16):
@@ -8134,7 +8135,7 @@ def joint4_fit(workers=1, *, cmax_driven=False):
                         clock = time.perf_counter()
                         candidate_schedule, called = evaluate_once(candidate['plan'], seen,
                                                                     blocker_cache=blockers)
-                        b32_s += time.perf_counter()-clock
+                        coordination_s += time.perf_counter()-clock
                         calls += int(called)
                         row = routeaware_result_row(name, JOINT4_METHOD, candidate['plan'], candidate_schedule,
                             blockers.get(candidate_key, ()))
@@ -8144,7 +8145,7 @@ def joint4_fit(workers=1, *, cmax_driven=False):
                                        method=CMAX_METHOD, removed_parent_ids=json.dumps(removed),
                                        gnn_score=candidate['score'],
                                        feedback=json.dumps(measured), route_lb_s=candidate['lb'],
-                                       b32_calls=int(called))
+                                       coordination_calls=int(called))
                             writer([row])
                         rank = joint4_training_rank(row, initial_peak, initial_spread)
                         labelled.append(dict(plan=candidate['plan'], joint_plans=candidate['joint_plans'],
@@ -8178,7 +8179,7 @@ def joint4_fit(workers=1, *, cmax_driven=False):
                 collect(best['plan'], best['schedule'], limit=2)
             label_rows.append(dict(layout_id=name, stage='layout', candidates=0, good=good_total,
                 feasible=feasible_total, cores=0, diagnostic=json.dumps(dict(
-                    prepared_groups=groups, b32_calls=calls))))
+                    prepared_groups=groups, coordination_calls=calls))))
     if not prepared:
         raise ValueError('no usable Joint4 ranking preference in TRAIN')
     history = []
@@ -8212,12 +8213,12 @@ def joint4_fit(workers=1, *, cmax_driven=False):
             ranking_accuracy=epoch_correct/max(1, epoch_pairs), pairs=epoch_pairs, updates=updates,
             gradient_norm=max(gradients, default=0.), learning_rate=JOINT3_LEARNING_RATE,
             candidates=sum(len(labelled) for _, labelled in prepared),
-            b32_calls=calls, construct_s=construct_s, b32_s=b32_s,
+            coordination_calls=calls, construct_s=construct_s, coordination_s=coordination_s,
             runtime_s=time.perf_counter()-started,
             diagnostic=json.dumps(dict(training_split='TRAIN_ONLY', groups=groups,
                 layouts=len(names), positives=good_total, feasible=feasible_total,
                 positive_share=good_total/max(1, feasible_total),
-                label='FEASIBLE ordered directly by true B32 Cmax; DEADLOCK has no Cmax')))
+                label='FEASIBLE ordered directly by true NATIVE Cmax; DEADLOCK has no Cmax')))
         history.append(record)
         if cmax_driven:
             record.update(method=CMAX_METHOD, phase='fit_origin_nodes')
@@ -8227,12 +8228,12 @@ def joint4_fit(workers=1, *, cmax_driven=False):
             state_dict=copy.deepcopy(model.state_dict()), initial_state_dict=initial_state,
             optimizer_state_dict=optimizer.state_dict(), completed_epoch=epoch,
             training_complete=epoch == JOINT4_EPOCHS, history=history, training_split='TRAIN_ONLY',
-            training_layouts=names, feedback_outcomes=True, b32_calls=calls,
-            construct_s=construct_s, b32_s=b32_s, label_rows=label_rows,
+            training_layouts=names, feedback_outcomes=True, coordination_calls=calls,
+            construct_s=construct_s, coordination_s=coordination_s, label_rows=label_rows,
             independent_layouts=holdout if cmax_driven else [],
-            objective='FEASIBLE_B32_CMAX', graph_relations=list(gnn.GRAPH_RELATIONS)), model_path)
+            objective='FEASIBLE_NATIVE_CMAX', graph_relations=list(gnn.GRAPH_RELATIONS)), model_path)
         print('JOINT4_FIT_EPOCH', json.dumps({key_: record[key_] for key_ in
-            ('epoch', 'loss', 'ranking_accuracy', 'pairs', 'updates', 'b32_calls')}), flush=True)
+            ('epoch', 'loss', 'ranking_accuracy', 'pairs', 'updates', 'coordination_calls')}), flush=True)
     return torch.load(model_path, map_location='cpu', weights_only=True)
 
 
@@ -8273,7 +8274,7 @@ def cmax_summary(phase='independent'):
                 output['detail'].append(dict(layout_id=key[0], seed=key[1], reference=method,
                     original_cmax_s=float(old['cmax_s']), cmax_s=float(new['cmax_s']), delta_pct=delta,
                     original_runtime_s=float(old['runtime_s']), runtime_s=float(new['runtime_s']),
-                    original_b32=int(old['b32_calls']), b32_calls=int(new['b32_calls'])))
+                    original_coordination=int(old['coordination_calls']), coordination_calls=int(new['coordination_calls'])))
             elif new['status'] == 'FEASIBLE' and old['status'] == 'DEADLOCK':
                 feasibility_wins += 1
         output['paired'][method] = dict(pairs=len(deltas), median_delta_pct=median(deltas) if deltas else None,
@@ -8291,7 +8292,7 @@ def cmax_summary(phase='independent'):
 
 
 def cmax_evaluate(phase='independent'):
-    """The requested sequential experiment stages, using only the existing B32."""
+    """The requested sequential experiment stages, using only the existing NATIVE."""
     if phase == 'validation' and not cmax_summary('independent')['passed']:
         print('CMAX_STOP: independent TRAIN comparison did not pass', flush=True)
         return []
@@ -8381,7 +8382,7 @@ def joint3_summary():
                   final_feasible_rate=len(feasible)/max(1, len(rows)),
                   candidate_deadlock_rate=candidate_deadlocks/max(1, candidate_total),
                   median_runtime_s=median([float(row['runtime_s']) for row in rows]) if rows else None,
-                  median_b32_calls=median([int(row['b32_calls']) for row in rows]) if rows else None,
+                  median_coordination_calls=median([int(row['coordination_calls']) for row in rows]) if rows else None,
                   duration_seconds={})
     thresholds = dict(final_feasible_load_ok=len(load_ok) == 30,
                       hga_median_below_zero=(result['HGA']['median_pct'] is not None
@@ -8401,7 +8402,7 @@ BVNS_METHODS = ('Bottleneck-VNS-v1','GNN-BVNS-v1')
 BVNS_V2_METHOD = 'GNN-BVNS-v2'
 BVNS_CASES = ('train_04','train_26','train_16','train_03','train_14','train_10')
 BVNS_FIELDS = ('stage','phase','layout_id','seed','method','protocol','source','operator','candidate_id','origin_id',
-    'status','cmax_s','native_cmax_s','gnn_score','priority_calls','b32_calls','generated','unique',
+    'status','cmax_s','native_cmax_s','gnn_score','priority_calls','coordination_calls','generated','unique',
     'cross_robot_candidates','cross_parent_transfers','duplicate','invalid','canonical_changed','lb_pruned',
     'accepted','native_cross_robot_candidates','native_cross_parent_transfers','accepted_parent_transfers',
     'states','shakes','max_processing_s','move_s','wait_s','route_lb_s','runtime_s',
@@ -8483,35 +8484,35 @@ def bvns_case(name, parents, seed, *, use_gnn, native_budget=500, max_states=80,
         native_seconds += elapsed
         ids[candidate.signature] = len(ids)+1
         observations.append(dict(stage='native_candidate',phase=phase,layout_id=name,seed=seed,method=method,
-            protocol='native search; exactly one final B32',operator=candidate.operator,
+            protocol='native search; exactly one final NATIVE',operator=candidate.operator,
             candidate_id=ids[candidate.signature],origin_id='' if origin is None else ids.get(origin.signature,''),
             status=schedule.status.value,cmax_s=None,native_cmax_s=schedule.cmax if schedule.feasible else None,
-            gnn_score=candidate.score if use_gnn else None,priority_calls=1,b32_calls=0,
+            gnn_score=candidate.score if use_gnn else None,priority_calls=1,coordination_calls=0,
             route_lb_s=max(workspace.cycles(candidate.state)),route_delta_s=json.dumps(candidate.route_delta_s),
             transfer_details=json.dumps(candidate.transfers),
             solution=json.dumps(pack_directed_plan(candidate)) if phase not in ('validation','test') else '',
             runtime_s=time.perf_counter()-started))
     if not initial:
         row = dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,
-                   status='CONSTRUCTION_FAILED',b32_calls=0,priority_calls=0,runtime_s=time.perf_counter()-started)
+                   status='CONSTRUCTION_FAILED',coordination_calls=0,priority_calls=0,runtime_s=time.perf_counter()-started)
         if write:bvns_write([row])
         return row
     search = lns.run_bottleneck_vns(initial,workspace,priority_schedule,
         scorer=scorer,repair_ranker=None if scorer is None else scorer.partial_scores,
         native_budget=native_budget,max_states=max_states,max_shakes=max_shakes,observer=observed)
     selected,native = search['candidate'],search['native']
-    # Search has returned its final selected candidate; no earlier B32 call.
+    # Search has returned its final selected candidate; no earlier NATIVE call.
     final_clock = time.perf_counter()
-    final_schedule = b32(selected)
-    b32_seconds = time.perf_counter()-final_clock
+    final_schedule = coordination(selected)
+    coordination_seconds = time.perf_counter()-final_clock
     metrics = routeaware_metrics(selected,final_schedule)
     transfers = joint3_assignment_changes(search['initial_selected'],selected)
     counts = search['counts']
     final = dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,
-        protocol='native search; exactly one final B32',status=final_schedule.status.value,
+        protocol='native search; exactly one final NATIVE',status=final_schedule.status.value,
         cmax_s=final_schedule.cmax if final_schedule.feasible else None,
         native_cmax_s=native.cmax if native.feasible else None,
-        priority_calls=search['native_calls'],b32_calls=1,
+        priority_calls=search['native_calls'],coordination_calls=1,
         generated=sum(v.get('generated',0) for v in counts.values()),
         unique=sum(v.get('unique',0) for v in counts.values()),
         cross_robot_candidates=sum(v.get('cross_robot_candidates',0) for v in counts.values()),
@@ -8525,20 +8526,20 @@ def bvns_case(name, parents, seed, *, use_gnn, native_budget=500, max_states=80,
         **{k:metrics.get(k) for k in ('max_processing_s','move_s','wait_s')},
         diagnostic=json.dumps(dict(stop=search['stop'],counts=counts,native_budget=native_budget,
             max_states=max_states,max_shakes=max_shakes,route_cache_hits=search['route_cache_hits'],
-            b32_seconds=b32_seconds,
+            coordination_seconds=coordination_seconds,
             neighbourhood_rounds=search['rounds'],initial_selected=pack_directed_plan(search['initial_selected']),
             route_cache_builds=search['route_cache_builds'],native_deadlock_reserve=search['native_deadlock_reserve'],
             initial_candidates=[pack_directed_plan(c) for c in initial],
-            evaluation='unchanged priority_schedule search; unchanged final B32 once; no wall-clock cutoff')))
+            evaluation='unchanged priority_schedule search; unchanged final NATIVE once; no wall-clock cutoff')))
     summaries = [dict(stage='neighbourhood',phase=phase,layout_id=name,seed=seed,method=method,operator=op,
-                     priority_calls=value.get('native_calls',0),b32_calls=0,
+                     priority_calls=value.get('native_calls',0),coordination_calls=0,
                      **{k:v for k,v in value.items() if k in BVNS_FIELDS}) for op,value in counts.items()]
     if write:
         bvns_write([*observations,*summaries])
         final['runtime_s'] = time.perf_counter()-started
         bvns_write([final])
     print('BVNS_FINAL',json.dumps({k:final.get(k) for k in ('layout_id','method','status','cmax_s','native_cmax_s',
-        'runtime_s','generated','unique','cross_robot_candidates','priority_calls','b32_calls','graph_encodings')},ensure_ascii=False),flush=True)
+        'runtime_s','generated','unique','cross_robot_candidates','priority_calls','coordination_calls','graph_encodings')},ensure_ascii=False),flush=True)
     return final
 
 
@@ -8548,7 +8549,7 @@ def bvns_summary(phase='train'):
         if r.get('stage')=='final' and r.get('phase')==phase and r['method']==method} for method in BVNS_METHODS}
     references = {(r['layout_id'],int(r['seed'])):r for r in rows if r.get('stage')=='reference'
                   and r['method']==CMAX_METHOD and r.get('phase')==phase}
-    output = dict(phase=phase,methods={},historical_protocol='old Cmax-Conflict uses B32 inside search; not equal-budget evidence')
+    output = dict(phase=phase,methods={},historical_protocol='old Cmax-Conflict uses NATIVE inside search; not equal-budget evidence')
     for method,records in finals.items():
         paired = [(float(r['cmax_s'])/float(references[k]['cmax_s'])-1)*100 for k,r in records.items()
                   if k in references and r['status']=='FEASIBLE' and references[k]['status']=='FEASIBLE']
@@ -8559,7 +8560,7 @@ def bvns_summary(phase='train'):
             wins=sum(x<0 for x in paired),losses=sum(x>0 for x in paired),
             median_runtime_s=median(runtime) if runtime else None,
             median_runtime_ratio=median(ratios) if ratios else None,
-            b32_calls=sum(int(r['b32_calls']) for r in records.values()),
+            coordination_calls=sum(int(r['coordination_calls']) for r in records.values()),
             priority_calls=sum(int(r['priority_calls']) for r in records.values()))
     # Preserve the preceding six-case TRAIN quality criterion. This is an
     # experiment decision, not a new scheduler/certification mechanism.
@@ -8589,7 +8590,7 @@ def bvns_restore_action(parents, snapshot, workspace, *, operator='initial', rem
 
 
 def bvns_fit_root(name, parents, source, workspace, model, hga_record, ordinal):
-    """TRAIN roots only. Baseline labels are ignored; no B32 root evaluation."""
+    """TRAIN roots only. Baseline labels are ignored; no NATIVE root evaluation."""
     clock = time.perf_counter();calls = 0
     if source=='HGA':
         expected = tuple(sorted((p.parent_id,p.start,p.end) for p in parents))
@@ -8618,7 +8619,7 @@ def bvns_fit_root(name, parents, source, workspace, model, hga_record, ordinal):
         root = (bvns_restore_action(parents,dict(patterns=[p.pattern_id for p in teacher.solution.patterns],
             routes=[r.block_ids for r in teacher.solution.routes],directions=teacher.directions),workspace)
             if teacher.solution is not None and teacher.directions is not None else None)
-        metadata = dict(teacher_budget=asdict(settings),formal_baseline=False,teacher_b32_calls=0)
+        metadata = dict(teacher_budget=asdict(settings),formal_baseline=False,teacher_coordination_calls=0)
     else:
         initial = bvns_initial(parents,workspace.space,workspace,SEED+ordinal)
         if not initial:return None,None,dict(source=source,unavailable=True),time.perf_counter()-clock,0
@@ -8631,7 +8632,7 @@ def bvns_fit_root(name, parents, source, workspace, model, hga_record, ordinal):
             tested = [(c,priority_schedule(c.solution,CONFIG,c.directions)) for c in initial]
             calls = len(tested);feasible = [(c,s) for c,s in tested if s.feasible]
             root = min(feasible,key=lambda x:x[1].cmax)[0] if feasible else initial[0]
-        metadata = dict(teacher_b32_calls=0,native_budget=100 if source=='GNN' else 4)
+        metadata = dict(teacher_coordination_calls=0,native_budget=100 if source=='GNN' else 4)
     if root is None:return None,None,metadata,time.perf_counter()-clock,calls
     native = priority_schedule(root.solution,CONFIG,root.directions);calls += 1
     return root,native,metadata,time.perf_counter()-clock,calls
@@ -8676,11 +8677,11 @@ def bvns_fit():
                 with torch.no_grad():root,native,meta,seconds,calls=bvns_fit_root(name,parents,source,w,model,hga_records.get(name),ordinal)
                 if root is None:
                     bvns_write([dict(stage='training_root_unavailable',phase='fit',layout_id=name,seed=SEED,
-                        method=BVNS_V2_METHOD,source=source,candidate_id=group_id,b32_calls=0,priority_calls=calls,
+                        method=BVNS_V2_METHOD,source=source,candidate_id=group_id,coordination_calls=0,priority_calls=calls,
                         runtime_s=seconds,diagnostic=json.dumps(meta))]);continue
                 rootrow=dict(stage='training_root',phase='fit',layout_id=name,seed=SEED,method=BVNS_V2_METHOD,
                     source=source,candidate_id=group_id,status=native.status.value,native_cmax_s=native.cmax if native.feasible else None,
-                    b32_calls=0,priority_calls=calls,runtime_s=seconds,solution=json.dumps(pack_directed_plan(root)),diagnostic=json.dumps(meta))
+                    coordination_calls=0,priority_calls=calls,runtime_s=seconds,solution=json.dumps(pack_directed_plan(root)),diagnostic=json.dumps(meta))
                 bvns_write([rootrow]);roots[group_id]=rootrow;labels.setdefault(group_id,[])
             if group_id not in groups_done:
                 actor=gnn.BottleneckActionScorer(model,space,w,CONFIG);pool=[];native_values={}
@@ -8710,19 +8711,19 @@ def bvns_fit():
                         if old is not None:continue
                         clock=time.perf_counter();called=candidate.signature not in cached
                         if called:
-                            outcome=b32(candidate);cached[candidate.signature]=(outcome.status.value,outcome.cmax if outcome.feasible else None)
+                            outcome=coordination(candidate);cached[candidate.signature]=(outcome.status.value,outcome.cmax if outcome.feasible else None)
                             label_calls+=1
                         status,cmax=cached[candidate.signature]
                         row=dict(stage='training_candidate',phase='fit',layout_id=name,seed=SEED,method=BVNS_V2_METHOD,
                             source=source,candidate_id=f'{group_id}-{index}',origin_id=group_id,operator=candidate.operator,
                             status=status,cmax_s=cmax,native_cmax_s=native_values.get(candidate.signature),
-                            b32_calls=int(called),gnn_score=candidate.score,route_delta_s=json.dumps(candidate.route_delta_s),
+                            coordination_calls=int(called),gnn_score=candidate.score,route_delta_s=json.dumps(candidate.route_delta_s),
                             transfer_details=json.dumps(candidate.transfers),solution=json.dumps(pack_directed_plan(candidate)),
                             runtime_s=time.perf_counter()-started,diagnostic=json.dumps(dict(parents=candidate.parents,
-                                b32_seconds=time.perf_counter()-clock,teacher_label_used=False)))
+                                coordination_seconds=time.perf_counter()-clock,teacher_label_used=False)))
                         bvns_write([row]);labels[group_id].append(row)
                 bvns_write([dict(stage='training_group',phase='fit',layout_id=name,seed=SEED,method=BVNS_V2_METHOD,
-                    source=source,candidate_id=group_id,unique=len(labels[group_id]),b32_calls=0,
+                    source=source,candidate_id=group_id,unique=len(labels[group_id]),coordination_calls=0,
                     priority_calls=sum(len(group) for group in families_pool),
                     diagnostic=json.dumps(dict(counts=w.counts,graph_encodings=actor.encodings,
                         scoring_seconds=actor.scoring_seconds,feature_seconds=actor.feature_seconds)))])
@@ -8735,8 +8736,8 @@ def bvns_fit():
                 candidates.append(candidate);ranks.append(joint4_training_rank(row,0.,0.))
             if len(set(ranks))>1:prepared.append((name,source,w,root,native,candidates,ranks))
             print('BVNS_FIT_GROUP',json.dumps(dict(layout_id=name,source=source,candidates=len(candidates),
-                feasible=sum(r[0]==0 for r in ranks),new_b32_total=label_calls)),flush=True)
-    if not prepared:raise ValueError('no usable true-B32 TRAIN preferences')
+                feasible=sum(r[0]==0 for r in ranks),new_coordination_total=label_calls)),flush=True)
+    if not prepared:raise ValueError('no usable true-NATIVE TRAIN preferences')
     collection_seconds=time.perf_counter()-started
     model.requires_grad_(True);model.train()
     optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4);history=[]
@@ -8761,14 +8762,14 @@ def bvns_fit():
                         ff_pairs+=1;ff_correct+=int((float(scores[a].detach())-float(scores[b].detach()))*(ranks[a][2]-ranks[b][2])<0)
         record=dict(epoch=epoch,loss=sum(losses)/max(1,len(losses)),pairs=pairs,accuracy=correct/max(1,pairs),
             feasible_pairs=ff_pairs,feasible_accuracy=ff_correct/max(1,ff_pairs),updates=len(losses),
-            groups=len(prepared),new_b32_calls=label_calls,collection_seconds=collection_seconds,
+            groups=len(prepared),new_coordination_calls=label_calls,collection_seconds=collection_seconds,
             elapsed_s=time.perf_counter()-started)
         history.append(record)
         torch.save(dict(version=2,state_dict=model.state_dict(),frozen_state_dict=frozen,
             optimizer=optimizer.state_dict(),history=history,training_complete=epoch==3,
             training_layouts=names,heldout_layouts=heldout,features=dict(node_extra=2,edge=6,action_extra=32),
-            label='same-state actual feasible B32 Cmax; DEADLOCK separately, no fake Cmax'),BVNS_MODEL)
-        bvns_write([dict(stage='epoch',phase='fit',seed=SEED,method=BVNS_V2_METHOD,b32_calls=0,
+            label='same-state actual feasible NATIVE Cmax; DEADLOCK separately, no fake Cmax'),BVNS_MODEL)
+        bvns_write([dict(stage='epoch',phase='fit',seed=SEED,method=BVNS_V2_METHOD,coordination_calls=0,
                          runtime_s=record['elapsed_s'],diagnostic=json.dumps(record))])
         print('BVNS_FIT_EPOCH',json.dumps(record),flush=True)
     return history
@@ -8785,7 +8786,7 @@ def bvns_warmup(phase):
     warm = canonicalize(parents,patterns,{r:(f'BVNS_SETUP_R{r}::whole',) for r in range(4)},
                         CONFIG,scope=FORMAL_SCOPE_V2)
     priority_schedule(warm,CONFIG,((0,),)*4)
-    row = dict(stage='setup',phase=phase,method='BVNS_SHARED_SETUP',priority_calls=1,b32_calls=0,
+    row = dict(stage='setup',phase=phase,method='BVNS_SHARED_SETUP',priority_calls=1,coordination_calls=0,
         runtime_s=time.perf_counter()-clock,source='synthetic native kernel compilation; no training label')
     bvns_write([row]);print('BVNS_SHARED_SETUP',json.dumps(row),flush=True)
 
@@ -8807,7 +8808,7 @@ def bvns_trained_summary():
     runtimes = [float(r['runtime_s']) for r in finals.values()]
     output['median_runtime_s'] = median(runtimes) if runtimes else None
     output['priority_calls'] = sum(int(r['priority_calls']) for r in finals.values())
-    output['b32_calls'] = sum(int(r['b32_calls']) for r in finals.values())
+    output['coordination_calls'] = sum(int(r['coordination_calls']) for r in finals.values())
     old,plain = output['paired'][CMAX_METHOD],output['paired'][BVNS_METHODS[0]]
     output['criteria'] = dict(feasible_6=output['completed']==output['feasible']==6,
         historical_median_1pct=old['pairs']==6 and old['median_change_pct']<=-1.,
@@ -8846,7 +8847,7 @@ def bvns_formal_summary(phase='validation',*,results_path=None,method=None):
         feasible=sum(r['status']=='FEASIBLE' for r in records),paired={},detail=[],
         median_runtime_s=median([float(r['runtime_s']) for r in records]) if records else None,
         priority_calls=sum(int(r['priority_calls']) for r in records),
-        b32_calls=sum(int(r['b32_calls']) for r in records))
+        coordination_calls=sum(int(r['coordination_calls']) for r in records))
     for method,(_,_,filename) in BASELINES.items():
         reference = {(r['layout_id'],int(r['seed'])):r for r in read_rows(FINAL_RESULTS/filename)
                      if r.get('method')==method and completed_baseline_row(r)}
@@ -8868,7 +8869,7 @@ def bvns_formal_summary(phase='validation',*,results_path=None,method=None):
                 cmax_s=float(new['cmax_s']) if new['status']=='FEASIBLE' else None,
                 reference_cmax_s=float(old['cmax_s']) if old['status']=='FEASIBLE' else None,
                 delta_pct=change,runtime_s=float(new['runtime_s']),reference_runtime_s=float(old['runtime_s']),
-                b32_calls=int(new['b32_calls']),reference_b32_calls=int(old['b32_calls'])))
+                coordination_calls=int(new['coordination_calls']),reference_coordination_calls=int(old['coordination_calls'])))
         output['paired'][method] = dict(reference_records=sum(k in reference for k in expected),
             reference_feasible=sum(k in reference and reference[k]['status']=='FEASIBLE' for k in expected),
             pairs=len(changes),median_change_pct=median(changes) if changes else None,
@@ -8876,7 +8877,7 @@ def bvns_formal_summary(phase='validation',*,results_path=None,method=None):
             ties=sum(abs(x)<=1e-9 for x in changes),feasibility_wins=feasibility_wins,
             feasibility_losses=feasibility_losses,median_runtime_ratio=median(runtime_ratios) if runtime_ratios else None)
     output['criteria'] = dict(all_feasible=output['completed']==output['feasible']==len(expected),
-        one_final_b32=len(records)==len(expected) and all(int(r['b32_calls'])==1 for r in records),
+        one_final_coordination=len(records)==len(expected) and all(int(r['coordination_calls'])==1 for r in records),
         all_references=all(p['reference_records']==len(expected) for p in output['paired'].values()),
         better_medians=all(p['median_change_pct'] is not None and p['median_change_pct']<0 for p in output['paired'].values()),
         more_cmax_wins=all(p['wins']>p['losses'] for p in output['paired'].values()))
@@ -8910,8 +8911,8 @@ def bvns_pilot():
     for row in references:
         if (row['layout_id'],int(row['seed'])) in recorded:continue
         bvns_write([dict(stage='reference',phase='train',layout_id=row['layout_id'],seed=row['seed'],method=CMAX_METHOD,
-            protocol='historical B32-in-search; not equal-B32-budget comparison',
-            **{k:row.get(k) for k in ('status','cmax_s','runtime_s','b32_calls','max_processing_s','move_s','wait_s')},
+            protocol='historical NATIVE-in-search; not equal-NATIVE-budget comparison',
+            **{k:row.get(k) for k in ('status','cmax_s','runtime_s','coordination_calls','max_processing_s','move_s','wait_s')},
             source='gnn_cmax_conflict.csv.gz phase=independent')])
     completed = {(r['layout_id'],r['method']) for r in existing if r.get('stage')=='final' and r.get('phase')=='train'}
     if any((name,method) not in completed for name in BVNS_CASES for method in BVNS_METHODS):
@@ -8923,11 +8924,11 @@ def bvns_pilot():
 
 CHILD_JOINT_MODEL = ROOT/'models/gnn_child_joint.pt'
 CHILD_CONSTRUCT_MODEL = ROOT/'models/gnn_child_joint_construct.pt'
-CHILD_CONSTRUCT_METHOD = 'GNN-ChildJoint-ConstructB32-v1'
+CHILD_CONSTRUCT_METHOD = 'GNN-ChildJoint-ConstructNATIVE-v1'
 CHILD_CONSTRUCT_PHASE = 'construct-fit'
-CHILD_CONSTRUCT_B32_LIMIT = 240
+CHILD_CONSTRUCT_NATIVE_LIMIT = 240
 CHILD_JOINT_RESULTS = FINAL_RESULTS/'gnn_child_joint.csv'
-CHILD_JOINT_METHODS = ('ChildJoint-NoGNN-v1','GNN-ChildJoint-B32Rank-v1')
+CHILD_JOINT_METHODS = ('ChildJoint-NoGNN-v1','GNN-ChildJoint-NATIVERank-v1')
 CHILD_JOINT_FIELDS = (*BVNS_FIELDS,'noop_score','relative_score','moves','scored','retained','perturbation','cross_child_transfers','native_feasible')
 
 
@@ -9011,7 +9012,7 @@ def child_joint_case(name,parents,seed,*,use_gnn=True,phase='independent',write=
     init_seconds=time.perf_counter()-clock
     if not initial:
         row=dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,status='CONSTRUCTION_FAILED',
-            priority_calls=0,b32_calls=0,runtime_s=time.perf_counter()-clock,diagnostic=json.dumps(initial_diag))
+            priority_calls=0,coordination_calls=0,runtime_s=time.perf_counter()-clock,diagnostic=json.dumps(initial_diag))
         if write:child_joint_write([row])
         print('CHILD_JOINT_FINAL',json.dumps(row),flush=True);return row
     actor=gnn.ChildJointScorer(model,space,w,CONFIG) if model is not None else None
@@ -9022,7 +9023,7 @@ def child_joint_case(name,parents,seed,*,use_gnn=True,phase='independent',write=
         observations.append(dict(stage='native_candidate',phase=phase,layout_id=name,seed=seed,method=method,
             operator=candidate.operator,candidate_id=ids[candidate.signature],
             origin_id=ids.get(origin.signature,'') if origin is not None else '',status=native.status.value,
-            cmax_s=None,native_cmax_s=native.cmax if native.feasible else None,priority_calls=1,b32_calls=0,
+            cmax_s=None,native_cmax_s=native.cmax if native.feasible else None,priority_calls=1,coordination_calls=0,
             gnn_score=candidate.score if use_gnn else None,
             route_lb_s=max(w.cycles(candidate.state)),route_delta_s=json.dumps(candidate.route_delta_s),
             transfer_details=json.dumps(candidate.transfers),moves=json.dumps([asdict(m) for m in candidate.moves]),
@@ -9031,22 +9032,22 @@ def child_joint_case(name,parents,seed,*,use_gnn=True,phase='independent',write=
         for candidate,value in zip(pool,values):
             action=w.between(reference,candidate)
             observations.append(dict(stage='learned_decision',phase=phase,layout_id=name,seed=seed,method=method,
-                protocol='whole-action B32 preference; no B32 label online',operator=action.operator,
+                protocol='whole-action NATIVE preference; no NATIVE label online',operator=action.operator,
                 candidate_id=ids[candidate.signature],origin_id=ids[reference.signature],
-                gnn_score=value,noop_score=values[0],relative_score=value-values[0],b32_calls=0,
+                gnn_score=value,noop_score=values[0],relative_score=value-values[0],coordination_calls=0,
                 route_delta_s=json.dumps(action.route_delta_s),transfer_details=json.dumps(action.transfers),
                 accepted=int(selected.signature!=reference.signature and candidate.signature==selected.signature)))
     search=lns.run_child_joint(initial,w,priority_schedule,ranker=actor,native_budget=native_budget,
         max_states=max_states,max_shakes=max_shakes,observer=observed,decision_observer=decision if use_gnn else None)
-    selected,native=search['candidate'],search['native'];b32_clock=time.perf_counter()
-    schedule=b32(selected);b32_seconds=time.perf_counter()-b32_clock
+    selected,native=search['candidate'],search['native'];coordination_clock=time.perf_counter()
+    schedule=coordination(selected);coordination_seconds=time.perf_counter()-coordination_clock
     metrics=routeaware_metrics(selected,schedule)
     transfers=lns.actual_parent_transfers(search['initial_selected'],selected,CONFIG)
     counts=search['counts']
     row=dict(stage='final',phase=phase,layout_id=name,seed=seed,method=method,
-        protocol='GNN no-op-relative acceptance; native context only; one final B32' if use_gnn else 'no-GNN child-space/native acceptance control; one final B32',
+        protocol='GNN no-op-relative acceptance; native context only; one final NATIVE' if use_gnn else 'no-GNN child-space/native acceptance control; one final NATIVE',
         status=schedule.status.value,cmax_s=schedule.cmax if schedule.feasible else None,
-        native_cmax_s=native.cmax if native.feasible else None,priority_calls=search['native_calls'],b32_calls=1,
+        native_cmax_s=native.cmax if native.feasible else None,priority_calls=search['native_calls'],coordination_calls=1,
         generated=sum(c.get('generated',0) for c in counts.values()),unique=sum(c.get('unique',0) for c in counts.values()),
         cross_robot_candidates=sum(c.get('cross_robot_candidates',0) for c in counts.values()),cross_parent_transfers=len(transfers),
         states=search['states'],shakes=search['shakes'],route_lb_s=max(w.cycles(selected.state)),initial_seconds=init_seconds,
@@ -9058,8 +9059,8 @@ def child_joint_case(name,parents,seed,*,use_gnn=True,phase='independent',write=
         **{k:metrics.get(k) for k in ('max_processing_s','move_s','wait_s')},
         diagnostic=json.dumps(dict(stop=search['stop'],counts=counts,objective=search['runtime_objective'],
             native_budget=native_budget,max_states=max_states,max_shakes=max_shakes,initial=initial_diag,
-            initial_selected=pack_directed_plan(search['initial_selected']),b32_seconds=b32_seconds,
-            b32_diagnostics=schedule.diagnostics,route_cache_hits=search['route_cache_hits'],
+            initial_selected=pack_directed_plan(search['initial_selected']),coordination_seconds=coordination_seconds,
+            coordination_diagnostics=schedule.diagnostics,route_cache_hits=search['route_cache_hits'],
             search_encodings=actor.encodings if actor else 0)))
     if write:
         child_joint_write([*observations,*[dict(stage='action_count',phase=phase,layout_id=name,seed=seed,
@@ -9067,7 +9068,7 @@ def child_joint_case(name,parents,seed,*,use_gnn=True,phase='independent',write=
         row['runtime_s']=time.perf_counter()-clock;child_joint_write([row])
     else:row['runtime_s']=time.perf_counter()-clock
     print('CHILD_JOINT_FINAL',json.dumps({k:row.get(k) for k in ('layout_id','seed','method','status','cmax_s',
-        'native_cmax_s','runtime_s','priority_calls','b32_calls','generated','unique')}),flush=True)
+        'native_cmax_s','runtime_s','priority_calls','coordination_calls','generated','unique')}),flush=True)
     return row
 
 
@@ -9079,7 +9080,7 @@ def child_joint_loss(scores,rows):
     failed=[i for i,r in enumerate(rows) if r['status']=='DEADLOCK']
     for i in feasible:
         if not math.isfinite(float(rows[i]['cmax_s'])) or float(rows[i]['cmax_s'])<=0:
-            raise ValueError('FEASIBLE labels require a positive measured B32 Cmax')
+            raise ValueError('FEASIBLE labels require a positive measured NATIVE Cmax')
     if 0 in feasible:
         baseline=float(rows[0]['cmax_s'])
         for i in feasible:
@@ -9122,7 +9123,7 @@ def child_joint_fit(*,construction_supervised=False):
     roots={r['candidate_id']:r for r in existing if r['stage']=='training_root'}
     done={r['candidate_id'] for r in existing if r['stage']=='training_group'}
     label_rows={key:[r for r in existing if r['stage']=='training_candidate' and r['origin_id']==key] for key in roots}
-    prepared=[];new_b32=0
+    prepared=[];new_coordination=0
     for ordinal,name in enumerate(names):
         print('CHILD_JOINT_SELF_LAYOUT',name,flush=True)
         parents=layouts[name];space=gnn.parent_assignment_space(parents,CONFIG)
@@ -9133,20 +9134,20 @@ def child_joint_fit(*,construction_supervised=False):
                 initial,initial_diag=child_joint_initial(parents,space,trajectory_w,SEED+ordinal,model)
                 if not initial:
                     child_joint_write([dict(stage='construction_failed',phase='fit',layout_id=name,
-                        method=CHILD_JOINT_METHODS[1],source='SELF_GNN',b32_calls=0,diagnostic=json.dumps(initial_diag))]);continue
+                        method=CHILD_JOINT_METHODS[1],source='SELF_GNN',coordination_calls=0,diagnostic=json.dumps(initial_diag))]);continue
                 actor=gnn.ChildJointScorer(model,space,trajectory_w,CONFIG)
                 trajectory=lns.run_child_joint(initial,trajectory_w,priority_schedule,ranker=actor,
                     native_budget=64,max_states=4,max_shakes=1)
                 proposals=[trajectory['initial_selected'],trajectory['candidate'],*reversed(trajectory['visited_states'])]
                 selected=list({c.signature:c for c in proposals}.values())[:2]
                 child_joint_write([dict(stage='self_trajectory',phase='fit',layout_id=name,seed=SEED+ordinal,
-                    method=CHILD_JOINT_METHODS[1],source='SELF_GNN',priority_calls=trajectory['native_calls'],b32_calls=0,
+                    method=CHILD_JOINT_METHODS[1],source='SELF_GNN',priority_calls=trajectory['native_calls'],coordination_calls=0,
                     states=trajectory['states'],diagnostic=json.dumps(dict(initial=initial_diag,counts=trajectory['counts'],
                         no_label_feedback=True,source_weights='gnn_bvns.pt:frozen_state_dict')))])
                 for index,root in enumerate(selected):
                     row=dict(stage='training_root',phase='fit',layout_id=name,seed=SEED+ordinal,
                         method=CHILD_JOINT_METHODS[1],source='SELF_GNN_CONSTRUCT' if index==0 else 'SELF_GNN_SEARCH',
-                        candidate_id=group_ids[index],solution=json.dumps(pack_directed_plan(root)),b32_calls=0)
+                        candidate_id=group_ids[index],solution=json.dumps(pack_directed_plan(root)),coordination_calls=0)
                     child_joint_write([row]);roots[group_ids[index]]=row;label_rows[group_ids[index]]=[]
         cache={}
         for key in group_ids:
@@ -9174,18 +9175,18 @@ def child_joint_fit(*,construction_supervised=False):
                     if any(json.loads(r['solution'])==json.loads(json.dumps(snapshot)) for r in label_rows[key]):continue
                     called=candidate.signature not in cache;clock=time.perf_counter()
                     if called:
-                        outcome=b32(candidate);cache[candidate.signature]=(outcome.status.value,outcome.cmax if outcome.feasible else None)
-                        new_b32+=1
+                        outcome=coordination(candidate);cache[candidate.signature]=(outcome.status.value,outcome.cmax if outcome.feasible else None)
+                        new_coordination+=1
                     status,cmax=cache[candidate.signature]
                     row=dict(stage='training_candidate',phase='fit',layout_id=name,seed=SEED+ordinal,
                         method=CHILD_JOINT_METHODS[1],source=roots[key]['source'],origin_id=key,
                         candidate_id=f'{key}-{number}',operator=candidate.operator,status=status,cmax_s=cmax,
-                        b32_calls=int(called),solution=json.dumps(snapshot),moves=json.dumps([asdict(m) for m in candidate.moves]),
-                        diagnostic=json.dumps(dict(b32_seconds=time.perf_counter()-clock,no_op=candidate.operator=='noop',
-                            label='actual B32; no HGA/WAG/native labels')))
+                        coordination_calls=int(called),solution=json.dumps(snapshot),moves=json.dumps([asdict(m) for m in candidate.moves]),
+                        diagnostic=json.dumps(dict(coordination_seconds=time.perf_counter()-clock,no_op=candidate.operator=='noop',
+                            label='actual NATIVE; no HGA/WAG/native labels')))
                     child_joint_write([row]);label_rows[key].append(row)
                 child_joint_write([dict(stage='training_group',phase='fit',layout_id=name,method=CHILD_JOINT_METHODS[1],
-                    source=roots[key]['source'],candidate_id=key,unique=len(label_rows[key]),b32_calls=0,
+                    source=roots[key]['source'],candidate_id=key,unique=len(label_rows[key]),coordination_calls=0,
                     priority_calls=1,diagnostic=json.dumps(dict(counts=w.counts,graph_encodings=actor.encodings)))])
                 done.add(key)
             labels=sorted(label_rows[key],key=lambda r:r['operator']!='noop')
@@ -9195,8 +9196,8 @@ def child_joint_fit(*,construction_supervised=False):
             ranks=[joint4_training_rank(r,0.,0.) for r in labels]
             if len(set(ranks))>1:prepared.append((w,root,native,actions,labels))
             print('CHILD_JOINT_SELF_GROUP',json.dumps(dict(layout_id=name,group=index,candidates=len(labels),
-                feasible=sum(r['status']=='FEASIBLE' for r in labels),new_b32_total=new_b32)),flush=True)
-    if not prepared:raise ValueError('self-GNN trajectories produced no usable B32 preference; stop without external teachers')
+                feasible=sum(r['status']=='FEASIBLE' for r in labels),new_coordination_total=new_coordination)),flush=True)
+    if not prepared:raise ValueError('self-GNN trajectories produced no usable NATIVE preference; stop without external teachers')
     collection_seconds=time.perf_counter()-started
     model.requires_grad_(True);model.train();optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4)
     history=saved.get('history',[])
@@ -9221,13 +9222,13 @@ def child_joint_fit(*,construction_supervised=False):
         record=dict(epoch=epoch,loss=sum(losses)/max(1,len(losses)),groups=len(prepared),updates=len(losses),
             pair_accuracy=totals['correct']/max(1,totals['pairs']),reference_accuracy=totals['reference_correct']/max(1,totals['reference_pairs']),
             feasible_accuracy=ff_correct/max(1,ff_pairs),feasible_pairs=ff_pairs,reference_pairs=totals['reference_pairs'],
-            collection_seconds=collection_seconds,elapsed_s=time.perf_counter()-started,new_b32_calls=new_b32)
+            collection_seconds=collection_seconds,elapsed_s=time.perf_counter()-started,new_coordination_calls=new_coordination)
         history.append(record)
         torch.save(dict(state_dict=model.state_dict(),optimizer=optimizer.state_dict(),history=history,
             training_complete=epoch==3,training_layouts=names,heldout_layouts=heldout,training_sources=['SELF_GNN'],
             initialization='models/gnn_bvns.pt:frozen_state_dict',method=CHILD_JOINT_METHODS[1],feature_dim=80,
-            target='measured B32 feasible Cmax ranking + relative-to-no-op preference'),CHILD_JOINT_MODEL)
-        child_joint_write([dict(stage='epoch',phase='fit',method=CHILD_JOINT_METHODS[1],b32_calls=0,diagnostic=json.dumps(record))])
+            target='measured NATIVE feasible Cmax ranking + relative-to-no-op preference'),CHILD_JOINT_MODEL)
+        child_joint_write([dict(stage='epoch',phase='fit',method=CHILD_JOINT_METHODS[1],coordination_calls=0,diagnostic=json.dumps(record))])
         print('CHILD_JOINT_EPOCH',json.dumps(record),flush=True)
     return history
 
@@ -9267,7 +9268,7 @@ def child_construct_replay(space,snapshot,inputs,model):
 def child_construct_collect(model,names,layouts):
     """Two self-GNN partial states/layout, six common-policy completions/state.
 
-    Only actual new B32 calls spend the 240-call budget. Existing SELF_GNN
+    Only actual new NATIVE calls spend the 240-call budget. Existing SELF_GNN
     complete-plan labels are reused using the workspace's ordinary identity.
     """
     old=read_rows(CHILD_JOINT_RESULTS)
@@ -9275,13 +9276,13 @@ def child_construct_collect(model,names,layouts):
     groups={r['candidate_id'] for r in old if r['phase']==CHILD_CONSTRUCT_PHASE and r['stage']=='construct_group'}
     labels={key:[r for r in old if r['phase']==CHILD_CONSTRUCT_PHASE and r['stage']=='construct_candidate'
                  and r['origin_id']==key] for key in roots}
-    spent=sum(int(r.get('b32_calls') or 0) for r in old if r['phase']==CHILD_CONSTRUCT_PHASE)
+    spent=sum(int(r.get('coordination_calls') or 0) for r in old if r['phase']==CHILD_CONSTRUCT_PHASE)
     for ordinal,name in enumerate(names):
         parents=layouts[name];space=gnn.parent_assignment_space(parents,CONFIG)
         w=lns.ChildJointWorkspace(parents,CONFIG,FORMAL_SCOPE_V2,space,seed=SEED+ordinal)
         steps=tuple(dict.fromkeys((max(1,round(.15*len(parents))),max(2,round(.5*len(parents))))))
         ids=[f'construct-{name}-{step}' for step in steps]
-        print('CHILD_CONSTRUCT_LAYOUT',name,'new_b32_total',spent,flush=True)
+        print('CHILD_CONSTRUCT_LAYOUT',name,'new_coordination_total',spent,flush=True)
         cache={}
         for row in old:
             if (row['layout_id']!=name or not row.get('source','').startswith('SELF_GNN') or
@@ -9304,7 +9305,7 @@ def child_construct_collect(model,names,layouts):
                         if key in groups:continue
                         if step not in sampled:
                             child_joint_write([dict(stage='construct_unreached',phase=CHILD_CONSTRUCT_PHASE,
-                                layout_id=name,method=CHILD_CONSTRUCT_METHOD,source='SELF_GNN',b32_calls=0,
+                                layout_id=name,method=CHILD_CONSTRUCT_METHOD,source='SELF_GNN',coordination_calls=0,
                                 diagnostic=json.dumps(dict(step=step,reason=trajectory.rejection_reason)))]);continue
                         state,selected,plans,scores=sampled[step]
                         rollout_seed=SEED+1009*ordinal+step
@@ -9312,7 +9313,7 @@ def child_construct_collect(model,names,layouts):
                         replay={k:v.detach().cpu().tolist() for k,v in packed.items()}
                         root=dict(stage='construct_state',phase=CHILD_CONSTRUCT_PHASE,layout_id=name,seed=rollout_seed,
                             method=CHILD_CONSTRUCT_METHOD,source='SELF_GNN_CONSTRUCT_COUNTERFACTUAL',candidate_id=key,
-                            solution=json.dumps(child_construct_state(state,selected)),b32_calls=0,
+                            solution=json.dumps(child_construct_state(state,selected)),coordination_calls=0,
                             diagnostic=json.dumps(dict(step=step,inputs=replay,continuation_seed=rollout_seed,
                                 continuation='same frozen GNN policy; beam1; common random seed',reference_index=0,
                                 initialization='gnn_bvns.pt:frozen_state_dict')))
@@ -9334,15 +9335,15 @@ def child_construct_collect(model,names,layouts):
                                 candidate=w.wrap(completed.solution,completed.directions)
                                 snapshot=pack_directed_plan(candidate)
                                 if candidate.signature not in cache:
-                                    if spent>=CHILD_CONSTRUCT_B32_LIMIT:
-                                        raise ValueError('240 new construction B32 labels exhausted')
-                                    outcome=b32(candidate);called=True;spent+=1
+                                    if spent>=CHILD_CONSTRUCT_NATIVE_LIMIT:
+                                        raise ValueError('240 new construction NATIVE labels exhausted')
+                                    outcome=coordination(candidate);called=True;spent+=1
                                     cache[candidate.signature]=(outcome.status.value,outcome.cmax if outcome.feasible else None)
                                 status,cmax=cache[candidate.signature]
                             row=dict(stage='construct_candidate',phase=CHILD_CONSTRUCT_PHASE,layout_id=name,seed=rollout_seed,
                                 method=CHILD_CONSTRUCT_METHOD,source='SELF_GNN_CONSTRUCT_COUNTERFACTUAL',origin_id=key,
                                 candidate_id=candidate_id,operator='noop' if number==0 else 'construct',
-                                status=status,cmax_s=cmax,b32_calls=int(called),gnn_score=float(scores[number]),
+                                status=status,cmax_s=cmax,coordination_calls=int(called),gnn_score=float(scores[number]),
                                 solution=json.dumps(snapshot) if snapshot else '',runtime_s=time.perf_counter()-clock,
                                 diagnostic=json.dumps(dict(index=number,assignment_index=plan.assignment_index,
                                     parent=assignment.parent_id,pattern=assignment.pattern.pattern_id,robots=assignment.robots,
@@ -9352,12 +9353,12 @@ def child_construct_collect(model,names,layouts):
                             child_joint_write([row]);labels[key].append(row);old.append(row)
                         child_joint_write([dict(stage='construct_group',phase=CHILD_CONSTRUCT_PHASE,layout_id=name,
                             method=CHILD_CONSTRUCT_METHOD,source='SELF_GNN_CONSTRUCT_COUNTERFACTUAL',candidate_id=key,
-                            unique=len(labels[key]),b32_calls=0,diagnostic=json.dumps(dict(
+                            unique=len(labels[key]),coordination_calls=0,diagnostic=json.dumps(dict(
                                 feasible=sum(r['status']=='FEASIBLE' for r in labels[key]),
-                                all_deadlock=all(r['status']=='DEADLOCK' for r in labels[key]),new_b32_total=spent)))])
+                                all_deadlock=all(r['status']=='DEADLOCK' for r in labels[key]),new_coordination_total=spent)))])
                         groups.add(key)
                         print('CHILD_CONSTRUCT_GROUP',name,step,'labels',len(labels[key]),'feasible',
-                            sum(r['status']=='FEASIBLE' for r in labels[key]),'new_b32_total',spent,flush=True)
+                            sum(r['status']=='FEASIBLE' for r in labels[key]),'new_coordination_total',spent,flush=True)
             finally:
                 del model._child_construction_cache
     return spent
@@ -9433,17 +9434,17 @@ def child_construct_fit():
         record=dict(epoch=epoch,loss=sum(losses)/len(losses),groups=len(prepared),coverage=dict(coverage),
             updates=len(losses),metrics=dict(metrics),assignment_gradient_groups=sum(g>0 for g in policy_grad),
             insertion_gradient_groups=sum(g>0 for g in insertion_grad),assignment_gradient_max=max(policy_grad),
-            insertion_gradient_max=max(insertion_grad),new_b32_calls=spent,collection_seconds=collection_seconds,
+            insertion_gradient_max=max(insertion_grad),new_coordination_calls=spent,collection_seconds=collection_seconds,
             elapsed_s=time.perf_counter()-started)
         history.append(record)
         checkpoint=dict(state_dict=model.state_dict(),optimizer=optimizer.state_dict(),history=history,
             training_complete=False,training_layouts=names,heldout_layouts=heldout,method=CHILD_CONSTRUCT_METHOD,
             training_sources=['SELF_GNN_CONSTRUCT_COUNTERFACTUAL','SELF_GNN_CONSTRUCT','SELF_GNN_SEARCH'],
-            initialization='models/gnn_bvns.pt:frozen_state_dict',construction_b32_limit=240,new_b32_calls=spent,
-            beam_width=4,target='Huber((score_action-score_noop),(B32_noop-B32_action)/B32_noop); feasible over deadlock')
+            initialization='models/gnn_bvns.pt:frozen_state_dict',construction_coordination_limit=240,new_coordination_calls=spent,
+            beam_width=4,target='Huber((score_action-score_noop),(NATIVE_noop-NATIVE_action)/NATIVE_noop); feasible over deadlock')
         torch.save(checkpoint,CHILD_CONSTRUCT_MODEL)
         child_joint_write([dict(stage='epoch',phase=CHILD_CONSTRUCT_PHASE,method=CHILD_CONSTRUCT_METHOD,
-            source='SELF_GNN',b32_calls=0,diagnostic=json.dumps(record))])
+            source='SELF_GNN',coordination_calls=0,diagnostic=json.dumps(record))])
         print('CHILD_CONSTRUCT_EPOCH',json.dumps(record),flush=True)
     evaluation={kind:Counter() for kind in ('construct','local')};model.eval()
     with torch.no_grad():
@@ -9454,8 +9455,8 @@ def child_construct_fit():
         insertion_weight_change=sum(float((v-initial_insertion[k]).square().sum()) for k,v in model.insertion_head.state_dict().items())**.5)
     torch.save(checkpoint,CHILD_CONSTRUCT_MODEL)
     child_joint_write([dict(stage='training_evaluation',phase=CHILD_CONSTRUCT_PHASE,method=CHILD_CONSTRUCT_METHOD,
-        source='SELF_GNN',b32_calls=0,diagnostic=json.dumps({k:checkpoint[k] for k in
-            ('evaluation','assignment_weight_change','insertion_weight_change','new_b32_calls')}))])
+        source='SELF_GNN',coordination_calls=0,diagnostic=json.dumps({k:checkpoint[k] for k in
+            ('evaluation','assignment_weight_change','insertion_weight_change','new_coordination_calls')}))])
     print('CHILD_CONSTRUCT_TRAINED',json.dumps(checkpoint['evaluation']),flush=True)
     return checkpoint
 
@@ -9477,10 +9478,10 @@ def child_construct_summary():
         wins=sum(x<-1.e-9 for x in changes),losses=sum(x>1.e-9 for x in changes),ties=sum(abs(x)<=1.e-9 for x in changes),
         feasibility_wins=fw,feasibility_losses=fl,median_change_pct=median(changes) if changes else None,
         median_runtime_s=median([float(r['runtime_s']) for r in records]) if records else None,
-        priority_calls=sum(int(r['priority_calls']) for r in records),b32_calls=sum(int(r['b32_calls']) for r in records))
+        priority_calls=sum(int(r['priority_calls']) for r in records),coordination_calls=sum(int(r['coordination_calls']) for r in records))
     result['passed']=(result['completed']==result['feasible']==6 and len(old.keys()&keys)==6 and
         result['wins']+fw>=4 and result['median_change_pct'] is not None and result['median_change_pct']<=-1. and
-        all(int(r['b32_calls'])==1 for r in records))
+        all(int(r['coordination_calls'])==1 for r in records))
     return result
 
 
@@ -9514,7 +9515,7 @@ def child_joint_summary():
         methods={method:dict(completed=sum(k in rs for k in expected),feasible=sum(k in rs and rs[k]['status']=='FEASIBLE' for k in expected),
             median_runtime_s=median([float(rs[k]['runtime_s']) for k in expected if k in rs]) if rs else None,
             priority_calls=sum(int(rs[k]['priority_calls']) for k in expected if k in rs),
-            b32_calls=sum(int(rs[k]['b32_calls']) for k in expected if k in rs)) for method,rs in records.items()})
+            coordination_calls=sum(int(rs[k]['coordination_calls']) for k in expected if k in rs)) for method,rs in records.items()})
     output['passed']=(output['completed']==output['feasible']==output['pairs']==6 and output['median_change_pct']<=-1. and output['wins']>=4)
     return output
 
@@ -9545,7 +9546,7 @@ def child_joint_evaluate(phase='independent'):
     patterns=tuple(next(a.pattern for a in space.actions if a.parent_id==p.parent_id and a.pattern.kind is SplitKind.WHOLE) for p in warm_parents)
     warm=canonicalize(warm_parents,patterns,{r:(f'CJ_SETUP_{r}::whole',) for r in range(4)},CONFIG,scope=FORMAL_SCOPE_V2)
     clock=time.perf_counter();priority_schedule(warm,CONFIG,((0,),)*4)
-    child_joint_write([dict(stage='setup',phase=phase,method='SHARED_NATIVE_SETUP',b32_calls=0,priority_calls=1,runtime_s=time.perf_counter()-clock)])
+    child_joint_write([dict(stage='setup',phase=phase,method='SHARED_NATIVE_SETUP',coordination_calls=0,priority_calls=1,runtime_s=time.perf_counter()-clock)])
     output=[]
     for name in names:
         for seed in seeds:

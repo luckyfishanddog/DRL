@@ -3,7 +3,7 @@ from __future__ import annotations
 from mrta_reference.certifier import certify_schedule
 from mrta_reference.geometry import robot_is_eligible
 from mrta_reference.model import ParentWeld, ScheduleResult, ScheduleStatus, ScientificConfig, SplitKind
-from mrta_reference.scheduler import reference_schedule, reference_schedule_formal
+from mrta_reference.scheduler import reference_schedule, native_schedule
 from mrta_reference.scope import FORMAL_SCOPE_V1_1
 from mrta_reference.solution import block_map
 import pytest

@@ -118,7 +118,7 @@ def summarize(stage='pilot'):
             initial_period_s=max(a['initial_route_periods_s']) if a.get('initial_route_periods_s') else None,
             final_period_s=max(a['final_route_periods_s']) if a.get('final_route_periods_s') else None,
             generated_columns=a['proposed_columns'], added_columns=a['added_columns'],
-            lp_calls=a['lp_calls'], milp_calls=a['milp_calls'], b32_calls=a['b32_calls'],
+            lp_calls=a['lp_calls'], milp_calls=a['milp_calls'], coordination_calls=a['coordination_calls'],
             gnn_scored_actions=a['gnn_scored_actions'], gnn_top_choice_differences=a['gnn_top_choice_differences'],
             parent_mode_changes=len(a.get('returned_parent_mode_changes', [])),
             transferred_parents=len(a.get('changes', {})), returned_initial=a.get('returned_initial')),
@@ -139,7 +139,7 @@ def _result_row(stage, name, parents, seed, method, result, initial):
     row = dict(stage=stage, layout_id=name, parent_count=len(parents), seed=seed,
         status=result.status, cmax_s=result.cmax, native_cmax_s=(initial.native_cmax if result.schedule is initial.schedule else None),
         runtime_s=result.runtime, generations='', valid_children='', native_calls=a['native_calls'],
-        b32_calls=a['b32_calls'], termination_reason=result.termination_reason, source=SOURCES[method],
+        coordination_calls=a['coordination_calls'], termination_reason=result.termination_reason, source=SOURCES[method],
         max_processing_s=max(loads) if loads else None, move_s=a.get('move_s'), wait_s=a.get('wait_s'),
         diagnostic=json.dumps(detail, ensure_ascii=False, allow_nan=False))
     row.update({f'processing_r{r}_s': v for r, v in enumerate(loads)})
@@ -177,7 +177,7 @@ def run_experiment(stage):
         fit = fit_pricing_head(policy, [(name, train[name]) for name in FIT_LAYOUTS], progress_callback=report)
         print('RCG_FIT', json.dumps(fit, ensure_ascii=False, allow_nan=False), flush=True)
         write(dict(stage='pricing_fit', layout_id='TRAIN_3', seed=SEEDS[0], source=FIT_SOURCE,
-            status='COMPLETED', runtime_s=fit['runtime_s'], native_calls=0, b32_calls=0,
+            status='COMPLETED', runtime_s=fit['runtime_s'], native_calls=0, coordination_calls=0,
             diagnostic=json.dumps(fit, ensure_ascii=False, allow_nan=False)))
         for name, parents, seed in pending:
             print('RCG_START', stage, name, len(parents), seed, flush=True)
@@ -190,7 +190,7 @@ def run_experiment(stage):
                 source=SOURCES['initial'], status=initial.status, cmax_s=initial.cmax,
                 native_cmax_s=initial.native_cmax, runtime_s=init_s, generations=initial.generations,
                 valid_children=initial.valid_children, native_calls=initial.accounting['native_calls'],
-                b32_calls=initial.accounting['b32_calls'], termination_reason=initial.termination_reason,
+                coordination_calls=initial.accounting['coordination_calls'], termination_reason=initial.termination_reason,
                 max_processing_s=max(loads) if loads else None,
                 diagnostic=json.dumps(dict(solution=solution_record(initial.solution, initial.directions),
                     accounting=initial.accounting, final_candidates=initial.final_candidates),

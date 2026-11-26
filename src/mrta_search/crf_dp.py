@@ -2,7 +2,7 @@
 
 Parent modes and the four original route heads stay fixed. Exactness refers
 only to distributing one selected fragment among the selected insertion gaps.
-SAEAX is run afresh; its feasible B32 result is retained without reevaluation.
+SAEAX is run afresh; its feasible NATIVE result is retained without reevaluation.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from numba import njit
 from mrta_baselines.hga import _HGAWorkspace
 from mrta_baselines.wag_vns import _priority_arrays
 from mrta_reference.model import OperationKind, ScientificConfig
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_search.saeax import (Individual, _heads_legal, _route_statistics,
     complete_identity, run_saeax, validate_individual)
@@ -281,16 +281,16 @@ def run_crf_dp(parents, config=None, settings=None, *, seed=20261110,
             progress_callback(dict(phase='SAEAX_INITIALIZATION', **row))
     initial = run_saeax(parents, config, seed=seed, scope=scope, progress_callback=initial_progress)
     a = dict(initialization_s=time.perf_counter()-started, initial_saeax_runtime_s=initial.runtime,
-        initial_native_calls=initial.accounting['native_calls'], initial_b32_calls=initial.accounting['b32_calls'],
-        native_calls=initial.accounting['native_calls'], b32_calls=initial.accounting['b32_calls'],
-        b32_s=initial.accounting['b32_s'], dp_search_s=0., dp_s=0., crf_native_s=0., crf_native_calls=0,
-        final_b32_calls=0, final_b32_s=0., rounds=0, windows=0, constructed=0, no_legal_partition=0,
+        initial_native_calls=initial.accounting['native_calls'], initial_coordination_calls=initial.accounting['coordination_calls'],
+        native_calls=initial.accounting['native_calls'], coordination_calls=initial.accounting['coordination_calls'],
+        coordination_s=initial.accounting['coordination_s'], dp_search_s=0., dp_s=0., crf_native_s=0., crf_native_calls=0,
+        final_coordination_calls=0, final_coordination_s=0., rounds=0, windows=0, constructed=0, no_legal_partition=0,
         duplicate_candidates=0, lower_bound_pruned=0, native_finite=0, native_nonfinite=0,
         accepted_improvements=0, transferred_children_generated=0, transferred_children_evaluated=0,
         transferred_children_accepted=0, initial_cmax_s=initial.cmax, final_fallback=False,
         search_complete=False)
     if initial.status != 'FEASIBLE' or initial.schedule is None:
-        a['return_reason'] = 'INITIAL_SAEAX_NOT_B32_FEASIBLE'
+        a['return_reason'] = 'INITIAL_SAEAX_NOT_NATIVE_FEASIBLE'
         return CRFDPResult(initial.status, initial.cmax, initial.solution, initial.directions,
             initial.schedule, initial.native_cmax, time.perf_counter()-started, 0,
             'INITIALIZATION_FAILED', a, initial)
@@ -389,21 +389,21 @@ def run_crf_dp(parents, config=None, settings=None, *, seed=20261110,
             raise RuntimeError('canonicalization changed the fixed-mode CRF-DP candidate')
         explicit = tuple(tuple(int(d) for d in row) for row in best.directions)
         t = time.perf_counter()
-        attempt = reference_schedule_formal(improved, config, scope=scope, orientations=dict(enumerate(explicit)))
+        attempt = native_schedule(improved, config, scope=scope, orientations=dict(enumerate(explicit)))
         elapsed = time.perf_counter()-t
-        a.update(final_b32_calls=1, final_b32_s=elapsed, b32_calls=a['b32_calls']+1,
-            b32_s=a['b32_s']+elapsed)
+        a.update(final_coordination_calls=1, final_coordination_s=elapsed, coordination_calls=a['coordination_calls']+1,
+            coordination_s=a['coordination_s']+elapsed)
         final = dict(status=attempt.status.value, cmax_s=attempt.cmax if attempt.feasible else None,
             native_cmax_s=best.native_cmax, route_periods_s=best.costs.tolist(),
             solution=solution_record(improved, explicit), diagnostics=list(attempt.diagnostics))
         if attempt.feasible and attempt.cmax < initial.cmax-1.e-8:
             if attempt.directions != explicit:
-                raise RuntimeError('B32 changed explicit CRF-DP directions')
+                raise RuntimeError('NATIVE changed explicit CRF-DP directions')
             solution, vectors, schedule, native = improved, explicit, attempt, best.native_cmax
-            a['return_reason'] = 'IMPROVED_B32'
+            a['return_reason'] = 'IMPROVED_NATIVE'
         else:
-            a.update(final_fallback=True, return_reason='FINAL_B32_FAILED' if not attempt.feasible
-                else 'INITIAL_B32_BETTER_OR_EQUAL')
+            a.update(final_fallback=True, return_reason='FINAL_NATIVE_FAILED' if not attempt.feasible
+                else 'INITIAL_NATIVE_BETTER_OR_EQUAL')
     else:
         a['return_reason'] = 'NO_NATIVE_IMPROVEMENT'
     returned_routes = w.encode(solution)

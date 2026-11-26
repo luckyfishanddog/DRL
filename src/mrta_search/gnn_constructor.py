@@ -313,7 +313,7 @@ def build_block_robot_graph(
     block_nodes=None,
     feedback=None,
 ) -> BlockRobotGraph:
-    """Separate geometric risk, route relations and actual B32 blocker evidence.
+    """Separate geometric risk, route relations and actual NATIVE blocker evidence.
 
     A cached geometry graph can be supplied to update only the current routes
     and observed timeline context during each step of joint reconstruction.
@@ -353,9 +353,9 @@ def build_block_robot_graph(
                     if position:
                         before = nodes[route[position-1]]
                         link(before, i, 6); link(i, before, 7)
-        # These edges refer to the last measured B32 rollout, never to proximity.
+        # These edges refer to the last measured NATIVE rollout, never to proximity.
         # A native child ID can recur at a different cut. Keep observed edges
-        # on the exact origin-mode nodes that produced the B32 evidence.
+        # on the exact origin-mode nodes that produced the NATIVE evidence.
         observed_nodes = {**nodes, **evidence.get('observed_nodes', {})}
         for blocked, blocker in evidence.get('blocked_pairs', ()):
             if blocked in observed_nodes and blocker in observed_nodes:
@@ -725,7 +725,7 @@ class CoordinationJointInsertionGNN(JointInsertionGNN):
     """Refresh route/order/direction and same-rail context at every decision.
 
     These edges describe the student's current partial solution only. They do
-    not assert schedulability: complete candidates still need B32 and the
+    not assert schedulability: complete candidates still need NATIVE and the
     independent certifier. The original static policy/checkpoints are intact.
     """
 
@@ -855,7 +855,7 @@ class JointCompletionResult:
     inference_seconds: float
     rejection_reason: str | None = None
     oriented_state: object | None = None
-    # Beam decoding returns complete plans here; the caller selects with B32.
+    # Beam decoding returns complete plans here; the caller selects with NATIVE.
     candidates: tuple[JointCompletionResult, ...] = ()
 
 
@@ -2295,7 +2295,7 @@ _VNEXT_LOCAL_COLUMNS = (8, 9, 10, 11, 16, 19, 20, 21, 22, 23, 24, 28)
 _VNEXT_FEATURE_DIM = len(_VNEXT_LOCAL_COLUMNS) + 8
 _VNEXT_TIME_SAMPLES = 12
 _VNEXT_JOINT_PRIOR = (-5., -1.5, -1., -1., -3., -1.5)
-# Measured B32 feedback enters the same outcome vector: work actually moved off
+# Measured NATIVE feedback enters the same outcome vector: work actually moved off
 # the critical robot for waiting/blocked parents, the candidate critical-robot
 # route cycle, and how many critical children changed hands.
 _VNEXT_FEEDBACK_OUTCOMES = 4
@@ -2808,7 +2808,7 @@ class ChildJointScorer:
 class BottleneckActionScorer:
     """Batch adapter for the existing actor, with one encoding per search state.
 
-    Current native completion/WAIT is observed input. No candidate B32 outcome
+    Current native completion/WAIT is observed input. No candidate NATIVE outcome
     is available here. Future geometric insertions are deterministic actions,
     not measured blocking. All scoring/training callers use these same rows.
     """
@@ -2826,7 +2826,7 @@ class BottleneckActionScorer:
                  for p in current.solution.patterns for b in self.space.children[p]}
         wait = [sum(op.duration for op in schedule.operations
                     if op.robot_id==r and op.kind.value=='WAIT') for r in range(4)]
-        feedback = dict(source='observed current NATIVE_PRIORITY schedule; no B32 search input',
+        feedback = dict(source='observed current NATIVE_PRIORITY schedule; no NATIVE search input',
             completion=list(schedule.robot_completion) if schedule.feasible else [0.]*4,
             robot_wait=wait if schedule.feasible else [0.]*4,blocked_pairs=[])
         graph = build_block_robot_graph((),(),self.config,base_graph=self.space.graph,
@@ -3030,7 +3030,7 @@ def imitation_joint_scores(space, embeddings, model, plans, *, graph_cache=None)
     """The original joint actor plus its existing directed insertion head."""
     if not isinstance(plans, dict) and any(plan.graph is not None for plan in plans):
         # Replay the exact per-step graph used to generate the action. Neither
-        # a static embedding nor a future candidate's B32 label enters replay.
+        # a static embedding nor a future candidate's NATIVE label enters replay.
         encoded, values = ({} if graph_cache is None else graph_cache), []
         for plan in plans:
             graph = plan.graph
@@ -3190,7 +3190,7 @@ def vnext_joint_actions(space, embeddings, model, state, blocks, nodes, pending,
     # Conflict repair keeps the checkpoint and feature semantics, but must not
     # freeze the original 1% processing band before a joint exchange completes.
     # Exact coverage and the formal mode/owner catalog still apply. Complete
-    # plans alone may be pruned against a measured feasible B32 Cmax bound.
+    # plans alone may be pruned against a measured feasible NATIVE Cmax bound.
     shortlist = (feedback_shortlist(space, indices, logits)
                  if conflict_core and assignment_indices is None else
                  shortlist_assignments(space,indices,logits,loadfirst_values=loadfirst_values)

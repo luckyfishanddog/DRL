@@ -851,7 +851,7 @@ def _numeric_follow(fixed, following, rf, rr, dx, dy, eps, spatial_skip=False, t
 def _priority_arrays(routes, travel, processing, points, parameters, fixed_directions=None, pair_status=None):
     """Same two-priority rule as WAG, plus four-robot initial/cross checks.
 
-    This is a native scorer: no dispatch tree, recovery, certification or B32.
+    This Numba scorer has no dispatch-tree recovery or certification.
     """
     speed, pre, post, dx, dy, eps = parameters
     directions = ([np.empty(0, np.int64) for _ in range(4)] if fixed_directions is None
@@ -952,14 +952,17 @@ def _priority_pair_directions(routes, left, travel, processing, points, paramete
 def _schedule_from_arrays(value, directions, operations, completion, ids, policy):
     from mrta_reference.model import Operation, OperationKind, ScheduleResult, ScheduleStatus
     vectors = tuple(tuple(int(d) for d in route) for route in directions)
-    if not math.isfinite(value):
-        return ScheduleResult(ScheduleStatus.DEADLOCK, directions=vectors,
-                              diagnostics=("native priority schedule blocked or initial order infeasible",),
-                              reference_policy_id=policy)
     kinds = (OperationKind.MOVE, OperationKind.SETUP, OperationKind.WELD, OperationKind.POST, OperationKind.WAIT)
     result = tuple(Operation(f"R{r}:NATIVE:{k}", r, kinds[int(op[8])], float(op[5]), float(op[6]),
                              (float(op[1]), float(op[2])), (float(op[3]), float(op[4])), k, ids[int(op[7])])
                    for r, route in enumerate(operations) for k, op in enumerate(route))
+    if not math.isfinite(value):
+        status = ScheduleStatus.NUMERIC_FAILURE if math.isnan(value) else ScheduleStatus.DEADLOCK
+        message = ("native priority schedule produced a nonfinite numeric result" if math.isnan(value)
+                   else "native fixed two-priority dispatch did not finish; this is not proof of physical infeasibility")
+        return ScheduleResult(status, result, robot_completion=tuple(float(x) for x in completion),
+                              directions=vectors, diagnostics=(message, "incomplete native timeline; no formal Cmax"),
+                              reference_policy_id=policy)
     return ScheduleResult(ScheduleStatus.FEASIBLE, result, float(value), tuple(float(x) for x in completion),
                           directions=vectors, reference_policy_id=policy)
 

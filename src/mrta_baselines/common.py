@@ -19,7 +19,7 @@ from mrta_reference.model import (
     ScientificConfig,
     SplitKind,
 )
-from mrta_reference.scheduler import FormalReferenceEvaluator
+from mrta_reference.scheduler import NativeReferenceEvaluator
 from mrta_reference.solution import official_metrics
 from mrta_reference.geometry import oriented_endpoints
 from mrta_reference.solution import block_map
@@ -63,8 +63,6 @@ class BaselineAccounting:
     certifier_calls: int = 0
     construction_rejected: int = 0
     direction_infeasible: int = 0
-    baseline_deadlock: int = 0
-    recovered: int = 0
     remaining_deadlock: int = 0
     infeasible: int = 0
     numeric_failure: int = 0
@@ -269,7 +267,7 @@ class CommonBaselineEvaluator:
         self.best_events: list[BaselineBestEvent] = []
         self.first_certified: float | None = None
         self.failure_diagnostics: list[str] = []
-        self.reference_evaluator = FormalReferenceEvaluator(scope)
+        self.reference_evaluator = NativeReferenceEvaluator(scope)
         self._evaluated_routes: dict[tuple, EvaluatedCandidate] = {}
 
     @property
@@ -409,10 +407,6 @@ class CommonBaselineEvaluator:
         self.accounting.reference_calls += int(native_schedule is None)
         self.accounting.x_pattern_reference_evaluated += int(has_x)
         self.accounting.y_pattern_reference_evaluated += int(has_y)
-        if schedule.baseline_deadlock:
-            self.accounting.baseline_deadlock += 1
-            if schedule.status is ScheduleStatus.FEASIBLE:
-                self.accounting.recovered += 1
         if schedule.status is ScheduleStatus.DEADLOCK:
             self.accounting.remaining_deadlock += 1
             return EvaluatedCandidate(

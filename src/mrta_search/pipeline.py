@@ -23,7 +23,7 @@ from mrta_reference.model import (
     SplitKind,
 )
 from mrta_reference.scheduler import (
-    FormalReferenceEvaluator,
+    NativeReferenceEvaluator,
     HardDeadlineReferenceEvaluator,
     ReferenceDeadlineExceeded,
     reference_schedule,
@@ -1772,7 +1772,7 @@ def run_bounded_sa_oi(
     ranker=None,
     budget_started_at: float | None = None,
 ) -> SearchResult:
-    """Run ALNS, optionally isolating all B32 calls behind one hard deadline."""
+    """Run ALNS, optionally isolating all NATIVE calls behind one hard deadline."""
     started = time.perf_counter() if budget_started_at is None else budget_started_at
     evaluator = resolve_reference_evaluator(scope, reference_evaluator)
     worker = None

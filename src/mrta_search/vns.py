@@ -1,4 +1,4 @@
-"""Small fixed-split VNS evaluated only by direction DP, B32 and certification."""
+"""Small fixed-split VNS evaluated only by direction DP, NATIVE and certification."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -97,7 +97,7 @@ def _route_repair_variants(
     seen = {tuple(tuple(route) for route in base)}
     candidates: list[list[list[str]]] = []
     # Same-rail spatial boundary shifts are the smallest assignment repair that
-    # addresses a common B32 deadlock without changing split patterns.  The exact
+    # addresses a common NATIVE deadlock without changing split patterns.  The exact
     # offset order and budget are identical for RULE and GNN.
     for left_robot, right_robot in ((0, 1), (2, 3)):
         combined = sorted(

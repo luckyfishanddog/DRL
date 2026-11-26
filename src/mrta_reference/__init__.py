@@ -46,8 +46,7 @@ from .model import (
     ACTIVE_FORMAL_SCOPE,
     RunScientificIdentity,
     DEVELOPMENT_NO_REPAIR_V1,
-    FORMAL_BOUNDED_DISPATCH_POLICY_V1,
-    FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
+    NATIVE_PRIORITY_POLICY_ID,
 )
 from .oracle import (
     TinyOracleResult,
@@ -80,9 +79,8 @@ from .scheduler import (
     reference_schedule_from_templates_optimized,
     reference_schedule_from_templates_slow,
     wait_for_cycles,
-    reference_schedule_formal,
-    reference_schedule_from_templates_formal,
-    FormalReferenceEvaluator,
+    native_schedule,
+    NativeReferenceEvaluator,
 )
 
 __all__ = [
@@ -92,10 +90,9 @@ __all__ = [
     "REPOSITORY_ID", "SOURCE_PROVENANCE_POLICY_V1", "SourceProvenance",
     "SourceProvenanceError", "canonicalize_repository_url",
     "compute_source_tree_hash", "resolve_source_provenance",
-    "DEVELOPMENT_NO_REPAIR_V1", "FORMAL_BOUNDED_DISPATCH_POLICY_V1",
-    "FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1",
-    "reference_schedule_formal", "reference_schedule_from_templates_formal",
-    "FormalReferenceEvaluator",
+    "DEVELOPMENT_NO_REPAIR_V1", "NATIVE_PRIORITY_POLICY_ID",
+    "native_schedule",
+    "NativeReferenceEvaluator",
     "CertificationReport",
     "CandidateKey",
     "CandidateMove",

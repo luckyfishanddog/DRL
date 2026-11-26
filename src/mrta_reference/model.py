@@ -13,8 +13,7 @@ from .scope import (
     FormalScope, FORMAL_SCOPE_V1, FORMAL_SCOPE_V1_1, ACTIVE_FORMAL_SCOPE,
     EXPERIMENTAL_X_SPLIT_SCOPE_V1, FORMAL_SCOPE_V2,
     RunScientificIdentity, DEVELOPMENT_NO_REPAIR_V1,
-    FORMAL_BOUNDED_DISPATCH_POLICY_V1,
-    FORMAL_LIMITED_DISCREPANCY_DISPATCH_POLICY_V1,
+    NATIVE_PRIORITY_POLICY_ID,
 )
 from .provenance import SourceProvenance
 
@@ -333,24 +332,23 @@ class ScheduleResult:
     reference_policy_id: str = "DEVELOPMENT_NO_REPAIR_V1"
     scope_id: str | None = None
     scope_hash: str | None = None
-    baseline_deadlock: bool = False
-    expanded_states: int = 0
-    state_budget: int = 0
-    recovery_exhausted: bool = False
-    frontier_exhausted: bool = False
-    recovery_rollouts: int = 0
-    rollout_budget: int = 0
-    max_discrepancies_used: int = 0
-    branch_points_considered: int = 0
     # Diagnostic evidence is deliberately outside canonical_json's scientific
-    # timeline. A failed recovery retains its historical baseline timeline,
-    # while these fields describe its last actual DEADLOCK continuation.
+    # timeline. They describe the selected dispatch's DEADLOCK evidence.
     deadlock_blockages: tuple[DeadlockBlockage, ...] = ()
     deadlock_evidence_source: str | None = None
 
     @property
     def feasible(self) -> bool:
         return self.status is ScheduleStatus.FEASIBLE
+
+    @property
+    def waiting_time(self) -> float:
+        return sum(op.duration for op in self.operations if op.kind is OperationKind.WAIT)
+
+    @property
+    def robot_waiting_time(self) -> tuple[float, float, float, float]:
+        return tuple(sum(op.duration for op in self.operations
+                         if op.robot_id == robot and op.kind is OperationKind.WAIT) for robot in range(4))
 
     def canonical_json(self) -> str:
         payload = {

@@ -33,13 +33,13 @@ configure_cpu()
 from mrta_reference.model import ParentWeld
 from mrta_search.saeax import BR_REPAIR_OPTIONS, SAEAXConfig, run_saeax
 
-RESULTS = ROOT/'results/saeax_validation.csv'
+RESULTS = ROOT/'results/native_priority/saeax_validation.csv'
 DATA = ROOT/'data/weld_layout'
 SEEDS = (20261110,20261111,20261112)
 SOURCE = '4R_SAEAX_ADJACENCY_V1'
 METHOD_SOURCES = dict(saeax=SOURCE,br='BR_SAEAX_BOTTLENECK_REINSERT_V1')
 FIELDS = ('stage','layout_id','parent_count','seed','status','cmax_s','native_cmax_s',
-    'runtime_s','generations','valid_children','native_calls','b32_calls','termination_reason',
+    'runtime_s','generations','valid_children','native_calls','coordination_calls','termination_reason',
     'max_processing_s','processing_r0_s','processing_r1_s','processing_r2_s','processing_r3_s',
     'move_s','wait_s','source','diagnostic')
 BASELINES = {
@@ -98,7 +98,7 @@ def experiment_job(job):
     row = dict(stage=stage,layout_id=name,parent_count=len(parents),seed=seed,status=result.status,
         cmax_s=result.cmax,native_cmax_s=result.native_cmax,runtime_s=result.runtime,
         generations=result.generations,valid_children=result.valid_children,native_calls=a['native_calls'],
-        b32_calls=a['b32_calls'],termination_reason=result.termination_reason,
+        coordination_calls=a['coordination_calls'],termination_reason=result.termination_reason,
         max_processing_s=max(loads) if loads else None,move_s=a.get('move_s'),wait_s=a.get('wait_s'),
         source=source,diagnostic=json.dumps(detail,ensure_ascii=False,allow_nan=False))
     if loads:
@@ -159,7 +159,7 @@ def baseline_rows(method):
     for row in read_rows(ROOT/'results/new_dataset_final'/filename):
         if (row['source'] != source or row['iterations'] != str(iterations)
             or row['status'] not in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE')
-            or row['b32_calls'] != '1'):
+            or row['coordination_calls'] != '1'):
             continue
         if method == 'HGA':
             diagnostic = json.loads(row['diagnostic'])

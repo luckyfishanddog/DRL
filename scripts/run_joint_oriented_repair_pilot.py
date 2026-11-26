@@ -19,7 +19,7 @@ from mrta_ranker import dataset
 from mrta_reference.geometry import oriented_endpoints, robot_is_eligible, build_legal_pattern_catalog
 from mrta_reference.model import OperationKind, ParentWeld, Route, ScheduleStatus, ScientificConfig, SplitKind
 from mrta_reference.scope import FORMAL_SCOPE_V2
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_reference.solution import block_map, canonicalize
 from mrta_search.direction import _initial_error
 from mrta_search.initialization import (
@@ -32,8 +32,8 @@ from mrta_search.lns import (
 )
 
 NAMES = ("g21_w035", "g15_w035", "g36_w086", "g33_w055", "g31_w055", "g45_w082")
-CSV_PATH = ROOT / "results/joint_oriented_repair_pilot.csv"
-REPORT_PATH = ROOT / "docs/JOINT_ORIENTED_REPAIR_PILOT.md"
+CSV_PATH = ROOT / "results/native_priority/joint_oriented_repair_pilot.csv"
+REPORT_PATH = ROOT / "docs/NATIVE_JOINT_ORIENTED_REPAIR_PILOT.md"
 METHODS = ("A0_RANDOM", "A1_RANDOM", "A1_LOAD", "A1_TRAVEL", "A1_WAIT_ANCHORED")
 
 
@@ -45,7 +45,7 @@ class DirectedSolution:
 
 
 def schedule_explicit(solution, directions, config, *, feasible_dispatch_observer=None):
-    """Basic input/output checks and exactly one call to the existing B32."""
+    """Basic input/output checks and exactly one call to the existing NATIVE."""
     blocks = block_map(solution, config, scope=FORMAL_SCOPE_V2)
     normalized = canonicalize(solution.parents, solution.patterns, solution.routes, config, scope=FORMAL_SCOPE_V2)
     if normalized.patterns != solution.patterns or normalized.routes != solution.routes:
@@ -61,7 +61,7 @@ def schedule_explicit(solution, directions, config, *, feasible_dispatch_observe
         if any(not robot_is_eligible(blocks[b], r, config) for b in route.block_ids):
             raise ValueError("robot eligibility mismatch")
     explicit = {r: tuple(directions[r]) for r in range(4)}
-    schedule = reference_schedule_formal(solution, config, scope=FORMAL_SCOPE_V2, orientations=explicit,
+    schedule = native_schedule(solution, config, scope=FORMAL_SCOPE_V2, orientations=explicit,
         **({'feasible_dispatch_observer':feasible_dispatch_observer} if feasible_dispatch_observer is not None else {}))
     if schedule.status is ScheduleStatus.FEASIBLE:
         welds = [op for op in schedule.operations if op.kind is OperationKind.WELD]
@@ -379,7 +379,7 @@ def conclusion_lines(rows, paired):
     coverage = {m: len({r['instance'] for r in rows if r['method'] == m and r['improved']}) for m in METHODS}
     lines = [
         f"1. 方向嵌入的质量机会：相同 RANDOM 移除输入，A0/A1 改善候选 {a0['improved']}/{a1['improved']}，"
-        f"组内唯一候选的 B32 成功数 {a0['schedule_success']}/{a1['schedule_success']}；"
+        f"组内唯一候选的 NATIVE 成功数 {a0['schedule_success']}/{a1['schedule_success']}；"
         f"运行时间 {a0['runtime_s']:.3f}/{a1['runtime_s']:.3f}s。"
         f"逐次配对共同成功 {pairs['both_success']} 次，A1 胜/平/A0 胜为 {pairs['a1_wins']}/{pairs['ties']}/{pairs['a0_wins']}；"
         f"仅 A1/仅 A0 成功 {pairs['only_a1_success']}/{pairs['only_a0_success']}。"
@@ -407,7 +407,7 @@ def conclusion_lines(rows, paired):
         generated = sum(r['unique_candidates'] for r in group)
         moved = sum(r['changed_assignment'] for r in group)
         best = min((r['best_cmax'] for r in group if r['best_cmax'] is not None), default=None)
-        lines.append(f"- {name}：A1 组内完整候选 {generated}，B32 成功 {success}，其中改变归属 {moved}；"
+        lines.append(f"- {name}：A1 组内完整候选 {generated}，NATIVE 成功 {success}，其中改变归属 {moved}；"
                      f"移除块中有其他合法机器人可选的累计次数 {sum(r['movable_blocks'] for r in group)}，"
                      f"来自当前最大完工路线的移除块累计 {sum(r['removed_from_critical_route'] for r in group)}；最佳 Cmax={best}。"
                      "这些计数不能把无改善解释为最优，或直接归因于完全缺乏合法动作。")
@@ -427,8 +427,8 @@ def save(rows, initial_logs, cases, examples, paired, smoke, args):
              "逐步插入后缓存更新受影响的最多四条弧。Regret 比较不同路线结构，方向不同而结构相同的方案仅保留较优者。"
              "有限预算按合法机器人/子块机器人组合分配，位置按 seed 打散；A1 每次局部配置评分计一次预算，故同预算下评估的结构数可能少于 A0。",
              "共同初解复用 REGION 归属/边界逻辑，但通过新可选 cost hook 和关闭旧路线工具绕过内部 DP；从空状态逐块定向追加，锁定合法首方向。"
-             "首个 B32 成功初解被所有组共享；失败才尝试其他首方向组合及现有 RULE/X 路线。",
-             "新实验无全路线方向 DP、方向 VNS、C2/C3/C4、独立 certifier、精确解或下界调用。每个组内唯一完整候选显式传入四个方向向量，仅调用一次原 B32。"
+             "首个 NATIVE 成功初解被所有组共享；失败才尝试其他首方向组合及现有 RULE/X 路线。",
+             "新实验无全路线方向 DP、方向 VNS、C2/C3/C4、独立 certifier、精确解或下界调用。每个组内唯一完整候选显式传入四个方向向量，仅调用一次原 NATIVE。"
              "只把 FEASIBLE 的 Cmax 用于比较；基本检查覆盖、资格、固定模式和焊接操作方向。DEADLOCK 不代表数学不可行。",
              "六例为历史已消耗开发几何。沿用 MLP_DEV/load_parents 白名单，未读取新封存测试几何。g15 的历史 ID_TEST 目录不表示当前封存角色。", "",
              "## 共同初解与尝试", ""]
@@ -441,8 +441,8 @@ def save(rows, initial_logs, cases, examples, paired, smoke, args):
             lines.append("  " + json.dumps(item["attempts"], ensure_ascii=False))
     lines += ["", "## 全部分组结果", "",
               "唯一候选按路线和方向共同去重。最佳值为成功候选中的最小值，可劣于初解；失败留空。仅严格改善候选作为专家保留。"
-              "时间包含修复、检查和 B32，选区生成时间另列于初解日志；组间候选可能重合。", "",
-              "|实例|方法|q|初始 Cmax|尝试|唯一候选|B32 成功|改善|最佳 Cmax|改善%|秒|",
+              "时间包含修复、检查和 NATIVE，选区生成时间另列于初解日志；组间候选可能重合。", "",
+              "|实例|方法|q|初始 Cmax|尝试|唯一候选|NATIVE 成功|改善|最佳 Cmax|改善%|秒|",
               "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for r in rows:
         fmt = lambda x: "—" if x is None else f"{x:.3f}"
@@ -459,7 +459,7 @@ def save(rows, initial_logs, cases, examples, paired, smoke, args):
         fields = ("attempts", "unique_candidates", "schedule_success", "improved", "restored_original", "changed_assignment",
                   "changed_direction", "reordered", "joint_expert_candidates", "direction_order_only_improved", "movable_blocks", "removed_from_critical_route")
         lines.append(f"- {method}：" + json.dumps({k: sum(r[k] for r in group) for k in fields}, ensure_ascii=False)
-                     + "；B32=" + str(dict(sum((Counter(json.loads(r['statuses'])) for r in group), Counter())))
+                     + "；NATIVE=" + str(dict(sum((Counter(json.loads(r['statuses'])) for r in group), Counter())))
                      + "；修复拒绝=" + str(dict(sum((Counter(json.loads(r['repair_failures'])) for r in group), Counter()))))
     lines += ["", "## 典型成功/失败与可重放动作", ""]
     labels = ('联合轨迹', '仅方向和顺序改善', 'g33_w055:A1_LOAD', 'g33_w055:A1_RANDOM',
@@ -498,7 +498,7 @@ def save(rows, initial_logs, cases, examples, paired, smoke, args):
 
 def followup_row(experiment, name, method, selection="", q=0):
     return dict(experiment=experiment, instance=name, method=method, selection=selection, q=q,
-                initial_cmax=None, attempts=0, unique_candidates=0, b32_calls=0, b32_success=0,
+                initial_cmax=None, attempts=0, unique_candidates=0, coordination_calls=0, coordination_success=0,
                 improved=0, best_cmax=None, improvement_pct=None, runtime_s=0.0,
                 construction_rejections=0, deadlock=0, infeasible=0, restored_structure=0,
                 changed_assignment=0, reordered=0, changed_direction=0, joint_improved=0,
@@ -518,27 +518,27 @@ def save_followup(rows, paired, examples, unique_new, args):
              f"seed={args.seed}；q={args.q}；attempts={args.attempts}；insertion_limit={args.insertion_limit}；repair_budget={args.repair_budget}。",
              "沿用 FORMAL_SCOPE_V2 与当前 0.0108/0.20m/s、20/30s、0.50m 窗口、0.20m 最短子段。仅使用六个已消耗 DEV 白名单几何。",
              "初解 GREEDY 是旧逐步追加定向流程，BEAM 固定 REGION/RULE 的归属参考，逐块联合选择位置与局部方向；宽度最多 4，优先不同路线结构，单结构最多两个方向。"
-             "BEAM 每种策略最多四次完整 B32，全部评价后取成功者最低 Cmax，REGION 全失败才尝试 RULE。GREEDY 按原实现运行，调用数如实单列。",
+             "BEAM 每种策略最多四次完整 NATIVE，全部评价后取成功者最低 Cmax，REGION 全失败才尝试 RULE。GREEDY 按原实现运行，调用数如实单列。",
              "修复 OLD 使用旧最大加工负载/局部空走评分、单方向状态；NEW 使用 max(P+M)、sum(P+M) 及同结构最多两个方向状态，Regret 次优仍取不同结构。"
              "两方向状态共享 4096 预算，不增加插入总评分次数；最终只选择一个完整候选调度。所有 OLD/NEW 共享同一新初解、逐次相同移除集合和 seed。",
-             "修复每次尝试最多一次 B32，成功构造的重复候选也按一次评价，避免因去重改变 OLD/NEW 实际调用预算；唯一候选数另列。"
+             "修复每次尝试最多一次 NATIVE，成功构造的重复候选也按一次评价，避免因去重改变 OLD/NEW 实际调用预算；唯一候选数另列。"
              "只比较 FEASIBLE 的真实 Cmax；DEADLOCK 是有限调度失败。未调用独立 DP/refinement、C2/C3/C4 或独立 certifier。"
              "空路线也显式传入空方向；固定模式、覆盖、合法机器人及最终 WELD 操作继续使用必要程序检查。",
              "WAIT 仅在 g36/g45 的新初解确有 WAIT 时做 q8、两次固定 seed 的诊断，不参与三种主选区的总量排名。", "",
              "## A：共同几何上的初解对比", "",
-             "|实例|构造|B32 调用|成功|DEADLOCK|最终初解 Cmax|秒|",
+             "|实例|构造|NATIVE 调用|成功|DEADLOCK|最终初解 Cmax|秒|",
              "|---|---|---:|---:|---:|---:|---:|"]
     for r in rows:
         if r['experiment'] == 'A':
-            lines.append(f"|{r['instance']}|{r['method']}|{r['b32_calls']}|{r['b32_success']}|{r['deadlock']}|{fmt(r['best_cmax'])}|{r['runtime_s']:.3f}|")
+            lines.append(f"|{r['instance']}|{r['method']}|{r['coordination_calls']}|{r['coordination_success']}|{r['deadlock']}|{fmt(r['best_cmax'])}|{r['runtime_s']:.3f}|")
     lines += ["", "## B：同一新初解与移除集合的修复对比", "",
               "改进数按尝试计；唯一数按路线与方向共同去重。最佳为成功候选最小 Cmax，可劣于初解。初解失败或无 WAIT 时不适用。", "",
-              "|实例|方法|q|初始 Cmax|尝试|唯一|B32 调用/成功|改善|最佳 Cmax|改善%|秒|",
+              "|实例|方法|q|初始 Cmax|尝试|唯一|NATIVE 调用/成功|改善|最佳 Cmax|改善%|秒|",
               "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for r in rows:
         if r['experiment'] == 'B':
             lines.append(f"|{r['instance']}|{r['method']}|{r['q']}|{fmt(r['initial_cmax'])}|{r['attempts']}|{r['unique_candidates']}|"
-                         f"{r['b32_calls']}/{r['b32_success']}|{r['improved']}|{fmt(r['best_cmax'])}|{fmt(r['improvement_pct'])}|{r['runtime_s']:.3f}|")
+                         f"{r['coordination_calls']}/{r['coordination_success']}|{r['improved']}|{fmt(r['best_cmax'])}|{fmt(r['improvement_pct'])}|{r['runtime_s']:.3f}|")
     lines += ["", "## 配对与判断", ""]
     old_init = {r['instance']: r for r in rows if r['method'] == 'GREEDY_INIT'}
     beam_init = {r['instance']: r for r in rows if r['method'] == 'BEAM_INIT'}
@@ -551,13 +551,13 @@ def save_followup(rows, paired, examples, unique_new, args):
             ties += abs(delta) <= 1e-6
             losses += delta > 1e-6
     lines.append(f"初解 BEAM 对 GREEDY 的 Cmax 胜/平/负={wins}/{ties}/{losses}；"
-                 f"B32 调用 {sum(r['b32_calls'] for r in beam_init.values())}/{sum(r['b32_calls'] for r in old_init.values())}；"
+                 f"NATIVE 调用 {sum(r['coordination_calls'] for r in beam_init.values())}/{sum(r['coordination_calls'] for r in old_init.values())}；"
                  f"总耗时 {sum(r['runtime_s'] for r in beam_init.values()):.3f}/{sum(r['runtime_s'] for r in old_init.values()):.3f}s。"
                  "这是初解构造比较，不用于归因修复评分效果。")
     totals = {}
     for label in ('OLD', 'NEW'):
         selected = [r for r in rows if r['experiment']=='B' and r['method'].startswith(label) and r['selection']!='WAIT_ANCHORED']
-        totals[label] = {k: sum(r[k] for r in selected) for k in ('attempts','unique_candidates','b32_calls','b32_success','improved','runtime_s','joint_improved','retained_two_directions')}
+        totals[label] = {k: sum(r[k] for r in selected) for k in ('attempts','unique_candidates','coordination_calls','coordination_success','improved','runtime_s','joint_improved','retained_two_directions')}
         lines.append(f"{label} 主实验合计：" + json.dumps(totals[label], ensure_ascii=False) + "。")
     p = {k: sum(item[k] for item in paired if item['selection']!='WAIT_ANCHORED')
          for k in ('both_success','new_wins','ties','old_wins','only_new_success','only_old_success')}
@@ -585,7 +585,7 @@ def save_followup(rows, paired, examples, unique_new, args):
         "成功率和改善候选数量的提升，不意味着每例最佳 Cmax 都更好，不将 NEW 直接替换为唯一教师。",
         "主要剩余问题是连续时空协调与局部代理/小宽度剪枝偏差。合法完整候选已经能产生归属、顺序、方向联合变化；"
         "max(P+M) 仍不含真实 WAIT，beam 也可能过早丢弃较好的路线。不能把这些负结果解释为数学不可改善或证明动作空间完整。",
-        "下一步可以开始小规模 GNN 部分解补全训练验证，复用当前显式动作和 B32 接口；"
+        "下一步可以开始小规模 GNN 部分解补全训练验证，复用当前显式动作和 NATIVE 接口；"
         "使用既有 TRAIN 池采集去重轨迹，保留 OLD/NEW 教师中的有效补全，并继续用本轮 DEV 验证。"
         "现有 DEV 轨迹足以调试学习接口，不足以单独组成正式泛化训练证据；不再追加一轮启发式堆叠。", "",
     ]
@@ -621,16 +621,16 @@ def run_followup(args):
             r = followup_row('A', name, label)
             r.update(seed=args.seed, insertion_limit=args.insertion_limit, repair_budget=args.repair_budget,
                      runtime_s=time.perf_counter()-started, attempts=len(attempts),
-                     b32_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts),
-                     b32_success=sum(a['status']=='FEASIBLE' for a in attempts),
+                     coordination_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts),
+                     coordination_success=sum(a['status']=='FEASIBLE' for a in attempts),
                      deadlock=sum(a['status']=='DEADLOCK' for a in attempts),
                      construction_rejections=sum(a['status']=='CONSTRUCTION_FAILED' for a in attempts),
                      best_cmax=None if initial is None else initial.schedule.cmax,
                      status='INITIALIZATION_FAILED' if initial is None else 'FEASIBLE')
             rows.append(r)
-            r['unique_candidates'] = r['b32_calls']
+            r['unique_candidates'] = r['coordination_calls']
             initials[label] = initial
-            print('FOLLOWUP INITIAL', name, label, r['best_cmax'], 'calls',r['b32_calls'], 'success',r['b32_success'],
+            print('FOLLOWUP INITIAL', name, label, r['best_cmax'], 'calls',r['coordination_calls'], 'success',r['coordination_success'],
                   'time',round(r['runtime_s'],3),flush=True)
         initial = initials['BEAM_INIT']
         best_for_instance = None
@@ -660,7 +660,7 @@ def run_followup(args):
                     r = followup_row('B', name, f'{label}_{selection.value}', selection.value, q)
                     statuses = json.loads(raw['statuses'])
                     r.update(initial_cmax=raw['initial_cmax'], attempts=raw['attempts'], unique_candidates=raw['unique_candidates'],
-                             b32_calls=sum(statuses.values()), b32_success=raw['schedule_success'], improved=raw['improved'],
+                             coordination_calls=sum(statuses.values()), coordination_success=raw['schedule_success'], improved=raw['improved'],
                              best_cmax=raw['best_cmax'], improvement_pct=raw['improvement_pct'], runtime_s=raw['runtime_s'],
                              construction_rejections=sum(json.loads(raw['repair_failures']).values()),
                              deadlock=statuses.get('DEADLOCK',0), infeasible=statuses.get('INFEASIBLE',0),

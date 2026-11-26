@@ -101,7 +101,7 @@ def experiment_job(stage, name, parents, seed):
         row = dict(stage=stage, layout_id=name, parent_count=len(parents), seed=seed,
             status=result.status, cmax_s=result.cmax, native_cmax_s=result.native_cmax,
             runtime_s=result.runtime, generations='', valid_children=a['crf_native_calls'],
-            native_calls=a['native_calls'], b32_calls=a['b32_calls'],
+            native_calls=a['native_calls'], coordination_calls=a['coordination_calls'],
             termination_reason=result.termination_reason, max_processing_s=max(loads) if loads else None,
             move_s=a.get('move_s'), wait_s=a.get('wait_s'), source=SOURCE,
             diagnostic=json.dumps(detail, ensure_ascii=False, allow_nan=False))

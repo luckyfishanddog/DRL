@@ -21,8 +21,8 @@ from mrta_search.gnn_constructor import (
     construct_or_repair_with_gnn,fixed_split_patterns,joint_geometry,
 )
 
-CSV=ROOT/'results/gnn_multi_initial.csv'
-REPORT=ROOT/'docs/GNN_MULTI_INITIAL.md'
+CSV=ROOT/'results/native_priority/gnn_multi_initial.csv'
+REPORT=ROOT/'docs/NATIVE_GNN_MULTI_INITIAL.md'
 from dataclasses import replace as _replace_config
 CONFIG=_replace_config(shared.CONFIG,min_child_length=0.20)
 CONFIG_05=ScientificConfig()
@@ -76,16 +76,16 @@ def neural_multi4(parents,model,label,phase,instance,seed,*,config=CONFIG):
         outcomes.append(scheduled)
         if index==0:
             greedy_row=dict(phase=phase,instance=instance,method=label+'-Greedy',status=status,best_cmax=cmax,
-                            b32_calls=calls,runtime_s=time.perf_counter()-started,unique_routes=len(scheduled_by_routes))
+                            coordination_calls=calls,runtime_s=time.perf_counter()-started,unique_routes=len(scheduled_by_routes))
             if config is CONFIG_05 and cmax is not None:
                 greedy_row.update(_minchild_metrics(scheduled.solution,scheduled.schedule,config))
         print('CANDIDATE',phase,instance,label,index+1,mode,'seed',path_seed,status,'Cmax',cmax,
-              'B32',called,'duplicate',duplicate,'actions',len(result.actions),
+              'NATIVE',called,'duplicate',duplicate,'actions',len(result.actions),
               'failure',result.rejection_reason,flush=True)
     feasible=[s for s in outcomes if s is not None and s.schedule.status is ScheduleStatus.FEASIBLE]
     best=min(feasible,key=lambda s:s.schedule.cmax) if feasible else None
     multi_row=dict(phase=phase,instance=instance,method=label+'-Multi4',status='FEASIBLE' if best else 'FAILED',
-                   best_cmax=None if best is None else best.schedule.cmax,b32_calls=calls,
+                   best_cmax=None if best is None else best.schedule.cmax,coordination_calls=calls,
                    runtime_s=time.perf_counter()-started,unique_routes=len(scheduled_by_routes))
     if config is CONFIG_05 and best is not None:
         multi_row.update(_minchild_metrics(best.solution,best.schedule,config))
@@ -96,32 +96,32 @@ def neural_multi4(parents,model,label,phase,instance,seed,*,config=CONFIG):
 
 def save_results(rows,seed):
     with CSV.open('w',encoding='utf-8-sig',newline='') as f:
-        writer=csv.DictWriter(f,fieldnames=('phase','instance','method','status','best_cmax','b32_calls','runtime_s','unique_routes'))
+        writer=csv.DictWriter(f,fieldnames=('phase','instance','method','status','best_cmax','coordination_calls','runtime_s','unique_routes'))
         writer.writeheader();writer.writerows(rows)
     def fmt(v):return '—' if v is None else f'{v:.3f}'
     dev=[r for r in rows if r['phase']=='DEV']
     lines=['# GNN 四候选联合初解实验','',
            f'冻结原V2与Shared checkpoint，model.eval() + torch.inference_mode()；无训练或归一化更新。seed={seed}，候选1为原greedy，候选2—4采样种子为{seed+1}/{seed+2}/{seed+3}；父选择与联合插入均直接使用softmax(logits)，温度固定1，insertion_limit=8。',
-           '全部神经候选从纯几何、固定合法模式和四条空路线开始；保持原子子块插入及同一步邻块方向翻转。每个完成且不同的路线+方向只调用一次现有B32；重复候选复用结果，四次解码之后不再补采。Greedy行直接复用Multi4的第一个候选，并非另外再运行一条。','',
+           '全部神经候选从纯几何、固定合法模式和四条空路线开始；保持原子子块插入及同一步邻块方向翻转。每个完成且不同的路线+方向只调用一次现有NATIVE；重复候选复用结果，四次解码之后不再补采。Greedy行直接复用Multi4的第一个候选，并非另外再运行一条。','',
            '## TRAIN 正确性运行','',
-           '从已有TRAIN构造数据按N选择15/53/90三个规模，仍通过原MLP_TRAIN白名单加载PPO原几何。所有完成候选检查父焊缝覆盖、子块原子性及方向长度，随后实际调用B32。不同路线数同时考虑显式方向。','',
-           '|TRAIN几何|方法|可调度|最佳Cmax/s|B32调用|构造+B32秒|不同完整路线/方向|',
+           '从已有TRAIN构造数据按N选择15/53/90三个规模，仍通过原MLP_TRAIN白名单加载PPO原几何。所有完成候选检查父焊缝覆盖、子块原子性及方向长度，随后实际调用NATIVE。不同路线数同时考虑显式方向。','',
+           '|TRAIN几何|方法|可调度|最佳Cmax/s|NATIVE调用|构造+NATIVE秒|不同完整路线/方向|',
            '|---|---|---|---:|---:|---:|---:|']
     for row in rows:
         if row['phase']=='TRAIN':
-            lines.append(f"|{row['instance']}|{row['method']}|{row['status']}|{fmt(row['best_cmax'])}|{row['b32_calls']}|{row['runtime_s']:.3f}|{row['unique_routes']}|")
+            lines.append(f"|{row['instance']}|{row['method']}|{row['status']}|{fmt(row['best_cmax'])}|{row['coordination_calls']}|{row['runtime_s']:.3f}|{row['unique_routes']}|")
     lines+=['','## 六 DEV 结果','',
-            '模型统一预加载，Excel读取不计时；计时包含几何模式/图、四次神经构造和实际B32。Beam保留现有实现，其4或8次B32预算如实列出。Beam在神经候选完成后独立运行，归属、路线与方向均未提供给GNN。不同预算不能称为严格等成本比较。','',
-            '|方法|至少一条可调度/实例数|B32调用合计|构造+B32合计秒|','|---|---:|---:|---:|']
+            '模型统一预加载，Excel读取不计时；计时包含几何模式/图、四次神经构造和实际NATIVE。Beam保留现有实现，其4或8次NATIVE预算如实列出。Beam在神经候选完成后独立运行，归属、路线与方向均未提供给GNN。不同预算不能称为严格等成本比较。','',
+            '|方法|至少一条可调度/实例数|NATIVE调用合计|构造+NATIVE合计秒|','|---|---:|---:|---:|']
     for method in ('Beam-Init','GNN-V2-Greedy','GNN-V2-Multi4','GNN-Shared-Greedy','GNN-Shared-Multi4'):
         group=[r for r in dev if r['method']==method]
         if group:
-            lines.append(f"|{method}|{sum(r['status']=='FEASIBLE' for r in group)}/{len(group)}|{sum(r['b32_calls'] for r in group)}|{sum(r['runtime_s'] for r in group):.3f}|")
-    lines+=['','|实例|方法|结果|最佳真实Cmax/s|B32调用|构造+B32秒|不同完整路线/方向|','|---|---|---|---:|---:|---:|---:|']
+            lines.append(f"|{method}|{sum(r['status']=='FEASIBLE' for r in group)}/{len(group)}|{sum(r['coordination_calls'] for r in group)}|{sum(r['runtime_s'] for r in group):.3f}|")
+    lines+=['','|实例|方法|结果|最佳真实Cmax/s|NATIVE调用|构造+NATIVE秒|不同完整路线/方向|','|---|---|---|---:|---:|---:|---:|']
     for row in dev:
         unique='—' if row['unique_routes'] is None else str(row['unique_routes'])
-        lines.append(f"|{row['instance']}|{row['method']}|{row['status']}|{fmt(row['best_cmax'])}|{row['b32_calls']}|{row['runtime_s']:.3f}|{unique}|")
-    lines+=['','DEADLOCK只表示现有B32在该完整方案与方向下未找到调度，不是数学不可行证明。失败无虚构Cmax，无Beam或Regret修复/回退。','']
+        lines.append(f"|{row['instance']}|{row['method']}|{row['status']}|{fmt(row['best_cmax'])}|{row['coordination_calls']}|{row['runtime_s']:.3f}|{unique}|")
+    lines+=['','DEADLOCK只表示现有NATIVE在该完整方案与方向下未找到调度，不是数学不可行证明。失败无虚构Cmax，无Beam或Regret修复/回退。','']
     if len(dev)==30:
         lookup={(r['instance'],r['method']):r for r in dev}
         lines+=['## 判断','']
@@ -148,7 +148,6 @@ def main():
                                                'pair-extension','pair-summary','pair-audit','diversity-diagnostic',
                                                'diversity-online','diversity-summary','diversity-audit',
                                                'sparse-online','sparse-summary','sparse-audit','sparse-constructor-diagnostic',
-                                               'sparse-recovery-budget','recovery-stratified','recovery-summary',
                                                'bound-shadow','bound-online','bound-summary','fresh-e2e','fresh-summary','summary','minchild05'))
     parser.add_argument('--workers',type=int,default=4)
     parser.add_argument('--seconds',type=float,default=30.)
@@ -197,9 +196,9 @@ def main():
             raise ValueError('Beam and GNN fixed patterns differ')
         rows.append(dict(phase='DEV',instance=name,method='Beam-Init',status='FEASIBLE' if beam else 'FAILED',
                     best_cmax=None if beam is None else beam.schedule.cmax,
-                    b32_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts),
+                    coordination_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts),
                     runtime_s=elapsed,unique_routes=None))
-        print('BEAM',name,rows[-1]['best_cmax'],'B32',rows[-1]['b32_calls'],'seconds',elapsed,flush=True)
+        print('BEAM',name,rows[-1]['best_cmax'],'NATIVE',rows[-1]['coordination_calls'],'seconds',elapsed,flush=True)
         save_results(rows,args.seed)
     for label,model in models.items():
         if not all(torch.equal(value,model.state_dict()[key]) for key,value in saved_states[label].items()):
@@ -242,10 +241,10 @@ def pattern_repair_diagnostic(initial,model,config):
             result=construct_or_repair_with_gnn(geometry,routes,directions,(pid,),model,config,
                                               insertion_limit=8)
             trial=dict(parent=pid,pattern=option.pattern_id,changed=option!=old[pid],
-                       status='CONSTRUCTION_FAILED',cmax=None,b32_calls=0,certified=False)
+                       status='CONSTRUCTION_FAILED',cmax=None,coordination_calls=0,certified=False)
             if result.solution is not None:
                 candidate=shared.pilot.oriented.schedule_explicit(result.solution,result.directions,config)
-                trial.update(status=candidate.schedule.status.value,b32_calls=1)
+                trial.update(status=candidate.schedule.status.value,coordination_calls=1)
                 if candidate.schedule.status is ScheduleStatus.FEASIBLE:
                     certificate=certify_schedule(result.solution,candidate.schedule,config,scope=FORMAL_SCOPE_V2)
                     if not certificate.certified:
@@ -257,7 +256,7 @@ def pattern_repair_diagnostic(initial,model,config):
     def summary(changed):
         group=[r for r in trials if r['changed']==changed]
         feasible=[r for r in group if r['cmax'] is not None]
-        return dict(attempts=len(group),b32_calls=sum(r['b32_calls'] for r in group),
+        return dict(attempts=len(group),coordination_calls=sum(r['coordination_calls'] for r in group),
                     feasible=len(feasible),improved=sum(r['cmax']<initial.schedule.cmax-1e-7 for r in feasible),
                     best=min(feasible,key=lambda r:r['cmax']) if feasible else None)
     return dict(initial_cmax=initial.schedule.cmax,best_cmax=best.schedule.cmax,
@@ -284,7 +283,7 @@ def run_diagnostic(args):
         if not certificate.certified:
             raise ValueError(certificate.errors)
         init_info=dict(initial_runtime_s=time.perf_counter()-started,
-                       initial_b32_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts))
+                       initial_coordination_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts))
         if args.diagnostic=='split':
             row,_=pattern_repair_diagnostic(initial,model,CONFIG)
             print('SPLIT_DIAGNOSTIC',json.dumps(dict(instance=name,seed=args.seed,**init_info,**row)),flush=True)
@@ -320,7 +319,7 @@ def run_diagnostic(args):
             pilot.oriented.schedule_explicit=original
 
 
-STUDY_PATH=ROOT/'results/parent_mode_reconstruction_20261030.jsonl.gz'
+STUDY_PATH=ROOT/'results/native_priority/parent_mode_reconstruction_20261030.jsonl.gz'
 STUDY_VERSION='parent-mode-v4-outer'
 STUDY_ARMS=('FIXED_NEW','MODE_NEW','FIXED_GNN','MODE_GNN','ADAPT_NEW')
 
@@ -406,7 +405,7 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
             alternatives=rank_parent_mode_changes(current.solution,partial,config)
             if alternatives:
                 # One actual proposal per iteration, with gradual access to
-                # lower-ranked legal alternatives. No hidden B32 screening.
+                # lower-ranked legal alternatives. No hidden NATIVE screening.
                 target=alternatives[(iteration//6)%len(alternatives)]
                 partial=replace(partial,patterns=tuple(target if p.parent_id==target.parent_id else p
                                                       for p in partial.patterns))
@@ -445,9 +444,8 @@ def _mode_search(parents,method,seed,budget,max_iterations, *, config=CONFIG, ce
                 candidate=pilot.oriented.schedule_explicit(solution,result.directions,config)
                 row['reference_calls']+=1
                 item['status']=candidate.schedule.status.value
-                item.update(recovery_rollouts=candidate.schedule.recovery_rollouts,
-                            recovery_exhausted=candidate.schedule.recovery_exhausted,
-                            frontier_exhausted=candidate.schedule.frontier_exhausted)
+                item.update(native_waiting_s=candidate.schedule.waiting_time,
+                            robot_completion=candidate.schedule.robot_completion)
                 if candidate.schedule.status is ScheduleStatus.FEASIBLE:
                     if certify:
                         check=certify_schedule(solution,candidate.schedule,config,scope=FORMAL_SCOPE_V2)
@@ -693,15 +691,6 @@ def run_mode_study(args):
     if args.mode_study=='sparse-constructor-diagnostic':
         diagnose_sparse_constructor()
         return
-    if args.mode_study=='sparse-recovery-budget':
-        diagnose_sparse_recovery_budget()
-        return
-    if args.mode_study=='recovery-stratified':
-        run_stratified_recovery(args)
-        return
-    if args.mode_study=='recovery-summary':
-        summarize_stratified_recovery()
-        return
     if args.mode_study=='bound-shadow':
         audit_route_bound_shadow()
         return
@@ -764,7 +753,7 @@ def run_mode_study(args):
     if not entries:
         _study_append(dict(record='plan',version=STUDY_VERSION,stage=stage,methods=methods,seeds=seeds,
                            seconds=budget,max_iterations=iterations,workers=args.workers,
-                           selection='RANDOM/TRAVEL/LOAD; q4/q8 every 3 iterations; one proposal and at most one B32 per iteration',
+                           selection='RANDOM/TRAVEL/LOAD; q4/q8 every 3 iterations; one proposal and at most one NATIVE per iteration',
                            mode_selection='MODE: every 2 iterations; ADAPT_NEW: period 2, double after 4 unsuccessful mode attempts up to 8, reset after improvement; same workload ranking and index=(iteration//6)%count',
                            cut_policy='configured boundaries + center + legal midpoint; default Y=5.5/6/6.5, X=center +/-0.5; no extra +/-0.2 cuts',
                            data_selection='PPO_VALIDATION: one sheet per existing V2 validation workbook; four targets each 85/55/35; nearest N then alternate high/low (mandatory-Y + whole-both)/N; no solver outcomes',
@@ -865,8 +854,8 @@ def _matched_worker(source, family='LEGACY', version='matched-state-v1'):
                             row['reference_calls']=1
                             candidate=pilot.oriented.schedule_explicit(candidate_solution,result.directions,CONFIG)
                             row.update(status=candidate.schedule.status.value,
-                                recovery_rollouts=candidate.schedule.recovery_rollouts,
-                                frontier_exhausted=candidate.schedule.frontier_exhausted,
+                                native_waiting_s=candidate.schedule.waiting_time,
+                                robot_completion=candidate.schedule.robot_completion,
                                 patterns=[asdict(p) for p in candidate_solution.patterns],
                                 routes=[r.block_ids for r in candidate_solution.routes],directions=result.directions)
                             if candidate.schedule.status is ScheduleStatus.FEASIBLE:
@@ -943,8 +932,8 @@ def _evaluate_mode_bundle(current,partial,changed,repairer,seed,model,*,deadline
                     return (row,None) if return_candidate else row
             row['reference_calls']=1
             candidate=shared.pilot.oriented.schedule_explicit(solution,result.directions,CONFIG)
-            row.update(status=candidate.schedule.status.value,recovery_rollouts=candidate.schedule.recovery_rollouts,
-                frontier_exhausted=candidate.schedule.frontier_exhausted,patterns=[asdict(p) for p in solution.patterns],
+            row.update(status=candidate.schedule.status.value,native_waiting_s=candidate.schedule.waiting_time,
+                robot_completion=candidate.schedule.robot_completion,patterns=[asdict(p) for p in solution.patterns],
                 routes=[r.block_ids for r in solution.routes],directions=result.directions)
             if candidate.schedule.status is ScheduleStatus.FEASIBLE:
                 check=certify_schedule(solution,candidate.schedule,CONFIG,scope=FORMAL_SCOPE_V2)
@@ -1037,7 +1026,7 @@ def run_pair_study(args):
                        'reuse exact control matches; these extra calls are diagnostic only and excluded from policy results',
             repairers=['NEW','GNN'],q=[4,8],selectors=['RANDOM','TRAVEL','LOAD'],seed='20261031+selector_index+q',
             statistics='report cohorts separately; pooled resampling grouped by workbook, not 21 independent geometries',
-            cost='same B32 allowance per policy; pair proposal and repair overhead separately recorded, no equal-wall-time claim'))
+            cost='same NATIVE allowance per policy; pair proposal and repair overhead separately recorded, no equal-wall-time claim'))
     if cohort=='BASE12':
         sources={r['instance']:r for r in rows if r.get('record')=='run' and r.get('version')==STUDY_VERSION
             and r.get('stage')=='PPO_VALIDATION' and r.get('method')=='FIXED_NEW' and r.get('seed')==20261031}
@@ -1200,7 +1189,7 @@ def audit_pair_study():
                         raise ValueError('pair/component replay Cmax or certification differs')
                     certified=True;replay_certified+=1
                 replayed.append(dict(name=name,status=trial['status'],cmax=trial['cmax'],certified=certified,
-                    recovery_rollouts=scheduled.schedule.recovery_rollouts,
+                    native_waiting_s=scheduled.schedule.waiting_time,
                     features=describe(solution,trial['directions'],trial['cmax'])))
             modes=[dict(parent_id=p['parent_id'],before=old[p['parent_id']],after=p) for p in pair['changed_modes']]
             examples.append(dict(cohort=run['cohort'],instance=run['instance'],q=context['q'],seed=context['seed'],
@@ -1364,11 +1353,11 @@ def run_diversity_study(args):
                 seeds=DIVERSITY_SEEDS,budget_seconds=20,repairers=['NEW','GNN'],policies=DIVERSITY_POLICIES,
                 start='same saved FIXED_NEW incumbent for each instance; 20s local continuation, not end-to-end initialization',
                 rounds='RANDOM/TRAVEL/LOAD, q4 then q8 every three rounds; origin fixed within round, accept certified improvement immediately',
-                timeout='no B32 if construction ends after deadline; certify complete feasible calls, exclude late improvements',
+                timeout='no NATIVE if construction ends after deadline; certify complete feasible calls, exclude late improvements',
                 order='cyclic policy order balanced across instance and seed; shuffled groups, four single-thread workers',
                 preparation='source replay and frozen model loading outside local timer, reported separately'),
             inference='development states only; matched analysis clustered by workbook, online average seeds per workbook; '
-                      'no independent generalization or 3D collision claim; no B32 or split catalog changes'))
+                      'no independent generalization or 3D collision claim; no NATIVE or split catalog changes'))
     for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS'):os.environ[key]='1'
     if args.mode_study=='diversity-diagnostic':
         prior=[r for r in rows if r.get('record')=='pair_run' and r.get('version')=='parent-pair-v1']
@@ -1683,7 +1672,7 @@ def run_sparse_study(args):
             pair='fresh partial from current incumbent after normal round; attempt index j chooses RANDOM/TRAVEL/LOAD[j%3], '
                  'q=(4,8)[j%2], seed=run_seed+100000+j; top1 original load-ranked pair; no new cut points; '
                  'no available pair still consumes request and resets counters',
-            timing='all proposal/repair/B32/certification within 30s; source replay/model preload outside local timer; '
+            timing='all proposal/repair/NATIVE/certification within 30s; source replay/model preload outside local timer; '
                    'complete noninterruptible calls, exclude late improvements; model unchanged',
             design='12 workbooks x 2 new seeds x 2 repairers x 3 policies = 144 fresh runs; '
                    'policy order cyclically balanced, groups shuffled, single-thread workers',
@@ -1934,8 +1923,8 @@ def diagnose_sparse_constructor():
                     solution=asdict(result.solution),directions=result.directions,
                     scheduler_diagnostics=candidate.schedule.diagnostics,
                     wait_for_graph=candidate.schedule.wait_for_graph,
-                    recovery_rollouts=candidate.schedule.recovery_rollouts,
-                    frontier_exhausted=candidate.schedule.frontier_exhausted)
+                    native_waiting_s=candidate.schedule.waiting_time,
+                    robot_completion=candidate.schedule.robot_completion)
                 if candidate.schedule.status is ScheduleStatus.FEASIBLE:
                     check=certify_schedule(result.solution,candidate.schedule,CONFIG,scope=FORMAL_SCOPE_V2)
                     if not check.certified:raise ValueError(check.errors)
@@ -1951,110 +1940,18 @@ def diagnose_sparse_constructor():
         scope='post-hoc all distinct original-mode NO_LEGAL_PARENT_ACTION contexts; exact direct equality deduplication, '
               'no hashing/cache; formal 144 runs unchanged and did not enable optional partial-start repair; '
               'only temporarily conflicting partial starts may bypass the insertion prune, legal starts keep it, '
-              'complete start validity, B32 and independent certification all retained; no model update')
+              'complete start validity, NATIVE and independent certification all retained; no model update')
     _study_append(record)
-    print('CONSTRUCTOR_DIAGNOSTIC_SAVED','cases',len(evaluated),'B32',calls,'certifications',certifications,flush=True)
+    print('CONSTRUCTOR_DIAGNOSTIC_SAVED','cases',len(evaluated),'NATIVE',calls,'certifications',certifications,flush=True)
 
 
-def diagnose_sparse_recovery_budget():
-    """Development-only fixed-candidate budget sensitivity, never formal scores."""
-    from dataclasses import asdict
-    from mrta_reference.model import ParentWeld,SplitPattern,SplitKind,Rail,OperationKind
-    from mrta_reference.solution import canonicalize
-    from mrta_reference.geometry import finite_x_split_validator
-    from mrta_reference.certifier import certify_schedule
-    from mrta_reference.scheduler import (_reference_schedule_with,prepare_dispatch_problem,
-        _prepared_dispatch_outcome,_limited_discrepancy_dispatch_recovery_optimized)
-    rows=_study_rows()
-    if any(r.get('record')=='sparse_recovery_budget' and r.get('version')==SPARSE_VERSION for r in rows):
-        print('SPARSE_RECOVERY_BUDGET already saved',flush=True);return
-    recovery=next(r for r in rows if r.get('record')=='sparse_constructor_recovery' and r.get('version')==SPARSE_VERSION)
-    budgets=(32,128,512)
-    if not any(r.get('record')=='sparse_recovery_budget_plan' and r.get('version')==SPARSE_VERSION for r in rows):
-        _study_append(dict(record='sparse_recovery_budget_plan',version=SPARSE_VERSION,budgets=budgets,
-            candidates='every completed GNN_RESTORE_START_PRIORITY candidate from sparse_constructor_recovery',
-            scope='fixed routes, patterns and directions; independent fresh recovery per budget; no formal scope changes; '
-                  'development physical certificate only, never a formal B32 result or an online improvement'))
-    output=[]
-    for case in recovery['cases']:
-        candidate=next(v for v in case['variants'] if v['method']=='GNN_RESTORE_START_PRIORITY')
-        if 'solution' not in candidate:continue
-        data=candidate['solution'];directions=candidate['directions']
-        parents=tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in data['parents'])
-        patterns=tuple(SplitPattern(p['parent_id'],SplitKind(p['kind']),p['t'],p['point_id'],p['mandatory'],
-            None if p['rail'] is None else Rail(p['rail'])) for p in data['patterns'])
-        solution=canonicalize(parents,patterns,{r['robot_id']:r['block_ids'] for r in data['routes']},CONFIG,scope=FORMAL_SCOPE_V2)
-        validator=finite_x_split_validator(parents,CONFIG) if any(p.kind is SplitKind.X_SPLIT for p in patterns) else None
-        for budget in budgets:
-            def dispatch(templates,cfg,*,directions,profile):
-                prepared=prepare_dispatch_problem(templates,cfg,directions=directions,profile=profile)
-                baseline=_prepared_dispatch_outcome(prepared,profile=profile,collect_trace=True)
-                return _limited_discrepancy_dispatch_recovery_optimized(prepared,baseline,rollout_budget=budget,profile=profile)
-            tick=time.perf_counter()
-            schedule=_reference_schedule_with(solution,CONFIG,dispatch,
-                orientations={r:tuple(bits) for r,bits in enumerate(directions)},x_split_validator=validator)
-            row=dict(instance=case['instance'],budget=budget,status=schedule.status.value,cmax=schedule.cmax,
-                seconds=time.perf_counter()-tick,recovery_rollouts=schedule.recovery_rollouts,
-                frontier_exhausted=schedule.frontier_exhausted,diagnostics=schedule.diagnostics,
-                certified_physical=False,formal_b32_result=False)
-            if budget==32 and (schedule.status.value!=candidate['status'] or schedule.cmax!=candidate['cmax']):
-                raise ValueError('diagnostic B32 differs from saved formal evaluation')
-            if schedule.status is ScheduleStatus.FEASIBLE:
-                check=certify_schedule(solution,schedule,CONFIG,x_split_validator=validator)
-                if not check.certified:raise ValueError(check.errors)
-                if schedule.directions!=tuple(tuple(bits) for bits in directions):raise ValueError('directions changed')
-                for route in solution.routes:
-                    ops=sorted((op for op in schedule.operations if op.robot_id==route.robot_id),key=lambda op:op.sequence_index)
-                    if route.block_ids and (not ops or ops[-1].kind is not OperationKind.POST):raise ValueError('terminal policy changed')
-                    if not route.block_ids and (ops or schedule.robot_completion[route.robot_id]!=0):raise ValueError('empty route deployed')
-                row.update(certified_physical=True,schedule=asdict(schedule))
-            output.append(row)
-            print('RECOVERY_BUDGET',case['instance'],budget,row['status'],row['cmax'],row['seconds'],flush=True)
-    _study_append(dict(record='sparse_recovery_budget',version=SPARSE_VERSION,trials=output,
-        diagnostic_dispatch_calls=len(output),certifications=sum(r['certified_physical'] for r in output),
-        note='development budget sensitivity, no replacement of the formal evaluator or 144 online results'))
 
 
-RECOVERY_VERSION='recovery-stratified-v1'
-RECOVERY_BUDGETS=(32,128,512)
 
 
-def _stratified_recovery_sample(rows):
-    """Uniform within workbook/repairer/mode-count strata, before larger-budget outcomes."""
-    from collections import defaultdict
-    import random
-    groups=defaultdict(list)
-    runs=sorted((r for r in rows if r.get('record')=='sparse_run' and r.get('version')==SPARSE_VERSION),
-        key=lambda r:(r['instance'],r['repairer'],r['seed'],r['policy']))
-    for run in runs:
-        for index,trial in enumerate(run['trace']):
-            if trial['status']!='DEADLOCK':continue
-            key=(run['instance'],run['repairer'],len(trial['changed_modes']))
-            occurrence=dict(policy=run['policy'],seed=run['seed'],trace_index=index,
-                incumbent=trial['incumbent_before'],late=trial['late'])
-            state=(trial['patterns'],trial['routes'],trial['directions'])
-            existing=next((c for c in groups[key] if (c['patterns'],c['routes'],c['directions'])==state),None)
-            if existing is not None:
-                if (existing['frontier_exhausted'],existing['recovery_rollouts'])!=(trial['frontier_exhausted'],trial['recovery_rollouts']):
-                    raise ValueError('identical candidate has differing saved B32 outcome')
-                existing['occurrences'].append(occurrence)
-            else:
-                groups[key].append(dict(instance=key[0],repairer=key[1],mode_count=key[2],
-                    parents=run['solution']['parents'],patterns=state[0],routes=state[1],directions=state[2],
-                    frontier_exhausted=trial['frontier_exhausted'],recovery_rollouts=trial['recovery_rollouts'],
-                    occurrences=[occurrence]))
-    rng=random.Random(20261101);cases=[];population=[]
-    for key,group in sorted(groups.items()):
-        n=min(3,len(group));chosen=sorted(rng.sample(range(len(group)),n))
-        population.append(dict(instance=key[0],repairer=key[1],mode_count=key[2],unique=len(group),
-            occurrences=sum(len(c['occurrences']) for c in group),sampled=n,
-            exhausted_unique=sum(c['frontier_exhausted'] for c in group)))
-        for index in chosen:
-            cases.append(dict(group[index],case_id=len(cases)+1,stratum_unique=len(group),stratum_sampled=n))
-    return cases,population
 
 
-def _recovery_case_solution(case):
+def _case_solution(case):
     from mrta_reference.model import ParentWeld,SplitPattern,SplitKind,Rail
     from mrta_reference.solution import canonicalize
     parents=tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in case['parents'])
@@ -2062,142 +1959,18 @@ def _recovery_case_solution(case):
         None if p['rail'] is None else Rail(p['rail'])) for p in case['patterns'])
     solution=canonicalize(parents,patterns,{r:ids for r,ids in enumerate(case['routes'])},CONFIG,scope=FORMAL_SCOPE_V2)
     if solution.patterns!=patterns or [list(r.block_ids) for r in solution.routes]!=case['routes']:
-        raise ValueError('saved recovery candidate changed under canonicalization')
+        raise ValueError('saved candidate changed under canonicalization')
     return solution
 
 
-def _development_budget_schedule(solution,directions,budget):
-    from mrta_reference.geometry import finite_x_split_validator
-    from mrta_reference.model import SplitKind
-    from mrta_reference.scheduler import (_reference_schedule_with,prepare_dispatch_problem,
-        _prepared_dispatch_outcome,_limited_discrepancy_dispatch_recovery_optimized)
-    validator=finite_x_split_validator(solution.parents,CONFIG) if any(p.kind is SplitKind.X_SPLIT for p in solution.patterns) else None
-    def dispatch(templates,cfg,*,directions,profile):
-        prepared=prepare_dispatch_problem(templates,cfg,directions=directions,profile=profile)
-        baseline=_prepared_dispatch_outcome(prepared,profile=profile,collect_trace=True)
-        return _limited_discrepancy_dispatch_recovery_optimized(prepared,baseline,rollout_budget=budget,profile=profile)
-    schedule=_reference_schedule_with(solution,CONFIG,dispatch,
-        orientations={r:tuple(bits) for r,bits in enumerate(directions)},x_split_validator=validator)
-    return schedule,validator
 
 
-def _certify_development_budget(solution,directions,schedule,validator):
-    """Independent physical certificate plus explicit formal terminal/direction semantics."""
-    from mrta_reference.certifier import certify_schedule
-    from mrta_reference.model import OperationKind
-    check=certify_schedule(solution,schedule,CONFIG,x_split_validator=validator)
-    if not check.certified:raise ValueError(check.errors)
-    if schedule.directions!=tuple(tuple(bits) for bits in directions):raise ValueError('directions changed')
-    for route in solution.routes:
-        ops=sorted((op for op in schedule.operations if op.robot_id==route.robot_id),key=lambda op:op.sequence_index)
-        if route.block_ids and (not ops or ops[-1].kind is not OperationKind.POST):raise ValueError('terminal policy changed')
-        if not route.block_ids and (ops or schedule.robot_completion[route.robot_id]!=0):raise ValueError('empty route deployed')
 
 
-def _stratified_recovery_worker(case):
-    from dataclasses import asdict
-    from mrta_search.lns import oriented_route_state
-    started=time.perf_counter();solution=_recovery_case_solution(case)
-    blocks=block_map(solution,CONFIG,scope=FORMAL_SCOPE_V2)
-    tick=time.perf_counter()
-    state=oriented_route_state(case['routes'],case['directions'],blocks,CONFIG)
-    lower_bound=max(p+sum(arcs) for p,arcs in zip(state.loads,state.arc_costs))
-    bound_seconds=time.perf_counter()-tick
-    offset=(case['case_id']-1)%3;order=RECOVERY_BUDGETS[offset:]+RECOVERY_BUDGETS[:offset]
-    trials=[]
-    for budget in order:
-        tick=time.perf_counter()
-        schedule,validator=_development_budget_schedule(solution,case['directions'],budget)
-        dispatch_seconds=time.perf_counter()-tick
-        row=dict(budget=budget,status=schedule.status.value,cmax=schedule.cmax,dispatch_seconds=dispatch_seconds,
-            recovery_rollouts=schedule.recovery_rollouts,frontier_exhausted=schedule.frontier_exhausted,
-            certified_physical=False,formal_b32_result=False,diagnostics=schedule.diagnostics)
-        if budget==32 and (schedule.status is not ScheduleStatus.DEADLOCK or
-            (schedule.recovery_rollouts,schedule.frontier_exhausted)!=(case['recovery_rollouts'],case['frontier_exhausted'])):
-            raise ValueError('saved formal B32 failure does not reproduce')
-        if schedule.status is ScheduleStatus.FEASIBLE:
-            _certify_development_budget(solution,case['directions'],schedule,validator)
-            if schedule.cmax<lower_bound-1e-7:raise ValueError('route lower bound exceeds certified makespan')
-            row.update(certified_physical=True,schedule=asdict(schedule))
-        elif schedule.status is not ScheduleStatus.DEADLOCK:raise ValueError('unexpected diagnostic status: '+schedule.status.value)
-        row['seconds']=time.perf_counter()-tick
-        row['improves_first']=bool(row['certified_physical'] and row['cmax']<case['occurrences'][0]['incumbent']-1e-7)
-        row['improving_occurrences']=sum(row['certified_physical'] and row['cmax']<o['incumbent']-1e-7 for o in case['occurrences'])
-        trials.append(row)
-    return dict(record='recovery_case',version=RECOVERY_VERSION,**case,budget_order=order,
-        lower_bound=lower_bound,bound_seconds=bound_seconds,
-        bound_blocks_first=lower_bound>=case['occurrences'][0]['incumbent']-1e-7,
-        bound_blocked_occurrences=sum(lower_bound>=o['incumbent']-1e-7 for o in case['occurrences']),
-        trials=trials,actual_runtime=time.perf_counter()-started)
 
 
-def run_stratified_recovery(args):
-    from concurrent.futures import ProcessPoolExecutor,as_completed
-    import multiprocessing,os,random
-    rows=_study_rows();cases,population=_stratified_recovery_sample(rows)
-    if not any(r.get('record')=='recovery_plan' and r.get('version')==RECOVERY_VERSION for r in rows):
-        _study_append(dict(record='recovery_plan',version=RECOVERY_VERSION,source_version=SPARSE_VERSION,
-            sampler_seed=20261101,max_per_stratum=3,population=population,budgets=RECOVERY_BUDGETS,workers=args.workers,
-            selected=[dict(case_id=c['case_id'],instance=c['instance'],repairer=c['repairer'],mode_count=c['mode_count'],
-                occurrences=c['occurrences']) for c in cases],
-            design='direct equality dedup within workbook/repairer/mode-count; uniform without replacement; '
-                'primary improvement relative to first occurrence in sorted instance/repairer/seed/policy/trace order; '
-                'all occurrence improvements secondary; no online counterfactual claim; fresh recovery each budget; '
-                'rotating order; all candidates evaluated regardless of route bound or frontier exhaustion; '
-                'fixed-route bound=max(process+travel), no waiting, no fit; physical certificate, not formal B32 results'))
-    done={r['case_id'] for r in rows if r.get('record')=='recovery_case' and r.get('version')==RECOVERY_VERSION}
-    jobs=[c for c in cases if c['case_id'] not in done];random.Random(20261102).shuffle(jobs)
-    for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS'):os.environ[key]='1'
-    with ProcessPoolExecutor(max_workers=args.workers,mp_context=multiprocessing.get_context('spawn'),initializer=_mode_worker_init) as pool:
-        futures=[pool.submit(_stratified_recovery_worker,c) for c in jobs]
-        for future in as_completed(futures):
-            row=future.result();_study_append(row)
-            print('RECOVERY_CASE',row['case_id'],row['repairer'],row['mode_count'],
-                [(t['budget'],t['status'],t['improves_first']) for t in row['trials']],flush=True)
 
 
-def summarize_stratified_recovery():
-    rows=_study_rows();cases,population=_stratified_recovery_sample(rows)
-    runs=sorted((r for r in rows if r.get('record')=='recovery_case' and r.get('version')==RECOVERY_VERSION),key=lambda r:r['case_id'])
-    if len(runs)!=len(cases):raise ValueError('complete all selected recovery candidates first')
-    if any(r.get('record')=='recovery_analysis' and r.get('version')==RECOVERY_VERSION for r in rows):
-        print('RECOVERY_ANALYSIS already saved',flush=True);return
-    summary=[];checked=0
-    for run,case in zip(runs,cases):
-        if any(run[k]!=v for k,v in case.items()):raise ValueError('selected candidate differs')
-        trials={t['budget']:t for t in run['trials']}
-        if set(trials)!=set(RECOVERY_BUDGETS):raise ValueError('budget missing')
-        for budget in (128,512):
-            row=trials[budget];previous=trials[32 if budget==128 else 128]
-            if previous['certified_physical'] and (not row['certified_physical'] or row['cmax']>previous['cmax']+1e-7):
-                raise ValueError('larger recovery budget lost a recovered schedule')
-            if run['frontier_exhausted'] and row['status']!='DEADLOCK':raise ValueError('exhausted B32 unexpectedly recovered')
-            if row['improves_first'] and run['bound_blocks_first']:raise ValueError('bound would prune improvement')
-        checked+=len(trials)
-    for repairer in ('NEW','GNN'):
-        group=[r for r in runs if r['repairer']==repairer]
-        for budget in RECOVERY_BUDGETS:
-            trial=[(r,next(t for t in r['trials'] if t['budget']==budget)) for r in group]
-            summary.append(dict(repairer=repairer,budget=budget,cases=len(group),
-                recovered=sum(t['certified_physical'] for r,t in trial),improves_first=sum(t['improves_first'] for r,t in trial),
-                improving_workbooks=len({r['instance'] for r,t in trial if t['improves_first']}),
-                improves_any_occurrence=sum(t['improving_occurrences']>0 for r,t in trial),
-                total_seconds=sum(t['seconds'] for r,t in trial),
-                exhausted_at_32=sum(r['frontier_exhausted'] for r in group),
-                bound_blocks_first=sum(r['bound_blocks_first'] for r in group),
-                eligible_extension=sum(not r['frontier_exhausted'] and not r['bound_blocks_first'] for r in group),
-                selected_extension_seconds=sum(t['seconds'] for r,t in trial if not r['frontier_exhausted'] and not r['bound_blocks_first']),
-                estimated_unique_recovery_rate=sum(t['certified_physical']*r['stratum_unique']/r['stratum_sampled'] for r,t in trial)/
-                    sum(p['unique'] for p in population if p['repairer']==repairer),
-                estimated_occurrence_improvement_rate=sum(t['improving_occurrences']*r['stratum_unique']/r['stratum_sampled'] for r,t in trial)/
-                    sum(p['occurrences'] for p in population if p['repairer']==repairer)))
-    record=dict(record='recovery_analysis',version=RECOVERY_VERSION,cases=len(runs),audited_trials=checked,
-        diagnostic_calls=checked,certifications=sum(t['certified_physical'] for r in runs for t in r['trials']),
-        worker_seconds=sum(r['actual_runtime'] for r in runs),summary=summary,
-        note='stratified sample from consumed development trajectories, not independent instances or online gains; '
-             'population estimates use N/n per stratum; first occurrence endpoint fixed before evaluation; '
-             'selected extension timing is a retrospective cost projection, not an equal-wall-time solver experiment')
-    _study_append(record);print(json.dumps(record,ensure_ascii=False),flush=True)
 
 
 BOUND_VERSION='route-bound-v1'
@@ -2215,7 +1988,7 @@ def audit_route_bound_shadow():
         for trial in run['trace']:
             if not trial['reference_calls']:continue
             case=dict(parents=run['solution']['parents'],**{k:trial[k] for k in ('patterns','routes','directions')})
-            solution=_recovery_case_solution(case);tick=time.perf_counter()
+            solution=_case_solution(case);tick=time.perf_counter()
             bound=_fixed_route_time_bound(solution,trial['directions']);s['bound_seconds']+=time.perf_counter()-tick
             prune=bound>=trial['incumbent_before']+1e-7;s['evaluated']+=1
             if trial['certified'] and bound>trial['cmax']+1e-7:raise ValueError('invalid fixed-route bound')
@@ -2254,8 +2027,8 @@ def run_bound_study(args):
             design='12 workbooks x 2 seeds x 2 repairers x 2 policies=96; O+S1/S2/S3 normal search, no pairs; '
                 'cyclic balanced policy order, shuffled groups, single-thread workers; same saved source per pair',
             bound='max per-robot process+travel for fixed routes/directions; prune only if bound>=current incumbent+1e-7; '
-                'a skipped candidate has no invented Cmax or feasibility label; original B32 on remaining candidates',
-            timing='all proposal/construction/bound/B32/certification within 20s; exclude late improvements; '
+                'a skipped candidate has no invented Cmax or feasibility label; original NATIVE on remaining candidates',
+            timing='all proposal/construction/bound/NATIVE/certification within 20s; exclude late improvements; '
                 'source replay and model preload outside local timer; no end-to-end or independent-test claim',
             statistics='20s primary paired endpoint; 10s secondary; average two seeds within workbook, '
                 'bootstrap20000 workbook resamples seed20261101, descriptive unadjusted intervals'))
@@ -2296,7 +2069,7 @@ def summarize_bound_study():
             if abs(current-t['incumbent_before'])>1e-7:raise ValueError('incumbent history differs')
             if t['status']=='NONIMPROVING_ROUTE_BOUND':
                 case=dict(parents=source['solution']['parents'],**{k:t[k] for k in ('patterns','routes','directions')})
-                bound=_fixed_route_time_bound(_recovery_case_solution(case),t['directions'])
+                bound=_fixed_route_time_bound(_case_solution(case),t['directions'])
                 if (run['policy']!='BOUND' or abs(bound-t['route_lower_bound'])>1e-7 or bound<current+1e-7 or
                     t['reference_calls'] or t['certified'] or t['cmax'] is not None):raise ValueError('invalid skipped candidate')
             accept=bool(t['certified'] and t['elapsed']<=20. and t['cmax']<current-1e-9*max(1.,current))
@@ -2510,7 +2283,7 @@ def choose_mode_rank(candidates, rule):
 
 
 def _ranking_existing_worker(job):
-    """Re-score saved complete routes; no B32 calls and no fitted parameters."""
+    """Re-score saved complete routes; no NATIVE calls and no fitted parameters."""
     source,run=job
     from mrta_reference.model import ParentWeld,SplitPattern,SplitKind,Rail
     from mrta_reference.solution import canonicalize
@@ -2592,11 +2365,11 @@ def run_ranking_study(args):
             selectors=['RANDOM','TRAVEL','LOAD'],q=[4,8],seed='20261031 + selector index + q',
             exposure='union per robot of continuous XY proximity and same-rail X order violation on independent time-zero routes; '
                      'score=max(nominal_completion+union_seconds), tie total_nominal_time then original mode rank',
-            protocol='decisions use only route features, never B32 outcomes; evaluate complete pool to audit decisions; '
+            protocol='decisions use only route features, never NATIVE outcomes; evaluate complete pool to audit decisions; '
                      'each policy gets original-mode plus one selected alternative evaluation, but PM/EXPOSURE build up to three alternatives',
             validation='nine unrecorded V2_VALIDATION layouts, one per workbook, 3 per N85/55/35; old workbook families reused; '
                        '30s FIXED_NEW incumbents, one source seed; no sealed data or model updates',
-            timing='candidate construction, feature extraction and B32 recorded separately; no equal wall-time claim'))
+            timing='candidate construction, feature extraction and NATIVE recorded separately; no equal wall-time claim'))
     # Select and save fresh layout IDs before either set of ranking outcomes is inspected.
     entries=[r for r in rows if r.get('record')=='ranking_instance' and r.get('version')=='mode-ranking-v1']
     if not entries:
@@ -3026,7 +2799,7 @@ FINAL_INITIAL=ROOT/'results/gnn_initial_minchild05_final.csv'
 FINAL_ABLATION=ROOT/'results/parent_mode_joint_reconstruction_05.csv'
 FINAL_FORMAL=ROOT/'results/final_parent_mode_joint_reconstruction_05.csv'
 FINAL_FIELDS=('record','instance','tier','N','geometry_seed','seed','method','status','cmax',
-              'b32_calls','runtime_s','loads','travel','wait','mode_changes','payload')
+              'coordination_calls','runtime_s','loads','travel','wait','mode_changes','payload')
 
 
 def _final_entries():
@@ -3088,7 +2861,7 @@ def _final_initial_worker(job):
                                                          max_reference_calls=4)
     row=dict(common,method='RULE/BEAM',status='FEASIBLE' if beam else 'FAILED',
         cmax=None if beam is None else beam.schedule.cmax,runtime_s=time.perf_counter()-started,
-        b32_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts))
+        coordination_calls=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts))
     if beam is not None:
         if beam.solution.patterns!=fixed_split_patterns(parents,CONFIG_05):
             raise ValueError('RULE and GNN fixed modes differ')
@@ -3126,14 +2899,14 @@ def _final_initial_report(rows):
     lines=['# 最后一次0.50 m GNN初始构造实验','',
         '仅使用现有V2和Shared checkpoint；无训练、无网络或权重修改。历史CONFIG=0.20保留，实验显式使用CONFIG_05=ScientificConfig()，min_child_length=0.50。',
         '两checkpoint均为hidden=64、heads=4、normalize_inputs=True，动态输入41维/父输入12维与现有特征实现一致；checkpoint未存ScientificConfig快照。当前教师脚本默认0.50不能证明历史训练域：V2已有294条轨迹中30条、Shared已有40条中4条含小于0.50 m的子段，最短0.277058 m。因此本次属于冻结既有权重在0.50合法目录上的迁移评价，不能称为0.50域专门训练的模型。没有重训或更新归一化。',
-        '固定父模式、FORMAL_SCOPE_V2、insertion_limit=8、同一B32。Multi4为Greedy及seed+1/+2/+3，温度1，不补采；完整路线和方向去重后最多4次B32。RULE/BEAM保持原Beam宽度并设max_reference_calls=4。Greedy复用Multi4第一候选。',
+        '固定父模式、FORMAL_SCOPE_V2、insertion_limit=8、同一NATIVE。Multi4为Greedy及seed+1/+2/+3，温度1，不补采；完整路线和方向去重后最多4次NATIVE。RULE/BEAM保持原Beam宽度并设max_reference_calls=4。Greedy复用Multi4第一候选。',
         'travel为MOVE总耗时（秒），wait为WAIT总耗时（秒）；负载为PRE+WELD+POST。失败无惩罚Cmax。','',
         f'已记录{len(rows)}/135行（9×3×5）。','',
-        '|方法|FEASIBLE/总次数|成功Cmax平均|成功Cmax中位|平均耗时秒|B32合计|',
+        '|方法|FEASIBLE/总次数|成功Cmax平均|成功Cmax中位|平均耗时秒|NATIVE合计|',
         '|---|---:|---:|---:|---:|---:|']
     for method in ('RULE/BEAM','GNN-V2-Greedy','GNN-V2-Multi4','GNN-Shared-Greedy','GNN-Shared-Multi4'):
         group=[r for r in rows if r['method']==method];ok=[r['cmax'] for r in group if r['status']=='FEASIBLE']
-        if group:lines.append(f"|{method}|{len(ok)}/{len(group)}|{statistics.mean(ok) if ok else None}|{statistics.median(ok) if ok else None}|{statistics.mean(r['runtime_s'] for r in group):.3f}|{sum(r['b32_calls'] for r in group)}|")
+        if group:lines.append(f"|{method}|{len(ok)}/{len(group)}|{statistics.mean(ok) if ok else None}|{statistics.median(ok) if ok else None}|{statistics.mean(r['runtime_s'] for r in group):.3f}|{sum(r['coordination_calls'] for r in group)}|")
     decisions=[_final_initial_decision(rows,label) for label in ('GNN-V2','GNN-Shared')]
     for decision in decisions:
         lines+=['',f"## {decision['method']}",'', '```json',json.dumps(decision,ensure_ascii=False,indent=2),'```']
@@ -3168,7 +2941,7 @@ def run_final_stages(args):
 def _final_result_row(entry,seed,method,out):
     row={k:entry[k] for k in ('instance','tier','N','geometry_seed')}
     row.update(record='run',seed=seed,method=method,status=out['status'],cmax=out.get('cmax'),
-               b32_calls=out.get('reference_calls',0),runtime_s=out.get('actual_runtime',0.),
+               coordination_calls=out.get('reference_calls',0),runtime_s=out.get('actual_runtime',0.),
                mode_changes=out.get('mode_changes',out.get('mode_accepted',0)),details=out)
     row.update(out.get('schedule_summary') or {})
     if out.get('final_state'):
@@ -3314,8 +3087,8 @@ def _final_ablation_report():
     comparisons=(('MODE_NEW','FIXED_NEW'),('MODE_GNN','FIXED_GNN'),('MODE_GNN','MODE_NEW'),
         ('FIXED_GNN','FIXED_NEW'),('MODE_NEW','WAG'),('MODE_NEW','HGA'),('MODE_GNN','WAG'),('MODE_GNN','HGA'))
     lines=['# 0.50 m父焊缝模式与方向感知联合重构2×2实验','',f'已记录{len(rows)}/162次运行。',
-        'ScientificConfig()、FORMAL_SCOPE_V2、同一合法WHOLE/Y_SPLIT/X_SPLIT目录、同一B32，30秒截止前结果。四种联合修复复用每个几何/seed同一个确定性共同初解及方向；共同初解实际构造耗时在四种方法中等额计入预算，GNN加载时间计入本方法预算。每次只接受截止前完成且严格改善Cmax的候选。',
-        '六种方法均关闭独立certify_schedule，生产默认认证不变。B32调用可跨截止时间返回，但跨时结果不纳入best；实际运行时间如实记录。模式变化为联合方法的已接受单父模式提案次数；WAG/HGA记录初始到最终不同模式的父数，不等同于搜索接受次数。',
+        'ScientificConfig()、FORMAL_SCOPE_V2、同一合法WHOLE/Y_SPLIT/X_SPLIT目录、同一NATIVE，30秒截止前结果。四种联合修复复用每个几何/seed同一个确定性共同初解及方向；共同初解实际构造耗时在四种方法中等额计入预算，GNN加载时间计入本方法预算。每次只接受截止前完成且严格改善Cmax的候选。',
+        '六种方法均关闭独立certify_schedule，生产默认认证不变。NATIVE调用可跨截止时间返回，但跨时结果不纳入best；实际运行时间如实记录。模式变化为联合方法的已接受单父模式提案次数；WAG/HGA记录初始到最终不同模式的父数，不等同于搜索接受次数。',
         '稳定收益判据在比较前固定：可行次数不降低、几何胜数大于负数、几何中位改善为正且至少两个规模有胜例；GNN须同时在MODE和FIXED组满足。','']
     lines+=_final_summary_lines(rows,FINAL_ARMS,3,comparisons)
     if len(rows)==162:
@@ -3378,7 +3151,7 @@ def _final_diagnosis():
     ranked=sorted((p for p in pairs if p['improvement_pct']<-1e-8),key=lambda p:p['improvement_pct'])
     preferred=[p for p in ranked if p['instance'] in ('N55_01','N85_01')]
     selected=(preferred+[p for p in ranked if p not in preferred])[:2]
-    lines=['','## 困难实例路线与B32时间线诊断','',
+    lines=['','## 困难实例路线与NATIVE时间线诊断','',
         '选择仍落后WAG的N55_01/N85_01；不足两个时按实际落后幅度补充。只读取本轮保留的原始ScheduleResult信息，不二次调度。方向0=start→end，方向1=end→start。完整PRE/WELD/POST/MOVE/WAIT操作及坐标存于CSV payload.details.final_state.operations。','']
     if not selected:lines+=['没有双方三个种子均成功且主方法落后WAG的几何。']
     for selected_pair in selected:
@@ -3422,7 +3195,7 @@ def _final_diagnosis():
                             '。这是同轨操作重叠的时间线证据，不将时间重叠本身当作独立因果证明。','']
     lines+=['','诊断阶段不新增搜索算子；上述等待与路线差异是观察证据，不能只凭加工负载判定协调效果。未根据本次诊断调参或增加WAIT/CRRR/JRRB。',
             '', '## 主方法确定（独立几何生成前）','', '```json',json.dumps(choice,ensure_ascii=False,indent=2),'```',
-            '固定沿用既有瓶颈选择轮换、q=4/8、插入限制8、插入评价上限4096、direction_versions=2、严格Cmax接受和B32；不随正式测试结果修改。']
+            '固定沿用既有瓶颈选择轮换、q=4/8、插入限制8、插入评价上限4096、direction_versions=2、严格Cmax接受和NATIVE；不随正式测试结果修改。']
     report=ROOT/'docs/PARENT_MODE_JOINT_RECONSTRUCTION_05.md'
     with report.open('a',encoding='utf-8') as stream:stream.write('\n'.join(lines)+'\n')
     return choice
@@ -3538,14 +3311,14 @@ def _final_report():
     selection=next((r for r in formal if r['record']=='method_selection'),None)
     choice=selection['choice'] if selection else (_final_choice(ablation) if len(ablation)==162 else None)
     lines=['# 父焊缝模式调整与方向感知联合重构最终实验报告','',
-        '当前研究配置为ScientificConfig()、最短子段0.50 m、FORMAL_SCOPE_V2和现有B32。历史0.20 m配置、CSV与checkpoint均保留。没有新增训练、搜索模块、独立方向/WAIT优化或独立认证系统。','',
+        '当前研究配置为ScientificConfig()、最短子段0.50 m、FORMAL_SCOPE_V2和现有NATIVE。历史0.20 m配置、CSV与checkpoint均保留。没有新增训练、搜索模块、独立方向/WAIT优化或独立认证系统。','',
         '## 1. GNN初始构造终止实验','',f'已完成{len(initial)}/135条方法结果。',
         '详见[GNN初始构造结果](GNN_INITIAL_MINCHILD05_FINAL.md)。冻结模型训练资料含短于0.50 m的子段；这是既有权重在0.50 m合法目录上的迁移评价。','']
     if len(initial)==135:
         keep=any(_final_initial_decision(initial,label)['keep'] for label in ('GNN-V2','GNN-Shared'))
         lines +=['结论：'+('通过者仅作为可选初解，停止训练调参。' if keep else 'GNN初始分配与排序正式淘汰，停止该方向训练、架构与解码调参。')]
     lines+=['','## 2. 2×2消融及强基线','',f'已完成{len(ablation)}/162次30秒运行。',
-        '完整结果和原始B32路线诊断见[2×2报告](PARENT_MODE_JOINT_RECONSTRUCTION_05.md)。四联合方法使用同一个确定性初解，全部方法依据B32 FEASIBLE和Cmax，关闭额外认证。','']
+        '完整结果和原始NATIVE路线诊断见[2×2报告](PARENT_MODE_JOINT_RECONSTRUCTION_05.md)。四联合方法使用同一个确定性初解，全部方法依据NATIVE FEASIBLE和Cmax，关闭额外认证。','']
     if choice:
         lines+=['```json',json.dumps(choice,ensure_ascii=False,indent=2),'```',
             '稳定性判据在阶段2结果比较前固定；正式测试期间不修改参数。仅保留所选联合修复作为主线，其他候选属于消融/历史研究。']
@@ -3553,9 +3326,9 @@ def _final_report():
     runs=[r for r in formal if r['record']=='run']
     entries=[r for r in formal if r['record']=='instance']
     lines+=['','## 3. 独立0.50 m正式实验','',f'已保存{len(entries)}/20个独立几何，已完成{len(runs)}/500次60秒运行。',
-        '几何与生成种子、算法选择和全部运行保存于results/final_parent_mode_joint_reconstruction_05.csv；失败保留，不换实例，不补失败Cmax。该CSV也集中保留必要路线、方向和B32操作时间线。',
+        '几何与生成种子、算法选择和全部运行保存于results/final_parent_mode_joint_reconstruction_05.csv；失败保留，不换实例，不补失败Cmax。该CSV也集中保留必要路线、方向和NATIVE操作时间线。',
         'REGION_FAST_ROUTE_REORDER显式传入CONFIG_05，未复用历史0.20结果；其原有ALNS/方向规则作为对比方法保留，关闭额外认证。',
-        '所有方法计入初始化和调度；B32跨截止返回的结果不计入最佳解。共同初解在配对联合方法间复用、等额计时。','',
+        '所有方法计入初始化和调度；NATIVE跨截止返回的结果不计入最佳解。共同初解在配对联合方法间复用、等额计时。','',
         '|组别|几何|生成种子|实际父焊缝数|总长度/m|强制拆分父数|','|---|---|---:|---:|---:|---:|']
     for entry in entries:
         lines.append(f"|{entry['tier']}|{entry['instance']}|{entry['geometry_seed']}|{entry['N']}|{entry['total_length']:.6f}|{entry['mandatory_splits']}|")

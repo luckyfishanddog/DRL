@@ -930,7 +930,7 @@ def write_sci_report(root=None):
     dev=summary['development'];formal=summary['formal'];edge=summary['edge_ablation'];pc=lambda value:'—' if value is None else f'{100*value:.2f}%'
     lines=['# SCI统一0.5 m最终实验结果','',
         '**算法已冻结：HEURISTIC是工程默认；GAT V05是论文学习排序方法；MLP V05、Adapted-HGA V2、Adapted-WAG+VNS V2为固定对照。C4-ranked已失败淘汰，不再开发GAT V07/V08。**','',
-        '统一模型：20m×12m、双滑轨四悬臂、WHOLE/Y_SPLIT/X_SPLIT、delta_x=delta_y=0.50m、min_child_length=0.20m、interference_dx=interference_dy=0.50m。ALNS固定M192(144+48)、Kdp8、Kref2/Kref_total4、BASELINE初始化、原SA/direction/B32/independent certifier、TWO_OPT_STAR OFF。B32仅是固定评价器，不声称全局最优。','',
+        '统一模型：20m×12m、双滑轨四悬臂、WHOLE/Y_SPLIT/X_SPLIT、delta_x=delta_y=0.50m、min_child_length=0.20m、interference_dx=interference_dy=0.50m。ALNS固定M192(144+48)、Kdp8、Kref2/Kref_total4、BASELINE初始化、原SA/direction/NATIVE/independent certifier、TWO_OPT_STAR OFF。NATIVE仅是固定评价器，不声称全局最优。','',
         '## 开发集五算法比较','',
         f"HGA/WAG固定矩阵完成 {dev['baseline_runs']}/24；与既有36个HEURISTIC/MLP/GAT运行合并为 {dev['runs']} 次五算法结果。旧48与新24均为4个spawn进程、各绑一个物理核；输入工作簿解析统一排除于求解计时，算法初始化计入60秒。",'',
         '|方法|认证/运行|相对HEURISTIC 胜/平/负|median Δ|mean Δ|最差 Δ|','|---|---:|---:|---:|---:|---:|']
@@ -1143,7 +1143,7 @@ def write_final_c4_report(root=None):
     tier_labels={'SMALL':'N35','MEDIUM':'N55','LARGE':'N85','ALL':'ALL'}
     lines=['# GRC-ALNS C4 最终选择','',
         '**冻结结论：选择 A——HEURISTIC 继续作为默认算法；GAT V05 冻结为论文学习排序方法与消融对象；最后一次 C4-ranked 被淘汰。此后不开发 GAT V07/V08。**','',
-        '全部结果使用 20m×12m、四机器人、WHOLE/Y_SPLIT/X_SPLIT、delta_x=delta_y=0.50m、min_child_length=0.20m、interference_dx=interference_dy=0.50m；M192=144 atomic+48 LNS、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/B32/independent certifier、TWO_OPT_STAR OFF。未访问 ID_TEST_SEALED、V2_VALIDATION 或 ORACLE_DEV_CONSUMED。','',
+        '全部结果使用 20m×12m、四机器人、WHOLE/Y_SPLIT/X_SPLIT、delta_x=delta_y=0.50m、min_child_length=0.20m、interference_dx=interference_dy=0.50m；M192=144 atomic+48 LNS、Kdp8、Kref2/Kref_total4、BASELINE initialization、原SA/direction/NATIVE/independent certifier、TWO_OPT_STAR OFF。未访问 ID_TEST_SEALED、V2_VALIDATION 或 ORACLE_DEV_CONSUMED。','',
         '## 1. C2/C4 四种交叉组合','',
         '34 个 DEV 状态、4184 个已有认证候选；C2/C4 都复用生产 family 与 tie-break。排序耗时为相同进程离线评分：GAT C2/C4 '+f"{offline['scoring_timing']['C2']['seconds']:.3f}s/{offline['scoring_timing']['C4']['seconds']:.3f}s；各组合 family 排序约 {statistics.fmean(v['selection_seconds'] for v in offline['combos'].values()):.4f}s。",'',
         '|组合|规模|C2 material capture|C2 zero|C4 material capture|C4 zero|C4最佳认证改善中位数(s)|','|---|---|---:|---:|---:|---:|---:|']
@@ -1154,7 +1154,7 @@ def write_final_c4_report(root=None):
             lines.append(f"|{key} {names[key]}|{tier_labels[tier]}|{pc(c2['material_candidate_capture'])}|{pc(c2['material_zero_capture'])}|{pc(c4['material_candidate_capture'])}|{pc(c4['material_zero_capture'])}|{c4['best_certified_gain_median'] if c4['best_certified_gain_median'] is not None else '—'}|")
     lines+=['','D 的 material capture 最高（4.78%），但 material 二分类并不等价于 Cmax 幅度排序；同一 GAT Top8 下，HEURISTIC-C4 的状态等权 Cmax 损失反而低于原 GAT-C4。C2 与 C4 不应被强制绑定为同一种排序方法。','',
         '## 2. 固定 Top8 的 C4 Oracle 上限','',
-        'Oracle 只事后重排固定 C2 Top8 中 direction-feasible 且已有 B32 标签的候选。生产 family_c4 的第一个名额可放全局最佳，因此所有有 C2Best 的状态均有 OracleC4Best=C2Best；C2Best→OracleC4Best 的 Cmax 差为 0，未人为制造 family 损失。未认证候选保持 NULL。','',
+        'Oracle 只事后重排固定 C2 Top8 中 direction-feasible 且已有 NATIVE 标签的候选。生产 family_c4 的第一个名额可放全局最佳，因此所有有 C2Best 的状态均有 OracleC4Best=C2Best；C2Best→OracleC4Best 的 Cmax 差为 0，未人为制造 family 损失。未认证候选保持 NULL。','',
         '|C2|规模|PoolBest存在|C2Best/Oracle存在|Oracle改善中位(s)|Pool→C2漏失均值(s)|C2→Oracle最大差(s)|','|---|---|---:|---:|---:|---:|---:|']
     for c2,by_c4 in offline['oracle'].items():
         source=by_c4['HEURISTIC']['states']
@@ -1207,7 +1207,7 @@ def write_final_c4_report(root=None):
         '## 6. HGA/WAG 0.5m 公平接口 smoke','',
         '|instance|method|seed|status|initial|Cmax@60|iterations|ref init/search|certifier|runtime|overshoot|','|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|']
     for row in baseline:lines.append(f"|{row['instance']}|{row['method']}|{row['seed']}|{row['status']}|{row['initial_cmax']:.6f}|{row['Cmax_at_60'] if row['Cmax_at_60'] is not None else 'NULL'}|{row['iterations']}|{row['initial_reference_calls']}/{row['search_reference_calls']}|{row['certifier_calls']}|{row['actual_runtime']:.3f}|{row['overshoot']:.3f}|")
-    lines+=['','4/4 smoke 均按原 seed 一次运行并取得 60 秒前认证解；未重试失败 seed。两基线通过 `FORMAL_SCOPE_V2` 和 `CONFIG_V05` 使用相同 parent 输入、WHOLE/Y/X 目录、x_up/x_low 冻结规则、min_child_length、理论干涉、B32 与 independent certifier。旧 0.2m 成绩未复用。','',
+    lines+=['','4/4 smoke 均按原 seed 一次运行并取得 60 秒前认证解；未重试失败 seed。两基线通过 `FORMAL_SCOPE_V2` 和 `CONFIG_V05` 使用相同 parent 输入、WHOLE/Y/X 目录、x_up/x_low 冻结规则、min_child_length、理论干涉、NATIVE 与 independent certifier。旧 0.2m 成绩未复用。','',
         '## 7. 验证、隔离与下一步','',
         f"完整回归：`pytest -q -p no:cacheprovider`，326 passed。最终不变量：{json.dumps(validation,ensure_ascii=False)}。36/36 在线结果独立认证；Cmax@60 已逐 run 对照 60 秒前 best event，截止后结果未回填；NUMERIC_FAILURE=0。",'',
         'SCI 正式比较接口已经可运行，可进入统一 0.5m 的 HEURISTIC ALNS、MLP、冻结 GAT V05、Adapted-HGA、Adapted-WAG+VNS 与消融实验。启动前唯一明确条件是冻结正式实例/seed 矩阵和统计分析方案；完成后才能解封最终 ID_TEST。','']
@@ -2881,7 +2881,7 @@ def final_coordination_method_spec(method):
         'construction_budget':None if traditional else 5,
         'kinit_ref':None if traditional else 5,
         'two_opt_star':False if not traditional else None,
-        'reference_recovery_rollouts':32,'wall_clock_seconds':60.0,
+        'reference_policy':'NATIVE_PRIORITY_FOUR_ROBOTS','wall_clock_seconds':60.0,
         'deadline_semantics':('certified-60s-soft-return' if traditional else 'hard-reference-deadline')}
 
 

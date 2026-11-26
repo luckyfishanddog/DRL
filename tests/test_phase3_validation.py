@@ -136,13 +136,13 @@ def test_candidate_labels_enforce_direction_stage_and_null_target(monkeypatch):
     absent=ConstrainedDirectionResult(DirectionStatus.NO_LEGAL_FIRST_ORIENTATION,((),(),(),()),None)
     monkeypatch.setattr(d,'optimize_directions_with_initial_feasibility',lambda *a:absent)
     def forbidden(*a,**k): raise AssertionError('Direction-infeasible candidate invoked reference')
-    monkeypatch.setattr(d,'FormalReferenceEvaluator',forbidden)
+    monkeypatch.setattr(d,'NativeReferenceEvaluator',forbidden)
     label=d.label_candidate(candidate,context,0)
     assert label['status']=='DIRECTION_INFEASIBLE' and label['c4'] is None
     assert label['y_feasible']==0 and label['y_improvement'] is None and label['reference_seconds']==0
     directed=ConstrainedDirectionResult(DirectionStatus.FEASIBLE,directions,5.)
     monkeypatch.setattr(d,'optimize_directions_with_initial_feasibility',lambda *a:directed)
-    monkeypatch.setattr(d,'FormalReferenceEvaluator',lambda *a:lambda *a,**k:ScheduleResult(ScheduleStatus.DEADLOCK))
+    monkeypatch.setattr(d,'NativeReferenceEvaluator',lambda *a:lambda *a,**k:ScheduleResult(ScheduleStatus.DEADLOCK))
     label=d.label_candidate(candidate,context,0)
     assert label['status']=='DEADLOCK' and label['c4'] is not None
     assert label['y_feasible']==0 and label['y_improvement'] is None
@@ -348,7 +348,7 @@ def test_actual_material_inference_never_invokes_scheduler(monkeypatch):
     import mrta_reference.scheduler as scheduler
     def forbidden(*a,**kw):raise AssertionError('Inference invoked scheduler')
     monkeypatch.setattr(scheduler,'reference_schedule',forbidden)
-    monkeypatch.setattr(d,'FormalReferenceEvaluator',forbidden)
+    monkeypatch.setattr(d,'NativeReferenceEvaluator',forbidden)
     current=_base();directions=((),(),(0,0),(0,0))
     candidates=[atomic_complete_candidate(current,directions,c,FAST) for c in _family_candidates()]
     direct=ConstrainedDirectionResult(DirectionStatus.FEASIBLE,directions,1.)

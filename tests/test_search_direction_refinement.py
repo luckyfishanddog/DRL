@@ -26,11 +26,11 @@ Q3 = (
 )
 
 
-def test_b32_only_experiment_skips_all_existing_certification(monkeypatch):
+def test_coordination_only_experiment_skips_all_existing_certification(monkeypatch):
     from mrta_reference import certifier
     from mrta_search import pipeline
     def forbidden(*args, **kwargs):
-        raise AssertionError('B32-only experiment called certifier')
+        raise AssertionError('NATIVE-only experiment called certifier')
     monkeypatch.setattr(certifier, 'certify_schedule', forbidden)
     monkeypatch.setattr(pipeline, 'certify_schedule', forbidden)
     result=run_bounded_sa_oi(Q3,FAST,SearchConfig(max_iterations=2,certify=False),seed=3)
@@ -145,7 +145,7 @@ def test_search_iteration_total_reference_cap_includes_refinement_and_replays() 
 def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
     from dataclasses import replace
     from mrta_reference.model import FORMAL_SCOPE_V1_1
-    from mrta_reference.scheduler import reference_schedule_formal
+    from mrta_reference.scheduler import native_schedule
     scope = FORMAL_SCOPE_V1_1
     config = SearchConfig(max_iterations=4)
     results = []
@@ -171,11 +171,11 @@ def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
     assert first.stats.final_operator_weights == replay.stats.final_operator_weights
     fixed = first.initialization.solution
     directions = dict(enumerate(first.initialization.directions))
-    expected = reference_schedule_formal(fixed, FAST, scope=scope, orientations=directions)
+    expected = native_schedule(fixed, FAST, scope=scope, orientations=directions)
     for other in reversed(results):
-        reference_schedule_formal(other.best_solution, FAST, scope=scope,
+        native_schedule(other.best_solution, FAST, scope=scope,
                                   orientations=dict(enumerate(other.best_directions)))
-        actual = reference_schedule_formal(replace(fixed, revision=99), FAST, scope=scope,
+        actual = native_schedule(replace(fixed, revision=99), FAST, scope=scope,
                                             orientations=dict(reversed(tuple(directions.items()))))
         assert actual == expected
     with pytest.raises(ValueError, match="matching formal"):
@@ -186,7 +186,7 @@ def test_formal_fixed_budget_replay_history_independence_and_shared_policy():
 def test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnostics(monkeypatch):
     from mrta_reference import certifier
     from mrta_reference.scope import FORMAL_SCOPE_V1_1
-    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scheduler import NativeReferenceEvaluator
     baseline = run_bounded_sa_oi(Q3, FAST, SearchConfig(max_iterations=0),
                                  scope=FORMAL_SCOPE_V1_1, source_provenance=_development_provenance("test"),
                                  allow_unverified_source=True)
@@ -195,7 +195,7 @@ def test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnos
     stats = SearchStats(FORMAL_SCOPE_V1_1.scope_id, 0)
     result = refine_directions_bounded(
         baseline.best_solution, baseline.best_directions, baseline.best_schedule, FAST,
-        max_calls=1, reference_evaluator=FormalReferenceEvaluator(FORMAL_SCOPE_V1_1), scope=FORMAL_SCOPE_V1_1, stats=stats,
+        max_calls=1, reference_evaluator=NativeReferenceEvaluator(FORMAL_SCOPE_V1_1), scope=FORMAL_SCOPE_V1_1, stats=stats,
     )
     assert result.statuses == (ScheduleStatus.NUMERIC_FAILURE,)
     assert stats.nref == stats.n_numeric_failure == 1 and stats.n_feasible == 0

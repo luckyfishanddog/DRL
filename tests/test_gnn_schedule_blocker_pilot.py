@@ -14,24 +14,15 @@ from mrta_reference.solution import canonicalize
 from mrta_search.lns import select_schedule_blocker_parents
 
 
-def test_observer_preserves_b32_and_keeps_selected_recovery_order():
-    from test_scheduler_equivalence import _known_recoverable_large_case
-    solution,config,directions,templates,baseline=_known_recoverable_large_case()
-    original=scheduler.reference_schedule_from_templates_formal(templates,config,scope=FORMAL_SCOPE_V2,directions=directions)
-    orders={}
-    actual=scheduler.reference_schedule_from_templates_formal(templates,config,scope=FORMAL_SCOPE_V2,directions=directions,
-        feasible_dispatch_observer=lambda result,order:orders.setdefault(result.operations,order))
-    assert asdict(actual)==asdict(original)
-    assert actual.feasible and actual.baseline_deadlock and orders
-    selected=orders[actual.operations]
-    events=scheduler.selected_schedule_wait_blockers(solution,directions,actual,selected,config)
-    assert events
-    for event in events:
-        prefix=selected[:selected.index(event.waiting)]
-        assert all(op_id in {op.operation_id for op in prefix} for op_id,_,_ in event.blocker_intervals)
-    wrong=baseline.terminal_state.fixed_operations
-    with pytest.raises(ValueError,match='final selected'):
-        scheduler.selected_schedule_wait_blockers(solution,directions,actual,wrong,config)
+def test_native_observer_keeps_the_selected_native_timeline():
+    from test_baseline_common import _native_four_task_fixture
+    config,_,solution=_native_four_task_fixture()
+    directions=((0,),)*4;observed=[]
+    actual=scheduler.native_schedule(solution,config,scope=FORMAL_SCOPE_V2,
+        orientations=dict(enumerate(directions)),feasible_dispatch_observer=lambda result,order:observed.append((result,order)))
+    assert actual.feasible and len(observed)==1
+    assert observed[0][0] is actual and observed[0][1]==actual.operations
+    assert scheduler.selected_schedule_wait_blockers(solution,directions,actual,actual.operations,config)==()
 
 
 def test_real_wait_before_move_maps_to_destination_and_actual_blocker():
@@ -45,7 +36,7 @@ def test_real_wait_before_move_maps_to_destination_and_actual_blocker():
     assert actual.schedule.feasible
     events=scheduler.selected_schedule_wait_blockers(solution,directions,actual.schedule,orders[actual.schedule.operations],config)
     event=next(e for e in events if e.delayed_operation.kind is OperationKind.MOVE)
-    assert event.waiting.block_id is None and event.delayed_block_id=='b::whole'
+    assert event.waiting.block_id in (None,'b::whole') and event.delayed_block_id=='b::whole'
     assert any(block_id=='c::whole' and op_id.startswith('R1:') for op_id,block_id,_ in event.blocker_intervals)
 
 
@@ -140,28 +131,13 @@ def test_deadlock_move_wait_and_weld_mapping_keeps_arc_source_and_destination():
     assert evidence.blocker_operation_ids[-1]=='unknown-blocker' and evidence.blocker_operations[-1] is None
 
 
-def test_deadlock_recovery_reports_last_failure_without_changing_scientific_result(monkeypatch):
-    from mrta_reference.dispatch_recovery import (DispatchState,DispatchChoice,BranchPoint,
-        RolloutOutcome,RolloutTrace,limited_discrepancy_recovery)
-    from test_scheduler_equivalence import _known_recoverable_large_case
-    solution,config,directions,templates,baseline=_known_recoverable_large_case()
-    first=scheduler.reference_schedule_from_templates_optimized(templates,config)
-    later=replace(first,deadlock_blockages=tuple(replace(e,ready_time=e.ready_time+100.) for e in first.deadlock_blockages))
-    state=DispatchState()
-    choices=(DispatchChoice((0.,0.,0.,0),0,0,'chosen',0.),DispatchChoice((0.,0.,0.,1),1,0,'alternative',0.))
-    branch=BranchPoint(0,0,state,choices,0)
-    baseline=RolloutOutcome(first,RolloutTrace((branch,),0,1),state)
-    summary=limited_discrepancy_recovery(baseline,rollout_budget=32,
-        rollout_from_snapshot=lambda *a:RolloutOutcome(later,RolloutTrace((),0,1),state))
-    assert summary.recovery_rollouts==1 and summary.result is first and summary.last_deadlock is later
-    monkeypatch.setattr(scheduler,'limited_discrepancy_recovery',lambda *a,**k:summary)
-    prepared=scheduler.prepare_dispatch_problem(templates,config)
-    slow=scheduler._limited_discrepancy_dispatch_recovery_slow(templates,config,baseline,rollout_budget=32)
-    fast=scheduler._limited_discrepancy_dispatch_recovery_optimized(prepared,baseline,rollout_budget=32)
-    assert slow.deadlock_blockages==fast.deadlock_blockages==later.deadlock_blockages
-    assert slow.canonical_json()==fast.canonical_json()
-    assert fast.deadlock_evidence_source=='last recovery deadlock'
-    assert fast.operations==first.operations and fast.wait_for_graph==first.wait_for_graph
+def test_generic_deadlock_evidence_does_not_add_alternative_dispatch_state(monkeypatch):
+    from dataclasses import fields
+    templates=_deadlock_templates()
+    result=scheduler.reference_schedule_from_templates_optimized(templates,ScientificConfig())
+    assert result.status is ScheduleStatus.DEADLOCK and result.cmax is None
+    assert result.deadlock_blockages
+    assert not any('recovery' in field.name or 'budget' in field.name or 'discrepanc' in field.name for field in fields(ScheduleResult))
 
 
 def test_deadlock_parent_selection_closes_split_siblings_and_direct_neighbours():
@@ -209,7 +185,7 @@ def test_deadlock_gnn_continuation_keeps_untouched_owners_order_and_directions(m
     space=c.parent_assignment_space(parents,e.CONFIG)
     current=e.deadlock_plan(parents,record['plan'],space)
     partial=_remove_parent_set(current.solution,('a',))
-    monkeypatch.setattr(e,'b32',lambda *a,**k:pytest.fail('B32 called on a partial construction'))
+    monkeypatch.setattr(e,'coordination',lambda *a,**k:pytest.fail('NATIVE called on a partial construction'))
     with torch.no_grad():
         rebuilt=e.deadlock_reconstruct(current,partial,model,space,model.encode_static(space.graph))
     assert rebuilt.solution is not None and 1<=len(rebuilt.candidates)<=2

@@ -1,4 +1,4 @@
-"""TRAIN-only supervised joint insertion, followed by paired DEV B32 runs."""
+"""TRAIN-only supervised joint insertion, followed by paired DEV NATIVE runs."""
 from __future__ import annotations
 
 import argparse
@@ -26,9 +26,9 @@ import run_joint_oriented_repair_pilot as oriented
 
 DATA = ROOT/'data/development/gnn_joint_repair_train_v2.jsonl'
 MODEL = ROOT/'models/gnn_joint_repair_v2.pt'
-CSV = ROOT/'results/gnn_joint_repair_v2.csv'
-REPORT = ROOT/'docs/GNN_JOINT_REPAIR_V2.md'
-V1_CSV = ROOT/'results/gnn_joint_repair_pilot.csv'
+CSV = ROOT/'results/native_priority/gnn_joint_repair_v2.csv'
+REPORT = ROOT/'docs/NATIVE_GNN_JOINT_REPAIR_V2.md'
+V1_CSV = ROOT/'results/native_priority/gnn_joint_repair_pilot.csv'
 CONFIG = ScientificConfig()
 SELECTORS = (BottleneckSelection.RANDOM,BottleneckSelection.TRAVEL,BottleneckSelection.LOAD)
 
@@ -137,7 +137,7 @@ def teacher_instance(entry,args,index):
                 print('TEACHER',index+1,entry['sheet_name'],q,selection.value,attempt+1,
                       source,record['quality'],round(record['cmax'],3),flush=True)
             print('TEACHER PROGRESS',index+1,entry['sheet_name'],q,selection.value,
-                  'B32',info['teacher_calls'],'feasible',info['teacher_success'],flush=True)
+                  'NATIVE',info['teacher_calls'],'feasible',info['teacher_success'],flush=True)
     strict=[r for r in unique.values() if r['quality']=='STRICT_IMPROVEMENT']
     # Keep a small, diverse feasibility supplement. q8, genuine transfers/order
     # changes and local flips provide useful supervision without dominating it.
@@ -331,7 +331,7 @@ def smoke_neural(model,records):
         item=dict(instance=record['entry']['sheet_name'],status=status,cmax=cmax,actions=len(result.actions),
                   failure=result.rejection_reason)
         results.append(item)
-        print('TRAIN SMOKE GNN+B32',json.dumps(item),flush=True)
+        print('TRAIN SMOKE GNN+NATIVE',json.dumps(item),flush=True)
     return results
 
 
@@ -370,7 +370,7 @@ def generate_data(args):
 def eval_group(entry,initial,partials,method,selection,q,model,args):
     row=dict(instance=entry['sheet_name'],method=method,selection=selection.value,q=q,
              initial_cmax=None if initial is None else initial.schedule.cmax,attempts=len(partials),constructed=0,
-             b32_calls=0,b32_success=0,improved=0,best_cmax=None if initial is None else initial.schedule.cmax,
+             coordination_calls=0,coordination_success=0,improved=0,best_cmax=None if initial is None else initial.schedule.cmax,
              best_candidate_cmax=None,runtime_s=0.0,construction_failed=0,deadlock=0,infeasible=0,
              neural_actions=0,direction0_actions=0,direction1_actions=0,flip_actions=0,neighbour_flips=0,failures='{}')
     started=time.perf_counter()
@@ -398,12 +398,12 @@ def eval_group(entry,initial,partials,method,selection,q,model,args):
             continue
         row['constructed']+=1
         scheduled=oriented.schedule_explicit(solution,result.directions,CONFIG)
-        row['b32_calls']+=1
+        row['coordination_calls']+=1
         status=scheduled.schedule.status
         trace.append(dict(attempt=attempt,status=status.value,
                           cmax=scheduled.schedule.cmax if status is ScheduleStatus.FEASIBLE else None))
         if status is ScheduleStatus.FEASIBLE:
-            row['b32_success']+=1
+            row['coordination_success']+=1
             cmax=scheduled.schedule.cmax
             if row['best_candidate_cmax'] is None or cmax<row['best_candidate_cmax']:
                 row['best_candidate_cmax']=cmax
@@ -420,7 +420,7 @@ def eval_group(entry,initial,partials,method,selection,q,model,args):
     row['failures']=json.dumps(reasons,sort_keys=True)
     row['runtime_s']=time.perf_counter()-started
     row['trace']=json.dumps(trace)
-    print('DEV',entry['sheet_name'],method,selection.value,q,'success',row['b32_success'],'improved',row['improved'],
+    print('DEV',entry['sheet_name'],method,selection.value,q,'success',row['coordination_success'],'improved',row['improved'],
           'constructfail',row['construction_failed'],'best',row['best_cmax'],'time',round(row['runtime_s'],3),flush=True)
     return row,examples
 
@@ -438,7 +438,7 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
     current=initial
     row=dict(experiment=f'STATEFUL_{iterations}',instance=entry['sheet_name'],method=method,
              selection='/'.join(selection.value for selection in selectors),
-             q='4/8',initial_cmax=initial.schedule.cmax,attempts=iterations,constructed=0,b32_calls=0,b32_success=0,
+             q='4/8',initial_cmax=initial.schedule.cmax,attempts=iterations,constructed=0,coordination_calls=0,coordination_success=0,
              improved=0,accepted=0,best_cmax=initial.schedule.cmax,best_candidate_cmax=None,runtime_s=0.,
              construction_failed=0,deadlock=0,infeasible=0,neural_actions=0,failures='{}',trace='[]',
              direction0_actions=0,direction1_actions=0,flip_actions=0,neighbour_flips=0,
@@ -455,7 +455,7 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
         wait_before=positive_wait_duration(current.schedule)
         if wait_feedback and wait_before>0:
             selection=BottleneckSelection.WAIT_ANCHORED
-        # Always select from the accepted incumbent, including its new B32 WAIT.
+        # Always select from the accepted incumbent, including its new NATIVE WAIT.
         partial=select_bottleneck_parents(current.solution,current.directions,current.schedule,selection,
                                           q=q,seed=seed,config=CONFIG)
         selection_fallback=None
@@ -492,17 +492,17 @@ def iterative_group(entry,initial,method,model,args,*,selectors=None,iterations=
         else:
             row['constructed']+=1
             candidate=oriented.schedule_explicit(solution,result.directions,CONFIG)
-            row['b32_calls']+=1
+            row['coordination_calls']+=1
             item['status']=candidate.schedule.status.value
             if candidate.schedule.status is ScheduleStatus.FEASIBLE:
-                row['b32_success']+=1
+                row['coordination_success']+=1
                 cmax=candidate.schedule.cmax;item['candidate_cmax']=cmax
                 item['candidate_wait']=positive_wait_duration(candidate.schedule)
                 row['best_candidate_cmax']=cmax if row['best_candidate_cmax'] is None else min(cmax,row['best_candidate_cmax'])
                 if cmax<before-1e-9*max(1,before):
                     item['changes']=oriented.summary(current,candidate,CONFIG)
                     if wait_feedback and item['wait_used']:
-                        # Retain actual accepted states for case studies; no replay B32.
+                        # Retain actual accepted states for case studies; no replay NATIVE.
                         item['routes_before']=[r.block_ids for r in current.solution.routes]
                         item['directions_before']=current.directions
                         item['routes_after']=[r.block_ids for r in candidate.solution.routes]
@@ -545,16 +545,16 @@ def save_results(rows,checkpoint,initials,examples,args):
             result.append((method,group))
         return result
     lines=['# GNN JointRepair V2：扩大 TRAIN 与真实调度反馈实验','',
-           '方法：调度反馈驱动的冲突感知联合构造与瓶颈重构。固定拆分模式，方向和邻块翻转由同一次联合插入处理；完整方案仅调用一次 B32，真实 Cmax 严格下降才接纳。',
+           '方法：调度反馈驱动的冲突感知联合构造与瓶颈重构。固定拆分模式，方向和邻块翻转由同一次联合插入处理；完整方案仅调用一次 NATIVE，真实 Cmax 严格下降才接纳。',
            '保持两层 SparseGATLayer、hidden=64、heads=4、父选择头和联合候选评分头。没有独立方向阶段或新增启发式算子。','',
            '## 1. TRAIN 数据','',
            f"现有17个 MLP_TRAIN 工作簿中514个 VALID、唯一、formal PASS、10≤N≤90的清单实例可用。实际尝试 {len(generation)} 个 sheet，Beam 成功 {successful} 个，监督覆盖 {stats['geometries']} 个几何、{len(paths)} 个工作簿。",
            '每个工作簿先选最小/中位/最大 N 的三个不同 sheet；同 N 按实例 ID 决定。替补及扩展按 N 与已有空间描述的标准化最小距离选取。全程只依据 TRAIN 几何；每工作簿最多尝试5个。未读取 V2_VALIDATION 或 ID_TEST_SEALED 的 Excel；MLP_DEV 无监督或参数选择用途。',
            f"有效轨迹 {stats['trajectories']}：STRICT_IMPROVEMENT={stats['strict']}，FEASIBLE_NONIMPROVING={stats['supplemental']}；插入动作 {stats['steps']}；q4/q8={qcounts[4]}/{qcounts[8]}。",
-           'RANDOM/TRAVEL/LOAD × q4/q8 × 3次。每个部分解均以 OLD/NEW 有向 Regret-2 补全，预算4096、insertion_limit=8，各完整补全仅一次 B32；选可调度且 Cmax 最低的教师。按原始几何、固定模式、部分路线及方向、待补父集合、最终路线及方向组成普通 tuple 去重。',
+           'RANDOM/TRAVEL/LOAD × q4/q8 × 3次。每个部分解均以 OLD/NEW 有向 Regret-2 补全，预算4096、insertion_limit=8，各完整补全仅一次 NATIVE；选可调度且 Cmax 最低的教师。按原始几何、固定模式、部分路线及方向、待补父集合、最终路线及方向组成普通 tuple 去重。',
            '保留全部严格改善；非改善每几何最多2—4条，优先真实归属/次序变化、邻块翻转，并覆盖q8。两类质量单列，不将非改善标成改善。',
-           f"教师生成耗时 {sum(i['runtime_s'] for i in generation):.3f}s；教师 B32 {sum(i['teacher_calls'] for i in generation)} 次，成功 {sum(i['teacher_success'] for i in generation)} 次。Beam B32 调用 {sum(i['init_calls'] for i in generation)} 次另计。",'',
-           '|TRAIN workbook::sheet|N|Beam Cmax|教师B32/成功|严格/非改善|秒|',
+           f"教师生成耗时 {sum(i['runtime_s'] for i in generation):.3f}s；教师 NATIVE {sum(i['teacher_calls'] for i in generation)} 次，成功 {sum(i['teacher_success'] for i in generation)} 次。Beam NATIVE 调用 {sum(i['init_calls'] for i in generation)} 次另计。",'',
+           '|TRAIN workbook::sheet|N|Beam Cmax|教师NATIVE/成功|严格/非改善|秒|',
            '|---|---:|---:|---:|---:|---:|']
     for info in generation:
         c='FAIL' if info['initial_cmax'] is None else f"{info['initial_cmax']:.3f}"
@@ -572,11 +572,11 @@ def save_results(rows,checkpoint,initials,examples,args):
         d=item['teacher_forced']
         lines.append(f"|{item['epoch']}|{item['loss']:.4f}|{d['insertion_accuracy']:.2%}|{d['parent_accuracy']:.2%}|{d.get('predicted_direction_1',0)}|{d['predicted_flip_actions']}|")
     lines+=['','## 3. 固定初解、相同部分解配对实验','',
-            '六个原DEV，seed=20261027，q4/q8，RANDOM/TRAVEL/LOAD，每组8次，共288候选/方法。共用同一Beam初解、固定模式、移除集合、合法资格、方向候选和B32。',
-            'V1与NEW条件一致时读取原CSV；初解Cmax逐组核对。代码保留V1未归一化默认行为，方向和候选生成器未改。历史运行时间沿用原测量，V2为本次测量；均含补全和B32，不含公共初解。CSV source 列区分历史复用与本次实测。','',
-            '|方法|B32成功/尝试|严格改善|补全+B32秒|', '|---|---:|---:|---:|']
+            '六个原DEV，seed=20261027，q4/q8，RANDOM/TRAVEL/LOAD，每组8次，共288候选/方法。共用同一Beam初解、固定模式、移除集合、合法资格、方向候选和NATIVE。',
+            'V1与NEW条件一致时读取原CSV；初解Cmax逐组核对。代码保留V1未归一化默认行为，方向和候选生成器未改。历史运行时间沿用原测量，V2为本次测量；均含补全和NATIVE，不含公共初解。CSV source 列区分历史复用与本次实测。','',
+            '|方法|NATIVE成功/尝试|严格改善|补全+NATIVE秒|', '|---|---:|---:|---:|']
     for method,group in aggregates('PAIRED_FIXED'):
-        lines.append(f"|{method}|{sum(r['b32_success'] for r in group)}/{sum(r['attempts'] for r in group)}|{sum(r['improved'] for r in group)}|{sum(r['runtime_s'] for r in group):.3f}|")
+        lines.append(f"|{method}|{sum(r['coordination_success'] for r in group)}/{sum(r['attempts'] for r in group)}|{sum(r['improved'] for r in group)}|{sum(r['runtime_s'] for r in group):.3f}|")
     vg=[r for r in rows if r['experiment']=='PAIRED_FIXED' and r['method']=='GNN-V2']
     lines+=['',f"V2实际DEV自主补全动作（含最终失败的部分轨迹）：方向0/1={sum(r['direction0_actions'] for r in vg)}/{sum(r['direction1_actions'] for r in vg)}，含邻翻转动作={sum(r['flip_actions'] for r in vg)}，邻块翻转总数={sum(r['neighbour_flips'] for r in vg)}。"]
     lines+=['','|实例|初解Cmax|V1最佳|V2最佳|NEW最佳|V2成功/改善|V2秒|', '|---|---:|---:|---:|---:|---:|---:|']
@@ -587,13 +587,13 @@ def save_results(rows,checkpoint,initials,examples,args):
             g=groups(name,'PAIRED_FIXED',method)
             return min(r['best_cmax'] for r in g) if g else initial
         v2=groups(name,'PAIRED_FIXED','GNN-V2')
-        lines.append(f"|{name}|{initial:.3f}|{best('GNN-V1'):.3f}|{best('GNN-V2'):.3f}|{best('NEW'):.3f}|{sum(r['b32_success'] for r in v2)}/{sum(r['improved'] for r in v2)}|{sum(r['runtime_s'] for r in v2):.3f}|")
+        lines.append(f"|{name}|{initial:.3f}|{best('GNN-V1'):.3f}|{best('GNN-V2'):.3f}|{best('NEW'):.3f}|{sum(r['coordination_success'] for r in v2)}/{sum(r['improved'] for r in v2)}|{sum(r['runtime_s'] for r in v2):.3f}|")
     lines+=['','V2各实例最好改善（没有改善时保存首个可调度/失败例）：','']
     for case in examples:
         changes=case['changes']
         lines.append(f"- {case['instance']} q{case['q']} {case['selection']} attempt={case['attempt']} {case['status']}：Cmax {changes['cmax_before']:.3f}→{changes['cmax_after']}，归属改变 {len(changes['transfers'])}，次序改变路线 {changes['reordered_routes']}，方向变化 {len(changes['flips'])}，WAIT {changes['wait_before']:.3f}→{changes['wait_after']}。")
     lines+=['','## 4. 有状态调度反馈循环（单列）','',
-            '每实例每方法24轮；RANDOM/TRAVEL/LOAD依次轮换，每三轮切换q4/q8，固定种子。NEW与V2各维护自己的current；严格改善后下一轮从更新路线、方向和调度重新选瓶颈。每轮最多一次B32，最多24次/实例/方法；不添加重启、SA或其他算子。CSV trace保存全部24轮的移除父集合、前后Cmax、B32状态、接纳与改变明细。','',
+            '每实例每方法24轮；RANDOM/TRAVEL/LOAD依次轮换，每三轮切换q4/q8，固定种子。NEW与V2各维护自己的current；严格改善后下一轮从更新路线、方向和调度重新选瓶颈。每轮最多一次NATIVE，最多24次/实例/方法；不添加重启、SA或其他算子。CSV trace保存全部24轮的移除父集合、前后Cmax、NATIVE状态、接纳与改变明细。','',
             '|实例|方法|成功/调用|接纳次数|初解→最终Cmax|相对48个独立候选最佳|相对24个独立候选最佳|秒|','|---|---|---:|---:|---:|---:|---:|---:|']
     for row in rows:
         if row['experiment']!='STATEFUL_24':continue
@@ -602,7 +602,7 @@ def save_results(rows,checkpoint,initials,examples,args):
         independent=[a['cmax'] for r in paired for a in json.loads(r['trace'])
                      if a.get('attempt',99)<4 and a.get('cmax') is not None]
         delta24=f"{row['best_cmax']-min([row['initial_cmax']]+independent):+.3f}" if independent else '历史CSV无逐次记录'
-        lines.append(f"|{row['instance']}|{row['method']}|{row['b32_success']}/{row['b32_calls']}|{row['accepted']}|{row['initial_cmax']:.3f}→{row['best_cmax']:.3f}|{row['best_cmax']-fixed:+.3f}|{delta24}|{row['runtime_s']:.3f}|")
+        lines.append(f"|{row['instance']}|{row['method']}|{row['coordination_success']}/{row['coordination_calls']}|{row['accepted']}|{row['initial_cmax']:.3f}→{row['best_cmax']:.3f}|{row['best_cmax']-fixed:+.3f}|{delta24}|{row['runtime_s']:.3f}|")
     lines+=['','循环24轮，完整配对实验48次/实例；V2另取每个选区/q组合的前4次构成24个独立候选比较，未按结果挑选。NEW历史CSV无逐次记录，不补造24次对照。等次数比较仍只是六个DEV上的观察；多次接纳证明当前方案确实逐轮更新，不能将288次独立候选称作反馈循环。','']
     REPORT.write_text('\n'.join(lines),encoding='utf-8')
 
@@ -611,8 +611,8 @@ def evaluate(model,checkpoint,args):
     _,dev=entries();by_name={e['sheet_name']:e for e in dev}
     historical=list(csv.DictReader(V1_CSV.open(encoding='utf-8-sig')))
     rows=[];initials={};examples=[];initial_states={};initial_times={}
-    fields=('experiment','instance','method','selection','q','initial_cmax','attempts','constructed','b32_calls',
-            'b32_success','improved','best_cmax','best_candidate_cmax','runtime_s','construction_failed','deadlock',
+    fields=('experiment','instance','method','selection','q','initial_cmax','attempts','constructed','coordination_calls',
+            'coordination_success','improved','best_cmax','best_candidate_cmax','runtime_s','construction_failed','deadlock',
             'infeasible','neural_actions','failures','accepted','trace','initial_runtime_s','seed','source')
     fields=fields+('direction0_actions','direction1_actions','flip_actions','neighbour_flips')
     for name in oriented.NAMES:
@@ -632,7 +632,7 @@ def evaluate(model,checkpoint,args):
         if reusable:
             for original in old:
                 row={k:None for k in fields};row.update(original)
-                for k in ('q','attempts','constructed','b32_calls','b32_success','improved','construction_failed','deadlock','infeasible','neural_actions'):
+                for k in ('q','attempts','constructed','coordination_calls','coordination_success','improved','construction_failed','deadlock','infeasible','neural_actions'):
                     row[k]=int(row[k])
                 for k in ('initial_cmax','best_cmax','best_candidate_cmax','runtime_s'):
                     row[k]=float(row[k]) if row[k] else None
@@ -679,18 +679,18 @@ def save_wait_results(rows,args):
     lines=['# GNN-V2：调度等待反馈选区实验','',
            '## 实验设置','',
            f'六个现有 MLP_DEV，seed={args.seed}，CPU单线程；加载 `models/gnn_joint_repair_v2.pt`，未训练或生成教师数据。',
-           '每实例只计算一次共同 Beam 初解，并把同一个初解对象交给 BASE 和 WAIT；模型、联合插入、B32、24轮预算均相同。',
+           '每实例只计算一次共同 Beam 初解，并把同一个初解对象交给 BASE 和 WAIT；模型、联合插入、NATIVE、24轮预算均相同。',
            '原定选区 RANDOM/TRAVEL/LOAD 循环；q序列为 [4,4,4,8,8,8] 重复4次；种子为 seed+实例原索引×10000+零基迭代号。',
            'WAIT每轮读取当前已接纳调度，累计 duration>numeric_epsilon 的 WAIT。存在正WAIT才覆盖为WAIT_ANCHORED；无WAIT保留原定选区；WAIT部分解不可用则回退本轮原定选区。',
-           '仅完整候选调用一次B32；判断WAIT不调用调度器。接纳沿用原实现 Cnew<Cold−1e−9×max(1,Cold)。方向和邻块翻转仍在联合插入中决定。',
+           '仅完整候选调用一次NATIVE；判断WAIT不调用调度器。接纳沿用原实现 Cnew<Cold−1e−9×max(1,Cold)。方向和邻块翻转仍在联合插入中决定。',
            'WAIT_ANCHORED 是等待时空关联代理，未识别真实因果阻塞操作。旧Regret-2和静态WAIT试验结果未混入本次数据。',
-           '运行时间仅含24轮选区、补全、B32和记录，不含共同Beam、Excel及模型加载。CSV每行对应一条24轮轨迹，trace保留逐轮原定/实际选区、WAIT、回退、移除集合、候选及接纳状态。','',
+           '运行时间仅含24轮选区、补全、NATIVE和记录，不含共同Beam、Excel及模型加载。CSV每行对应一条24轮轨迹，trace保留逐轮原定/实际选区、WAIT、回退、移除集合、候选及接纳状态。','',
            '## 最终结果','',
-           '|实例|方法|共同初始Cmax|最终Cmax|改善%|接纳|B32成功/调用|24轮秒|',
+           '|实例|方法|共同初始Cmax|最终Cmax|改善%|接纳|NATIVE成功/调用|24轮秒|',
            '|---|---|---:|---:|---:|---:|---:|---:|']
     for r in rows:
         gain=100*(r['initial_cmax']-r['best_cmax'])/r['initial_cmax']
-        lines.append(f"|{r['instance']}|{r['method']}|{r['initial_cmax']:.6f}|{r['best_cmax']:.6f}|{gain:.6f}|{r['accepted']}|{r['b32_success']}/{r['b32_calls']}|{r['runtime_s']:.3f}|")
+        lines.append(f"|{r['instance']}|{r['method']}|{r['initial_cmax']:.6f}|{r['best_cmax']:.6f}|{gain:.6f}|{r['accepted']}|{r['coordination_success']}/{r['coordination_calls']}|{r['runtime_s']:.3f}|")
     lines+=['','WAIT相对于BASE（相同1e−9相对容差）：','',
             '|实例|WAIT−BASE Cmax秒|胜/平/负|','|---|---:|---|']
     outcomes=Counter()
@@ -748,13 +748,13 @@ def save_wait_results(rows,args):
     if not cases:
         lines+=['没有WAIT_ANCHORED被实际使用且严格改善的案例。','']
     lines+=['## 失败与结论','',
-            '|方法|构造失败|DEADLOCK|其他调度失败|接纳总数|搜索B32成功/调用|24轮总秒|',
+            '|方法|构造失败|DEADLOCK|其他调度失败|接纳总数|搜索NATIVE成功/调用|24轮总秒|',
             '|---|---:|---:|---:|---:|---:|---:|']
     for method in ('GNN-V2-BASE','GNN-V2-WAIT'):
         group=[r for r in rows if r['method']==method]
-        totals={k:sum(r[k] for r in group) for k in ('construction_failed','deadlock','infeasible','accepted','b32_success','b32_calls','runtime_s')}
-        lines.append(f"|{method}|{totals['construction_failed']}|{totals['deadlock']}|{totals['infeasible']}|{totals['accepted']}|{totals['b32_success']}/{totals['b32_calls']}|{totals['runtime_s']:.3f}|")
-    lines+=['','最终以Cmax为准；WAIT下降或某轮接纳本身不代表超过BASE。DEADLOCK仅表示当前B32搜索未找到调度，不能证明数学不可行。',
+        totals={k:sum(r[k] for r in group) for k in ('construction_failed','deadlock','infeasible','accepted','coordination_success','coordination_calls','runtime_s')}
+        lines.append(f"|{method}|{totals['construction_failed']}|{totals['deadlock']}|{totals['infeasible']}|{totals['accepted']}|{totals['coordination_success']}/{totals['coordination_calls']}|{totals['runtime_s']:.3f}|")
+    lines+=['','最终以Cmax为准；WAIT下降或某轮接纳本身不代表超过BASE。DEADLOCK仅表示当前NATIVE搜索未找到调度，不能证明数学不可行。',
             '这是一组固定种子、六个DEV实例的控制变量实验，不能据此宣称跨种子的稳定性。','',
             '## 复现','',
             "```powershell\n& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B scripts/run_gnn_joint_repair_pilot.py --phase wait-eval\n```",'工作目录 `D:\\pybullet_test\\MRTA_GA\\DRL`。']
@@ -776,7 +776,7 @@ def evaluate_wait(model,args):
             method='GNN-V2-WAIT' if wait_feedback else 'GNN-V2-BASE'
             row=iterative_group(entry,initial,method,model,args,wait_feedback=wait_feedback)
             row['initial_runtime_s']=initial_time
-            row['initial_b32_calls']=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts)
+            row['initial_coordination_calls']=sum(a['status'] in {s.value for s in ScheduleStatus} for a in attempts)
             rows.append(row)
         save_wait_results(rows,args)
     print('Saved WAIT feedback CSV and report',flush=True)
@@ -788,9 +788,9 @@ def save_parent_selection_report(rows,blocked,args):
            f'复用原固定初解实验：RANDOM/TRAVEL/LOAD × q4/q8 × 每组8次，共48个部分解/实例；每次seed={args.seed}+原实例索引×10000+q×100+零基attempt。两方法从同一个部分解、保留方向和pending父集合独立补全，不更新初解，不执行24轮反馈。',
            'learned保留parent_head；MRV仅在同一个joint_parent_inputs可选父集合中排序。每个子块的选择数估计为合法机器人对应bounded_insertion_positions数量之和；父级取各子块数量的乘积，然后按父总加工时间降序、parent_id升序破同分。各子块均使用当前路线长度，不枚举完整父级组合，不额外评价方向或未来状态。X子块固定机器人规则与joint_block_candidates一致。',
            '此为低成本MRV估计，不是方向、首任务和同父邻接剪枝后的精确完整动作数；父级可选性和实际动作仍完全使用原候选生成器。',
-           '共同insertion_limit=8、greedy解码、GNN插入评分、方向/邻块翻转、固定模式与B32；每个完整候选仅一次B32，失败候选全部保留。每对交替先运行learned/MRV，以减轻固定执行顺序对计时的影响。',
-           '时间仅含逐次构造和B32，不含共同Beam、Excel、模型加载及CSV写入；最佳Cmax包含共同初解。严格改善沿用 Cnew<Cinitial−1e−9×max(1,Cinitial)。','',
-           '|实例|方法|初始Cmax|完成补全|B32成功/尝试|严格改善|最佳Cmax|改善%|秒|',
+           '共同insertion_limit=8、greedy解码、GNN插入评分、方向/邻块翻转、固定模式与NATIVE；每个完整候选仅一次NATIVE，失败候选全部保留。每对交替先运行learned/MRV，以减轻固定执行顺序对计时的影响。',
+           '时间仅含逐次构造和NATIVE，不含共同Beam、Excel、模型加载及CSV写入；最佳Cmax包含共同初解。严格改善沿用 Cnew<Cinitial−1e−9×max(1,Cinitial)。','',
+           '|实例|方法|初始Cmax|完成补全|NATIVE成功/尝试|严格改善|最佳Cmax|改善%|秒|',
            '|---|---|---:|---:|---:|---:|---:|---:|---:|']
     bests={}
     for name in dict.fromkeys(r['instance'] for r in rows):
@@ -801,7 +801,7 @@ def save_parent_selection_report(rows,blocked,args):
             best=min([initial]+[r['cmax'] for r in group if r['status']=='FEASIBLE'])
             bests[name][mode]=best
             lines.append(f"|{name}|{mode}|{initial:.6f}|{sum(r['constructed'] for r in group)}/{len(group)}|{sum(r['status']=='FEASIBLE' for r in group)}/{len(group)}|{sum(r['improved'] for r in group)}|{best:.6f}|{100*(initial-best)/initial:.6f}|{sum(r['runtime_s'] for r in group):.3f}|")
-    lines+=['','|方法|完成补全|B32成功/尝试|成功率|严格改善|构造+B32秒|',
+    lines+=['','|方法|完成补全|NATIVE成功/尝试|成功率|严格改善|构造+NATIVE秒|',
             '|---|---:|---:|---:|---:|---:|']
     for mode in ('learned','mrv'):
         group=[r for r in rows if r['parent_selection_mode']==mode]

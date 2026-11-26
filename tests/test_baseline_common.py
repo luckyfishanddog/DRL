@@ -34,6 +34,170 @@ def _solution():
     return config, parents, solution
 
 
+def _native_four_task_fixture():
+    from mrta_reference.fixed_taskset import generate_taskset
+    config=ScientificConfig()
+    parents=(ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('u',(13.,9.),(14.,9.)),
+             ParentWeld('l',(1.,2.),(2.,2.)),ParentWeld('r',(13.,2.),(14.,2.)))
+    taskset=generate_taskset(parents,config)
+    groups={0:tuple(t.task_id for t in taskset.tasks if t.source_parent_id=='p'),
+            1:('u::seg_000',),2:('l::seg_000',),3:('r::seg_000',)}
+    return config,taskset,canonicalize(taskset.parents,taskset.patterns,groups,config)
+
+
+def test_unified_native_interface_calls_only_one_compiled_kernel(monkeypatch):
+    import pytest
+    from mrta_baselines import wag_vns as wag
+    from mrta_reference import scheduler
+    from mrta_reference.model import OperationKind
+    config,ts,solution=_native_four_task_fixture()
+    calls=[];kernel=wag._priority_arrays
+    def observed(*a,**k):calls.append(1);return kernel(*a,**k)
+    def forbidden(*a,**k):raise AssertionError('Python reference scheduler called by current objective')
+    monkeypatch.setattr(wag,'_priority_arrays',observed)
+    monkeypatch.setattr(scheduler,'reference_schedule_optimized',forbidden)
+    result=scheduler.native_schedule(solution,config,orientations={r:(0,) for r in range(4)})
+    assert result.feasible and calls==[1]
+    assert result.cmax==max(result.robot_completion)
+    assert result.cmax==pytest.approx(config.process_time(6.6))
+    assert len(result.directions)==4 and all(d==(0,) for d in result.directions)
+    assert sum(op.kind is OperationKind.SETUP for op in result.operations)==4
+    assert sum(op.kind is OperationKind.POST for op in result.operations)==4
+    assert sum(op.duration for op in result.operations if op.kind is OperationKind.SETUP)==4*20.
+    assert sum(op.duration for op in result.operations if op.kind is OperationKind.POST)==4*30.
+    assert result.waiting_time==sum(result.robot_waiting_time)
+    assert len(ts.tasks)>4 and len(solution.routes[0].block_ids)==1
+
+
+def test_unified_native_gnn_array_and_public_results_match_without_final_call(monkeypatch):
+    import numpy as np
+    import pytest
+    from mrta_search import gnn_vns_br as br
+    from mrta_baselines.wag_vns import priority_schedule
+    config,ts,solution=_native_four_task_fixture()
+    workspace=br.FixedWorkspace(ts,config)
+    routes=[np.array([workspace.index[b] for b in route.block_ids],np.int64) for route in solution.routes]
+    bits=[np.zeros(len(route),np.int64) for route in routes]
+    calls=[];kernel=br._priority_arrays
+    def observed(*a,**k):calls.append(1);return kernel(*a,**k)
+    monkeypatch.setattr(br,'_priority_arrays',observed)
+    state=workspace.evaluate(routes,bits)
+    result=workspace.schedule_result(state)
+    assert calls==[1] and workspace.evaluations==1
+    public=priority_schedule(solution,config,bits)
+    assert result.status==public.status and result.cmax==pytest.approx(public.cmax)
+    assert result.robot_completion==pytest.approx(public.robot_completion)
+    assert result.directions==public.directions and result.operations==public.operations
+    assert result.waiting_time==pytest.approx(public.waiting_time)
+
+
+def test_unified_native_deadlock_has_no_alternative_dispatch(monkeypatch):
+    from mrta_reference import scheduler
+    from mrta_reference.model import ScheduleStatus
+    from mrta_baselines import wag_vns as wag
+    config=ScientificConfig()
+    parents=(ParentWeld('a',(10.,9.),(11.,9.)),ParentWeld('b',(1.,9.),(2.,9.)))
+    solution=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+                          {0:('a::whole',),1:('b::whole',)},config)
+    calls=[];kernel=wag._priority_arrays
+    def observed(*a,**k):calls.append(1);return kernel(*a,**k)
+    def forbidden(*a,**k):raise AssertionError('an alternative Python dispatch was attempted')
+    monkeypatch.setattr(wag,'_priority_arrays',observed)
+    monkeypatch.setattr(scheduler,'reference_schedule_optimized',forbidden)
+    result=scheduler.native_schedule(solution,config,orientations={0:(0,),1:(0,)})
+    assert result.status is ScheduleStatus.DEADLOCK and result.cmax is None
+    assert calls==[1] and result.diagnostics
+
+
+def test_native_wait_contributes_to_each_robot_completion():
+    import pytest
+    from mrta_reference.scheduler import native_schedule
+    from mrta_reference.model import OperationKind
+    config=ScientificConfig(weld_speed=1.,empty_speed=100.,t_pre=1.,t_post=1.)
+    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(17.,9.),(18.,9.)),
+             ParentWeld('c',(14.,9.),(20.,9.)))
+    solution=canonicalize(parents,tuple(SplitPattern(p.parent_id,SplitKind.WHOLE) for p in parents),
+                          {0:('a::whole','b::whole'),1:('c::whole',)},config)
+    result=native_schedule(solution,config,orientations={0:(0,0),1:(0,)})
+    assert result.feasible and result.waiting_time>0
+    for robot in range(4):
+        owned=[op for op in result.operations if op.robot_id==robot]
+        assert result.robot_completion[robot]==pytest.approx(max((op.end_time for op in owned),default=0.))
+        assert result.robot_completion[robot]==pytest.approx(sum(op.duration for op in owned))
+    assert result.cmax==max(result.robot_completion)
+    assert result.waiting_time==sum(op.duration for op in result.operations if op.kind is OperationKind.WAIT)
+
+
+def test_native_distinguishes_numeric_failure_from_structural_infeasibility(monkeypatch):
+    from mrta_reference import scheduler
+    from mrta_reference.model import ScheduleStatus
+    from mrta_baselines import wag_vns
+    import numpy as np
+    config,_,solution=_native_four_task_fixture()
+    result=scheduler.native_schedule(solution,config,orientations={0:(2,)})
+    assert result.status is ScheduleStatus.INFEASIBLE and result.cmax is None
+    def broken(*a,**k):
+        return float('nan'),[np.zeros(1,dtype=np.int64) for _ in range(4)],[],np.zeros(4)
+    monkeypatch.setattr(wag_vns,'_priority_arrays',broken)
+    result=scheduler.native_schedule(solution,config,orientations={r:(0,) for r in range(4)})
+    assert result.status is ScheduleStatus.NUMERIC_FAILURE and result.cmax is None
+
+
+def test_fixed_baseline_entries_reuse_native_schedule_without_final_evaluation(monkeypatch):
+    import importlib
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from mrta_reference.scheduler import native_schedule
+    from mrta_reference.model import ScheduleStatus
+    from mrta_baselines import wag_vns
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_fixed_taskset_experiment')
+    config,taskset,solution=_native_four_task_fixture()
+    schedule=native_schedule(solution,config,orientations={r:(0,) for r in range(4)})
+    def forbidden(*a,**k):raise AssertionError('baseline entry repeated native evaluation')
+    monkeypatch.setattr(wag_vns,'_priority_arrays',forbidden)
+    for method,attr,budget in [('wag_vns','run_adapted_wag_vns',500),('hga','run_adapted_hga',200000)]:
+        def fake(parents,config,settings,**kwargs):
+            assert kwargs['certify'] is False and kwargs['candidate_evaluator'] is runner.priority_schedule
+            if method=='hga':assert settings.vnd_objective=='ROUTE_CYCLE'
+            return SimpleNamespace(schedule=schedule,solution=solution,directions=schedule.directions,
+                iterations=budget,termination_reason='ITERATION_LIMIT',reference_calls=1,
+                status=ScheduleStatus.FEASIBLE,accounting={},diagnostics=(),actual_runtime=.01,
+                initialization_time=.005,search_time=.005)
+        monkeypatch.setattr(runner,attr,fake)
+        row=runner.baseline_job((method,'train','toy',taskset,17))
+        detail=json.loads(row['diagnostic'])
+        assert row['status']=='FEASIBLE' and row['cmax_s']==schedule.cmax
+        assert row['coordination_calls']==1 and detail['final_scheduler_extra_calls']==0
+        assert detail['final_schedule_reused']
+
+
+def test_legacy_baseline_entry_reuses_native_timeline(monkeypatch):
+    import importlib
+    from dataclasses import asdict
+    from pathlib import Path
+    from types import SimpleNamespace
+    from mrta_reference.scheduler import native_schedule
+    from mrta_baselines.common import BaselineAccounting
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_weld_layout')
+    config,_,solution=_native_four_task_fixture()
+    schedule=native_schedule(solution,config,orientations={r:(0,) for r in range(4)})
+    best=SimpleNamespace(solution=solution,directions=schedule.directions,schedule=schedule,completed_at=.01)
+    def forbidden(*a,**k):raise AssertionError('legacy entry repeated native scheduling')
+    monkeypatch.setattr(runner,'schedule_explicit',forbidden)
+    for method in ('WAG+VNS','HGA'):
+        result=SimpleNamespace(timely_best=best,iterations=runner.BASELINE_ITERATIONS[method],
+            accounting=asdict(BaselineAccounting()),reference_calls=7,certifier_calls=0,
+            actual_runtime=.02,initialization_time=.01,overshoot=0.,best_events=(),termination_reason='ITERATION_LIMIT')
+        monkeypatch.setattr(runner,'baseline_run',lambda *a,**k:result)
+        row=runner.baseline_job((('toy',solution.parents),method,17))
+        assert row['cmax_s']==schedule.cmax and row['native_cmax_s']==schedule.cmax
+        assert row['coordination_calls']==7 and row['wait_s']==schedule.waiting_time
+    assert runner.coordination(best) is schedule
+
+
 def test_common_baseline_path_uses_formal_scope_direction_and_certifier():
     config, parents, solution = _solution()
     evaluator = CommonBaselineEvaluator(
@@ -101,7 +265,7 @@ def test_native_cache_distinguishes_explicit_directions_on_the_same_order():
     assert evaluator.accounting.reference_calls == 0
 
 
-def test_experiment_can_use_b32_without_certifier(monkeypatch):
+def test_experiment_can_use_coordination_without_certifier(monkeypatch):
     import mrta_baselines.common as common
     config, parents, solution = _solution()
     def forbidden(*args, **kwargs):
@@ -109,7 +273,7 @@ def test_experiment_can_use_b32_without_certifier(monkeypatch):
     monkeypatch.setattr(common, 'certify_schedule', forbidden)
     evaluator = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V1_1,
                                         time_limit=2., certify=False)
-    result = evaluator.evaluate(solution, source='B32_ONLY')
+    result = evaluator.evaluate(solution, source='NATIVE_ONLY')
     assert result.status is BaselineStatus.COMPLETED
     assert result.schedule.feasible and result.certification is None
     assert evaluator.accounting.reference_calls == 1
@@ -164,10 +328,10 @@ def test_initial_solution_telemetry_hash_is_canonical_deterministic_and_source_f
 
 def test_zr_observer_same_result_and_candidate_replay():
     from dataclasses import asdict
-    from mrta_reference.scheduler import FormalReferenceEvaluator
+    from mrta_reference.scheduler import NativeReferenceEvaluator
     from mrta_reference.scope import FORMAL_SCOPE_V2
     config, parents, solution = _solution()
-    expected = FormalReferenceEvaluator(FORMAL_SCOPE_V2)(solution, config)
+    expected = NativeReferenceEvaluator(FORMAL_SCOPE_V2)(solution, config)
     for level in (0, 1, 2):
         with ReferenceTrace("FIXTURE", level) as trace:
             evaluator = CommonBaselineEvaluator(parents, config, FORMAL_SCOPE_V2, time_limit=2.0)
@@ -176,10 +340,9 @@ def test_zr_observer_same_result_and_candidate_replay():
         if level:
             row = trace.serialize({"instance_id": "fixture", "instance_geometry_hash": "fixture", "tier": "SMALL"})[0]
             assert row["scheduler_duration"] > 0
-            assert row["recovery_time"] == 0
             assert row["certified"] is True
             assert row["candidate_source"] == "FIXTURE_SOURCE"
-            assert abs(sum(row[k] for k in ("preparation_time", "baseline_dispatch_time", "recovery_time", "packaging_time"))-row["scheduler_duration"]) < 1e-8
+            assert row["native_evaluation_time"] == row["scheduler_duration"]
             recovered, cfg, directions = reconstruct(row["replay"])
             assert recovered.canonical_hash == solution.canonical_hash
             assert cfg.scientific_hash == config.scientific_hash
@@ -189,15 +352,15 @@ def test_zr_observer_same_result_and_candidate_replay():
 
 def test_zr_observer_exception_explicitly_fails_closed_and_restores():
     import pytest
-    from mrta_reference.scheduler import FormalReferenceEvaluator
-    original = FormalReferenceEvaluator.__call__
+    from mrta_reference.scheduler import NativeReferenceEvaluator
+    original = NativeReferenceEvaluator.__call__
     config, _, solution = _solution()
     def fail(row):
         raise RuntimeError("observer sink failed")
     with pytest.raises(RuntimeError, match="observer sink failed"):
         with ReferenceTrace("FIXTURE", sink=fail):
-            FormalReferenceEvaluator(FORMAL_SCOPE_V1_1)(solution, config)
-    assert FormalReferenceEvaluator.__call__ is original
+            NativeReferenceEvaluator(FORMAL_SCOPE_V1_1)(solution, config)
+    assert NativeReferenceEvaluator.__call__ is original
 
 def test_zr_observer_preserves_protected_certifier_identity_in_real_alns_initialization():
     from mrta_search.initialization import build_initial_solution, InitializationStatus
@@ -239,162 +402,61 @@ def reconstruct(data):
     return solution, config, {r: tuple(v) for r, v in enumerate(data["directions"])}
 
 class ReferenceTrace:
-    """Single-threaded scoped observer; failures are explicit execution failures.
-
-    No scheduling call is repeated to manufacture evidence. Existing certifier
-    results are observed. The context always restores every patched callable.
-    """
+    """Observe native calls and existing certification without replaying dispatch."""
     def __init__(self, method, level=1, sink=None):
-        if level not in (0, 1, 2):
-            raise ValueError("telemetry level must be 0, 1 or 2")
-        self.method, self.level, self.sink = method, level, sink
-        self.rows, self.errors, self.patches = [], [], []
-        self.current, self.source, self.in_recovery = None, "FORMAL_REFERENCE", False
-        self.started = time.perf_counter()
+        if level not in (0,1,2):raise ValueError('telemetry level must be 0,1 or 2')
+        self.method,self.level,self.sink=method,level,sink
+        self.rows,self.errors,self.patches=[],[],[]
+        self.source='NATIVE_REFERENCE'
 
-    def patch(self, obj, name, replacement):
-        self.patches.append((obj, name, getattr(obj, name)))
-        setattr(obj, name, replacement)
+    def patch(self,obj,name,replacement):
+        self.patches.append((obj,name,getattr(obj,name)))
+        setattr(obj,name,replacement)
 
     def __enter__(self):
-        if self.level == 0:
-            return self
-        original = scheduler.FormalReferenceEvaluator.__call__
+        if self.level==0:return self
+        original=scheduler.NativeReferenceEvaluator.__call__
         @wraps(original)
-        def reference(evaluator, solution, config, *, orientations=None):
-            start = time.perf_counter()
-            row = {"reference_call_index": len(self.rows)+1, "method_id": self.method,
-                   "candidate_source": self.source, "scheduler_start_time": start-self.started,
-                   "baseline_dispatch_time": 0.0, "recovery_time": 0.0, "preparation_time": 0.0,
-                   "packaging_time": 0.0, "rollouts": [], "certified": None}
-            if self.level == 2:
-                row.update(rollouts_attempted=0, rollouts_completed=0,
-                           selected_rollout_index=None, selected_plan=[])
-            previous = self.current
-            self.current = row
-            profile = scheduler.SchedulerProfile() if self.level == 2 else None
-            row["_absolute_start"] = start
-            try:
-                if profile is None:
-                    result = original(evaluator, solution, config, orientations=orientations)
-                else:
-                    if evaluator.deadlock_observer is not None:
-                        raise ValueError("deep replay excludes extra deadlock callback evaluations")
-                    result = scheduler.reference_schedule_formal(solution, config, scope=evaluator.scope,
-                                orientations=orientations, profile=profile)
-            except Exception:
-                row["exception"] = traceback.format_exc()
-                self.errors.append(row["exception"])
-                raise
-            finally:
-                end = time.perf_counter()
-                row["scheduler_end_time"] = end-self.started
-                row["scheduler_duration"] = end-start
-                if "_baseline_start" not in row:
-                    row["preparation_time"] = end-start
-                row["packaging_time"] = max(0.0, end-start-row["preparation_time"]-row["baseline_dispatch_time"]-row["recovery_time"])
-                self.current = previous
-            row.update({"schedule_status": result.status.value, "schedule_source": result.source,
-                "baseline_deadlock": result.baseline_deadlock, "recovered": result.baseline_deadlock and result.feasible,
-                "remaining_deadlock": result.status is ScheduleStatus.DEADLOCK, "Cmax": result.cmax if result.feasible else None,
-                **{k: getattr(result, k) for k in ("expanded_states", "state_budget", "recovery_rollouts", "rollout_budget", "max_discrepancies_used", "frontier_exhausted", "branch_points_considered")},
-                "_solution": solution, "_config": config, "_schedule": result,
-                "profile": None if profile is None else profile.as_dict()})
+        def reference(evaluator,solution,config,*,orientations=None):
+            started=time.perf_counter()
+            result=original(evaluator,solution,config,orientations=orientations)
+            duration=time.perf_counter()-started
+            row=dict(reference_call_index=len(self.rows)+1,method_id=self.method,
+                candidate_source=self.source,scheduler_duration=duration,native_evaluation_time=duration,
+                schedule_status=result.status.value,Cmax=result.cmax,certified=None,certification_errors=[],
+                _solution=solution,_config=config,_schedule=result)
             self.rows.append(row)
-            if self.sink is not None:
-                self.sink(row)  # explicit fail-closed; never silently omit measurement
+            if self.sink is not None:self.sink(row)
             return result
-        self.patch(scheduler.FormalReferenceEvaluator, "__call__", reference)
-
-        original_evaluate = CommonBaselineEvaluator.evaluate
+        self.patch(scheduler.NativeReferenceEvaluator,'__call__',reference)
+        original_evaluate=CommonBaselineEvaluator.evaluate
         @wraps(original_evaluate)
-        def evaluate(evaluator, solution, *, source):
-            previous, self.source = self.source, source
-            calls_before = len(self.rows)
-            try:
-                result = original_evaluate(evaluator, solution, source=source)
-                if len(self.rows) > calls_before and self.rows[-1]["_solution"] is solution:
-                    certification = result.certification
-                    self.rows[-1]["certified"] = bool(certification and certification.certified)
-                    self.rows[-1]["certification_errors"] = [] if certification is None else list(certification.errors)
-                return result
-            finally:
-                self.source = previous
-        self.patch(CommonBaselineEvaluator, "evaluate", evaluate)
-
-        original_dispatch = scheduler._prepared_dispatch_outcome
-        @wraps(original_dispatch)
-        def dispatch(*args, **kwargs):
-            row = self.current
-            if row is None:
-                return original_dispatch(*args, **kwargs)
-            started = time.perf_counter()
-            recovering = self.in_recovery
-            if not recovering:
-                row["_baseline_start"] = started
-                row["preparation_time"] = started-row["_absolute_start"]
-            result = original_dispatch(*args, **kwargs)
-            duration = time.perf_counter()-started
-            if not recovering:
-                row["baseline_dispatch_time"] += duration
-            elif self.level == 2:
-                row["rollouts"].append({"index": len(row["rollouts"])+1, "duration": duration,
-                    "status": result.result.status.value, "Cmax": result.result.cmax,
-                    "forced_decisions": [asdict(d) for d in result.trace.forced_decisions],
-                    "initial_depth": result.trace.initial_depth, "terminal_depth": result.trace.terminal_depth,
-                    "branch_points": len(result.trace.branch_points),
-                    "actual_discrepancies": sum(b.chosen_choice_rank != 0 for b in result.trace.branch_points),
-                    "_result": result.result})
+        def evaluate(evaluator,solution,*args,**kwargs):
+            previous=self.source;self.source=kwargs.get('source','NATIVE_REFERENCE')
+            before=len(self.rows)
+            try:result=original_evaluate(evaluator,solution,*args,**kwargs)
+            finally:self.source=previous
+            if len(self.rows)>before:
+                self.rows[-1]['certified']=bool(result.certification and result.certification.certified)
             return result
-        self.patch(scheduler, "_prepared_dispatch_outcome", dispatch)
-
-        original_recovery = scheduler._limited_discrepancy_dispatch_recovery_optimized
-        @wraps(original_recovery)
-        def recovery(*args, **kwargs):
-            started = time.perf_counter()
-            previous, self.in_recovery = self.in_recovery, True
-            try:
-                return original_recovery(*args, **kwargs)
-            finally:
-                self.in_recovery = previous
-                if self.current is not None:
-                    self.current["recovery_time"] += time.perf_counter()-started
-        self.patch(scheduler, "_limited_discrepancy_dispatch_recovery_optimized", recovery)
-
-        # Attach the actual selected plan without changing frontier order or selection.
-        original_summary = scheduler.limited_discrepancy_recovery
-        @wraps(original_summary)
-        def summary(*args, **kwargs):
-            result = original_summary(*args, **kwargs)
-            if self.current is not None and self.level == 2:
-                self.current["selected_plan"] = [asdict(d) for d in result.best_plan]
-                self.current["rollouts_attempted"] = result.recovery_rollouts
-                self.current["rollouts_completed"] = len(self.current["rollouts"])
-                self.current["selected_rollout_index"] = next((r["index"] for r in self.current["rollouts"] if r["_result"] is result.result), None)
-            return result
-        self.patch(scheduler, "limited_discrepancy_recovery", summary)
-
-        # Formal initialization validates certifier identity against a default
-        # argument bound at import time. Observe the existing post-certification
-        # accounting instead of wrapping that protected certifier callable.
-        original_record = SearchStats.record_reference
+        self.patch(CommonBaselineEvaluator,'evaluate',evaluate)
+        original_record=SearchStats.record_reference
+        from inspect import signature
+        record_signature=signature(original_record)
         @wraps(original_record)
-        def recorded(stats, status, duration, **kwargs):
-            result = original_record(stats, status, duration, **kwargs)
-            schedule = kwargs.get("schedule")
-            if self.rows:
-                row = self.rows[-1]
-                if schedule is row["_schedule"] or (schedule is not None and schedule.directions == row["_schedule"].directions):
-                    row["certified"] = status is ScheduleStatus.FEASIBLE
-                    row["candidate_source"] = "ALNS_INITIALIZATION" if kwargs["initialization"] else "ALNS_REFERENCE"
-                    row["certification_errors"] = list(schedule.diagnostics) if status is ScheduleStatus.NUMERIC_FAILURE else []
+        def recorded(stats,*args,**kwargs):
+            result=original_record(stats,*args,**kwargs)
+            values=record_signature.bind(stats,*args,**kwargs).arguments
+            schedule=values.get('schedule')
+            if self.rows and schedule is self.rows[-1]['_schedule']:
+                self.rows[-1]['certified']=values.get('status') is ScheduleStatus.FEASIBLE
+                self.rows[-1]['candidate_source']='ALNS_INITIALIZATION' if values.get('initialization') else 'ALNS_REFERENCE'
             return result
-        self.patch(SearchStats, "record_reference", recorded)
+        self.patch(SearchStats,'record_reference',recorded)
         return self
 
-    def __exit__(self, *exc):
-        for obj, name, original in reversed(self.patches):
-            setattr(obj, name, original)
+    def __exit__(self,*exc):
+        for obj,name,original in reversed(self.patches):setattr(obj,name,original)
 
     def serialize(self, entry):
         rows = []
@@ -415,7 +477,6 @@ class ReferenceTrace:
             # Ordinary compound primary key from the requested identities; no
             # extra hash/contract is needed to identify a unique reference call.
             row["call_identity"] = ":".join((entry["instance_geometry_hash"], row["solution_canonical_hash"], row["direction_hash"]))
-            row["rollouts"] = [{k: v for k, v in r.items() if not k.startswith("_")} for r in row["rollouts"]]
             if row["certified"] is None and not schedule.feasible:
                 row["certified"] = False
             rows.append(json.loads(json.dumps(row)))

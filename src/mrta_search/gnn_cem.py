@@ -1,4 +1,4 @@
-"""GNN-conditioned complete-plan sampling and B32-elite cross entropy.
+"""GNN-conditioned complete-plan sampling and NATIVE-elite cross entropy.
 
 One probability model samples legal modes, then complete append-only directed
 routes from empty state. Every elite is replayed in full, including its modes;
@@ -23,7 +23,7 @@ from mrta_ranker.model import build_static_graph
 from mrta_reference.geometry import blocks_for_pattern
 from mrta_reference.model import ScientificConfig, OperationKind
 from mrta_reference.scope import FORMAL_SCOPE_V2
-from mrta_reference.scheduler import reference_schedule_formal
+from mrta_reference.scheduler import native_schedule
 from mrta_search.gnn_constructor import VNextGNN, build_block_robot_graph
 from mrta_search.saeax import _heads_legal, _route_statistics, validate_individual, complete_identity
 
@@ -33,7 +33,7 @@ class CEMConfig:
     population_size: int = 8
     max_generations: int = 3
     elite_fraction: float = .25
-    max_new_b32: int = 24
+    max_new_coordination: int = 24
     entropy_beta: float = .01
     exploration_mix: float = .05
     learning_rate: float = .001
@@ -376,7 +376,7 @@ def cem_update(world, policy, optimizer, elites, settings):
     This is maximum likelihood, not a policy-gradient/reward update.
     """
     if not elites or any(p.schedule is None or not p.schedule.feasible for p in elites):
-        raise ValueError('CEM elites must have cached feasible B32 schedules')
+        raise ValueError('CEM elites must have cached feasible NATIVE schedules')
     trained = [(n, p) for n, p in policy.named_parameters() if p.requires_grad]
     before = {n: p.detach().clone() for n, p in trained}
     optimizer.zero_grad(set_to_none=True)
@@ -420,10 +420,10 @@ class CEMResult:
 
 
 def evaluate(plan, w):
-    result = reference_schedule_formal(plan.solution, w.config, scope=FORMAL_SCOPE_V2,
+    result = native_schedule(plan.solution, w.config, scope=FORMAL_SCOPE_V2,
         orientations=dict(enumerate(plan.directions)))
     if result.feasible and result.directions != plan.directions:
-        raise ValueError('B32 changed the sampled directions')
+        raise ValueError('NATIVE changed the sampled directions')
     plan.schedule = result
     return result
 
@@ -433,10 +433,10 @@ def run_cem(parents, checkpoint, initial_builder, *, seed=20261110, settings=Non
     settings = settings or CEMConfig()
     started = time.perf_counter()
     a = accounting if accounting is not None else {}
-    a.update(initial_b32_calls=0, new_b32_calls=0, b32_calls=0, sample_attempts=0,
+    a.update(initial_coordination_calls=0, new_coordination_calls=0, coordination_calls=0, sample_attempts=0,
         complete_samples=0, construction_failures=0, duplicates=0, accepted_elites=0, updates=0)
     raw_initial, initial_meta = initial_builder(parents, ScientificConfig(), seed)
-    a.update(initial_b32_calls=initial_meta['b32_calls'], b32_calls=initial_meta['b32_calls'], initial=initial_meta)
+    a.update(initial_coordination_calls=initial_meta['coordination_calls'], coordination_calls=initial_meta['coordination_calls'], initial=initial_meta)
     w = _HGAWorkspace(parents, ScientificConfig(), FORMAL_SCOPE_V2)
     world, policy = World(w), load_policy(checkpoint, seed, settings.exploration_mix)
     optimizer = torch.optim.Adam([p for p in policy.parameters() if p.requires_grad], lr=settings.learning_rate)
@@ -452,7 +452,7 @@ def run_cem(parents, checkpoint, initial_builder, *, seed=20261110, settings=Non
     if progress_callback:
         progress_callback(dict(phase='INITIAL', status=initial.schedule.status.value if initial else 'CONSTRUCTION_FAILED',
             cmax=initial.schedule.cmax if initial is not None and initial.schedule.feasible else None,
-            b32_calls=a['b32_calls'], elapsed_s=time.perf_counter()-started))
+            coordination_calls=a['coordination_calls'], elapsed_s=time.perf_counter()-started))
     progress, generations = [], 0
     reason = 'GENERATION_LIMIT'
     for generation in range(1, settings.max_generations+1):
@@ -469,9 +469,9 @@ def run_cem(parents, checkpoint, initial_builder, *, seed=20261110, settings=Non
             if reused:
                 a['duplicates'] += 1; plan.schedule = cache[plan.key].schedule
             else:
-                if a['new_b32_calls'] >= settings.max_new_b32:
-                    reason = 'NEW_B32_BUDGET'; break
-                a['new_b32_calls'] += 1; a['b32_calls'] += 1
+                if a['new_coordination_calls'] >= settings.max_new_coordination:
+                    reason = 'NEW_NATIVE_BUDGET'; break
+                a['new_coordination_calls'] += 1; a['coordination_calls'] += 1
                 evaluate(plan, w); cache[plan.key] = plan
             population.setdefault(plan.key, plan)
             feasible = plan.schedule.feasible
@@ -493,10 +493,10 @@ def run_cem(parents, checkpoint, initial_builder, *, seed=20261110, settings=Non
         row = dict(generation=generation, samples=observations, feasible_unique=len(feasible),
             elite_origins=[p.origin for p in elites], elite_cmax=[p.schedule.cmax for p in elites],
             retained_previous_elites=not bool(feasible), update=update,
-            best_cmax=best.schedule.cmax if best else None, b32_calls=a['b32_calls'], elapsed_s=time.perf_counter()-started)
+            best_cmax=best.schedule.cmax if best else None, coordination_calls=a['coordination_calls'], elapsed_s=time.perf_counter()-started)
         progress.append(row)
         if progress_callback: progress_callback(dict(phase='GENERATION', **{k:v for k,v in row.items() if k != 'samples'}))
-        if reason == 'NEW_B32_BUDGET': break
+        if reason == 'NEW_NATIVE_BUDGET': break
     if best is None: reason = 'NO_FEASIBLE_COMPLETE_PLAN'
     a.update(unique_evaluated=len(cache), search_complete=True,
         initial_cmax=initial.schedule.cmax if initial is not None and initial.schedule.feasible else None,

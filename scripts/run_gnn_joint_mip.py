@@ -20,7 +20,7 @@ from mrta_search import gnn_joint_mip as j
 FIT_LAYOUTS = ('train_08', 'train_35', 'train_25')
 PILOTS = ('train_20', 'train_21', 'train_09')
 SOURCES = dict(initial='JN_MIP_INITIAL_V1', rule='RULE_JN_MIP_V1', gnn='GNN_JN_MIP_V1')
-LABEL_SOURCE, FIT_SOURCE = 'JN_MIP_B32_LABELS_V1', 'JN_MIP_SET_FIT_V1'
+LABEL_SOURCE, FIT_SOURCE = 'JN_MIP_NATIVE_LABELS_V1', 'JN_MIP_SET_FIT_V1'
 ENCODER = ROOT/'models/gnn_weld_layout_cmax_conflict.pt'
 EXPOSURE = ('The frozen base encoder has seen all TRAIN layouts historically. '
     'These fit/screen layouts exclude the named recent development and algorithm pilots; '
@@ -71,7 +71,7 @@ def summarize(stage='pilot'):
             d = json.loads(r['diagnostic']); a = d.get('accounting', {})
             print('JN_MIP_ROW', json.dumps(dict(layout_id=r['layout_id'], method=method, status=r['status'],
                 cmax_s=r['cmax_s'], runtime_s=r['runtime_s'], initial_cmax_s=a.get('initial_cmax_s'),
-                milp_calls=a.get('milp_calls'), new_b32_calls=a.get('b32_calls'),
+                milp_calls=a.get('milp_calls'), new_coordination_calls=a.get('coordination_calls'),
                 accepted=a.get('accepted'), changes=a.get('changes'), reason=r['termination_reason']),
                 ensure_ascii=False, allow_nan=False), flush=True)
     return decision
@@ -83,7 +83,7 @@ def result_row(stage, name, parents, seed, method, result, initial):
         status=plan.schedule.status.value, cmax_s=plan.schedule.cmax, runtime_s=result.runtime,
         native_cmax_s=initial.native_cmax if a['returned_initial'] else None,
         native_calls=initial.accounting['native_calls'],
-        b32_calls=initial.accounting['b32_calls']+a['b32_calls'],
+        coordination_calls=initial.accounting['coordination_calls']+a['coordination_calls'],
         source=SOURCES[method], termination_reason=result.reason,
         max_processing_s=float(max(plan.loads)), move_s=float(sum(plan.costs-plan.loads)),
         wait_s=sum(op.duration for op in plan.schedule.operations if op.kind is j.OperationKind.WAIT),
@@ -102,11 +102,11 @@ def run_case(stage, name, parents, seed, selector, write, *, paired=True):
         detail = dict(initial_cmax_s=initial.cmax, initial_status=initial.status,
             solution=j.solution_record(initial), initial_accounting=initial.accounting,
             accounting=dict(initial_cmax_s=initial.cmax, search_complete=False),
-            reason='fresh shared initialization is not B32 feasible; no joint search or replacement run')
+            reason='fresh shared initialization is not NATIVE feasible; no joint search or replacement run')
         for method in (('initial', 'rule', 'gnn') if paired else ('initial', 'gnn')):
             write(dict(stage=stage, layout_id=name, parent_count=len(parents), seed=seed,
                 source=SOURCES[method], status=initial.status, cmax_s=initial.cmax, runtime_s=elapsed,
-                native_calls=initial.accounting['native_calls'], b32_calls=initial.accounting['b32_calls'],
+                native_calls=initial.accounting['native_calls'], coordination_calls=initial.accounting['coordination_calls'],
                 termination_reason='INITIALIZATION_FAILED',
                 diagnostic=json.dumps(detail, ensure_ascii=False, allow_nan=False)))
         print('JN_MIP_INITIALIZATION_FAILED', name, initial.status, elapsed, flush=True)
@@ -117,7 +117,7 @@ def run_case(stage, name, parents, seed, selector, write, *, paired=True):
     write(dict(stage=stage, layout_id=name, parent_count=len(parents), seed=seed,
         source=SOURCES['initial'], status=initial.status, cmax_s=initial.cmax,
         native_cmax_s=initial.native_cmax, runtime_s=initialization_s,
-        native_calls=initial.accounting['native_calls'], b32_calls=initial.accounting['b32_calls'],
+        native_calls=initial.accounting['native_calls'], coordination_calls=initial.accounting['coordination_calls'],
         generations=initial.generations, valid_children=initial.valid_children,
         termination_reason=initial.termination_reason,
         diagnostic=json.dumps(dict(solution=j.solution_record(plan), accounting=initial.accounting,
@@ -126,8 +126,8 @@ def run_case(stage, name, parents, seed, selector, write, *, paired=True):
     for method, head in methods:
         if method == 'gnn' and head is None:
             row = dict(stage=stage, layout_id=name, parent_count=len(parents), seed=seed, source=SOURCES['gnn'],
-                status='NOT_RUN', termination_reason='NO_TRAINABLE_B32_IMPROVEMENT',
-                diagnostic=json.dumps(dict(reason='Joint MILP label stage produced no positive trainable B32 gains; '
+                status='NOT_RUN', termination_reason='NO_TRAINABLE_NATIVE_IMPROVEMENT',
+                diagnostic=json.dumps(dict(reason='Joint MILP label stage produced no positive trainable NATIVE gains; '
                     'do not deploy an untrained set head.', exposure=EXPOSURE)))
         else:
             result = j.optimize(w, plan, initialization_s, selector=head, progress_callback=report)
@@ -176,7 +176,7 @@ def run_experiment():
             if initial.status != 'FEASIBLE':
                 write(dict(stage='training_labels', layout_id=name, parent_count=len(train[name]), seed=SEEDS[0],
                     source=LABEL_SOURCE, status=initial.status, runtime_s=time.perf_counter()-tick,
-                    native_calls=initial.accounting['native_calls'], b32_calls=initial.accounting['b32_calls'],
+                    native_calls=initial.accounting['native_calls'], coordination_calls=initial.accounting['coordination_calls'],
                     termination_reason='INITIALIZATION_FAILED', diagnostic=json.dumps(dict(records=[],
                         initial_accounting=initial.accounting, initial_status=initial.status,
                         initial_solution=j.solution_record(initial), initialization_s=initialization_s,
@@ -194,14 +194,14 @@ def run_experiment():
             write(dict(stage='training_labels', layout_id=name, parent_count=len(train[name]), seed=SEEDS[0],
                 source=LABEL_SOURCE, status='COMPLETED', runtime_s=time.perf_counter()-tick,
                 native_calls=initial.accounting['native_calls'],
-                b32_calls=initial.accounting['b32_calls']+sum(r['b32_called'] for r in records),
+                coordination_calls=initial.accounting['coordination_calls']+sum(r['coordination_called'] for r in records),
                 diagnostic=json.dumps(detail, ensure_ascii=False, allow_nan=False)))
             print('JN_MIP_LABEL_RESULT', name, json.dumps([{k: v for k, v in r.items() if k != 'solution'}
                 for r in records], ensure_ascii=False, allow_nan=False), flush=True)
         fit = j.fit_selector(selector, groups, j.JNConfig().training_epochs)
         write(dict(stage='training_fit', layout_id='TRAIN_3', seed=SEEDS[0], source=FIT_SOURCE,
             status='TRAINED' if fit['trained'] else 'NOT_TRAINED', runtime_s=fit['runtime_s'],
-            native_calls=0, b32_calls=0, diagnostic=json.dumps(fit, ensure_ascii=False, allow_nan=False)))
+            native_calls=0, coordination_calls=0, diagnostic=json.dumps(fit, ensure_ascii=False, allow_nan=False)))
         print('JN_MIP_FIT', json.dumps(fit, ensure_ascii=False, allow_nan=False), flush=True)
         active = selector if fit['trained'] else None
         for name in PILOTS:
