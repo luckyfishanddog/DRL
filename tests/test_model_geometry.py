@@ -695,3 +695,182 @@ def test_new_outer_x_does_not_replace_existing_midpoint_identity():
     new=generate_x_split_patterns(parent,3.,CONFIG,rail=Rail.UPPER)
     assert next(p for p in old if p.t==.5).point_id=='MIDPOINT'
     assert next(p for p in new if p.t==.5).point_id=='MIDPOINT'
+
+
+def _br_fixed_fixture():
+    import numpy as np
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    from mrta_search.gnn_vns_br import FixedWorkspace
+    c = ScientificConfig()
+    ts = generate_taskset((
+        ParentWeld('p', (0., 9.), (6.6, 9.)),
+        ParentWeld('a', (2., 10.), (3., 10.)),
+        ParentWeld('b', (7., 9.), (8., 9.)),
+        ParentWeld('c', (12., 9.), (13., 9.)),
+        ParentWeld('d', (16., 9.), (17., 9.)),
+        ParentWeld('l', (1., 2.), (2., 2.)),
+        ParentWeld('r', (15., 2.), (16., 2.))))
+    w = FixedWorkspace(ts, c)
+    names = [('p::job_000_003', 'a::seg_000', 'b::seg_000'),
+             ('p::job_003_006', 'c::seg_000', 'd::seg_000'),
+             ('l::seg_000',), ('r::seg_000',)]
+    routes = [np.array([w.index[n] for n in row], np.int64) for row in names]
+    bits = [np.array([i % 2 for i in range(len(row))], np.int64) for row in names]
+    return w, w.evaluate(routes, bits)
+
+
+def test_br_six_actions_match_independent_fixed_canonical_rebuild_and_native_score():
+    import numpy as np
+    import pytest
+    from mrta_baselines.wag_vns import priority_schedule
+    from mrta_reference.solution import canonicalize
+    w, state = _br_fixed_fixture()
+    original_patterns = w.taskset.patterns
+    for move in range(1, 7):
+        ru, iu, rv, iv = (0, 0, 0, 2) if move == 4 else (0, 0, 1, 1)
+        action = w.apply(state, move, ru, iu, rv, iv)
+        assert action is not None
+        raw = [list(map(int, r)) for r in state.routes]
+        u, v = raw[ru][iu], raw[rv][iv]
+        if move == 1:
+            raw[ru].pop(iu); raw[rv].insert(iv + 1, u)
+        elif move == 2:
+            raw[ru][iu], raw[rv][iv] = v, u
+        elif move == 3:
+            a, b = raw[ru][iu:iu + 2], raw[rv][iv:iv + 2]
+            raw[ru][iu:iu + 2], raw[rv][iv:iv + 2] = b, a
+        elif move == 4:
+            raw[ru][iu + 1:iv + 1] = reversed(raw[ru][iu + 1:iv + 1])
+            assert action.bits[ru][1:].tolist() == (1 - state.bits[ru][1:][::-1]).tolist()
+        elif move == 5:
+            a, b = raw[ru][:], raw[rv][:]
+            raw[ru] = a[:iu + 1] + b[:iv + 1][::-1]
+            raw[rv] = a[iu + 1:][::-1] + b[iv + 1:]
+        else:
+            a, b = raw[ru][iu + 1:], raw[rv][iv + 1:]
+            raw[ru][iu + 1:], raw[rv][iv + 1:] = b, a
+        expected = canonicalize(w.taskset.parents, original_patterns,
+            {r: tuple(w.numeric.ids[n] for n in row) for r, row in enumerate(raw)}, w.config)
+        numeric = w.evaluate(action.routes, action.bits)
+        w.validate(action.routes, action.bits)
+        actual = w.solution(numeric)
+        assert actual == expected
+        assert actual.patterns == original_patterns
+        public = priority_schedule(actual, w.config, directions=action.bits)
+        assert public.feasible == numeric.feasible
+        if public.feasible:
+            assert numeric.value == pytest.approx(public.cmax)
+            assert np.allclose(numeric.completion, public.robot_completion)
+    # An action can create a job on an empty route, while a cross-rail illegal
+    # transfer is rejected before scheduling rather than relaxed for speed.
+    assert w.apply(state, 1, 0, 0, 2, 0) is None
+
+
+def test_br_shared_gat_pairwise_gradients_and_infeasible_label_order():
+    import random
+    import torch
+    from mrta_search.gnn_vns_br import (
+        BRConfig, BottleneckGAT, candidate_actions, local_graph, ranking_pairs,
+    )
+    torch.set_num_threads(1)
+    w, state = _br_fixed_fixture()
+    rng = random.Random(17)
+    actions = candidate_actions(w, state, BRConfig(candidates=6), rng)
+    graph = local_graph(w, state, actions)
+    assert graph.nodes.shape[1] == 23
+    assert graph.action_features.shape[1] == 18
+    pairs = ranking_pairs([3., float('inf'), 2., 3.], rng)
+    assert len(pairs) == 5
+    assert all(b != 2 for a, b in pairs.tolist())
+    model = BottleneckGAT()
+    scores = model(graph)
+    loss = torch.nn.functional.softplus(scores[1:] - scores[0]).mean()
+    loss.backward()
+    for layer in (model.layer1, model.layer2):
+        assert layer.linear.weight.grad.abs().sum() > 0
+    assert model.scorer[-1].out_features == 1
+    assert {a.move for a in actions} == set(range(1, 7))
+
+
+def test_br_search_is_independent_of_baseline_solvers_and_full_vnd(monkeypatch):
+    import mrta_baselines.hga as hga
+    import mrta_baselines.wag_vns as wag
+    from mrta_search.gnn_vns_br import BRConfig, BottleneckGAT, run_gnn_vns_br
+    def forbidden(*args, **kwargs):
+        raise AssertionError('new method must not call a baseline solver or full VND')
+    monkeypatch.setattr(hga, 'run_adapted_hga', forbidden)
+    monkeypatch.setattr(hga, '_vnd_oriented_arrays', forbidden)
+    monkeypatch.setattr(wag, 'run_adapted_wag_vns', forbidden)
+    w, state = _br_fixed_fixture()
+    workspace, result, record = run_gnn_vns_br(w.taskset, BottleneckGAT(), seed=18,
+        settings=BRConfig(candidates=4, top_k=2, max_rounds=2, perturbations=0,
+                          initial_attempts=2, time_limit=30.))
+    assert workspace.validate(result.routes, result.bits)
+    assert record['native_evaluations'] >= 2
+    assert record['graph_encodings'] <= 2
+    assert workspace.solution(result).patterns == w.taskset.patterns
+
+
+def test_br_final_b32_is_called_once_with_serializable_direction_genes(monkeypatch):
+    import importlib
+    import sys
+    from pathlib import Path
+    scripts = Path(__file__).resolve().parents[1] / 'scripts'
+    monkeypatch.syspath_prepend(str(scripts))
+    runner = importlib.import_module('run_gnn_vns_br')
+    w, state = _br_fixed_fixture()
+    calls = []
+    formal = runner.reference_schedule_formal
+    def checked(solution, config, **kwargs):
+        calls.append(kwargs['orientations'])
+        assert all(type(bit) is int for bits in kwargs['orientations'].values() for bit in bits)
+        result = formal(solution, config, **kwargs)
+        result.canonical_json()  # Exercises recovery's JSON tie-break boundary.
+        return result
+    monkeypatch.setattr(runner, 'reference_schedule_formal', checked)
+    monkeypatch.setattr(runner, 'run_gnn_vns_br', lambda *a, **k:
+        (w, state, dict(rounds=0, termination_reason='SMOKE')))
+    checkpoint = dict(settings=runner.asdict(runner.BRConfig()),
+                      training=dict(learning=dict(selected_epoch=1), total_offline_s=1.))
+    row = runner.run_one('train', 'toy', w.taskset, 17, model=object(), checkpoint=checkpoint)
+    assert row['b32_calls'] == len(calls) == 1
+
+
+def test_br_m1_can_reassign_existing_end_atoms_inside_merged_jobs():
+    from mrta_reference.fixed_taskset import expand_routes
+    w, state = _br_fixed_fixture()
+    old = w.solution(state)
+    before = {a: r for r, atoms in enumerate(expand_routes(old.routes)) for a in atoms}
+    for portion, moved_atom in ((1, 'p::seg_000'), (-1, 'p::seg_002')):
+        action = w.apply(state, 1, 0, 0, 1, 1, portion=portion)
+        assert action is not None
+        w.validate(action.routes, action.bits)
+        candidate = w.solution(w.evaluate(action.routes, action.bits))
+        after = {a: r for r, atoms in enumerate(expand_routes(candidate.routes)) for a in atoms}
+        assert set(after) == set(before)
+        assert [a for a in before if before[a] != after[a]] == [moved_atom]
+        assert after[moved_atom] == 1
+        assert candidate.patterns == old.patterns == w.taskset.patterns
+
+
+def test_br_insufficient_validation_feasibility_leaves_test_untouched(monkeypatch):
+    import importlib
+    from pathlib import Path
+    from types import SimpleNamespace
+    import pytest
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / 'scripts'))
+    runner = importlib.import_module('run_gnn_vns_br')
+    rows = [dict(trial='main', split='validation', layout_id=f'validation_{i // 3 + 1:02d}',
+                 seed=str(runner.SEEDS[i % 3]), status='FEASIBLE' if i < 25 else 'DEADLOCK',
+                 cmax_s='4900' if i < 25 else '', runtime_s='50') for i in range(30)]
+    baseline = [dict(r, status='FEASIBLE', cmax_s='5000', runtime_s='100',
+                     termination_reason='ITERATION_LIMIT') for r in rows]
+    monkeypatch.setattr(runner, 'read_results', lambda: rows)
+    monkeypatch.setattr(runner, 'read_baselines', lambda method: baseline)
+    def forbidden():
+        raise AssertionError('a model/TEST instance must not be loaded')
+    monkeypatch.setattr(runner, 'load_model', forbidden)
+    assert not runner.compare('validation')['ready_for_test']
+    with pytest.raises(ValueError, match='TEST is untouched'):
+        runner.experiment(SimpleNamespace(trial='main'), 'test')

@@ -346,7 +346,7 @@ def update_report():
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument('stage',choices=('prepare','baselines','benchmark','train','compare','summary','all'))
+    parser.add_argument('stage',choices=('prepare','baselines','benchmark','summary'))
     parser.add_argument('--workers',type=int,default=4)
     parser.add_argument('--method',choices=('wag_vns','hga','both'),default='both')
     parser.add_argument('--split',choices=('train','validation','test','all'),default='all')
@@ -359,12 +359,6 @@ def main():
     if args.stage in ('baselines','all'):
         baselines(('wag_vns','hga') if args.method == 'both' else (args.method,),
                   ('train','validation','test') if args.split == 'all' else (args.split,),args.workers)
-    if args.stage in ('train','all'):
-        from mrta_search.gnn_ppo import train_experiment
-        train_experiment(sys.modules[__name__])
-    if args.stage in ('compare','all'):
-        from mrta_search.gnn_ppo import compare_experiment
-        compare_experiment(sys.modules[__name__])
     if args.stage in ('summary','all'):
         update_report()
         print(REPORT.read_text(encoding='utf-8').split('复现命令')[0],flush=True)

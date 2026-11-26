@@ -1,6 +1,8 @@
 # 固定欧氏拆分任务集实验
 
-当前请求：后台完成WAG/HGA各70排样×3种子的完整对照实验，再自动执行共享GNN的BC预训练8轮、PPO微调80次更新和最终三种子评价。WAG已按4个工作进程运行；HGA恢复旧正式入口后，先完成train_03/20261111的200000有效子代测速，无执行错误再加入4个工作进程批量。单例使用新Python进程、Numba/BLAS单线程，首次编译不扣除；HGA测速时WAG批量并行，运行上下文随测速记录保存。后续由本机后台进程顺序执行，不调用在线模型或使用模型轮询；实际完成情况以本报告表格、训练CSV及模型文件为准。
+2026-11-26当前正式算法为Adapted-WAG+VNS、Adapted-HGA及独立的GNN-VNS-BR。研究路线仅为固定拆分→四机器人分配→连续原子任务合并→排序及方向→调度评价。WAG/HGA各210次和GNN-PPO的210次失败结果均已完成，本轮不重跑；PPO只保留失败记录，不再训练。新方法的TRAIN监督学习、VALIDATION配对实测及是否进入TEST见本文GNN-VNS-BR节。原B32调度和现有核心校验保持不变。
+
+下文已有对照参数、测速、CSV汇总及PPO失败记录保留为历史实验记录；其中早期执行过程不再作为当前操作指令。
 本地工作目录为D:\pybullet_test\MRTA_GA\DRL；指定解释器D:\pybullet_test\.venv\Scripts\python.exe。DRL没有独立.git，外围MRTA_GA实际HEAD为0935ad8a723057084be190e31c6be4733ce3cb62，外围remote是MRTA.git；未将其误记为独立DRL提交，也未覆盖或提交用户既有修改。
 
 数据及原始焊缝未修改。先判定整条焊缝的轨道资格；仅无法由任一轨道承担时，在共享区域内将参数0.5投影到合法区间，最大化较短段。优先两段严格大于1m，否则严格大于0.5m；不合法实例直接报告。区域段欧氏长度L>5m时按n=ceil(L)-1等分，每个新段严格大于1m。
@@ -52,12 +54,12 @@ HGA原文没有本项目的固定拆分谱系和强制合并；其六邻域在�
 
 以上汇总仅包含本目录的新固定任务集实测。未落盘的运行不计入完成数；空值不代表零Cmax。每个算法结果CSV保存全部任务归属、合并作业、路线、方向、实际停止计数、参数及失败原因，直接作为TRAIN教师来源。
 
-GNN设置：随机初始化共享两层64维/4头GAT Actor-Critic，完整TRAIN教师轨迹BC 8轮，随后PPO 80次更新、每次4条完整轨迹、4轮裁剪更新，clip=0.2、学习率0.0003、gamma=1、GAE lambda=0.95、熵系数0.01。唯一终止奖励为-B32 Cmax/固定TRAIN参考Cmax，不可行惩罚-10；无辅助奖励。每10次PPO更新评价全部VALIDATION及三个种子。
+历史失败GNN-PPO设置：随机初始化共享两层64维/4头GAT Actor-Critic，完整TRAIN教师轨迹BC 8轮，随后PPO 80次更新、每次4条完整轨迹、4轮裁剪更新，clip=0.2、学习率0.0003、gamma=1、GAE lambda=0.95、熵系数0.01。唯一终止奖励为-B32 Cmax/固定TRAIN参考Cmax，不可行惩罚-10；无辅助奖励。每10次PPO更新评价全部VALIDATION及三个种子。
 有可行TRAIN教师时参考尺度使用最优教师B32 Cmax；没有可行BC标签的排样仍保留在PPO中，使用该实例固定加工Cmax下界作为尺度，来源随模型记录。TRAIN串行加工及最远空走时长上界/加工尺度最大为8.922938，因此-10对当前数据给予不可行候选明确劣势；此上界不用于搜索、剪枝或正式评价。
 
 VALIDATION选择各阶段权重；PPO checkpoint明确保存selected_update（0表示VALIDATION仍选择BC初始策略）和实际最后训练参数，不把PPO未改善说成改善。TEST仅在最终模型训练结束后推理。训练配置与逐轮实际记录保存在gnn_ppo_training.csv；阶段权重分别为gnn_fixed_euclidean_bc.pt和gnn_fixed_euclidean_ppo.pt。
 
-当前复现命令（在DRL目录，WAG批量及HGA单例）：
+已完成对照与PPO历史执行命令（保留记录，本轮不重复运行）：
 
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_fixed_taskset_experiment.py baselines --method wag_vns --workers 4
@@ -68,7 +70,7 @@ VALIDATION选择各阶段权重；PPO checkpoint明确保存selected_update（0�
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_fixed_taskset_experiment.py summary
 ```
 
-后台顺序：等待当前HGA单例进程正常结束，核对已保存测速，再运行HGA批量；等待当前WAG批量进程结束并续补未完成项；两算法各210条完整预算记录齐备后，才依次train（BC→PPO）、compare、summary。各阶段非零退出即停止后续训练并将异常写回本报告，不以部分预算充作完整结果。已有本版本同键完整结果只读取，不自动替换排样或降低预算。
+历史执行顺序（现已结束）：等待当时HGA单例进程正常结束，核对已保存测速，再运行HGA批量；等待当前WAG批量进程结束并续补未完成项；两算法各210条完整预算记录齐备后，才依次train（BC→PPO）、compare、summary。各阶段非零退出即停止后续训练并将异常写回本报告，不以部分预算充作完整结果。已有本版本同键完整结果只读取，不自动替换排样或降低预算。
 
 |算法|划分|排样|种子|状态|B32 Cmax(s)|耗时(s)|迭代数|停止原因|
 |---|---|---|---:|---|---:|---:|---:|---|
@@ -1251,4 +1253,172 @@ VALIDATION选择各阶段权重；PPO checkpoint明确保存selected_update（0�
 |PPO|80||8.566992069294645e-05|0.0015374719138475932|-10.0|34|329.877110100002|0/30||
 
 2026-11-25本轮HGA完整回归155项通过，另12项针对性检查通过（有重叠）：包含固定合并后的六邻域穷举、完整重建与快速路径一致、ROUTE_CYCLE邻域内零协调调用、每完整个体一次原生协调评价及最优时间线复用。较早9项新增逻辑专项及核心回归313项亦已通过（有重叠），涵盖双阈值与欧氏拆分、资格继承、多段合并与一次准备处理、精确覆盖、GNN完整教师轨迹/真实B32、共享编码器BC和裁剪PPO实际更新与TRAIN/TEST隔离。真实TRAIN首个教师246个完整动作已只读重放通过，未因此提前优化GNN。
-旧GNN三模式特征及原数据类语义保留。宽范围兼容性检查另有3项旧断言未通过（CSV Mock接口、旧PPO checkpoint关系维度、历史Joint3精确数值）；没有将这些旧结果纳入本次固定任务域比较，也未据此调整本次GNN。
+历史兼容性检查记录：宽范围兼容性检查另有3项旧断言未通过（CSV Mock接口、旧PPO checkpoint关系维度、历史Joint3精确数值）；没有将这些旧结果纳入本次固定任务域比较，也未据此调整本次GNN。
+
+## GNN-VNS-BR 监督排序与瓶颈重构
+
+
+当前正式路线为固定拆分→四机器人分配→连续原子任务合并→排序及方向→调度评价。
+Adapted-WAG+VNS 与 Adapted-HGA 为保留原始结果的独立对照组；GNN-PPO 作为失败历史保留，不再训练。
+
+GNN-VNS-BR 独立执行空间/插入贪心初始化，以原生调度完工时间识别瓶颈，
+在瓶颈局部合并作业图上使用两层64维/4头GAT与一个标量候选动作头。
+M1–M6 同时处理路线和方向；仅Top-K进入实际原生评价。
+原子边界由已有FixedTaskset决定，动作仅迁移现有作业并强制合并连续归属原子。
+B32 limited-discrepancy 调度政策保持现有FORMAL_SCOPE_V2。
+
+监督标签仅来自已完成且B32可行的TRAIN对照方案及少量合法扰动，
+采用实际priority_schedule候选Cmax构造pairwise ranking loss，不可行候选排在可行候选之后。
+VALIDATION和TEST独立初始化；训练内部按TRAIN排样留出，不读取VALIDATION/TEST标签。
+
+离线训练实测：
+```json
+{
+  "data": {
+    "source_split": "train",
+    "teacher_solutions": 80,
+    "states": 155,
+    "candidate_labels": 6961,
+    "feasible_labels": 3762,
+    "infeasible_labels": 3199,
+    "pairs": 36617,
+    "duplicate_states_skipped": 0,
+    "uninformative_states": 5,
+    "layouts": [
+      "train_01",
+      "train_02",
+      "train_03",
+      "train_04",
+      "train_05",
+      "train_06",
+      "train_07",
+      "train_08",
+      "train_09",
+      "train_10",
+      "train_11",
+      "train_12",
+      "train_13",
+      "train_14",
+      "train_15",
+      "train_16",
+      "train_17",
+      "train_18",
+      "train_19",
+      "train_20",
+      "train_21",
+      "train_22",
+      "train_23",
+      "train_24",
+      "train_25",
+      "train_26",
+      "train_27",
+      "train_28",
+      "train_29",
+      "train_30",
+      "train_31",
+      "train_32",
+      "train_33",
+      "train_34",
+      "train_35",
+      "train_36",
+      "train_37",
+      "train_38",
+      "train_39",
+      "train_40"
+    ],
+    "source_methods": [
+      "wag_vns",
+      "hga"
+    ],
+    "label_generation_s": 21.662069299956784
+  },
+  "selected_epoch": 24,
+  "label_generation_s": 21.662069299956784,
+  "training_s": 15.021189499995671,
+  "total_offline_s": 36.683258799952455,
+  "initial_trial_offline_s": 54.82026169996243,
+  "experiment_notes": [
+    "VALIDATION initial attempt exposed NumPy int64 direction serialization during B32 recovery; normalized input genes to Python ints and resumed; scheduler policy unchanged.",
+    "One targeted correction: M1 may reassign existing end atoms from a merged job; cuts stay unchanged. Round budget raised from 100 to 200 for these fine ownership changes.",
+    "If no M5/M6 shake is native-feasible, use the same finite shaking budget for GNN-ranked M1/M2; preserve global feasible best."
+  ]
+}
+```
+
+实测配对汇总（仅双方B32可行的同排样同种子计算Cmax变化，失败数量单独保留）：
+```json
+{
+  "split": "validation",
+  "trial": "initial",
+  "runs": 30,
+  "feasible": 22,
+  "cmax_mean_s": 5732.024227352567,
+  "cmax_median_s": 5695.804169605266,
+  "runtime_median_s": 3.7161210000049323,
+  "paired": {
+    "wag_vns": {
+      "pairs": 21,
+      "median_relative_cmax": 0.024465945429722264,
+      "baseline_runtime_median_s": 165.34712619998027,
+      "runtime_ratio": 0.02247466336675512
+    },
+    "hga": {
+      "pairs": 22,
+      "median_relative_cmax": 0.05107774254387193,
+      "baseline_runtime_median_s": 1363.6465762000298,
+      "runtime_ratio": 0.0027251349908862486
+    }
+  },
+  "ready_for_test": false
+}
+```
+
+实测配对汇总（仅双方B32可行的同排样同种子计算Cmax变化，失败数量单独保留）：
+```json
+{
+  "split": "validation",
+  "trial": "main",
+  "runs": 30,
+  "feasible": 25,
+  "cmax_mean_s": 5569.127361609622,
+  "cmax_median_s": 5639.594202940968,
+  "runtime_median_s": 6.595023249974474,
+  "paired": {
+    "wag_vns": {
+      "pairs": 24,
+      "median_relative_cmax": 0.014240590279505864,
+      "baseline_runtime_median_s": 165.34712619998027,
+      "runtime_ratio": 0.03988592606077759
+    },
+    "hga": {
+      "pairs": 23,
+      "median_relative_cmax": 0.032343724647858715,
+      "baseline_runtime_median_s": 1363.6465762000298,
+      "runtime_ratio": 0.004836314163125994
+    }
+  },
+  "ready_for_test": false
+}
+```
+
+结论：完整VALIDATION未达到可行率与配对质量要求，TEST未运行。
+验证：现有test_model_geometry.py完整56项通过，包含新增六邻域重建、原子覆盖、GAT梯度、方向序列化及未达标时禁止进入TEST的检查；清理前固定域相关31项亦通过。新算法的六邻域检查没有调用完整对照求解器。
+当前产物状态：两个新增代码文件已获用户确认并写入；权重models/gnn_vns_br.pt与结果results/fixed_euclidean_split/gnn_vns_br.csv的逐文件确认尚未收到，因此模型和两轮共60条完整方案暂保存在运行进程内存中，本报告已保存实测汇总。两处原始对照CSV和PPO失败CSV未改写。
+清理状态：README和正式研究描述已统一，原固定实验入口不再提供PPO训练/评价命令，PPO源码标记为失败历史；B32及原固定任务算法主体保持原样。核心动态兼容分支和旧GNN历史文件的彻底删除尚未完成：自动审批先后以“可能削弱核心校验”和“可能破坏HGA对照主体”为由拒绝删除，已向用户请求明确授权。没有绕过拒绝或宣称这部分已经清理完成。
+仅进行了一次针对性修正及TRAIN重训：M1允许迁移合并作业中的已有端部原子，
+对应轮数上限从100调至200；M5/M6无可行扰动时，在同一有限预算内回退到M1/M2。
+首轮结果以initial区分保留，没有重跑WAG/HGA，也没有改变B32或空间约束。
+
+在线耗时包含独立初始化、GNN编码/推理、候选评价和唯一一次最终B32。
+本轮批量串行、单线程，复用TRAIN标签生成和单例阶段已编译的内核；
+首次冷JIT包含在初始离线标签计时内。单独启动实验入口时，首例运行计时也包含其编译。离线训练时间单独列示。
+VALIDATION要求至少28/30可行、配对优于WAG、相对HGA配对中位退化不超过2%、
+中位耗时≤WAG的1.5倍且低于HGA；未满足时不执行TEST。
+
+复现入口（指定Python，在DRL目录执行）：
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py train
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py smoke --layout train_01
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py validation
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py test
+```

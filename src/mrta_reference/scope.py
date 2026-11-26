@@ -105,6 +105,9 @@ FORMAL_SCOPE_V2 = replace(
     combined_xy_split_policy_id="EXCLUDED_V1",
 )
 
+# FixedTaskset/FIXED owns the immutable task domain. These historical scope
+# fields are retained for the existing B32 policy and validation machinery;
+# ACTIVE_FORMAL_SCOPE does not authorize search-time pattern changes.
 ACTIVE_FORMAL_SCOPE = FORMAL_SCOPE_V2
 
 

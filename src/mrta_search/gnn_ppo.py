@@ -1,4 +1,4 @@
-"""One shared GAT Actor-Critic: fixed-atom ownership, then joint job routes.
+"""Historical failed GNN-PPO experiment; excluded from the current route.
 
 BC replays complete TRAIN teacher assignments, merged job order and directions.
 PPO receives exactly one terminal reward from the existing formal B32 Cmax.
