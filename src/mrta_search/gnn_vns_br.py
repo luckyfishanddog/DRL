@@ -147,8 +147,9 @@ class SparseGATLayer(nn.Module):
 class BottleneckGAT(nn.Module):
     """One shared two-layer encoder and one scalar action ranking head."""
 
-    def __init__(self, hidden=64, heads=4):
+    def __init__(self, hidden=64, heads=4, *, use_edge_features=True):
         super().__init__()
+        self.use_edge_features = use_edge_features
         self.layer1 = SparseGATLayer(len(NODE_FEATURES), hidden, heads)
         self.layer2 = SparseGATLayer(hidden, hidden, heads)
         self.scorer = nn.Sequential(
@@ -156,8 +157,9 @@ class BottleneckGAT(nn.Module):
             nn.Linear(hidden, 1))
 
     def encode(self, graph):
-        h = F.elu(self.layer1(graph.nodes, graph.edges, graph.relations, graph.edge_attr))
-        return F.elu(self.layer2(h, graph.edges, graph.relations, graph.edge_attr))
+        edge_attr = graph.edge_attr if self.use_edge_features else torch.zeros_like(graph.edge_attr)
+        h = F.elu(self.layer1(graph.nodes, graph.edges, graph.relations, edge_attr))
+        return F.elu(self.layer2(h, graph.edges, graph.relations, edge_attr))
 
     def score(self, graph, embedding):
         involved = embedding[graph.action_nodes].flatten(1)
@@ -165,6 +167,29 @@ class BottleneckGAT(nn.Module):
 
     def forward(self, graph):
         return self.score(graph, self.encode(graph))
+
+
+class ActionMLP(nn.Module):
+    """The requested control: rank only the same 18 action features."""
+
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.scorer = nn.Sequential(nn.Linear(len(ACTION_FEATURES), hidden), nn.ELU(),
+                                    nn.Linear(hidden, 1))
+
+    def forward(self, graph):
+        return self.scorer(graph.action_features).squeeze(-1)
+
+
+MODEL_VARIANTS = ('full_gnn', 'no_edge_gnn', 'action_mlp')
+
+
+def make_ranker(variant='full_gnn'):
+    if variant == 'action_mlp':
+        return ActionMLP()
+    if variant in ('full_gnn', 'no_edge_gnn'):
+        return BottleneckGAT(use_edge_features=variant == 'full_gnn')
+    raise ValueError(f'unknown ranking model: {variant}')
 
 
 class FixedWorkspace:
@@ -579,7 +604,8 @@ def ranking_pairs(values, rng, limit=256):
                          for i, j in possible], dtype=torch.long).reshape(-1, 2)
 
 
-def train_ranker(examples, *, seed=20261126, epochs=24, learning_rate=3.e-4, progress=print):
+def train_ranker(examples, *, seed=20261126, epochs=24, learning_rate=3.e-4,
+                 variant='full_gnn', progress=print):
     """All examples are TRAIN-derived; hold out complete TRAIN layouts."""
     torch.manual_seed(seed)
     rng = random.Random(seed)
@@ -589,7 +615,7 @@ def train_ranker(examples, *, seed=20261126, epochs=24, learning_rate=3.e-4, pro
     held = [e for e in examples if e[0] in holdout]
     if not training:
         raise ValueError('no informative TRAIN ranking examples')
-    model = BottleneckGAT()
+    model = make_ranker(variant)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     best_loss, best_state, best_epoch = math.inf, None, 0
     history = []
@@ -615,9 +641,11 @@ def train_ranker(examples, *, seed=20261126, epochs=24, learning_rate=3.e-4, pro
             best_loss, best_epoch, best_state = criterion, epoch, copy.deepcopy(model.state_dict())
         record = dict(epoch=epoch, train_loss=float(np.mean(losses)),
                       held_train_loss=criterion, held_train_pair_accuracy=correct / max(1, total))
-        history.append(record); progress('BR_EPOCH', record)
+        history.append(record); progress('BR_EPOCH', dict(model=variant, **record))
     model.load_state_dict(best_state); model.eval()
-    return model, dict(selected_epoch=best_epoch, history=history,
+    return model, dict(variant=variant, selected_epoch=best_epoch, history=history,
+                       epochs=epochs, seed=seed, learning_rate=learning_rate,
+                       parameters=sum(p.numel() for p in model.parameters()),
                        train_layouts=sorted(set(layouts) - holdout), held_train_layouts=sorted(holdout),
                        feature_names=NODE_FEATURES, action_feature_names=ACTION_FEATURES)
 
@@ -638,12 +666,18 @@ def run_gnn_vns_br(taskset, model, *, seed, settings=BRConfig(), config=Scientif
     best = current if current.feasible else None
     initial_value = current.value
     rounds = accepted = shakes = encodings = 0
+    generated_by_move = [0] * 6
+    evaluated_by_move = [0] * 6
+    feasible_by_move = [0] * 6
+    accepted_by_move = [0] * 6
     inference_seconds = 0.
     model.eval()
     while rounds < settings.max_rounds and time.perf_counter() < deadline:
         actions = candidate_actions(workspace, current, settings, rng)
         if not actions:
             break
+        for action in actions:
+            generated_by_move[action.move - 1] += 1
         tick = time.perf_counter()
         graph = local_graph(workspace, current, actions)
         with torch.inference_mode():
@@ -653,6 +687,7 @@ def run_gnn_vns_br(taskset, model, *, seed, settings=BRConfig(), config=Scientif
         improved = False
         evaluated = {}
         winner = None
+        winner_move = None
         for move in range(1, 7):
             indices = [i for i, a in enumerate(actions) if a.move == move]
             indices.sort(key=lambda i: (-float(scores[i]), i))
@@ -662,15 +697,19 @@ def run_gnn_vns_br(taskset, model, *, seed, settings=BRConfig(), config=Scientif
                 action = actions[i]
                 candidate = workspace.evaluate(action.routes, action.bits)
                 evaluated[i] = candidate
+                evaluated_by_move[move - 1] += 1
+                feasible_by_move[move - 1] += int(candidate.feasible)
                 # Infeasible states are used only to seek a first feasible one.
                 # They never replace a feasible current or global incumbent.
                 if candidate.feasible and (not current.feasible or candidate.value < current.value - 1.e-7):
                     if winner is None or candidate.value < winner.value:
                         winner = candidate
+                        winner_move = move
         if winner is not None:
             # Compare the native Cmax of all six neighborhoods before moving.
             # GNN scores determine only which bounded candidates are evaluated.
             current = winner; accepted += 1; improved = True
+            accepted_by_move[winner_move - 1] += 1
             if best is None or current.value < best.value:
                 best = current
         rounds += 1
@@ -716,6 +755,8 @@ def run_gnn_vns_br(taskset, model, *, seed, settings=BRConfig(), config=Scientif
         rounds=rounds, accepted=accepted, perturbations=shakes,
         native_evaluations=workspace.evaluations, graph_encodings=encodings,
         inference_and_graph_s=inference_seconds,
+        generated_by_move=generated_by_move, evaluated_by_move=evaluated_by_move,
+        feasible_by_move=feasible_by_move, accepted_by_move=accepted_by_move,
         initial_native_cmax_s=initial_value if math.isfinite(initial_value) else None,
         search_runtime_s=time.perf_counter() - started,
         termination_reason='TIME_LIMIT' if time.perf_counter() >= deadline else

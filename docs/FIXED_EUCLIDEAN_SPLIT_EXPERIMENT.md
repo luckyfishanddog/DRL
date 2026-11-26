@@ -1573,3 +1573,414 @@ Smoke原生可行3/3，B32可行3/3；这不是完整VALIDATION，也不据此�
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py smoke
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py summary
 ```
+
+## GNN-VNS-BR scale1000训练、消融与正式实验
+
+实际数据核对：scale1000 JSONL为1000/100/100条。TRAIN已包含原始40条完全相同记录；经用户确认，使用1000个不同TRAIN排样（原始40＋新增960），不重复计为1040个。
+沿用generate_taskset逐条转换，不重新生成数据、不保存任务集或监督样本副本。原始40个可复用已完成的WAG/HGA教师，新排样只用独立贪心及合法扰动。
+标签只生成一次，Full GNN、屏蔽3维边特征的同结构GNN及18维动作MLP共用完全相同的图、候选与Pairwise标签。训练种子20261126、24轮、学习率0.0003，按完整TRAIN排样留出。
+三组沿用相同M1–M6、每邻域40候选/Top-3、实际Cmax全局比较、180秒/200轮/3次扰动。节点16维、边3维、动作18维，Full GAT仍为2层64维4头。
+不重跑WAG/HGA、PPO或旧23维GNN；旧边特征模型和3条TRAIN Smoke保留。最终方案仅调用一次原B32，失败记录保留。
+本轮产物：models/gnn_vns_br_edgeaware_scale1000.pt；results/new_dataset_final/gnn_vns_br_edgeaware_scale1000.csv；单文件限制100MB。
+
+本轮代码与文件：修改scripts/run_gnn_vns_br.py、src/mrta_search/gnn_vns_br.py、tests/test_model_geometry.py、README.md及本报告；仅新增上述一个checkpoint和一个CSV。
+本轮14项直接相关检查已通过，覆盖三模型输入隔离、共同TRAIN留出、原始TRAIN前缀复用、配对准入、CSV中断续写及唯一最终B32；未重复执行全部历史测试。
+已保存文件大小：models/gnn_vns_br_edgeaware_scale1000.pt，247543字节。
+已保存文件大小：results/new_dataset_final/gnn_vns_br_edgeaware_scale1000.csv，6484455字节。
+实际监督统计：
+```json
+{
+  "source_split": "train",
+  "dataset": "scale1000",
+  "teacher_solutions": 80,
+  "greedy_initializations": 1000,
+  "generated_states": 2160,
+  "states": 2074,
+  "candidate_labels": 515946,
+  "feasible_labels": 212646,
+  "infeasible_labels": 303300,
+  "pairs": 530723,
+  "duplicate_states_skipped": 0,
+  "uninformative_states": 86,
+  "state_sources": {
+    "wag_vns": 79,
+    "hga": 78,
+    "greedy": 1917
+  },
+  "perturbed_states": 1020,
+  "candidate_parameters": {
+    "alpha": 8,
+    "anchors": 12,
+    "candidates": 40,
+    "top_k": 3,
+    "max_rounds": 200,
+    "perturbations": 3,
+    "initial_attempts": 10,
+    "time_limit": 180.0
+  },
+  "label_generation_s": 1621.2515375000658,
+  "layout_records": 1000,
+  "unique_layouts": 1000
+}
+```
+1000个输入排样中，976个产生有效Pair；其余24个未产生有效Pair，未替换排样或重复生成标签。
+离线总耗时2412.643秒；三个模型训练合计791.238秒。
+
+|模型|参数量|训练排样/留出排样|选择轮次|该轮训练Loss|留出Loss|留出Pair准确率|训练秒数|
+|---|---:|---:|---:|---:|---:|---:|---:|
+|full_gnn|23241|780/196|23|0.47732607047342196|0.4808774758402894|0.7624036069355347|389.22583709994797|
+|no_edge_gnn|23241|780/196|23|0.4803046322060534|0.4813599076576349|0.7636427761202566|356.018938299967|
+|action_mlp|1281|780/196|23|0.519013369232058|0.5192602721656241|0.7433775939147261|45.99294679996092|
+
+正式结果（Cmax只汇总B32可行项，运行时间包括全部成功和失败项）：
+
+|数据|划分|模型|完成/计划|B32可行|平均Cmax(s)|中位Cmax(s)|中位在线(s)|原生初始改善中位数|改善有效对数|
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+|original|validation|full_gnn|30/30|25|5855.496747|5907.119887|6.636414|4.47%|30|
+|original|validation|no_edge_gnn|30/30|23|5879.971020|5937.199416|7.791666|4.66%|30|
+|original|validation|action_mlp|30/30|25|5664.429562|5666.021420|10.185943|7.84%|30|
+|scale1000|validation|full_gnn|100/100|88|5839.278795|5792.974039|5.695640|5.49%|95|
+|original|test|full_gnn|0/60|0|||||0|
+|scale1000|test|full_gnn|0/100|0|||||0|
+
+消融配对（同原始VALIDATION排样/种子，双方B32可行；负值表示Full GNN更好）：
+```json
+{
+  "no_edge_gnn": {
+    "pairs": 22,
+    "full_median_relative_cmax": -9.077870686724498e-05,
+    "full_wins": 11,
+    "ties": 6
+  },
+  "action_mlp": {
+    "pairs": 21,
+    "full_median_relative_cmax": 0.012782043756701222,
+    "full_wins": 4,
+    "ties": 0
+  }
+}
+```
+
+原始VALIDATION准入及配对比较（负相对变化表示GNN更好）：
+```json
+{
+  "ready_for_test": false,
+  "checks": {
+    "complete_30": true,
+    "b32_feasible_28": false,
+    "paired_wag_improves": false,
+    "paired_hga_at_most_2pct": false,
+    "runtime_vs_wag": true,
+    "runtime_vs_hga": true
+  },
+  "summary": {
+    "dataset": "original",
+    "split": "validation",
+    "variant": "full_gnn",
+    "runs": 30,
+    "feasible": 25,
+    "failures": {
+      "DEADLOCK": 5
+    },
+    "cmax_mean_s": 5855.496747245272,
+    "cmax_median_s": 5907.119887227973,
+    "runtime_mean_s": 6.7529413333473105,
+    "runtime_median_s": 6.636413500003982,
+    "initial_improvement_pairs": 30,
+    "initial_native_improvement_mean": 0.05956735145994941,
+    "initial_native_improvement_median": 0.04470691331340265,
+    "native_feasible": 30,
+    "initial_native_feasible": 30,
+    "rounds_median": 34.0,
+    "accepted_median": 30.0,
+    "generated_by_move": [
+      40360,
+      38307,
+      36893,
+      40355,
+      38012,
+      37989
+    ],
+    "evaluated_by_move": [
+      3030,
+      2990,
+      2882,
+      3030,
+      2946,
+      2967
+    ],
+    "feasible_by_move": [
+      2493,
+      2540,
+      2206,
+      2762,
+      2578,
+      2497
+    ]
+  },
+  "paired": {
+    "wag_vns": {
+      "pairs": 24,
+      "median_relative_cmax": 0.039949586235004,
+      "mean_relative_cmax": 0.04888830317825857,
+      "baseline_runs": 30,
+      "baseline_feasible": 29,
+      "baseline_runtime_median_s": 165.34712619998027
+    },
+    "hga": {
+      "pairs": 23,
+      "median_relative_cmax": 0.07937699568411238,
+      "mean_relative_cmax": 0.0809366520594635,
+      "baseline_runs": 30,
+      "baseline_feasible": 28,
+      "baseline_runtime_median_s": 1363.6465762000298
+    }
+  }
+}
+```
+初始改善使用同一次搜索的原生初始/最终Cmax；初始不可行时不伪造改善比例，B32最终可行率独立报告。在线耗时含初始化、候选、图/GNN推理和唯一最终B32，首例包含冷JIT；JSONL读取、固定任务转换及checkpoint加载在单例计时之外，与原对照任务集预处理口径一致。
+
+结果分析：原始Full GNN的原生可行数为30/30，B32可行数为25/30；其中5次原生可行却在最终B32失败。这说明优化原生Cmax不能直接保证B32可行，优先需要核对现有快速评价与B32调度结果之间的差异。
+现有六邻域确实生成并评价了可行候选，MLP采用完全相同的生成与搜索预算；应结合配对Cmax判断GNN排序收益，不能以内部Pair准确率替代正式搜索效果。
+Full GNN相对MLP的双可行配对Cmax中位退化为1.28%；本轮未证明图编码提供额外的Cmax收益。这些结果首先提示排序目标与正式可行性/搜索收益的衔接问题，尚不足以把问题归因于候选覆盖不足；未追加模块、超参数搜索或重训。
+
+原始Full GNN VALIDATION未通过既有准入标准，本轮不运行TEST。
+
+搜索诊断：
+```json
+{
+  "dataset": "original",
+  "split": "validation",
+  "variant": "full_gnn",
+  "runs": 30,
+  "feasible": 25,
+  "failures": {
+    "DEADLOCK": 5
+  },
+  "cmax_mean_s": 5855.496747245272,
+  "cmax_median_s": 5907.119887227973,
+  "runtime_mean_s": 6.7529413333473105,
+  "runtime_median_s": 6.636413500003982,
+  "initial_improvement_pairs": 30,
+  "initial_native_improvement_mean": 0.05956735145994941,
+  "initial_native_improvement_median": 0.04470691331340265,
+  "native_feasible": 30,
+  "initial_native_feasible": 30,
+  "rounds_median": 34.0,
+  "accepted_median": 30.0,
+  "generated_by_move": [
+    40360,
+    38307,
+    36893,
+    40355,
+    38012,
+    37989
+  ],
+  "evaluated_by_move": [
+    3030,
+    2990,
+    2882,
+    3030,
+    2946,
+    2967
+  ],
+  "feasible_by_move": [
+    2493,
+    2540,
+    2206,
+    2762,
+    2578,
+    2497
+  ]
+}
+```
+
+搜索诊断：
+```json
+{
+  "dataset": "original",
+  "split": "validation",
+  "variant": "no_edge_gnn",
+  "runs": 30,
+  "feasible": 23,
+  "failures": {
+    "DEADLOCK": 7
+  },
+  "cmax_mean_s": 5879.971020143868,
+  "cmax_median_s": 5937.199415827483,
+  "runtime_mean_s": 7.9356774566617485,
+  "runtime_median_s": 7.791665750031825,
+  "initial_improvement_pairs": 30,
+  "initial_native_improvement_mean": 0.053872315069283444,
+  "initial_native_improvement_median": 0.04660383846015925,
+  "native_feasible": 30,
+  "initial_native_feasible": 30,
+  "rounds_median": 47.0,
+  "accepted_median": 43.0,
+  "generated_by_move": [
+    52288,
+    50750,
+    49800,
+    52165,
+    50560,
+    50543
+  ],
+  "evaluated_by_move": [
+    3924,
+    3903,
+    3800,
+    3924,
+    3867,
+    3872
+  ],
+  "feasible_by_move": [
+    3417,
+    3405,
+    3035,
+    3647,
+    3530,
+    3343
+  ]
+}
+```
+
+搜索诊断：
+```json
+{
+  "dataset": "original",
+  "split": "validation",
+  "variant": "action_mlp",
+  "runs": 30,
+  "feasible": 25,
+  "failures": {
+    "DEADLOCK": 5
+  },
+  "cmax_mean_s": 5664.429561641318,
+  "cmax_median_s": 5666.021420225166,
+  "runtime_mean_s": 10.674942859991765,
+  "runtime_median_s": 10.185943449963816,
+  "initial_improvement_pairs": 30,
+  "initial_native_improvement_mean": 0.08253416138457083,
+  "initial_native_improvement_median": 0.07843506616453527,
+  "native_feasible": 30,
+  "initial_native_feasible": 30,
+  "rounds_median": 69.5,
+  "accepted_median": 65.5,
+  "generated_by_move": [
+    80528,
+    77602,
+    75173,
+    80415,
+    77148,
+    77106
+  ],
+  "evaluated_by_move": [
+    6045,
+    5997,
+    5860,
+    6045,
+    5937,
+    5947
+  ],
+  "feasible_by_move": [
+    4918,
+    5140,
+    3810,
+    5616,
+    5068,
+    4702
+  ]
+}
+```
+
+搜索诊断：
+```json
+{
+  "dataset": "scale1000",
+  "split": "validation",
+  "variant": "full_gnn",
+  "runs": 100,
+  "feasible": 88,
+  "failures": {
+    "DEADLOCK": 12
+  },
+  "cmax_mean_s": 5839.278795359648,
+  "cmax_median_s": 5792.974038884307,
+  "runtime_mean_s": 5.626478977997322,
+  "runtime_median_s": 5.695639649929944,
+  "initial_improvement_pairs": 95,
+  "initial_native_improvement_mean": 0.057584532407858074,
+  "initial_native_improvement_median": 0.054866057703337634,
+  "native_feasible": 99,
+  "initial_native_feasible": 95,
+  "rounds_median": 39.5,
+  "accepted_median": 35.5,
+  "generated_by_move": [
+    156040,
+    151140,
+    147218,
+    155083,
+    150404,
+    150392
+  ],
+  "evaluated_by_move": [
+    11709,
+    11629,
+    11313,
+    11709,
+    11559,
+    11589
+  ],
+  "feasible_by_move": [
+    10038,
+    10142,
+    8374,
+    10801,
+    10282,
+    9781
+  ]
+}
+```
+
+失败记录：
+
+|数据|划分|排样|种子|模型|B32状态|原生可行|停止原因|
+|---|---|---|---:|---|---|---|---|
+|original|validation|validation_01|20261111|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_01|20261111|no_edge_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_03|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_03|20261110|no_edge_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_03|20261111|no_edge_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_04|20261110|action_mlp|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_04|20261112|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_04|20261112|no_edge_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_04|20261112|action_mlp|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_05|20261112|action_mlp|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_06|20261111|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_06|20261111|no_edge_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_06|20261112|action_mlp|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_07|20261111|no_edge_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_07|20261111|action_mlp|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_08|20261110|no_edge_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|original|validation|validation_08|20261111|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|validation_fresh_11|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|validation_fresh_13|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|validation_fresh_20|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0030|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0047|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0048|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0051|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0064|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0070|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0071|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0084|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+|scale1000|validation|scale_validation_0092|20261110|full_gnn|DEADLOCK|True|LOCAL_OPTIMUM|
+
+本轮复现入口（本地DRL、指定解释器）：
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py train --dataset scale1000
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py validation --dataset scale1000
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py test --dataset scale1000
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py summary --dataset scale1000
+```
+train发现已有本轮checkpoint时直接复用；正式CSV按数据集、划分、排样、种子和模型读取已有完整记录，失败的完整B32记录同样保留且不重跑。

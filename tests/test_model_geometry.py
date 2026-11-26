@@ -817,7 +817,9 @@ def test_br_search_is_independent_of_baseline_solvers_and_full_vnd(monkeypatch):
     assert workspace.solution(result).patterns == w.taskset.patterns
 
 
-def test_br_final_b32_is_called_once_with_serializable_direction_genes(monkeypatch):
+@pytest.mark.parametrize('dataset,variant', [('original','full_gnn'),
+    ('scale1000','full_gnn'),('scale1000','no_edge_gnn'),('scale1000','action_mlp')])
+def test_br_final_b32_is_called_once_with_serializable_direction_genes(monkeypatch,dataset,variant):
     import importlib
     import sys
     from pathlib import Path
@@ -838,7 +840,9 @@ def test_br_final_b32_is_called_once_with_serializable_direction_genes(monkeypat
         (w, state, dict(rounds=0, termination_reason='SMOKE')))
     checkpoint = dict(settings=runner.asdict(runner.BRConfig()),
                       training=dict(learning=dict(selected_epoch=1), total_offline_s=1.))
-    row = runner.run_one('train', 'toy', w.taskset, 17, model=object(), checkpoint=checkpoint)
+    checkpoint['learning'] = {variant:dict(selected_epoch=1)}
+    row = runner.run_one('train', 'toy', w.taskset, 17, model=object(), checkpoint=checkpoint,
+                         dataset=dataset,variant=variant)
     assert row['b32_calls'] == len(calls) == 1
 
 
@@ -1064,3 +1068,121 @@ def test_br_supervision_uses_online_budgets_greedy_states_and_train_only(monkeyp
     assert all(name=='train_A' and graph.nodes.shape[1]==16 and graph.edge_attr.shape[1]==3
                for name,graph,pairs in examples)
     assert stats['candidate_parameters']==runner.asdict(BRConfig())
+
+
+def test_br_three_rankers_mask_edges_and_mlp_ignores_the_graph():
+    import random
+    from dataclasses import replace
+    import torch
+    from mrta_search.gnn_vns_br import BRConfig,candidate_actions,local_graph,make_ranker
+    torch.set_num_threads(1);torch.manual_seed(4)
+    w,state=_br_fixed_fixture()
+    actions=candidate_actions(w,state,BRConfig(candidates=4),random.Random(7))
+    graph=local_graph(w,state,actions)
+    changed=replace(graph,edge_attr=torch.randn_like(graph.edge_attr)*10)
+    full,no_edge,mlp=(make_ranker(v) for v in ('full_gnn','no_edge_gnn','action_mlp'))
+    no_edge.load_state_dict(full.state_dict())
+    assert torch.equal(no_edge(graph),no_edge(changed))
+    assert not torch.allclose(full(graph),full(changed))
+    changed=replace(changed,nodes=torch.randn_like(graph.nodes)*10)
+    assert torch.equal(mlp(graph),mlp(changed))
+    assert mlp(graph).shape==(len(actions),)
+    mlp(graph).sum().backward()
+    assert mlp.scorer[0].weight.grad.abs().sum()>0
+
+
+def test_br_three_trainers_share_samples_and_layout_holdout():
+    import random
+    import torch
+    from mrta_search.gnn_vns_br import BRConfig,MODEL_VARIANTS,candidate_actions,local_graph,ranking_pairs,train_ranker
+    torch.set_num_threads(1)
+    w,state=_br_fixed_fixture();rng=random.Random(4)
+    actions=candidate_actions(w,state,BRConfig(candidates=4),rng)
+    graph=local_graph(w,state,actions)
+    pairs=ranking_pairs([w.evaluate(a.routes,a.bits).value for a in actions],rng)
+    assert len(pairs)
+    examples=[(f'train_{i}',graph,pairs) for i in range(5)]
+    saved_nodes,saved_edges,saved_pairs=graph.nodes.clone(),graph.edge_attr.clone(),pairs.clone()
+    records=[]
+    for variant in MODEL_VARIANTS:
+        model,record=train_ranker(examples,seed=20261126,epochs=2,variant=variant,progress=lambda *a:None)
+        assert len(record['history'])==2 and torch.isfinite(model(graph)).all()
+        records.append(record)
+    assert all(r['train_layouts']==records[0]['train_layouts']
+               and r['held_train_layouts']==records[0]['held_train_layouts'] for r in records)
+    assert all(set(r['train_layouts']).isdisjoint(r['held_train_layouts']) for r in records)
+    assert torch.equal(graph.nodes,saved_nodes) and torch.equal(graph.edge_attr,saved_edges)
+    assert torch.equal(pairs,saved_pairs) and len(examples)==5
+
+
+def test_br_scale_training_reuses_existing_primary_keys_without_repeating_layouts(monkeypatch):
+    import importlib
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    original,new=object(),object()
+    def entries(split,dataset='original'):
+        assert split=='train'
+        return iter([('train_01',original)] if dataset=='original'
+                    else [('train_01',original),('scale_train_0002',new)])
+    monkeypatch.setattr(runner,'iter_tasksets',entries)
+    assert list(runner.training_tasksets('scale1000'))==[('train_01',original),('scale_train_0002',new)]
+
+
+def test_br_validation_pairs_only_matching_feasible_runs_and_stops_test_on_failure(monkeypatch):
+    import importlib,json
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    names=[f'validation_{i:02d}' for i in range(1,11)]
+    baseline=[dict(split='validation',layout_id=name,seed=str(seed),status='FEASIBLE',
+                   cmax_s='100',runtime_s='10',termination_reason='ITERATION_LIMIT')
+              for name in names for seed in runner.SEEDS]
+    monkeypatch.setattr(runner,'read_baselines',lambda method:baseline)
+    monkeypatch.setattr(runner,'iter_tasksets',lambda split:iter((name,None) for name in names))
+    rows=[]
+    for i,base in enumerate(baseline):
+        for variant in runner.MODEL_VARIANTS:
+            failed=variant=='full_gnn' and i<2
+            rows.append(dict(base,dataset='original',trial='main',variant=variant,
+                status='DEADLOCK' if failed else 'FEASIBLE',cmax_s='' if failed else '99',
+                native_cmax_s='99',runtime_s='1',iterations='4',
+                diagnostic=json.dumps(dict(native_feasible=True,initial_native_cmax_s=100,accepted=1))))
+    admission=runner.validation_admission(rows)
+    assert admission['ready_for_test'] and admission['summary']['runs']==30
+    assert admission['summary']['feasible']==28 and admission['paired']['wag_vns']['pairs']==28
+    assert admission['summary']['failures']=={'DEADLOCK':2}
+    assert admission['paired']['wag_vns']['median_relative_cmax']==pytest.approx(-.01)
+    rows[6]['status']='DEADLOCK';rows[6]['cmax_s']=''
+    assert not runner.validation_admission(rows)['ready_for_test']
+    monkeypatch.setattr(runner,'read_results',lambda dataset:rows)
+    monkeypatch.setattr(runner,'update_scale_report',lambda **kwargs:None)
+    def forbidden(*a,**kw):raise AssertionError('TEST must not load a model before admission')
+    monkeypatch.setattr(runner,'load_model',forbidden)
+    runner.run_experiment('test')
+
+
+def test_br_result_resume_discards_only_the_interrupted_csv_tail(monkeypatch):
+    import importlib,io
+    from contextlib import contextmanager
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    class MemoryFile:
+        data=b''
+        def exists(self):return bool(self.data)
+        def read_bytes(self):return self.data
+        def read_text(self,**kwargs):return self.data.decode('utf-8')
+        @contextmanager
+        def open(self,mode,**kwargs):
+            stream=io.BytesIO(self.data) if mode=='r+b' else io.StringIO(newline='')
+            yield stream
+            self.data=stream.getvalue() if mode=='r+b' else self.data+stream.getvalue().encode('utf-8')
+    path=MemoryFile();monkeypatch.setattr(runner,'SCALE_CSV',path)
+    row={k:'1' for k in runner.SCALE_FIELDS};row['layout_id']='validation_01'
+    runner.append_result(row,'scale1000')
+    path.data+=b'original,validation,unfinished'
+    assert len(runner.read_results('scale1000'))==1
+    second=dict(row,layout_id='validation_02')
+    runner.append_result(second,'scale1000')
+    assert [r['layout_id'] for r in runner.read_results('scale1000')]==['validation_01','validation_02']
