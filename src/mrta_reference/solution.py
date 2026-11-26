@@ -58,6 +58,14 @@ def canonicalize(
     if missing:
         raise ValueError(f"parents without a WHOLE/X_SPLIT/Y_SPLIT pattern: {missing}")
 
+    if any(p.kind is SplitKind.FIXED for p in patterns):
+        if not all(p.kind is SplitKind.FIXED for p in patterns):
+            raise ValueError("fixed tasksets cannot contain dynamic split patterns")
+        from .fixed_taskset import canonical_fixed_routes
+        ordered_patterns = tuple(pattern_by_id[p.parent_id] for p in ordered_parents)
+        merged_routes, _ = canonical_fixed_routes(ordered_parents, ordered_patterns, routes, config)
+        return CanonicalSolution(ordered_parents, ordered_patterns, merged_routes, revision)
+
     current_routes = [list(route.block_ids) for route in canonical_routes(routes)]
     # Same-robot consecutive children are a representation artifact, not two blocks.
     for parent_id in sorted(pattern_by_id):
@@ -159,6 +167,12 @@ def block_map(
     x_split_validator: XSplitValidator | None = None,
     scope: FormalScope | None = None,
 ):
+    if any(p.kind is SplitKind.FIXED for p in solution.patterns):
+        from .fixed_taskset import canonical_fixed_routes
+        routes, blocks = canonical_fixed_routes(solution.parents, solution.patterns, solution.routes, config)
+        if routes != solution.routes:
+            raise ValueError("fixed solution must merge contiguous owned atoms before route evaluation")
+        return blocks
     if scope is not None:
         catalog = build_legal_pattern_catalog(solution.parents, config, scope)
         parents_for_validation = {
@@ -232,7 +246,7 @@ def official_metrics(
     )
     parents = {parent.parent_id: parent for parent in solution.parents}
     optional_splits = sum(
-        pattern.kind is not SplitKind.WHOLE
+        pattern.kind not in (SplitKind.WHOLE, SplitKind.FIXED)
         and bool(whole_eligible_rails(parents[pattern.parent_id].start, parents[pattern.parent_id].end, config))
         for pattern in solution.patterns
     )

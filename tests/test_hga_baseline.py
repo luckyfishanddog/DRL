@@ -1,8 +1,155 @@
 from __future__ import annotations
 
-import random
-
 import pytest
+
+
+def test_fixed_hga_merged_insertion_matches_all_raw_positions_and_directions():
+    import numpy as np
+    import pytest
+    import mrta_baselines.hga as h
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.))))
+    w = h._HGAWorkspace(ts.parents,ScientificConfig(),FORMAL_SCOPE_V2,patterns=ts.patterns)
+    ix = {name:i for i,name in enumerate(w.ids)}
+    raw = [np.array([ix[f'p::seg_{j:03d}'] for j in (0,2,3)],np.int64),
+           np.array([ix[f'p::seg_{j:03d}'] for j in (4,5)]+[ix['q::seg_000']],np.int64),
+           np.empty(0,np.int64),np.empty(0,np.int64)]
+    bits = [np.zeros(len(r),np.int64) for r in raw]
+    routes,bits = h._merge_fixed_arrays(raw,bits,w.fixed_starts,w.fixed_stops,w.fixed_lookup)
+    node = ix['p::seg_001']
+    costs = [h._oriented_route_cost(r,d,w.travel,w.processing) for r,d in zip(routes,bits)]
+    for shortest in (False,True):
+        available = [r for r in range(4) if w.eligible[node,r]]
+        minimum = min(costs[r] for r in available)
+        expected = float('inf')
+        for r in available:
+            if shortest and costs[r] > minimum+1.e-12: continue
+            for k in range(len(routes[r])+1):
+                for bit in (0,1):
+                    candidate,ds = [x.copy() for x in routes],[x.copy() for x in bits]
+                    h._put_oriented(candidate,ds,node,bit,r,k)
+                    candidate,ds = h._merge_fixed_arrays(candidate,ds,w.fixed_starts,w.fixed_stops,w.fixed_lookup)
+                    new_costs = [h._oriented_route_cost(a,b,w.travel,w.processing) for a,b in zip(candidate,ds)]
+                    expected = min(expected,new_costs[r]-costs[r] if shortest else max(new_costs))
+        r,k,bit = h._insert_fixed_oriented(node,routes,bits,w.eligible,w.travel,w.processing,
+                              w.fixed_starts,w.fixed_stops,w.fixed_lookup,shortest)
+        candidate,ds = [x.copy() for x in routes],[x.copy() for x in bits]
+        h._put_oriented(candidate,ds,node,bit,r,k)
+        candidate,ds = h._merge_fixed_arrays(candidate,ds,w.fixed_starts,w.fixed_stops,w.fixed_lookup)
+        new_costs = [h._oriented_route_cost(a,b,w.travel,w.processing) for a,b in zip(candidate,ds)]
+        actual = new_costs[r]-costs[r] if shortest else max(new_costs)
+        assert actual == pytest.approx(expected)
+        w.solution(candidate,w.initial_selected)  # complete, legal, maximally merged
+
+
+def test_fixed_hga_numeric_union_and_repair_preserve_atomic_coverage():
+    import numpy as np
+    import pytest
+    from mrta_reference.fixed_taskset import generate_taskset, expand_routes
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import canonicalize, block_map
+    from mrta_baselines.hga import _HGAWorkspace, _merge_fixed_arrays
+    from mrta_baselines.wag_vns import generate_wag_assignments, priority_schedule
+    c = ScientificConfig()
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.))))
+    w = _HGAWorkspace(ts.parents,c,FORMAL_SCOPE_V2,patterns=ts.patterns)
+    # Allocate alternating runs, scramble provisional order, then compare the
+    # optimized numeric representation with the canonical job implementation.
+    raw = [w.atomic_nodes[[2,0,1,6]],w.atomic_nodes[[5,3,4]],np.empty(0,np.int64),np.empty(0,np.int64)]
+    bits = [np.zeros(len(r),np.int64) for r in raw]
+    routes,ds = _merge_fixed_arrays(raw,bits,w.fixed_starts,w.fixed_stops,w.fixed_lookup)
+    solution = w.solution(routes,w.initial_selected)
+    expected = canonicalize(ts.parents,ts.patterns,{r:tuple(w.ids[i] for i in raw[r]) for r in range(4)},c)
+    assert solution == expected
+    assert [w.ids[i] for i in routes[0]] == ['p::job_000_003','q::seg_000']
+    # Overlapping inherited jobs from the two parents must not duplicate atoms.
+    inherited = [routes[0],np.concatenate((routes[0],routes[1])),routes[2],routes[3]]
+    inherited_ds = [ds[0],np.concatenate((ds[0],ds[1])),ds[2],ds[3]]
+    repaired,directions = w.repair(inherited,w.initial_selected,excluded=1,directions=inherited_ds)
+    result = w.solution(repaired,w.initial_selected)
+    actual = [a for row in expand_routes(result.routes) for a in row]
+    assert sorted(actual) == sorted(t.task_id for t in ts.tasks)
+    assert len(actual) == len(set(actual))
+    numeric = sum(w.processing[n] for route in repaired for n in route)
+    assert numeric == pytest.approx(sum(c.process_time(b.length) for b in block_map(result,c).values()))
+    assignments = generate_wag_assignments(ts.parents,ts.patterns,c,max_variants=None,scope=FORMAL_SCOPE_V2)
+    assert assignments
+    assert all(s.patterns == w.patterns == ts.patterns for s in assignments)
+    for s in assignments:
+        assert sorted(a for row in expand_routes(s.routes) for a in row) == sorted(t.task_id for t in ts.tasks)
+
+
+def test_fixed_hga_merged_prefix_bounds_match_unpruned_native_vnd():
+    import numpy as np
+    import pytest
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_baselines.hga import _HGAWorkspace, _vnd_oriented_arrays
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.)),
+                           ParentWeld('a',(0.,2.),(3.,2.)),ParentWeld('b',(10.,2.),(12.,2.))))
+    w = _HGAWorkspace(ts.parents,ScientificConfig(),FORMAL_SCOPE_V2,patterns=ts.patterns)
+    for seed in (17,31):
+        rng = np.random.default_rng(seed)
+        raw = [[] for _ in range(4)]
+        for node in w.atomic_nodes:
+            candidates = np.where(w.eligible[node])[0]
+            raw[int(rng.choice(candidates))].append(int(node))
+        raw = [np.array(r,np.int64) for r in raw]
+        directions = [rng.integers(0,2,len(r),dtype=np.int64) for r in raw]
+        routes,bits = w.repair(raw,w.initial_selected,directions=directions)
+        results = []
+        for bounded in (False,True):
+            result = _vnd_oriented_arrays(routes,bits,w.travel,w.processing,w.points,w.eligible,
+                w.vnd_parent_index,w.nearest,w.parameters,20,0,0,w.oriented_scratch,np.zeros(4,np.int64),
+                use_schedule_bound=bounded,fixed_starts=w.fixed_starts,fixed_stops=w.fixed_stops,fixed_lookup=w.fixed_lookup)
+            results.append(result)
+        assert [tuple(r) for r in results[0][0]] == [tuple(r) for r in results[1][0]]
+        assert [tuple(d) for d in results[0][1]] == [tuple(d) for d in results[1][1]]
+        assert results[0][2] == pytest.approx(results[1][2])
+
+
+@pytest.mark.parametrize('route_objective',(False,True))
+def test_fixed_hga_fast_path_matches_always_materialized_merged_moves(monkeypatch,route_objective):
+    import numpy as np
+    import pytest
+    import mrta_baselines.hga as h
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.fixed_taskset import generate_taskset
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.)),
+                           ParentWeld('a',(0.,2.),(3.,2.)),ParentWeld('b',(10.,2.),(12.,2.))))
+    w = h._HGAWorkspace(ts.parents,ScientificConfig(),FORMAL_SCOPE_V2,patterns=ts.patterns)
+    rng = np.random.default_rng(59)
+    raw = [[] for _ in range(4)]
+    for n in w.atomic_nodes: raw[int(rng.choice(np.where(w.eligible[n])[0]))].append(n)
+    raw = [np.array(r,np.int64) for r in raw]
+    bits = [rng.integers(0,2,len(r),dtype=np.int64) for r in raw]
+    routes,bits = w.repair(raw,w.initial_selected,directions=bits)
+    args = (routes,bits,w.travel,w.processing,w.points,w.eligible,w.vnd_parent_index,w.nearest,
+            w.parameters,20,0,0,w.oriented_scratch,np.zeros(4,np.int64))
+    kwargs = dict(fixed_starts=w.fixed_starts,fixed_stops=w.fixed_stops,fixed_lookup=w.fixed_lookup,
+                  route_objective=route_objective)
+    # Interpret the SAME VND with every transferred interval materialized,
+    # then compare its exact solution and direction genes to the native path.
+    with monkeypatch.context() as patch:
+        patch.setattr(h,'_fixed_move_merges',lambda *a:True)
+        if route_objective:
+            def unexpected_coordination(*a,**k):
+                raise AssertionError('original route-cycle VND must not schedule candidates')
+            patch.setattr(h,'_fixed_native_update',unexpected_coordination)
+        reference = h._vnd_oriented_arrays.py_func(*args,**kwargs)
+    actual = h._vnd_oriented_arrays(*args,**kwargs)
+    assert [tuple(r) for r in actual[0]] == [tuple(r) for r in reference[0]]
+    assert [tuple(d) for d in actual[1]] == [tuple(d) for d in reference[1]]
+    assert actual[2] == pytest.approx(reference[2])
+    if route_objective:
+        assert args[-1][3] == 0
+
+import random
 
 from mrta_baselines.hga import (
     _Individual,
@@ -767,17 +914,31 @@ def test_oriented_candidate_arrays_preserve_directed_order_and_symmetric_first_e
 
 
 @pytest.mark.parametrize('route_objective', (False, True))
-def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods(route_objective):
+@pytest.mark.parametrize('fixed', (False, True))
+def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods(route_objective,fixed):
     import numpy as np
     from mrta_baselines import hga as h
     from mrta_baselines.wag_vns import _priority_arrays
     config, _, solution = _fixture()
-    w = h._HGAWorkspace(solution.parents, config, None, patterns=solution.patterns)
-    routes = w.encode(solution)
-    bits = [np.arange(len(r), dtype=np.int64) % 2 for r in routes]
-    result = h._vnd_oriented_arrays(routes, bits, w.travel, w.processing, w.points, w.eligible, w.parent_index,
+    if fixed:
+        from mrta_reference.fixed_taskset import generate_taskset
+        ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.)),
+                               ParentWeld('a',(0.,2.),(3.,2.)),ParentWeld('b',(10.,2.),(12.,2.))))
+        w = h._HGAWorkspace(ts.parents,config,FORMAL_SCOPE_V2,patterns=ts.patterns)
+        rng = np.random.default_rng(59)
+        raw = [[] for _ in range(4)]
+        for node in w.atomic_nodes: raw[int(rng.choice(np.where(w.eligible[node])[0]))].append(node)
+        routes = [np.array(r,np.int64) for r in raw]
+        bits = [np.arange(len(r),dtype=np.int64)%2 for r in routes]
+        routes,bits = w.repair(routes,w.initial_selected,directions=bits)
+    else:
+        w = h._HGAWorkspace(solution.parents, config, None, patterns=solution.patterns)
+        routes = w.encode(solution)
+        bits = [np.arange(len(r), dtype=np.int64) % 2 for r in routes]
+    result = h._vnd_oriented_arrays(routes, bits, w.travel, w.processing, w.points, w.eligible, w.vnd_parent_index,
                                     w.nearest, w.parameters, 20, 0, 0, w.oriented_scratch, np.zeros(1, np.int64),
-                                    route_objective=route_objective)
+                                    route_objective=route_objective,fixed_starts=w.fixed_starts,
+                                    fixed_stops=w.fixed_stops,fixed_lookup=w.fixed_lookup)
     current, directions, score, operations, _, pass_hit, candidate_hit, _ = result
     assert np.isfinite(score) and operations > 0 and not pass_hit and not candidate_hit
     expected = (max(h._oriented_route_cost(r, d, w.travel, w.processing) for r, d in zip(current, directions))
@@ -802,6 +963,8 @@ def test_oriented_vnd_exhausts_all_six_fixed_gene_neighborhoods(route_objective)
                         candidate, db = list(current), list(directions)
                         for r, segments in ((ru, a),) if move == 4 else ((ru, a), (rv, b)):
                             candidate[r], db[r] = h._materialize_segments(segments, current), h._materialize_directions(segments, directions)
+                        if fixed:
+                            candidate,db = h._merge_fixed_arrays(candidate,db,w.fixed_starts,w.fixed_stops,w.fixed_lookup)
                         if any(not w.eligible[n, r] for r, route in enumerate(candidate) for n in route):
                             continue
                         value = (max(h._oriented_route_cost(r, d, w.travel, w.processing) for r, d in zip(candidate, db))
@@ -832,11 +995,17 @@ def test_route_cycle_vnd_never_calls_native_coordination(monkeypatch):
     assert all(len(r) == len(d) for r, d in zip(current, directions))
 
 
-def test_route_cycle_children_use_one_native_evaluation_and_reuse_best_timeline(monkeypatch):
+@pytest.mark.parametrize('fixed', (False, True))
+def test_route_cycle_children_use_one_native_evaluation_and_reuse_best_timeline(monkeypatch,fixed):
     from dataclasses import replace
     from mrta_baselines import common, hga as h
     config = ScientificConfig()
     parents = (ParentWeld('a', (1., 9.), (2., 9.)), ParentWeld('b', (8., 9.), (9., 9.)))
+    if fixed:
+        from mrta_reference.fixed_taskset import generate_taskset,expand_routes
+        parents = (ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.)),
+                   ParentWeld('a',(0.,2.),(3.,2.)),ParentWeld('b',(10.,2.),(12.,2.)))
+        ts = generate_taskset(parents,config)
     original, calls = h._priority_arrays, []
     def observed(*args, **kwargs):
         result = original(*args, **kwargs)
@@ -848,17 +1017,27 @@ def test_route_cycle_children_use_one_native_evaluation_and_reuse_best_timeline(
     monkeypatch.setattr(common.FormalReferenceEvaluator, '__call__', forbidden)
     monkeypatch.setattr(common, 'certify_schedule', forbidden)
     settings = replace(AdaptedHGAConfig(), mu=3, lambda_size=2, max_iterations=4, vnd_objective='ROUTE_CYCLE')
-    result = h.run_adapted_hga_v2(parents, config, settings, seed=731, time_limit=float('inf'), checkpoints=())
+    if fixed:
+        result = h.run_adapted_hga(parents,config,settings,seed=731,time_limit=float('inf'),
+            scope=FORMAL_SCOPE_V2,checkpoints=(),certify=False,candidate_evaluator=h.priority_schedule,fixed_taskset=ts)
+    else:
+        result = h.run_adapted_hga_v2(parents, config, settings, seed=731, time_limit=float('inf'), checkpoints=())
     assert result.iterations == 4 and result.termination_reason == 'ITERATION_LIMIT'
     initial_proposals = min(settings.mu, settings.initialization_reference_limit)
     assert len(calls) == result.reference_calls == settings.mu + result.iterations + initial_proposals
     assert result.accounting['vnd_unique_calls'] + result.accounting['vnd_cache_hits'] == settings.mu + result.iterations
-    assert result.accounting['vnd_cache_hits'] > 0
+    if not fixed:
+        assert result.accounting['vnd_cache_hits'] > 0
     assert result.accounting['vnd_native_candidate_evaluations'] == 0 and result.certifier_calls == 0
     best = result.timely_best
     expected = h.priority_schedule(best.solution, config, best.directions)
     assert best.schedule.cmax == min(calls) == expected.cmax
     assert best.schedule.operations == expected.operations
+    if fixed:
+        atoms = [a for row in expand_routes(best.solution.routes) for a in row]
+        assert sorted(atoms) == sorted(t.task_id for t in ts.tasks)
+        assert len(atoms) == len(set(atoms))
+        assert best.solution.patterns == ts.patterns
 
 
 def _oriented_wait_fixture(two_rails=False):

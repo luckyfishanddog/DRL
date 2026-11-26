@@ -28,6 +28,7 @@ class SplitKind(str, Enum):
     WHOLE = "WHOLE"
     X_SPLIT = "X_SPLIT"
     Y_SPLIT = "Y_SPLIT"
+    FIXED = "FIXED"
 
 
 class OperationKind(str, Enum):
@@ -169,6 +170,18 @@ class SplitPattern:
     rail: Rail | None = None
 
     def __post_init__(self) -> None:
+        if self.kind is SplitKind.FIXED:
+            if not isinstance(self, FixedSplitPattern):
+                raise ValueError('FIXED requires fixed atomic intervals')
+            if (self.t is not None or self.point_id is not None or self.rail is not None
+                    or self.mandatory or len(self.cuts) < 2 or self.cuts[0] != 0.
+                    or self.cuts[-1] != 1. or any(not math.isfinite(t) for t in self.cuts)
+                    or any(a >= b for a, b in zip(self.cuts, self.cuts[1:]))
+                    or len(self.fixed_eligible) != len(self.cuts)-1
+                    or any(not rs or tuple(sorted(set(rs))) != rs or any(r not in range(4) for r in rs)
+                           for rs in self.fixed_eligible)):
+                raise ValueError("FIXED requires increasing, complete parameter intervals only")
+            return
         if self.kind is SplitKind.WHOLE:
             if self.t is not None or self.point_id is not None:
                 raise ValueError("WHOLE cannot carry a split point")
@@ -188,12 +201,21 @@ class SplitPattern:
 
     @property
     def pattern_id(self) -> str:
+        if self.kind is SplitKind.FIXED:
+            return f"{self.parent_id}:FIXED"
         if self.kind is SplitKind.WHOLE:
             return f"{self.parent_id}:WHOLE"
         if self.kind is SplitKind.X_SPLIT:
             assert self.rail is not None
             return f"{self.parent_id}:{self.kind.value}:{self.rail.value}:{self.point_id}"
         return f"{self.parent_id}:{self.kind.value}:{self.point_id}"
+
+
+@dataclass(frozen=True, order=True)
+class FixedSplitPattern(SplitPattern):
+    # Keep legacy dataclass fields/equality/memoization semantics untouched.
+    cuts: tuple[float, ...] = ()
+    fixed_eligible: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True, order=True)
@@ -208,6 +230,11 @@ class WeldingBlock:
     @property
     def length(self) -> float:
         return math.dist(self.start, self.end)
+
+
+@dataclass(frozen=True, order=True)
+class FixedWeldingBlock(WeldingBlock):
+    eligible_robots: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, order=True)
@@ -372,6 +399,9 @@ class CanonicalSolution:
             ]
             if pattern.rail is not None:
                 row.append(pattern.rail.value)
+            if pattern.kind is SplitKind.FIXED:
+                row.append(list(pattern.cuts))
+                row.append([list(rs) for rs in pattern.fixed_eligible])
             patterns.append(row)
         return {
             "parents": [

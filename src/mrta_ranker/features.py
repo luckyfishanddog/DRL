@@ -95,7 +95,7 @@ def extract_c2_features(current, current_directions, current_cmax, candidate, co
         out[label + "_max_robot_load"] = max(loads)
         out[label + "_load_range"] = max(loads) - min(loads)
         out[label + "_load_std"] = statistics.pstdev(loads)
-        for kind in SplitKind:
+        for kind in (SplitKind.WHOLE, SplitKind.X_SPLIT, SplitKind.Y_SPLIT):
             out[label + "_" + kind.value.lower() + "_count"] = float(sum(p.kind is kind for p in solution.patterns))
     affected = set(move.key.affected_parent_ids if move is not None else metadata.get("removed_parent_ids", ()))
     robots = {r for r in range(4) if before_routes[r] != after_routes[r]}

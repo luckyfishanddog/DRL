@@ -5,6 +5,73 @@ from dataclasses import replace
 
 import pytest
 
+
+def _fixed_original_wag_fixture():
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    from mrta_reference.solution import canonicalize
+    config = ScientificConfig()
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(16.6,9.)),
+                          ParentWeld('u',(18.,9.),(19.,9.)),ParentWeld('a',(0.,2.),(3.,2.)),
+                          ParentWeld('b',(10.,2.),(13.,2.))))
+    solution = canonicalize(ts.parents,ts.patterns,{0:('p::job_000_006','q::job_000_006'),
+        1:('u::seg_000',),2:('a::seg_000',),3:('b::seg_000',)},config)
+    return ts,config,solution
+
+
+def test_fixed_wag_paper_assignment_uses_atoms_then_merges_route_jobs(monkeypatch):
+    import mrta_baselines.wag_vns as w
+    from mrta_reference.fixed_taskset import expand_routes
+    ts,c,solution = _fixed_original_wag_fixture()
+    before = {atom:r for r,route in enumerate(expand_routes(solution.routes)) for atom in route}
+    for function in (w.wag_move_candidates,w.wag_swap_candidates):
+        candidates = function(solution,c,random.Random(7),n=10,heavy_robot=0)
+        assert candidates
+        for candidate in candidates:
+            owners = {atom:r for r,route in enumerate(expand_routes(candidate.routes)) for atom in route}
+            assert set(owners) == {t.task_id for t in ts.tasks}
+            changed = sum(before[atom] != owners[atom] for atom in owners)
+            assert changed == (1 if function is w.wag_move_candidates else 2)
+            assert any(len({owners[t.task_id] for t in ts.tasks if t.source_parent_id==parent})>1
+                       for parent in ('p','q'))
+    captured = []
+    original = w.generate_wag_assignments
+    def observed(*args,**kwargs):
+        captured.append(dict(kwargs['retained_assignments']))
+        return original(*args,**kwargs)
+    monkeypatch.setattr(w,'generate_wag_assignments',observed)
+    candidates = w.wag_lns_candidates(solution,c,random.Random(7),p=.5,max_variants=None)
+    assert candidates and len(captured)==1
+    # Algorithm 2 modifies unmerged W_k, not the derived sequencing W'_k.
+    assert len(captured[0]) == 6  # keep half of R0's twelve fixed atoms
+    assert all('::seg_' in atom for atom in captured[0])
+    for candidate in candidates:
+        owners = {atom:r for r,route in enumerate(expand_routes(candidate.routes)) for atom in route}
+        assert set(owners) == {t.task_id for t in ts.tasks}
+        assert all(owners[atom] == robot for atom,robot in captured[0].items())
+
+
+def test_fixed_wag_original_numeric_fast_path_matches_generic_evaluation():
+    import math
+    import mrta_baselines.wag_vns as w
+    from mrta_baselines.common import CommonBaselineEvaluator
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_reference.solution import canonicalize
+    ts,c,first = _fixed_original_wag_fixture()
+    second = canonicalize(ts.parents,ts.patterns,{0:('p::job_000_002','p::job_004_006'),
+        1:('p::job_002_004','q::job_000_006','u::seg_000'),2:('a::seg_000',),3:('b::seg_000',)},c)
+    outcomes = []
+    for scoring in (w.priority_schedule,lambda solution,cfg:w.priority_schedule(solution,cfg)):
+        evaluator = CommonBaselineEvaluator(ts.parents,c,FORMAL_SCOPE_V2,time_limit=math.inf,
+                                             certify=False,candidate_evaluator=scoring)
+        for i,assignment in enumerate((first,second)):
+            w._evaluate_routed_assignment(assignment,c,w.AdaptedWAGConfig(),evaluator,source=str(i))
+        assert evaluator.best is not None
+        outcomes.append(evaluator.best)
+    assert outcomes[0].solution == outcomes[1].solution
+    assert outcomes[0].directions == outcomes[1].directions
+    assert outcomes[0].metrics.cmax == pytest.approx(outcomes[1].metrics.cmax)
+
 from mrta_baselines.wag_vns import (
     AdaptedWAGConfig,
     _blocks_for,

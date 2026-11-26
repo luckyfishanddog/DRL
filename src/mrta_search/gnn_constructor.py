@@ -1838,7 +1838,7 @@ def parent_assignment_space(parents: Sequence[ParentWeld], config: ScientificCon
                 child_nodes.append(nodes if len(nodes) == 2 else (*nodes, 0))
                 owners.append(robots if len(robots) == 2 else (*robots, 0))
                 masks.append((True, len(robots) == 2))
-                modes.append([float(pattern.kind is kind) for kind in SplitKind]
+                modes.append([float(pattern.kind is kind) for kind in (SplitKind.WHOLE, SplitKind.X_SPLIT, SplitKind.Y_SPLIT)]
                              + [float(pattern.mandatory), pattern.t if pattern.t is not None else .5])
                 loads = [0.] * 4
                 for robot, seconds in zip(robots, times):
@@ -3105,7 +3105,7 @@ def feedback_shortlist(space, indices, logits):
             index = next((i for i in order if robot in space.actions[i].robots), None)
             if index is not None:
                 add(index)
-    for kind in SplitKind:
+    for kind in (SplitKind.WHOLE, SplitKind.X_SPLIT, SplitKind.Y_SPLIT):
         if kind not in kinds:
             index = next((i for i in order if space.actions[i].pattern.kind is kind), None)
             if index is not None:

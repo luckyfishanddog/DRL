@@ -30,6 +30,7 @@ from mrta_reference.model import (
 )
 from mrta_reference.solution import block_map, canonicalize
 from mrta_reference.scope import FORMAL_SCOPE_V2
+from mrta_reference.fixed_taskset import fixed_patterns, expand_routes
 
 from .common import (
     BaselineAccounting,
@@ -1155,6 +1156,9 @@ def generate_wag_assignments(
     only the destroyed tasks participate in residual balancing and offsets.
     """
     blocks = _blocks_for(parents, patterns, config)
+    if fixed_patterns(patterns) and retained_assignments:
+        retained_assignments = {atom: r for identifier, r in retained_assignments.items()
+                                for atom in expand_routes({r: (identifier,)})[r]}
     fixed_robot = {
         f"{pattern.parent_id}::{child}": robot
         for pattern in patterns
@@ -1277,7 +1281,10 @@ def _route_combinations(
         factorial_calls += calls
     combinations = []
     costs = [[_route_cost(route, blocks, config) for route in route_set] for route_set in variants]
-    has_split = any(pattern.kind is not SplitKind.WHOLE for pattern in assignment.patterns)
+    # Fixed ownership has already been merged BEFORE route construction.
+    # Permuting these indivisible jobs cannot create another geometric union.
+    has_split = (not fixed_patterns(assignment.patterns)
+                 and any(pattern.kind is not SplitKind.WHOLE for pattern in assignment.patterns))
     for indices in itertools.product(range(3), repeat=4):
         routes = tuple(variants[robot][indices[robot]] for robot in range(4))
         cost = max(costs[robot][indices[robot]] for robot in range(4))
@@ -1299,6 +1306,18 @@ def _same_rail_neighbors(robot: int) -> tuple[int, ...]:
     return ({0: (1,), 1: (0,), 2: (3,), 3: (2,)})[robot]
 
 
+def _wag_assignment_view(solution, config):
+    """Paper W_k for assignment moves; canonical routes remain W'_k.
+
+    Algorithm 1 stores best_WAG=W_k (step 21), while steps 7--11 derive
+    merged jobs for sequencing. Reconstructing atom ownership from W'_k is
+    lossless and does not reopen splitting or change the fixed task set.
+    """
+    if fixed_patterns(solution.patterns):
+        return _blocks_for(solution.parents,solution.patterns,config),expand_routes(solution.routes)
+    return block_map(solution,config),[list(route.block_ids) for route in solution.routes]
+
+
 def wag_move_candidates(
     solution: CanonicalSolution,
     config: ScientificConfig,
@@ -1308,12 +1327,12 @@ def wag_move_candidates(
     heavy_robot: int,
     scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
-    blocks = block_map(solution, config)
+    blocks, assignment_routes = _wag_assignment_view(solution, config)
     if not solution.routes[heavy_robot].block_ids:
         return ()
     result = []
     for _ in range(n):
-        routes = [list(route.block_ids) for route in solution.routes]
+        routes = [list(route) for route in assignment_routes]
         block_id = routes[heavy_robot][rng.randrange(len(routes[heavy_robot]))]
         pattern = next(
             item for item in solution.patterns
@@ -1355,7 +1374,7 @@ def wag_swap_candidates(
     heavy_robot: int,
     scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
-    blocks = block_map(solution, config)
+    blocks, assignment_routes = _wag_assignment_view(solution, config)
     result = []
     if not solution.routes[heavy_robot].block_ids:
         return ()
@@ -1363,7 +1382,7 @@ def wag_swap_candidates(
         neighbor = _same_rail_neighbors(heavy_robot)[0]
         if not solution.routes[neighbor].block_ids:
             continue
-        routes = [list(route.block_ids) for route in solution.routes]
+        routes = [list(route) for route in assignment_routes]
         left = routes[heavy_robot][rng.randrange(len(routes[heavy_robot]))]
         right = routes[neighbor][rng.randrange(len(routes[neighbor]))]
         pattern_by_parent = {
@@ -1403,7 +1422,7 @@ def wag_lns_candidates(
     max_variants: int | None,
     scope: FormalScope | None = None,
 ) -> tuple[CanonicalSolution, ...]:
-    routes = [list(route.block_ids) for route in solution.routes]
+    blocks, routes = _wag_assignment_view(solution, config)
     removed = []
     for robot in range(4):
         count = max(1, math.ceil(len(routes[robot]) * p)) if routes[robot] else 0
@@ -1411,7 +1430,6 @@ def wag_lns_candidates(
         removed.extend(routes[robot][:count])
         routes[robot] = routes[robot][count:]
     retained = {block_id: robot for robot, route in enumerate(routes) for block_id in route}
-    blocks = block_map(solution, config)
     removed.sort(
         key=lambda item: (
             min(blocks[item].start[0], blocks[item].end[0]), item
@@ -1547,17 +1565,24 @@ def _evaluate_routed_assignment(
     native = (getattr(evaluator, 'candidate_evaluator', None) is priority_schedule
               and not evaluator.certify)
     if native:
+        fixed = fixed_patterns(assignment.patterns)
         if not hasattr(evaluator, '_wag_native_contexts'):
             evaluator._wag_native_contexts = {}
-        context = evaluator._wag_native_contexts.get(assignment.patterns)
+        # Fixed patterns retain the atoms while job geometry depends on owners.
+        # Tables are shared by the original bounded _route_tables cache. The
+        # assignment-local encoding/scoring cache covers all 81 combinations;
+        # retaining a full numeric table per ownership would waste memory.
+        context = None if fixed else evaluator._wag_native_contexts.get(assignment.patterns)
         if context is None:
-            table_ids, index, points, travel, processing = _tables_for(_blocks_for(
-                assignment.parents, assignment.patterns, scientific_config), scientific_config)
+            source_blocks = (block_map(assignment, scientific_config) if fixed else
+                _blocks_for(assignment.parents, assignment.patterns, scientific_config))
+            table_ids, index, points, travel, processing = _tables_for(source_blocks, scientific_config)
             parameters = np.array([scientific_config.empty_speed, scientific_config.t_pre, scientific_config.t_post,
                                    scientific_config.interference_dx, scientific_config.interference_dy,
                                    scientific_config.numeric_epsilon])
             context = table_ids, index, points, travel, processing, parameters, {}, set()
-            evaluator._wag_native_contexts[assignment.patterns] = context
+            if not fixed:
+                evaluator._wag_native_contexts[assignment.patterns] = context
         table_ids, index, points, travel, processing, parameters, encoded, scored = context
     for index, (lower, routes) in enumerate(combinations):
         native_arrays = None
@@ -1610,10 +1635,15 @@ def run_adapted_wag_vns(
     pattern_access_policy: bool | None = None,
     certify: bool = True,
     candidate_evaluator: CandidateEvaluator | None = None,
+    fixed_taskset=None,
 ) -> BaselineResult:
     rng = random.Random(seed)
     v2 = scope.x_split_rule_id is not None
     repaired_access = (v2 and method_id == METHOD_ID_V2) if pattern_access_policy is None else pattern_access_policy
+    if fixed_taskset is not None:
+        if tuple(sorted(parents, key=lambda p: p.parent_id)) != fixed_taskset.parents:
+            raise ValueError('fixed taskset parents differ from WAG input')
+        repaired_access = False
     if repaired_access and not v2:
         raise ValueError("pattern-first access requires FORMAL_SCOPE_V2")
     evaluator = CommonBaselineEvaluator(
@@ -1625,7 +1655,7 @@ def run_adapted_wag_vns(
         certify=certify,
         candidate_evaluator=candidate_evaluator,
     )
-    if v2:
+    if v2 and fixed_taskset is None:
         evaluator.accounting.legal_x_pattern_count = sum(
             pattern.kind is SplitKind.X_SPLIT
             for patterns in build_legal_pattern_catalog(
@@ -1640,7 +1670,7 @@ def run_adapted_wag_vns(
         )
     else:
         try:
-            patterns = _initial_patterns(
+            patterns = fixed_taskset.patterns if fixed_taskset is not None else _initial_patterns(
                 parents, scientific_config, scope=scope if v2 else None
             )
             assignments = generate_wag_assignments(
@@ -1766,7 +1796,7 @@ def run_adapted_wag_vns(
                 scope=scope if v2 else None,
             )
             name = "LNS"
-        if not repaired_access and iterations % 3 == 0:
+        if fixed_taskset is None and not repaired_access and iterations % 3 == 0:
             evaluator.accounting.optional_y_toggle_attempts += 1
             if v2:
                 optional, proposed_kind = transition_legal_pattern(

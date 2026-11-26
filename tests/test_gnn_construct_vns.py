@@ -1,5 +1,101 @@
 from __future__ import annotations
 
+
+def test_fixed_ppo_full_teacher_sequence_shared_gradients_and_real_b32(monkeypatch):
+    import torch
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld
+    from mrta_reference.solution import canonicalize
+    from mrta_search import gnn_ppo as p
+    torch.set_num_threads(1); torch.manual_seed(7)
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),
+                           ParentWeld('q',(10.,9.),(12.,9.)),ParentWeld('a',(0.,2.),(2.,2.))))
+    payload = dict(assignments={t.task_id: (0 if t.source_parent_id=='p' else 1 if t.source_parent_id=='q' else 2) for t in ts.tasks},
+                   routes=[['p::job_000_006'],['q::seg_000'],['a::seg_000'],[]],directions=[[0],[1],[0],[]])
+    graph = p.TaskGraph(ts); actions = p.teacher_actions(graph,payload)
+    assert len(actions) == len(ts.tasks)+3
+    assert graph.base.shape == (len(ts.tasks)+4,p.NODE_DIM)
+    model = p.FixedActorCritic(); before = {k:v.detach().clone() for k,v in model.state_dict().items()}
+    state = graph.state(); optimizer = torch.optim.Adam(model.parameters(),lr=.001)
+    optimizer.zero_grad()
+    for action in actions:
+        available,distribution,value = model(state)
+        loss = (-distribution.log_prob(torch.tensor(available.index(action)))+.1*(value+1).square())/len(actions)
+        loss.backward(); state.step(action)
+    optimizer.step()
+    assert state.done
+    assert state.solution().patterns == ts.patterns
+    for prefix in ('layer1','layer2','actor','critic'):
+        assert any(not torch.equal(before[k],v) for k,v in model.state_dict().items() if k.startswith(prefix))
+    called = []
+    original = p.reference_schedule_formal
+    def observed(solution,config,**kwargs):
+        called.append(solution)
+        assert config.t_pre == 20 and config.t_post == 30
+        return original(solution,config,**kwargs)
+    monkeypatch.setattr(p,'reference_schedule_formal',observed)
+    first = p.formal_episode(model,graph,123)
+    second = p.formal_episode(model,graph,123)
+    assert len(called) == 2
+    assert first['actions'] == second['actions']
+    assert first['solution'] == second['solution']
+    assert first['solution'].patterns == ts.patterns
+    assert len(first['old_log']) == len(first['actions'])
+    assert all(torch.isfinite(torch.tensor(first['old_log'])))
+
+
+def test_fixed_ppo_terminal_reward_and_gae_have_no_auxiliary_objective():
+    import numpy as np
+    import pytest
+    from mrta_reference.model import ScheduleResult, ScheduleStatus
+    from mrta_search.gnn_ppo import terminal_reward, generalized_advantages, PPOSettings
+    assert terminal_reward(ScheduleResult(ScheduleStatus.FEASIBLE,cmax=500.),1000.) == -.5
+    assert terminal_reward(ScheduleResult(ScheduleStatus.FEASIBLE,cmax=800.),1000.) == -.8
+    assert terminal_reward(ScheduleResult(ScheduleStatus.DEADLOCK),1000.) == -10.
+    settings = PPOSettings(gae_lambda=1.)
+    advantages,returns = generalized_advantages([0.,0.,0.],-.8,settings)
+    assert returns == pytest.approx([-.8,-.8,-.8])
+    assert np.isfinite(advantages).all()
+
+
+def test_fixed_ppo_bc_then_clipped_updates_execute_without_test_labels(monkeypatch):
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld
+    from mrta_reference.solution import canonicalize
+    from mrta_reference.scheduler import reference_schedule_formal
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    from mrta_search import gnn_ppo as p
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.))))
+    payload = dict(assignments={t.task_id:0 if t.source_parent_id=='p' else 1 for t in ts.tasks},
+                   routes=[['p::job_000_006'],['q::seg_000'],[],[]],directions=[[0],[0],[],[]])
+    solution = canonicalize(ts.parents,ts.patterns,dict(enumerate(payload['routes'])),p.CONFIG)
+    schedule = reference_schedule_formal(solution,p.CONFIG,scope=FORMAL_SCOPE_V2,orientations=dict(enumerate(payload['directions'])))
+    assert schedule.feasible
+    records = [dict(split=split,layout_id=name,seed=1,termination_reason='ITERATION_LIMIT',
+                    status='FEASIBLE',cmax_s=schedule.cmax,solution=json.dumps(payload))
+               for split,name in (('train','tiny_train'),('validation','tiny_validation'))]
+    # The TEST payload is deliberately invalid and must never be decoded as a
+    # teacher. Unit-test artifact writes are captured in memory, not on disk.
+    data = [('train','tiny_train',ts),('validation','tiny_validation',ts),('test','tiny_test',ts)]
+    records.append(dict(split='test',layout_id='tiny_test',seed=1,termination_reason='ITERATION_LIMIT',
+                        status='FEASIBLE',cmax_s=1.,solution='INVALID TEST TEACHER'))
+    rows,weights = [],[]
+    monkeypatch.setattr(p,'append_training',lambda api,row: rows.append(row))
+    monkeypatch.setattr(p,'save_weights',lambda api,path,model,settings,**meta: weights.append(dict(path=path,metadata=meta)))
+    api = SimpleNamespace(ROOT=Path.cwd(),SEEDS=(1,),LIMIT=100_000_000,
+             load_tasksets=lambda:data,read_rows=lambda method:[dict(r,iterations=500 if method=='wag_vns' else 200000) for r in records],
+             json_text=lambda value:json.dumps(value,allow_nan=False),update_report=lambda:None)
+    p.train_experiment(api,p.PPOSettings(bc_epochs=1,ppo_updates=2,rollouts_per_update=1,ppo_epochs=2,validation_every=1))
+    assert [(row['stage'],row['update']) for row in rows] == [('BC',1),('PPO',1),('PPO',2)]
+    assert rows[1]['b32_calls'] == 2  # one real TRAIN rollout + one VALIDATION
+    assert rows[2]['b32_calls'] == 2
+    assert weights[-1]['metadata']['training_complete']
+    assert weights[-1]['metadata']['completed_updates'] == 2
+    assert 'tiny_test' not in weights[-1]['metadata']['references']
+
 from dataclasses import replace
 from pathlib import Path
 import math
@@ -3518,7 +3614,7 @@ def test_joint_assignment_head_scores_all_and_only_eligible_tuples_with_one_stat
     space = c.parent_assignment_space(parents, CONFIG)
     assert set(space.actions) == expected
     assert len(space.actions) == len(expected)
-    assert {a.pattern.kind for a in space.actions} == set(SplitKind)
+    assert {a.pattern.kind for a in space.actions} == {SplitKind.WHOLE, SplitKind.X_SPLIT, SplitKind.Y_SPLIT}
     model = c.ParentAssignmentGNN()
     embeddings = model.encode_static(space.graph)
     assert embeddings.shape == (len(space.graph.node_features), 64)

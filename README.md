@@ -1,5 +1,18 @@
 # 双滑轨四机器人焊缝分配与排序
 
+2026-11-25：WAG按文献使用未合并`W_k`分配/VNS、合并`W'_k`排序评价，保留原生数值快速路径；`train_03`（93父、167固定子段）、种子20261111完整500轮含冷编译及最终B32实测73.015秒，B32可行。用户已同意4个工作进程后台批量续跑70排样×3种子。HGA慢速原因已查明：旧正式入口覆盖为`ROUTE_CYCLE`，新固定入口误用`COORDINATED`，使大量邻域候选调用协调器，确实改变了实际搜索路径。现在恢复旧正式入口的路线代价VND、每完整个体一次原生协调选择及最终B32；mu=20、lambda=10、alpha=20、完整六邻域及200000有效子代不变。HGA完整回归155项通过；单例完整结束后，后台自动加入HGA批量（4个工作进程），两组对照各210条完成后自动BC预训练8轮、PPO微调80次更新及最终评价，全程由本机进程执行，无在线模型轮询。旧诊断原样保留并通过普通input_adapter字段区分，实际进度与结果见[报告](docs/FIXED_EUCLIDEAN_SPLIT_EXPERIMENT.md)。
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_fixed_taskset_experiment.py baselines --method wag_vns --workers 4
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_fixed_taskset_experiment.py benchmark --method hga --layout train_03 --seed 20261111
+```
+
+2026-11-25：正在执行新的固定欧氏拆分任务域。70个原始排样保持不变，TRAIN/VALIDATION/TEST生成6,446/1,671/3,201个固定原子任务；Y责任判定后才进行欧氏长拆分，同机器人承担的任意连续段在排序前强制合并。WAG每例500轮、HGA每例200,000有效子代，最终使用原B32。新逻辑专项9项和核心回归313项通过（有重叠），共享GNN的BC+PPO实现及微型执行测试已完成，正式训练等待本轮完整教师结果；**当前不能宣称三算法正式实验已经完成或模型已经训练。** 新任务集及逐例结果独立保存在[固定任务域目录](results/fixed_euclidean_split/)，进度和复现命令见[新报告](docs/FIXED_EUCLIDEAN_SPLIT_EXPERIMENT.md)。旧动态WHOLE/Y/X实验保留，仅下文记录其历史情况，不混入本次比较。
+
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_fixed_taskset_experiment.py all --workers 4
+```
+
 本项目联合决定父焊缝的合法拆分、四机器人归属、路线顺序和焊接方向，以 B32 调度返回的 Cmax 为优化目标。当前数据来自真实小组立排样，TRAIN、VALIDATION、TEST 分别包含 40、10、20 个排样和 3,749、936、2,060 条父焊缝。所有最终父焊缝的平面长度至少为 50 mm，TEST 的构件型号独立于训练侧。
 
 2026-11-25 **GNN-CEM已完成全局联合概率模型和一次固定TRAIN实验，未通过1%中位改善门槛，停止，未进入VALIDATION/TEST。** 两层64维/4头GAT复用几何编码，新模式头先采样合法拆分，再在实际激活的动态任务图上从空路线采样任务、机器人和方向；每代重放完整精英序列进行真实参数更新。train_12/05/07各运行8个体、3代，最终Cmax为5066.242573/5844.684790/5804.536919秒，均保留本次公共RULE/BEAM初解，改善率均0%。67个新完整候选全部B32 DEADLOCK，另5次构造未完成；三例含初解的B32分别23/23/24次，完整时间77.73/103.81/150.58秒，中位103.81秒。9次更新全部使用保留的初解精英，编码器和两个新头确有变化，但没有获得新的可行精英。新增仅获批的[算法](src/mrta_search/gnn_cem.py)、[入口](scripts/run_gnn_cem.py)和[结果CSV](results/new_dataset_final/gnn_cem.csv)，CSV保留完整最终方案；11项新测试及1项相关回归通过。无同键正式HGA/WAG结果，不能宣称超过对照；失败证据和复核命令见[报告第22节](docs/WAG_HGA_BASELINE_REPORT_20261111.md#22-2026-11-25gnn-cem-全局联合采样与一次train筛查未通过)。

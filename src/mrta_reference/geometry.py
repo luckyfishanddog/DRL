@@ -17,6 +17,7 @@ from .model import (
     SplitKind,
     SplitPattern,
     WeldingBlock,
+    FixedWeldingBlock,
     robot_rail,
 )
 
@@ -156,6 +157,8 @@ def whole_eligible_rails(
 
 
 def robot_is_eligible(block: WeldingBlock, robot_id: int, config: ScientificConfig) -> bool:
+    if getattr(block, 'eligible_robots', None) is not None and robot_id not in block.eligible_robots:
+        return False
     return robot_rail(robot_id) in whole_eligible_rails(block.start, block.end, config)
 
 
@@ -263,6 +266,12 @@ def validate_split_pattern(
 ) -> None:
     if pattern.parent_id != parent.parent_id:
         raise ValueError("split pattern parent mismatch")
+    if pattern.kind is SplitKind.FIXED:
+        for i, (a, b) in enumerate(zip(pattern.cuts, pattern.cuts[1:])):
+            rails = whole_eligible_rails(parent.point(a), parent.point(b), config)
+            if not rails or any(robot_rail(r) not in rails for r in pattern.fixed_eligible[i]):
+                raise ValueError(f"{parent.parent_id}: fixed atom has no eligible rail")
+        return
     if pattern.kind is SplitKind.WHOLE:
         if not whole_eligible_rails(parent.start, parent.end, config):
             raise ValueError(f"parent {parent.parent_id} requires a legal Y split")
@@ -312,6 +321,10 @@ def blocks_for_pattern(
         x_split_validator=x_split_validator,
         require_formal_x_validation=require_formal_x_validation,
     )
+    if pattern.kind is SplitKind.FIXED:
+        return tuple(FixedWeldingBlock(parent.parent_id, f"{parent.parent_id}::seg_{i:03d}",
+                                  a, b, parent.point(a), parent.point(b), pattern.fixed_eligible[i])
+                     for i, (a, b) in enumerate(zip(pattern.cuts, pattern.cuts[1:])))
     if pattern.kind is SplitKind.WHOLE:
         return (
             WeldingBlock(parent.parent_id, f"{parent.parent_id}::whole", 0.0, 1.0, parent.start, parent.end),

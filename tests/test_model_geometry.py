@@ -1,6 +1,79 @@
 from __future__ import annotations
 
 
+def test_fixed_euclidean_strict_lengths_and_conservation():
+    import math
+    import pytest
+    from mrta_reference.fixed_taskset import generate_taskset, long_segment_count
+    from mrta_reference.model import ParentWeld
+    for length, n in ((4.8,1),(5.,1),(5.1,5),(6.,5),(6.6,6),(10.2,10)):
+        assert long_segment_count(length) == n
+        ts = generate_taskset((ParentWeld('p',(0.,9.),(length,9.)),))
+        assert len(ts.tasks) == n
+        assert sum(t.length for t in ts.tasks) == pytest.approx(length)
+        if n > 1:
+            assert all(t.length > 1. for t in ts.tasks)
+    ts = generate_taskset((ParentWeld('diag',(0.,6.6),(4.,10.6)),))
+    assert len(ts.tasks) == 5  # Euclidean >5, X projection only 4.
+    assert sum(t.length for t in ts.tasks) == pytest.approx(math.sqrt(32.))
+    upper = generate_taskset((ParentWeld('upper',(0.,5.5),(12.,7.5)),))
+    assert any(max(t.start[1],t.end[1]) < 6.5 for t in upper.tasks)
+    assert all(t.eligible_robots == (0,1) for t in upper.tasks)
+
+
+def test_fixed_y_maximin_double_threshold_and_both_rails():
+    import pytest
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld, ScientificConfig
+    ts = generate_taskset((ParentWeld('preferred',(2.,3.),(2.,8.)),
+                           ParentWeld('relaxed',(3.,5.4),(3.,6.6)),
+                           ParentWeld('both',(1.,5.6),(3.,6.4)),
+                           ParentWeld('reachable',(6.,6.),(6.,9.))))
+    assert ts.statistics['y_split_count'] == 2
+    assert ts.statistics['y_strict_1m_count'] == 1
+    assert ts.statistics['y_relaxed_0_5m_count'] == 1
+    for p in ('preferred','relaxed'):
+        children = [t for t in ts.tasks if t.source_parent_id == p]
+        assert len(children) == 2
+        assert children[0].u_end == pytest.approx(.5 if p == 'relaxed' else .5)
+        assert 5.5 <= children[0].end[1] <= 6.5
+        assert min(t.length for t in children) > (.5 if p == 'relaxed' else 1.)
+    assert next(t for t in ts.tasks if t.source_parent_id == 'both').eligible_robots == (0,1,2,3)
+    assert len([t for t in ts.tasks if t.source_parent_id == 'reachable']) == 1
+    with pytest.raises(ValueError, match='impossible.*start='):
+        generate_taskset((ParentWeld('impossible',(1.,5.98),(1.,6.02)),),ScientificConfig(delta_y=.01))
+
+
+def test_fixed_merges_owned_runs_before_ordering_and_b32_counts_setup_once():
+    import pytest
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld, ScientificConfig, OperationKind
+    from mrta_reference.solution import canonicalize, block_map
+    from mrta_reference.scheduler import reference_schedule_formal
+    from mrta_reference.scope import FORMAL_SCOPE_V2
+    c = ScientificConfig()
+    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(9.,9.),(10.,9.))))
+    ids = [t.task_id for t in ts.tasks if t.source_parent_id == 'p']
+    # Deliberately separate all sibling atoms in the provisional ordering.
+    s = canonicalize(ts.parents,ts.patterns,{0:(ids[0],'q::seg_000',*ids[1:])},c,scope=FORMAL_SCOPE_V2)
+    assert s.routes[0].block_ids == ('p::job_000_006','q::seg_000')
+    blocks = block_map(s,c,scope=FORMAL_SCOPE_V2)
+    assert blocks['p::job_000_006'].length == pytest.approx(6.6)
+    result = reference_schedule_formal(s,c,scope=FORMAL_SCOPE_V2,orientations={0:(0,0),1:(),2:(),3:()})
+    assert result.feasible
+    assert sum(o.kind is OperationKind.SETUP for o in result.operations) == 2
+    assert sum(o.kind is OperationKind.POST for o in result.operations) == 2
+    assert result.cmax == pytest.approx(c.process_time(6.6)+c.process_time(1.)+2.4/c.empty_speed)
+    s = canonicalize(ts.parents,ts.patterns,{0:(ids[0],*ids[2:],'q::seg_000'),1:(ids[1],)},c)
+    assert s.routes[0].block_ids[:2] == (ids[0],'p::job_002_006')
+    with pytest.raises(ValueError,match='more than once'):
+        canonicalize(ts.parents,ts.patterns,{0:(*ids,'q::seg_000',ids[0])},c)
+    with pytest.raises(ValueError,match='missing fixed atom'):
+        canonicalize(ts.parents,ts.patterns,{0:(*ids[:-1],'q::seg_000')},c)
+    with pytest.raises(ValueError,match='ineligible'):
+        canonicalize(ts.parents,ts.patterns,{2:(*ids,'q::seg_000')},c)
+
+
 def test_formal_scope_hash_separates_f1_f4_from_numeric_config():
     from dataclasses import FrozenInstanceError, replace
     import hashlib

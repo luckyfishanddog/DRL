@@ -35,6 +35,7 @@ from mrta_reference.model import (
     WeldingBlock,
 )
 from mrta_reference.scope import FORMAL_SCOPE_V2
+from mrta_reference.fixed_taskset import fixed_patterns, job_id
 from mrta_reference.solution import block_map, canonicalize
 
 from .common import (
@@ -1379,10 +1380,172 @@ def _trace_vnd_action(trace, slot, move, u, v, ru, iu, rv, iv, ordinal, accepted
 
 
 @njit
+def _merge_fixed_arrays(routes, directions, starts, stops, lookup):
+    """Materialize maximal owned geometric runs before any route score.
+
+    Intervals are indices into the already fixed atom list; no cut is created.
+    The provisional list only determines the first occurrence of each job.
+    Partial coverage is allowed here solely for crossover repair.
+    """
+    count = lookup.shape[0]
+    owners = np.full(count, -1, np.int64)
+    for r in range(4):
+        for node in routes[r]:
+            for atom in range(starts[node], stops[node]):
+                if owners[atom] >= 0:
+                    raise ValueError('duplicate atom in fixed individual')
+                owners[atom] = r
+    jobs = np.full(count, -1, np.int64)
+    atom = 0
+    while atom < count:
+        if owners[atom] < 0:
+            atom += 1
+            continue
+        end = atom+1
+        while end < count and owners[end] == owners[atom] and lookup[atom, end+1] >= 0:
+            end += 1
+        node = lookup[atom, end]
+        for j in range(atom, end):
+            jobs[j] = node
+        atom = end
+    merged, bits = [np.empty(0, np.int64) for _ in range(4)], [np.empty(0, np.int64) for _ in range(4)]
+    seen = np.zeros(len(starts), np.bool_)
+    for r in range(4):
+        out, ds = [], []
+        for k in range(len(routes[r])):
+            old = routes[r][k]
+            for a in range(starts[old], stops[old]):
+                node = jobs[a]
+                if not seen[node]:
+                    out.append(node); ds.append(directions[r][k]); seen[node] = True
+        merged[r], bits[r] = np.array(out, np.int64), np.array(ds, np.int64)
+    return merged, bits
+
+
+@njit
+def _insert_fixed_oriented(node, routes, directions, eligible, travel, processing,
+                            starts, stops, lookup, shortest, excluded=-1):
+    """Original insertion criterion on the actual merged fixed-task jobs.
+
+    If a new atom joins existing jobs, remove those jobs virtually and use
+    the precomputed union node. Only positions at/before the first joined
+    job are distinct after canonicalization; all later raw insertions repeat
+    an already considered merged route. No candidate outcomes are truncated.
+    """
+    costs = np.array([_oriented_route_cost(routes[r],directions[r],travel,processing) for r in range(4)])
+    available = np.array([eligible[node,r] and r != excluded for r in range(4)])
+    if not np.any(available):
+        available[:] = eligible[node]
+    minimum = np.inf
+    for r in range(4):
+        if available[r]:
+            minimum = min(minimum,costs[r])
+    best,best_delta,robot,position,direction = np.inf,np.inf,-1,0,0
+    for r in range(4):
+        if not available[r] or (shortest and costs[r] > minimum+1.e-12):
+            continue
+        partner = np.zeros(len(routes[r]),np.bool_)
+        lo,hi,first = starts[node],stops[node],len(routes[r])
+        for k in range(len(routes[r])):
+            old = routes[r][k]
+            a,b = min(starts[node],starts[old]),max(stops[node],stops[old])
+            if ((stops[old] == starts[node] or starts[old] == stops[node]) and lookup[a,b] >= 0):
+                partner[k] = True
+                lo,hi,first = min(lo,starts[old]),max(hi,stops[old]),min(first,k)
+        union = lookup[lo,hi]
+        keep = np.where(~partner)[0]
+        route,bits = routes[r][keep],directions[r][keep]
+        base = _oriented_route_cost(route,bits,travel,processing)
+        other_peak = 0.
+        for other in range(4):
+            if other != r:
+                other_peak = max(other_peak,costs[other])
+        for k in range(min(first,len(route))+1):
+            for bit in range(2):
+                delta = processing[union]
+                if k:
+                    delta += travel[route[k-1],union,bits[k-1],bit]
+                if k < len(route):
+                    delta += travel[union,route[k],bit,bits[k]]
+                if k and k < len(route):
+                    delta -= travel[route[k-1],route[k],bits[k-1],bits[k]]
+                new_cost = base+delta
+                increase = new_cost-costs[r]
+                primary = increase if shortest else max(new_cost,other_peak)
+                if primary < best or (primary == best and increase < best_delta):
+                    best,best_delta,robot,position,direction = primary,increase,r,k,bit
+    return robot,position,direction
+
+
+@njit
+def _repair_fixed_numeric(inherited, inherited_bits, atomic_nodes, starts, stops, lookup,
+                          eligible, travel, processing, points, parameters, excluded):
+    routes, directions = [np.empty(0, np.int64) for _ in range(4)], [np.empty(0, np.int64) for _ in range(4)]
+    seen = np.zeros(len(atomic_nodes), np.bool_)
+    for order in range(4):
+        r = excluded if order == 0 and excluded >= 0 else order-1 if excluded >= 0 and order <= excluded else order
+        retained, bits = [], []
+        for k in range(len(inherited[r])):
+            node = inherited[r][k]
+            for a in range(starts[node], stops[node]):
+                atom = atomic_nodes[a]
+                if not seen[a] and eligible[atom, r]:
+                    retained.append(atom); bits.append(inherited_bits[r][k]); seen[a] = True
+        routes[r], directions[r] = np.array(retained, np.int64), np.array(bits, np.int64)
+    routes, directions = _merge_fixed_arrays(routes, directions, starts, stops, lookup)
+    pending = np.where(~seen)[0]
+    np.random.shuffle(pending)
+    for a in pending:
+        node = atomic_nodes[a]
+        robot, position, bit = _insert_fixed_oriented(node,routes,directions,eligible,travel,processing,
+                                                     starts,stops,lookup,False,excluded)
+        if robot < 0:
+            raise ValueError('no legal fixed-task crossover insertion')
+        _put_oriented(routes, directions, node, bit, robot, position)
+        routes, directions = _merge_fixed_arrays(routes, directions, starts, stops, lookup)
+    return _repair_oriented_first(routes, directions, points, travel, parameters, len(processing))
+
+
+@njit
+def _fixed_destination(node, a, b, ru, rv, robot, position):
+    source, index = robot[node], position[node]
+    for r,lo,hi,_ in a:
+        if source == r and lo <= index < hi:
+            return ru
+    for r,lo,hi,_ in b:
+        if source == r and lo <= index < hi:
+            return rv
+    return source
+
+
+@njit
+def _fixed_move_merges(a, b, ru, rv, current, robot, position, atom_node, starts, stops, lookup):
+    """Only a transferred interval can create a new same-owner boundary.
+
+    If no boundary changes to equal ownership, the original oriented interval
+    bounds and evaluator remain exact. No candidate or neighbor is removed.
+    """
+    for target,segments in ((ru,a),(rv,b)):
+        for source,lo,hi,_ in segments:
+            if source == target:
+                continue
+            for k in range(lo,hi):
+                node = current[source][k]
+                for atom in (starts[node]-1,stops[node]):
+                    if atom < 0 or atom >= len(atom_node):
+                        continue
+                    neighbor = atom_node[atom]
+                    low,high = min(starts[node],starts[neighbor]),max(stops[node],stops[neighbor])
+                    if lookup[low,high] >= 0 and _fixed_destination(neighbor,a,b,ru,rv,robot,position) == target:
+                        return True
+    return False
+
+
+@njit
 def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligible, parent_index,
                            nearest, parameters, alpha, max_passes, candidate_cap, scratch,
                            move_cache_hits=None, use_schedule_bound=True, route_objective=False,
-                           teacher_trace=None):
+                           teacher_trace=None, fixed_starts=None, fixed_stops=None, fixed_lookup=None):
     """Complete oriented M1--M6, using coordinated or route-cycle Cmax.
 
     Route-cycle mode never schedules a candidate. Coordinated mode retains its
@@ -1416,15 +1579,37 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
                 count += 1
                 if count == alpha:
                     break
+    # Job moves preserve each job or merge jobs; they never split one inside
+    # VND. Active job count therefore cannot exceed its initial count. Reindex
+    # active jobs per pass, retaining the original compact duplicate table.
     width = len(active_ids) if move_cache_hits is not None else 0
     seen = np.zeros((width, width), np.int64)
     candidates = np.empty((6, len(active_ids) * alpha, 2), np.int64)
     candidate_counts = np.zeros(6, np.int64)
     passes, operations, accepted = 0, 0, 0
+    atom_node = np.empty(0,np.int64) if fixed_lookup is None else np.empty(fixed_lookup.shape[0],np.int64)
     while True:
         if max_passes > 0 and passes >= max_passes:
             return current, bits, score, operations, accepted, True, False, rejected
         passes += 1
+        if fixed_starts is not None:
+            # Merging after an ownership change can replace the active interval
+            # IDs. Rebuild the SAME alpha-neighbor candidate domain each pass.
+            active[:] = False
+            active_ids = np.concatenate((current[0], current[1], current[2], current[3]))
+            for active_index,node in enumerate(active_ids):
+                active[node], index[node] = True, active_index
+                for atom in range(fixed_starts[node],fixed_stops[node]):
+                    atom_node[atom] = node
+            near[:] = -1
+            for u in active_ids:
+                count = 0
+                for v in nearest[u]:
+                    if v != u and active[v]:
+                        near[u, count] = v
+                        count += 1
+                        if count == alpha:
+                            break
         trace_slot = -1
         if teacher_trace is not None:
             trace_slot = _trace_vnd_state(teacher_trace,current,bits,passes)
@@ -1460,6 +1645,106 @@ def _vnd_oriented_arrays(routes, directions, travel, processing, points, eligibl
                         continue
                     seen[a, b], seen[b, a] = stamp, stamp
                 if move == 6 and iu + 1 == lengths[ru] and iv + 1 == lengths[rv]:
+                    continue
+                merge_needed = False
+                if fixed_starts is not None and move != 4:
+                    a_fixed,b_fixed = _move_segments(current,move,ru,iu,rv,iv)
+                    # Original eligibility-prefix rejection is independent of
+                    # merging: a union cannot make an ineligible atom legal.
+                    legal_move = True
+                    invalid_prefix = scratch[4]
+                    for target,segments in ((ru,a_fixed),(rv,b_fixed)):
+                        for source,lo,hi,_ in segments:
+                            if invalid_prefix[source,target,hi] != invalid_prefix[source,target,lo]:
+                                legal_move = False
+                    if not legal_move:
+                        continue
+                    merge_needed = _fixed_move_merges(a_fixed,b_fixed,ru,rv,current,robot,position,
+                        atom_node,fixed_starts,fixed_stops,fixed_lookup)
+                if fixed_starts is not None and merge_needed:
+                    # Old unmerged interval bounds can overestimate setup and
+                    # travel after a union. Materialize the original M1--M6
+                    # move, merge owned atoms, then apply the configured
+                    # route-cycle or native coordinated objective.
+                    if not route_objective and math.isfinite(score) and ru//2 == rv//2 and pairs[1-ru//2] >= score-1.e-8:
+                        continue
+                    seg_a, seg_b = _move_segments(current, move, ru, iu, rv, iv)
+                    candidate, candidate_bits = list(current), list(bits)
+                    candidate[ru] = _materialize_segments(seg_a, current)
+                    candidate_bits[ru] = _materialize_directions(seg_a, bits)
+                    if move != 4:
+                        candidate[rv] = _materialize_segments(seg_b, current)
+                        candidate_bits[rv] = _materialize_directions(seg_b, bits)
+                    candidate, candidate_bits = _merge_fixed_arrays(candidate, candidate_bits,
+                        fixed_starts, fixed_stops, fixed_lookup)
+                    legal, lower = True, 0.
+                    changed = np.zeros(4, np.bool_)
+                    prefixes = np.zeros(4, np.int64)
+                    candidate_costs = np.zeros(4)
+                    for r in range(4):
+                        for node in candidate[r]:
+                            if not eligible[node, r]:
+                                legal = False
+                        candidate_costs[r] = _oriented_route_cost(candidate[r], candidate_bits[r], travel, processing)
+                        lower = max(lower, candidate_costs[r])
+                        shared = min(len(current[r]),len(candidate[r]))
+                        while prefixes[r] < shared:
+                            k0 = prefixes[r]
+                            if current[r][k0] != candidate[r][k0] or bits[r][k0] != candidate_bits[r][k0]:
+                                break
+                            prefixes[r] += 1
+                        changed[r] = len(current[r]) != len(candidate[r]) or prefixes[r] != len(current[r])
+                    if not legal or (math.isfinite(score) and lower > score+1.e-8*max(1., abs(score))):
+                        continue
+                    if not np.any(changed):
+                        continue
+                    if route_objective:
+                        # Preserve the original formal HGA path: VND compares
+                        # route-cycle costs only. Coordination is evaluated
+                        # once per fully improved individual by the runner.
+                        value = max(candidate_costs)
+                        if value < score-1.e-8:
+                            current,bits,score = candidate,candidate_bits,value
+                            dirty[:] = True
+                            accepted += 1
+                            improved = True
+                            break
+                        continue
+                    skip_priorities = np.zeros(4, np.bool_)
+                    blocked = False
+                    if use_schedule_bound and math.isfinite(score):
+                        for left in (0,2):
+                            right = left+1
+                            if not changed[left] and not changed[right]:
+                                continue
+                            skip_priorities[right] = _fixed_prefix_reject(left,right,prefixes,changed,
+                                nominal,progress,candidate_costs,score,parameters[5],failures)
+                            skip_priorities[left] = _fixed_prefix_reject(right,left,prefixes,changed,
+                                nominal,progress,candidate_costs,score,parameters[5],failures)
+                            if move_cache_hits is not None and len(move_cache_hits)>2:
+                                move_cache_hits[1] += int(skip_priorities[left])+int(skip_priorities[right])
+                            if skip_priorities[left] and skip_priorities[right]:
+                                blocked = True
+                                break
+                    if blocked:
+                        if move_cache_hits is not None and len(move_cache_hits)>2:
+                            move_cache_hits[2] += 1
+                        continue
+                    new_failures = failures.copy()
+                    if move_cache_hits is not None and len(move_cache_hits) > 3:
+                        move_cache_hits[3] += 1
+                    value, new_ops, new_pairs, new_nominal, new_follows = _fixed_native_update(
+                        candidate, candidate_bits, points, processing, parameters, ops, pairs,
+                        nominal, follows, changed, score, skip_priorities, new_failures)
+                    new_rejected = int(not math.isfinite(new_pairs[0]))+int(not math.isfinite(new_pairs[1]))
+                    if value < score-1.e-8 or (not math.isfinite(score) and not math.isfinite(value) and new_rejected < rejected):
+                        current, bits, score = candidate, candidate_bits, value
+                        ops, pairs, nominal, follows = new_ops, new_pairs, new_nominal, new_follows
+                        failures, rejected = new_failures, new_rejected
+                        dirty[:] = True
+                        accepted += 1
+                        improved = True
+                        break
                     continue
                 untouched = 0.
                 if math.isfinite(score):
@@ -2233,6 +2518,11 @@ class _HGAWorkspace:
     def __init__(self, parents, config, scope, *, patterns=None):
         self.parents = tuple(sorted(parents, key=lambda p: p.parent_id))
         self.config, self.scope = config, scope
+        self.fixed = patterns is not None and fixed_patterns(patterns)
+        self.fixed_starts = self.fixed_stops = self.fixed_lookup = None
+        if self.fixed:
+            self._init_fixed(tuple(patterns))
+            return
         catalog = build_legal_pattern_catalog(self.parents, config, scope) if scope is not None else None
         self.patterns = tuple(option for parent in self.parents for option in
                               (legal_pattern_options(parent, config, catalog=catalog) if patterns is None else
@@ -2269,6 +2559,7 @@ class _HGAWorkspace:
                 self.travel[:, :, d, e] = np.sqrt(np.sum(delta * delta, axis=-1)) / config.empty_speed
         self.eligible = np.array(eligible, np.bool_)
         self.parent_index = np.array(parent_index, np.int64)
+        self.vnd_parent_index = self.parent_index
         self.node_pattern, self.node_child = np.array(node_pattern, np.int64), np.array(node_child, np.int64)
         distance = self.travel.min(axis=(2, 3))
         np.fill_diagonal(distance, np.inf)
@@ -2280,6 +2571,57 @@ class _HGAWorkspace:
                                     config.interference_dx, config.interference_dy, config.numeric_epsilon])
         self.vnd_scratch = _vnd_scratch(2 * len(parents), len(self.processing))
         self.oriented_scratch = _oriented_scratch(2 * len(parents), len(self.processing), self.vnd_scratch[4])
+
+    def _init_fixed(self, patterns):
+        """All possible unions of the fixed atoms, for static numeric tables.
+
+        A union is one physical job, never a newly optimized split. Its atom
+        coverage is retained so crossover can repair partial inheritance.
+        """
+        from mrta_reference.model import FixedWeldingBlock
+        self.patterns = patterns
+        self.initial_selected = np.arange(len(patterns), dtype=np.int64)
+        self.options = tuple((i,) for i in range(len(patterns)))
+        maximum = max(len(p.cuts)-1 for p in patterns)
+        self.pattern_nodes = np.full((len(patterns), maximum), -1, np.int64)
+        total = sum(len(p.cuts)-1 for p in patterns)
+        self.fixed_lookup = np.full((total, total+1), -1, np.int64)
+        blocks, starts, stops, parents, atomic = [], [], [], [], []
+        offset = 0
+        for pi, (p, pattern) in enumerate(zip(self.parents, patterns)):
+            cuts = pattern.cuts
+            for lo in range(len(cuts)-1):
+                for hi in range(lo+1, len(cuts)):
+                    node = len(blocks)
+                    self.fixed_lookup[offset+lo, offset+hi] = node
+                    blocks.append(FixedWeldingBlock(p.parent_id, job_id(p.parent_id, lo, hi),
+                        cuts[lo], cuts[hi], p.point(cuts[lo]), p.point(cuts[hi]),
+                        tuple(r for r in range(4) if all(r in pattern.fixed_eligible[j] for j in range(lo,hi)))))
+                    starts.append(offset+lo); stops.append(offset+hi); parents.append(pi)
+                    if hi == lo+1:
+                        self.pattern_nodes[pi, lo] = node
+                        atomic.append(node)
+            offset += len(cuts)-1
+        self.fixed_starts, self.fixed_stops = np.array(starts, np.int64), np.array(stops, np.int64)
+        self.atomic_nodes = np.array(atomic, np.int64)
+        self.ids = tuple(b.block_id for b in blocks)
+        self.points = np.array([(b.start, b.end) for b in blocks], float)
+        self.processing = np.array([self.config.process_time(b.length) for b in blocks])
+        self.travel = np.empty((len(blocks), len(blocks), 2, 2))
+        for d in range(2):
+            for e in range(2):
+                delta = self.points[:, 1-d, None, :]-self.points[None, :, e, :]
+                self.travel[:, :, d, e] = np.linalg.norm(delta, axis=-1)/self.config.empty_speed
+        self.eligible = np.array([[robot_is_eligible(b, r, self.config) for r in range(4)] for b in blocks])
+        self.parent_index = np.array(parents, np.int64)
+        self.vnd_parent_index = np.arange(len(blocks),dtype=np.int64)
+        self.node_pattern, self.node_child = self.parent_index.copy(), np.zeros(len(blocks), np.int64)
+        distance = self.travel.min(axis=(2, 3)); np.fill_diagonal(distance, np.inf)
+        self.nearest = np.argsort(distance, axis=1, kind='stable').astype(np.int64)
+        c = self.config
+        self.parameters = np.array([c.empty_speed, c.t_pre, c.t_post, c.interference_dx, c.interference_dy, c.numeric_epsilon])
+        self.vnd_scratch = _vnd_scratch(total, len(blocks))
+        self.oriented_scratch = _oriented_scratch(total, len(blocks), self.vnd_scratch[4])
 
     def encode(self, solution):
         selected = {p.parent_id: self.patterns.index(p) for p in solution.patterns}
@@ -2294,6 +2636,12 @@ class _HGAWorkspace:
                             self.config, scope=self.scope)
 
     def repair(self, routes, selected, excluded=-1, directions=None):
+        if self.fixed:
+            if directions is None:
+                raise ValueError('fixed HGA requires explicit direction genes')
+            return _repair_fixed_numeric(routes, directions, self.atomic_nodes, self.fixed_starts,
+                self.fixed_stops, self.fixed_lookup, self.eligible, self.travel, self.processing,
+                self.points, self.parameters, excluded)
         if directions is not None:
             return _repair_oriented_numeric(routes, directions, selected, self.pattern_nodes, self.node_child,
                                             self.parent_index, self.eligible, self.travel, self.processing,
@@ -2390,7 +2738,7 @@ def _run_hga_route_dp(parents, config, settings, *, seed, scope, checkpoints, me
             move_cache_hits = np.zeros(1, np.int64)
             result, score, operations, _, pass_hit, candidate_hit = _vnd_arrays(
                 routes, workspace.travel, workspace.processing, workspace.points, workspace.eligible,
-                workspace.parent_index, workspace.nearest, workspace.parameters, settings.alpha,
+                workspace.vnd_parent_index, workspace.nearest, workspace.parameters, settings.alpha,
                 settings.vnd_max_passes or 0, settings.vnd_candidate_cap or 0, True, workspace.vnd_scratch,
                 move_cache_hits)
             accounting.cheap_candidate_operations += operations
@@ -2526,12 +2874,13 @@ def _oriented_identity(routes, directions):
 
 
 def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoints, method_id,
-                             time_limit=math.inf, vnd_observer=None):
+                             time_limit=math.inf, vnd_observer=None, fixed_taskset=None):
     """Explicit oriented individuals; the final experiment wrapper runs B32."""
     rng = random.Random(seed)
     evaluator = CommonBaselineEvaluator(parents, config, scope, time_limit=time_limit,
                                         checkpoints=checkpoints, certify=False, candidate_evaluator=priority_schedule)
-    workspace = _HGAWorkspace(parents, config, scope)
+    workspace = _HGAWorkspace(parents, config, scope,
+                              patterns=None if fixed_taskset is None else fixed_taskset.patterns)
     _seed_numeric_rng(seed % (2 ** 32))
     population, cache = [], {}
     accounting = evaluator.accounting
@@ -2570,9 +2919,11 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
                      if vnd_observer is not None else None)
             result, bits, score, operations, _, pass_hit, candidate_hit, rejected = _vnd_oriented_arrays(
                 routes, directions, workspace.travel, workspace.processing, workspace.points, workspace.eligible,
-                workspace.parent_index, workspace.nearest, workspace.parameters, settings.alpha,
+                workspace.vnd_parent_index, workspace.nearest, workspace.parameters, settings.alpha,
                 settings.vnd_max_passes or 0, settings.vnd_candidate_cap or 0, workspace.oriented_scratch, hits,
-                route_objective=route_objective,teacher_trace=trace)
+                route_objective=route_objective,teacher_trace=trace,
+                fixed_starts=workspace.fixed_starts, fixed_stops=workspace.fixed_stops,
+                fixed_lookup=workspace.fixed_lookup)
             if trace is not None:
                 vnd_observer.end(workspace,selected,trace)
             accounting.cheap_candidate_operations += operations
@@ -2620,8 +2971,9 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
         if evaluator.expired:
             break
         selected = workspace.initial_selected.copy()
-        if index == 0:
-            solution = initialize_hga_region_seed(parents, config, scope=scope)
+        if index == 0 and not workspace.fixed:
+            solution = initialize_hga_region_seed(parents, config, scope=scope,
+                patterns=workspace.patterns if workspace.fixed else None)
             routes = workspace.encode(solution)
             directions = [_greedy_route_directions(route, workspace.travel) for route in routes]
         else:
@@ -2630,11 +2982,19 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
             routes = [np.empty(0, np.int64) for _ in range(4)]
             directions = [np.empty(0, np.int64) for _ in range(4)]
             for node in pending:
-                robot, position, bit = _insert_oriented(node, routes, directions, workspace.eligible,
-                    workspace.travel, workspace.processing, workspace.parent_index, True)
+                if workspace.fixed:
+                    robot,position,bit = _insert_fixed_oriented(node,routes,directions,workspace.eligible,
+                        workspace.travel,workspace.processing,workspace.fixed_starts,workspace.fixed_stops,
+                        workspace.fixed_lookup,True)
+                else:
+                    robot, position, bit = _insert_oriented(node, routes, directions, workspace.eligible,
+                        workspace.travel, workspace.processing, workspace.parent_index, True)
                 if robot < 0:
                     raise ValueError('no legal oriented initialization insertion')
                 _put_oriented(routes, directions, node, bit, robot, position)
+                if workspace.fixed:
+                    routes,directions = _merge_fixed_arrays(routes,directions,workspace.fixed_starts,
+                        workspace.fixed_stops,workspace.fixed_lookup)
         routes, directions = workspace.repair(routes, selected, directions=directions)
         if index < settings.initialization_reference_limit:
             # Keep the existing unmodified initialization proposals as native
@@ -2674,7 +3034,7 @@ def _run_hga_oriented_native(parents, config, settings, *, seed, scope, checkpoi
             selected[parent] = second.selected[parent]
         inherited, inherited_bits = list(first.routes), list(first.directions)
         inherited[ra], inherited_bits[ra] = second.routes[rb], second.directions[rb]
-        if rng.random() < settings.pattern_mutation_probability:
+        if not workspace.fixed and rng.random() < settings.pattern_mutation_probability:
             accounting.optional_y_mutations_attempted += 1
             by_kind = {kind: [] for kind in SplitKind}
             for parent, options in enumerate(workspace.options):
@@ -2748,7 +3108,16 @@ def run_adapted_hga(
     certify: bool = False,
     candidate_evaluator: CandidateEvaluator | None = priority_schedule,
     vnd_observer=None,
+    fixed_taskset=None,
 ) -> BaselineResult:
+    if fixed_taskset is not None:
+        if tuple(sorted(parents, key=lambda p: p.parent_id)) != fixed_taskset.parents:
+            raise ValueError('fixed taskset parents differ from HGA input')
+        if hga_config.direction_encoding != 'EXPLICIT':
+            raise ValueError('fixed-task HGA requires explicit direction genes')
+        return _run_hga_oriented_native(parents, scientific_config, hga_config, seed=seed,
+            scope=scope, checkpoints=checkpoints, method_id=method_id, time_limit=time_limit,
+            fixed_taskset=fixed_taskset)
     if vnd_observer is not None and (hga_config.direction_encoding != 'EXPLICIT'
                                     or hga_config.vnd_objective != 'ROUTE_CYCLE'):
         raise ValueError('teacher observer records the existing explicit route-cycle HGA only')
