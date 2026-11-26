@@ -36,7 +36,7 @@
 | 核心规模回退阶梯 | q=4 的核心若无法完成重构（兄弟子段会被 canonicalize 合并），自动缩到 4→3，而不是丢掉整轮 | 5 父核心在部分排样上 8/8 完成全部被“canonicalization changed”拒绝 |
 | `joint3_case` 恢复逻辑 | 断点续跑改为同时匹配 `phase` | 之前的续跑会跨 phase 误命中（消融实验暴露） |
 
-没有改动：`gnn_constructor.py`、`hga.py`、`wag_vns.py`、B32、方向优化、负载阈值公式；没有新增网络、PPO、独立调度器/认证器/hash。
+没有改动：`gnn_constructor.py`、`hga.py`、`wag_vns.py`、B32、方向优化、负载阈值公式；没有新增网络、独立调度器/认证器/hash。
 
 ## 3. 核心规模 q 的证据与一处方法学披露
 
@@ -135,7 +135,7 @@ D:/pybullet_test/.venv/Scripts/python.exe -m pytest tests/test_gnn_construct_vns
 
 只修改现有 gnn_constructor.py、run_gnn_weld_layout.py、test_gnn_construct_vns.py 和本报告。经用户逐项同意后，仅新增 models/gnn_weld_layout_cmax_conflict.pt 与 results/new_dataset_final/gnn_cmax_conflict.csv。原 Joint4、Joint3、HGA、WAG 的权重与结果文件未写入。
 
-同一个 VNextGNN 保持两层 GAT、64 维隐藏层、4 个注意力头。原 20 维几何输入后增加 12 维当前归属、路线位置/方向、加工、MOVE、实测 WAIT/完成时间和诊断上下文。原输入投影的 20 列完整复制，新增列零初始化；沿用 assignment、joint、insertion 评分头，没有新增 Cmax 预测器、PPO 或第二套 GNN。
+同一个 VNextGNN 保持两层 GAT、64 维隐藏层、4 个注意力头。原 20 维几何输入后增加 12 维当前归属、路线位置/方向、加工、MOVE、实测 WAIT/完成时间和诊断上下文。原输入投影的 20 列完整复制，新增列零初始化；沿用 assignment、joint、insertion 评分头，没有新增 Cmax预测器或第二套GNN。
 
 | relation | 含义 |
 |---|---|
@@ -290,7 +290,7 @@ D:/pybullet_test/.venv/Scripts/python.exe -B -X utf8 scripts/run_gnn_weld_layout
 
 GNN保持原两层64维、4头及原assignment/joint/insertion头。每个当前搜索状态仅编码一次，Relocate/Swap/2-opt批量评分及LNS各部分重建共享该编码。图只使用当前已观察到的原生完成/WAIT与当前路线；没有真实blocked/blocker证据时不捏造8/9号边，没有把候选未来B32反馈写进在线输入。训练和推理的动作输入由同一适配函数生成。
 
-阶段1/2先验证现有冻结模型及搜索机制，没有提前增加关系、GAT层数/头数、Cmax预测器、PPO/REINFORCE或新训练。更进一步的连续边属性/动作增量学习属于搜索有效后才允许开展的阶段3。
+阶段1/2先验证现有冻结模型及搜索机制，没有提前增加关系、GAT层数/头数、Cmax预测器或新训练。更进一步的连续边属性/动作增量学习属于搜索有效后才允许开展的阶段3。
 
 ### 10.3 耗时分析、测试与预先固定的实验条件
 

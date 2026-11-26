@@ -252,7 +252,7 @@ def baselines(methods=('wag_vns','hga'), splits=('train','validation','test'), w
 def update_report():
     """Print current native-policy summaries; never rewrite an existing report."""
     summaries=[]
-    for method in ('wag_vns','hga','gnn_ppo'):
+    for method in ('wag_vns','hga'):
         for split in ('train','validation','test'):
             rows=[r for r in read_rows(method) if r['split']==split]
             if not rows:continue

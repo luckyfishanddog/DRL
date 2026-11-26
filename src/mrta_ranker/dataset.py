@@ -14,17 +14,17 @@ from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.provenance import SourceProvenance,REPOSITORY_ID,compute_source_tree_hash
 from mrta_reference.scheduler import NativeReferenceEvaluator
 from mrta_reference.certifier import certify_schedule
-from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
-from mrta_data.phase3_split import assert_v2_solver_access_allowed
+from mrta_data.platform_instances import load_platform_instance,instance_geometry_hash,to_parent_welds
+from mrta_data.dataset_split import assert_v2_solver_access_allowed
 from mrta_search import pipeline
 from mrta_search.stats import SearchStats
 from mrta_search.direction import optimize_directions_with_initial_feasibility
 from .features import extract_c2_features,extract_c4_features,make_training_targets
 ROOT=Path(__file__).resolve().parents[2]
-PPO=ROOT.parent/'ppo'
+PLATFORM_ROOT=ROOT.parent/'ppo'
 SPLIT=ROOT/'data/development/mlp_workbook_split_v1.json'
-DATASET=ROOT/'data/manifests/PPO_DATASET_MANIFEST_V1.json'
-ROLES=ROOT/'data/manifests/PPO_V2_DATA_ROLES_V1.json'
+DATASET=ROOT/'data/manifests/platform_dataset_manifest_v1.json'
+ROLES=ROOT/'data/manifests/dataset_roles_v2.json'
 DATABASE=ROOT/'data/development/mlp_candidate_dataset_v1.sqlite'
 DATABASE_V05=ROOT/'data/development/graph_ranker_dataset_v05.sqlite'
 RESULT=ROOT/'data/development/phase4_1b_mlp_results.json'
@@ -174,7 +174,7 @@ def load_parents(entry,*,split=None,loader=None):
     if entry.get('split') not in ('MLP_TRAIN','MLP_DEV') or entry['relative_path'] not in split[entry['split']]:
         raise PermissionError('Workbook is outside the explicit MLP split whitelist')
     assert_v2_solver_access_allowed(read(ROLES),[entry['relative_path']],allowed_roles=('V2_TRAIN_POOL',))
-    instance=(loader or load_ppo_platform_instance)(PPO/entry['relative_path'],entry['sheet_name'],ppo_root=PPO,instance_id=entry['instance_id'])
+    instance=(loader or load_platform_instance)(PLATFORM_ROOT/entry['relative_path'],entry['sheet_name'],platform_root=PLATFORM_ROOT,instance_id=entry['instance_id'])
     if instance.raw_file_sha256!=entry['raw_file_sha256'] or instance_geometry_hash(instance)!=entry['instance_geometry_hash']:
         raise ValueError('Workbook/geometry differs from existing dataset identity')
     return to_parent_welds(instance)

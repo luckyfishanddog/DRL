@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 import torch
 import run_gnn_shared_construction as shared
 from run_gnn_multi_initial import CONFIG_05, _mode_search
-from mrta_data.ppo_instances import load_ppo_platform_instance, to_parent_welds
+from mrta_data.platform_instances import load_platform_instance, to_parent_welds
 from mrta_reference.geometry import build_legal_pattern_catalog
 from mrta_reference.model import ParentWeld, ScheduleStatus
 from mrta_reference.scope import FORMAL_SCOPE_V2
@@ -52,7 +52,7 @@ def geometry_coordinates(parents):
 
 
 def _entry(path, sheet, name, tier, seed):
-    instance = load_ppo_platform_instance(path, sheet)
+    instance = load_platform_instance(path, sheet)
     parents = to_parent_welds(instance)
     build_legal_pattern_catalog(parents, CONFIG_05, FORMAL_SCOPE_V2)
     return dict(instance=name, tier=tier, N=len(parents), geometry_seed=int(seed),
@@ -106,7 +106,7 @@ def prepare_entries():
         if source['relative_path'] in selected_books:
             continue
         path = ROOT.parent / 'ppo' / source['relative_path']
-        instance = load_ppo_platform_instance(path, source['sheet_name'])
+        instance = load_platform_instance(path, source['sheet_name'])
         seed = int(instance.family_metadata['dataset_generation_seed'])
         try:
             entry = _entry(path, source['sheet_name'], f'HIGH_WORKLOAD_{len(selected_books) + 1:02d}',

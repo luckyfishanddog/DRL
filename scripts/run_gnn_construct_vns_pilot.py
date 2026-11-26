@@ -21,7 +21,7 @@ from torch import nn
 
 from mrta_baselines.common import BaselineStatus, CommonBaselineEvaluator
 from mrta_baselines.wag_vns import AdaptedWAGConfig, run_adapted_wag_vns_v2
-from mrta_data import phase3_split
+from mrta_data import dataset_split
 from mrta_ranker import dataset as ranker_dataset
 from mrta_reference.geometry import robot_is_eligible
 from mrta_reference.model import OperationKind, Route, ScientificConfig
@@ -1593,7 +1593,7 @@ def _write_initial_study_outputs(rows, histories, audit_rows, config, *, extra_n
         "",
         "## E. 下一步判断",
         "",
-        f"- GNN 排序：{'值得以更大专家集复验' if ordering_signal else '当前不值得增加层数或引入 PPO'}。",
+        f"- GNN 排序：{'值得以更大专家集复验' if ordering_signal else '当前不值得增加网络复杂度'}。",
         f"- 联合构造：{'有继续验证价值' if joint_signal else '当前不应宣称优于 RULE；若排序有效应保留 RULE+排序'}。",
         f"- 扩大专家数据：{'必要，重点增加非 X 排序与真实归属变化' if ordering_signal or joint_signal else '若继续 GNN 则必要；必须增加能区分有效/无效逆序和真实归属变化的专家，而不是重复近似 X 顺序'}。",
         "- 可选 X/Y 拆分：本轮没有足够依据引入；应等固定拆分下图排序价值成立后再研究。",

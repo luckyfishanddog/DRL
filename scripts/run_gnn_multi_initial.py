@@ -142,7 +142,7 @@ def main():
     parser.add_argument('--seed',type=int,default=20261027)
     parser.add_argument('--diagnostic',choices=('split','wait'),
                         help='Run consumed-DEV diagnostics to stdout; do not write results or models.')
-    parser.add_argument('--mode-study',choices=('dev','independent','ppo-validation','matched',
+    parser.add_argument('--mode-study',choices=('dev','independent','platform-validation','matched',
                                                'neighborhood','neighborhood-summary','rank-diagnostic',
                                                'rank-validation','rank-summary','rank-audit','pair-diagnostic',
                                                'pair-extension','pair-summary','pair-audit','diversity-diagnostic',
@@ -633,11 +633,11 @@ def summarize_mode_study(rows):
     return output
 
 
-def _ppo_validation_mode_instances():
+def _platform_validation_mode_instances():
     """One sheet per existing validation workbook, chosen without solver results."""
     from dataclasses import asdict
-    from mrta_data.phase3_split import assert_v2_solver_access_allowed
-    from mrta_data.ppo_instances import load_ppo_platform_instance,to_parent_welds
+    from mrta_data.dataset_split import assert_v2_solver_access_allowed
+    from mrta_data.platform_instances import load_platform_instance,to_parent_welds
     dataset=shared.pilot.dataset
     roles=json.loads(dataset.ROLES.read_text(encoding='utf-8'))
     manifest=json.loads(dataset.DATASET.read_text(encoding='utf-8'))
@@ -664,8 +664,8 @@ def _ppo_validation_mode_instances():
             groups=[g for g in groups if g[0]!=path]
     entries=[]
     for target,e in chosen:
-        instance=load_ppo_platform_instance(dataset.PPO/e['relative_path'],e['sheet_name'],
-                                           ppo_root=dataset.PPO,instance_id=e['instance_id'])
+        instance=load_platform_instance(dataset.PLATFORM_ROOT/e['relative_path'],e['sheet_name'],
+                                           platform_root=dataset.PLATFORM_ROOT,instance_id=e['instance_id'])
         parents=to_parent_welds(instance)
         entries.append(dict(record='instance',version=STUDY_VERSION,stage='PPO_VALIDATION',
             instance=e['instance_id'],relative_path=e['relative_path'],sheet_name=e['sheet_name'],
@@ -743,7 +743,7 @@ def run_mode_study(args):
         for row in summarize_mode_study(_study_rows()):
             print(json.dumps(row,ensure_ascii=False),flush=True)
         return
-    stage={'dev':'DEV','independent':'INDEPENDENT','ppo-validation':'PPO_VALIDATION'}[args.mode_study]
+    stage={'dev':'DEV','independent':'INDEPENDENT','platform-validation':'PPO_VALIDATION'}[args.mode_study]
     budget=args.seconds
     iterations=24 if stage=='DEV' else 1000000
     methods=STUDY_ARMS if stage=='DEV' else STUDY_ARMS+('WAG','HGA')
@@ -764,7 +764,7 @@ def run_mode_study(args):
             entries=[dict(record='instance',version=STUDY_VERSION,stage=stage,instance=e['sheet_name'],
                           N=e['N'],parents=[asdict(p) for p in shared.pilot.dataset.load_parents(e)])
                      for e in shared.pilot.entries()[1]]
-        elif stage=='PPO_VALIDATION':entries=_ppo_validation_mode_instances()
+        elif stage=='PPO_VALIDATION':entries=_platform_validation_mode_instances()
         else:entries=_independent_mode_instances()
         for entry in entries:_study_append(entry)
     finished={(r['instance'],r['method'],r['seed'],r['budget'],r['max_iterations']) for r in existing
@@ -2323,8 +2323,8 @@ def _ranking_validation_worker(entry):
 def _ranking_validation_entries(rows):
     """Nine previously unrecorded layouts, one per validation workbook."""
     from dataclasses import asdict
-    from mrta_data.phase3_split import assert_v2_solver_access_allowed
-    from mrta_data.ppo_instances import load_ppo_platform_instance,to_parent_welds
+    from mrta_data.dataset_split import assert_v2_solver_access_allowed
+    from mrta_data.platform_instances import load_platform_instance,to_parent_welds
     dataset=shared.pilot.dataset
     roles=json.loads(dataset.ROLES.read_text(encoding='utf-8'))
     manifest=json.loads(dataset.DATASET.read_text(encoding='utf-8'))
@@ -2344,8 +2344,8 @@ def _ranking_validation_entries(rows):
                 return abs(e['actual_weld_count']-target),(-density if index%2==0 else density),e['relative_path'],e['sheet_name']
             e=min(available,key=order)
             available=[x for x in available if x['relative_path']!=e['relative_path']]
-            instance=load_ppo_platform_instance(dataset.PPO/e['relative_path'],e['sheet_name'],
-                ppo_root=dataset.PPO,instance_id=e['instance_id'])
+            instance=load_platform_instance(dataset.PLATFORM_ROOT/e['relative_path'],e['sheet_name'],
+                platform_root=dataset.PLATFORM_ROOT,instance_id=e['instance_id'])
             parents=to_parent_welds(instance)
             entries.append(dict(record='ranking_instance',version='mode-ranking-v1',stage='NEW_LAYOUT_VALIDATION',
                 instance=e['instance_id'],relative_path=e['relative_path'],sheet_name=e['sheet_name'],
@@ -3202,11 +3202,11 @@ def _final_diagnosis():
 
 
 def _final_fresh_entries():
-    """Generate only after selection; use existing PPO generator, no workbooks."""
+    """Generate only after selection; use existing geometry primitives, no workbooks."""
     import contextlib,io,importlib.util,sqlite3
     from types import SimpleNamespace
     from mrta_reference.geometry import build_legal_pattern_catalog
-    from mrta_data.ppo_instances import instance_geometry_hash
+    from mrta_data.platform_instances import instance_geometry_hash
     # Reuse the project's existing geometry identity to compare its historical
     # manifests. No new hash format, manifest or identity file is introduced.
     dataset=shared.pilot.dataset

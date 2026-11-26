@@ -1,100 +1,10 @@
 from __future__ import annotations
 
 
-def test_fixed_ppo_full_teacher_sequence_shared_gradients_and_real_coordination(monkeypatch):
-    import torch
-    from mrta_reference.fixed_taskset import generate_taskset
-    from mrta_reference.model import ParentWeld
-    from mrta_reference.solution import canonicalize
-    from mrta_search import gnn_ppo as p
-    torch.set_num_threads(1); torch.manual_seed(7)
-    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),
-                           ParentWeld('q',(10.,9.),(12.,9.)),ParentWeld('a',(0.,2.),(2.,2.))))
-    payload = dict(assignments={t.task_id: (0 if t.source_parent_id=='p' else 1 if t.source_parent_id=='q' else 2) for t in ts.tasks},
-                   routes=[['p::job_000_006'],['q::seg_000'],['a::seg_000'],[]],directions=[[0],[1],[0],[]])
-    graph = p.TaskGraph(ts); actions = p.teacher_actions(graph,payload)
-    assert len(actions) == len(ts.tasks)+3
-    assert graph.base.shape == (len(ts.tasks)+4,p.NODE_DIM)
-    model = p.FixedActorCritic(); before = {k:v.detach().clone() for k,v in model.state_dict().items()}
-    state = graph.state(); optimizer = torch.optim.Adam(model.parameters(),lr=.001)
-    optimizer.zero_grad()
-    for action in actions:
-        available,distribution,value = model(state)
-        loss = (-distribution.log_prob(torch.tensor(available.index(action)))+.1*(value+1).square())/len(actions)
-        loss.backward(); state.step(action)
-    optimizer.step()
-    assert state.done
-    assert state.solution().patterns == ts.patterns
-    for prefix in ('layer1','layer2','actor','critic'):
-        assert any(not torch.equal(before[k],v) for k,v in model.state_dict().items() if k.startswith(prefix))
-    called = []
-    original = p.native_schedule
-    def observed(solution,config,**kwargs):
-        called.append(solution)
-        assert config.t_pre == 20 and config.t_post == 30
-        return original(solution,config,**kwargs)
-    monkeypatch.setattr(p,'native_schedule',observed)
-    first = p.formal_episode(model,graph,123)
-    second = p.formal_episode(model,graph,123)
-    assert len(called) == 2
-    assert first['actions'] == second['actions']
-    assert first['solution'] == second['solution']
-    assert first['solution'].patterns == ts.patterns
-    assert len(first['old_log']) == len(first['actions'])
-    assert all(torch.isfinite(torch.tensor(first['old_log'])))
 
 
-def test_fixed_ppo_terminal_reward_and_gae_have_no_auxiliary_objective():
-    import numpy as np
-    import pytest
-    from mrta_reference.model import ScheduleResult, ScheduleStatus
-    from mrta_search.gnn_ppo import terminal_reward, generalized_advantages, PPOSettings
-    assert terminal_reward(ScheduleResult(ScheduleStatus.FEASIBLE,cmax=500.),1000.) == -.5
-    assert terminal_reward(ScheduleResult(ScheduleStatus.FEASIBLE,cmax=800.),1000.) == -.8
-    assert terminal_reward(ScheduleResult(ScheduleStatus.DEADLOCK),1000.) == -10.
-    settings = PPOSettings(gae_lambda=1.)
-    advantages,returns = generalized_advantages([0.,0.,0.],-.8,settings)
-    assert returns == pytest.approx([-.8,-.8,-.8])
-    assert np.isfinite(advantages).all()
 
 
-def test_fixed_ppo_bc_then_clipped_updates_execute_without_test_labels(monkeypatch):
-    import json
-    from pathlib import Path
-    from types import SimpleNamespace
-    from mrta_reference.fixed_taskset import generate_taskset
-    from mrta_reference.model import ParentWeld
-    from mrta_reference.solution import canonicalize
-    from mrta_reference.scheduler import native_schedule
-    from mrta_reference.scope import FORMAL_SCOPE_V2
-    from mrta_search import gnn_ppo as p
-    ts = generate_taskset((ParentWeld('p',(0.,9.),(6.6,9.)),ParentWeld('q',(10.,9.),(12.,9.))))
-    payload = dict(assignments={t.task_id:0 if t.source_parent_id=='p' else 1 for t in ts.tasks},
-                   routes=[['p::job_000_006'],['q::seg_000'],[],[]],directions=[[0],[0],[],[]])
-    solution = canonicalize(ts.parents,ts.patterns,dict(enumerate(payload['routes'])),p.CONFIG)
-    schedule = native_schedule(solution,p.CONFIG,scope=FORMAL_SCOPE_V2,orientations=dict(enumerate(payload['directions'])))
-    assert schedule.feasible
-    records = [dict(split=split,layout_id=name,seed=1,termination_reason='ITERATION_LIMIT',
-                    status='FEASIBLE',cmax_s=schedule.cmax,solution=json.dumps(payload))
-               for split,name in (('train','tiny_train'),('validation','tiny_validation'))]
-    # The TEST payload is deliberately invalid and must never be decoded as a
-    # teacher. Unit-test artifact writes are captured in memory, not on disk.
-    data = [('train','tiny_train',ts),('validation','tiny_validation',ts),('test','tiny_test',ts)]
-    records.append(dict(split='test',layout_id='tiny_test',seed=1,termination_reason='ITERATION_LIMIT',
-                        status='FEASIBLE',cmax_s=1.,solution='INVALID TEST TEACHER'))
-    rows,weights = [],[]
-    monkeypatch.setattr(p,'append_training',lambda api,row: rows.append(row))
-    monkeypatch.setattr(p,'save_weights',lambda api,path,model,settings,**meta: weights.append(dict(path=path,metadata=meta)))
-    api = SimpleNamespace(ROOT=Path.cwd(),SEEDS=(1,),LIMIT=100_000_000,
-             load_tasksets=lambda:data,read_rows=lambda method:[dict(r,iterations=500 if method=='wag_vns' else 200000) for r in records],
-             json_text=lambda value:json.dumps(value,allow_nan=False),update_report=lambda:None)
-    p.train_experiment(api,p.PPOSettings(bc_epochs=1,ppo_updates=2,rollouts_per_update=1,ppo_epochs=2,validation_every=1))
-    assert [(row['stage'],row['update']) for row in rows] == [('BC',1),('PPO',1),('PPO',2)]
-    assert rows[1]['coordination_calls'] == 2  # one real TRAIN rollout + one VALIDATION
-    assert rows[2]['coordination_calls'] == 2
-    assert weights[-1]['metadata']['training_complete']
-    assert weights[-1]['metadata']['completed_updates'] == 2
-    assert 'tiny_test' not in weights[-1]['metadata']['references']
 
 from dataclasses import replace
 from pathlib import Path
@@ -287,12 +197,6 @@ def test_feedback_joint_trajectory_preserves_coverage_legality_and_replays_exact
     for logits, (inputs, choice) in zip(observed, trace):
         assert torch.allclose(model.feedback_scores(space, embeddings, inputs), logits, atol=1e-6)
         assert choice == int(logits.argmax())
-    before = {key: value.clone() for key, value in model.state_dict().items()}
-    loss, norm = experiment.feedback_update(model, space, trace, .2,
-                                           torch.optim.AdamW(model.parameters(), lr=1e-3))
-    assert math.isfinite(loss) and math.isfinite(norm)
-    for prefix in ('layer1.', 'policy.', 'insertion_head.'):
-        assert any(not torch.equal(value, model.state_dict()[key]) for key, value in before.items() if key.startswith(prefix))
     assert model.cmax_value_head is None
 
 
@@ -361,10 +265,6 @@ def test_feedback_accepts_only_strict_feasible_cmax_improvements(status, cmax, a
     incumbent = ScheduleResult(ScheduleStatus.FEASIBLE, cmax=10.)
     candidate = ScheduleResult(ScheduleStatus(status), cmax=cmax)
     assert experiment.feedback_improves(candidate, incumbent) is accepted
-    if status == 'NUMERIC_FAILURE':
-        assert experiment.feedback_reward(candidate, 10.) is None
-    elif status == 'DEADLOCK':
-        assert experiment.feedback_reward(candidate, 10.) == -5.
 
 
 def test_feedback_complete_schedule_and_blocker_evidence_are_evaluated_once(monkeypatch):
@@ -408,47 +308,6 @@ def test_feedback_search_retains_best_after_failed_or_nonimproving_repair(monkey
     assert row['coordination_calls'] == len(constructions) and row['runtime_s'] <= 10.
 
 
-def test_feedback_continuation_uses_packed_120_train_and_retains_original_validation(monkeypatch):
-    import copy
-    from types import SimpleNamespace
-    experiment, c, _, model = _feedback_fixture()
-    parent = ParentWeld('p', (1., 9.), (2., 9.))
-    base = [(f'train_{i + 1:02d}', (parent,) * (94 if i < 29 else 93)) for i in range(40)]
-    expanded = base + [(f'train_{i + 41:02d}', (parent,) * (94 if i < 78 else 93)) for i in range(80)]
-    validation = [(f'validation_{i + 1:02d}', (parent,) * (94 if i < 6 else 93)) for i in range(10)]
-    calls, trained, stored = [], [], []
-    def load(split):
-        calls.append(split)
-        return dict(train=base, train_expanded=expanded, validation=validation)[split]
-    weights = copy.deepcopy(model.state_dict())
-    saved = dict(state_dict=weights, last_state_dict=weights, selected_epoch=0, completed_epoch=1,
-        training_complete=True, training_layouts=[name for name, _ in base],
-        history=[dict(epoch=0), dict(epoch=1)], test_eligible=False)
-    reference = [dict(stage='validation', epoch=0, layout_id=name, seed=experiment.SEED,
-                      status='FEASIBLE', cmax_s=100., runtime_s=119.) for name, _ in validation]
-    monkeypatch.setattr(experiment, 'load_layouts', load)
-    monkeypatch.setattr(experiment, 'FEEDBACK_MODEL', SimpleNamespace(exists=lambda: True))
-    monkeypatch.setattr(experiment, 'FEEDBACK_TEST_CSV', SimpleNamespace(exists=lambda: False))
-    monkeypatch.setattr(experiment.torch, 'load', lambda *a, **kw: saved)
-    monkeypatch.setattr(experiment.torch, 'save', lambda state, path: stored.append(copy.deepcopy(state)))
-    monkeypatch.setattr(experiment, 'feedback_model', lambda *a: c.VNextGNN(16, 4,
-        workload_lookahead=True, joint_actions=True, schedule_feedback=True))
-    monkeypatch.setattr(experiment, 'read_rows', lambda path: reference)
-    monkeypatch.setattr(experiment, 'feedback_write', lambda *a: None)
-    def train(model, baseline, layout, epoch, optimizer, **kwargs):
-        trained.append((layout[0], epoch, kwargs['training_stage']))
-        return []
-    monkeypatch.setattr(experiment, 'feedback_train_layout', train)
-    monkeypatch.setattr(experiment, 'feedback_evaluate', lambda *a, **kw:
-                        [dict(row, epoch=2, cmax_s=110.) for row in reference])
-    result = experiment.train_feedback(1, 2, expanded=True)
-    assert calls == ['train', 'train_expanded', 'validation']
-    assert len(trained) == 120 and len({name for name, _, _ in trained}) == 120
-    assert all(epoch == 2 and stage == 'train_expanded' for _, epoch, stage in trained)
-    assert result['history'][:2] == [dict(epoch=0), dict(epoch=1)]
-    assert result['history'][-1]['training_parents'] == result['training_parents'] == 11267
-    assert result['selected_epoch'] == 0 and result['training_complete']
-    assert 'forty_layout_state_dict' in stored[-1]
 
 
 def test_feedback_late_initial_schedule_is_not_reported_as_timely_feasible(monkeypatch):
@@ -488,35 +347,6 @@ def test_feedback_fixed_reconstruction_count_finishes_after_120_seconds(monkeypa
     assert row['coordination_calls'] == 4
 
 
-def test_feedback_full_validation_uses_only_selected_weights_and_leaves_checkpoint_unchanged(monkeypatch):
-    from types import SimpleNamespace
-    import run_gnn_weld_layout as experiment
-    weights = {i: {'weight': torch.tensor(float(i))} for i in (0, 2, 3)}
-    saved = dict(training_complete=True, initial_state_dict=weights[0], state_dict=weights[2],
-        last_state_dict=weights[3], completed_epoch=3, selected_epoch=2, round_state_dicts={2: weights[2]})
-    reference = [dict(layout_id=f'validation_{i:02d}', method='GNN_WIDTH1', seed=experiment.SEED,
-        status='FEASIBLE' if i <= 6 else 'DEADLOCK', cmax_s=110. if i <= 6 else '', runtime_s=10.)
-        for i in range(1, 11)]
-    evaluated, stored, loaded = [], [], []
-    def load(split):
-        loaded.append(split)
-        return [(r['layout_id'], ()) for r in reference]
-    def evaluate(model, layouts, epoch, workers, **kwargs):
-        evaluated.append((epoch, kwargs['reconstruction_limit'], model))
-        return [dict(r, status='DEADLOCK' if epoch == 3 and i == 9 else 'FEASIBLE',
-                     cmax_s=100. if epoch == 0 else (105. if epoch == 2 else ('' if i == 9 else 90.)))
-                for i, r in enumerate(reference)]
-    monkeypatch.setattr(experiment, 'FEEDBACK_TEST_CSV', SimpleNamespace(exists=lambda: False))
-    monkeypatch.setattr(experiment.torch, 'load', lambda *a, **kw: saved)
-    monkeypatch.setattr(experiment.torch, 'save', lambda state, path: stored.append(state))
-    monkeypatch.setattr(experiment, 'feedback_model', lambda state: SimpleNamespace(eval=lambda: state))
-    monkeypatch.setattr(experiment, 'feedback_evaluate', evaluate)
-    monkeypatch.setattr(experiment, 'load_layouts', load)
-    monkeypatch.setattr(experiment, 'read_rows', lambda path: reference)
-    monkeypatch.setattr(experiment, 'summarize_feedback', lambda **kwargs: dict(split=kwargs['split']))
-    experiment.validate_feedback_complete(1)
-    assert evaluated == [(2, 500, weights[2])] and loaded == ['validation']
-    assert stored == [] and saved['state_dict'] is weights[2]
 
 
 @pytest.mark.parametrize('status,cmax,draw,expected', [
@@ -645,72 +475,8 @@ def test_feedback_critical_quota_uses_real_completion_and_fills_insufficient_rou
     assert empty.removed_parent_ids == () and empty.routes[0] == ('p00::whole',)
 
 
-def test_feedback_validation_three_seeds_resumes_only_new_source(monkeypatch):
-    from types import SimpleNamespace
-    experiment, _, _, model = _feedback_fixture()
-    names = [f'validation_{i:02d}' for i in range(1, 11)]
-    def row(name, seed, source):
-        return dict(layout_id=name, seed=seed, stage='full_validation', epoch=0, source=source)
-    old = [row(name, seed, 'COMPLETE_100_RECONSTRUCTIONS') for name in names for seed in experiment.TEST_SEEDS]
-    current = [row(names[0], experiment.TEST_SEEDS[0], experiment.FEEDBACK_FULL_SOURCE)]
-    jobs, written = [], []
-    class Pool:
-        def __init__(self, **kwargs): pass
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def submit(self, fn, job):
-            jobs.append(job)
-            return SimpleNamespace(result=lambda: row(job[0], job[2], experiment.FEEDBACK_FULL_SOURCE))
-    monkeypatch.setattr(experiment, 'read_rows', lambda path: old + current)
-    monkeypatch.setattr(experiment, 'ProcessPoolExecutor', Pool)
-    monkeypatch.setattr(experiment, 'as_completed', iter)
-    monkeypatch.setattr(experiment, 'feedback_write', lambda path, rows: written.extend(rows))
-    rows = experiment.feedback_evaluate(model, [(name, ()) for name in names], 0, 4, reconstruction_limit=500)
-    assert len(rows) == 30 and len(jobs) == len(written) == 29
-    assert {job[2] for job in jobs} == set(experiment.TEST_SEEDS) and all(job[-1] == 500 for job in jobs)
-    assert all(r['source'] == experiment.FEEDBACK_FULL_SOURCE for r in rows)
 
 
-@pytest.mark.parametrize('failure,eligible', [(None, True), ('feasibility', False),
-    ('wag_cmax', False), ('hga_cmax', False), ('wag_wins', False), ('wag_layouts', False)])
-def test_feedback_test_requires_all_four_validation_conditions(monkeypatch, failure, eligible):
-    import json
-    import run_gnn_weld_layout as experiment
-    rows = [dict(stage='full_validation', epoch=0, source=experiment.FEEDBACK_FULL_SOURCE,
-        layout_id=f'validation_{i:02d}', seed=seed, status='FEASIBLE', cmax_s=99., runtime_s=200.,
-        initial_status='FEASIBLE', initial_cmax_s=110., reconstruction_attempts=500,
-        reconstructions=500, accepted=1, coordination_calls=501, cache_hits=0, incomplete=0, deadlocks=0,
-        numeric_failures=0) for i in range(1, 11) for seed in experiment.TEST_SEEDS]
-    if failure == 'feasibility':
-        rows[0] = dict(rows[0], status='DEADLOCK', cmax_s='')
-    references = {}
-    for method in experiment.BASELINES:
-        records = [dict(row, method=method, cmax_s=100., coordination_calls=1,
-            source=experiment.FORMAL_BASELINE_SOURCES[method],
-            iterations=experiment.BASELINE_ITERATIONS[method],
-            diagnostic=json.dumps(dict(phase='FULL', run_status='COMPLETED'))) for row in rows]
-        for i, record in enumerate(records):
-            if failure == ('wag_cmax' if method == 'WAG+VNS' else 'hga_cmax'):
-                record['cmax_s'] = 98.
-            if method == 'WAG+VNS' and failure == 'wag_wins':
-                # Even-sized pairs have a negative median, yet wins == losses.
-                record['cmax_s'] = 100. if i < 15 else 98.5
-            if method == 'WAG+VNS' and failure == 'wag_layouts':
-                # Five layouts improve on all seeds, five regress on two seeds.
-                record['cmax_s'] = 100. if i < 15 or i % 3 == 0 else 98.
-        references[experiment.BASELINES[method][2]] = records
-    old = [dict(row, source='COMPLETE_100_RECONSTRUCTIONS', cmax_s=1.) for row in rows]
-    def read(path):
-        return rows + old if path == experiment.FEEDBACK_TRAIN_CSV else references.get(path.name, [])
-    monkeypatch.setattr(experiment, 'read_rows', read)
-    summary = experiment.summarize_feedback(split='validation')
-    assert summary['gnn']['runs'] == 30 and summary['test_eligible'] is eligible
-    if not eligible:
-        loaded = []
-        monkeypatch.setattr(experiment, 'load_layouts', lambda split: loaded.append(split))
-        monkeypatch.setattr(experiment.torch, 'load', lambda *a, **kw: pytest.fail('TEST loaded the model after failure'))
-        experiment.test_feedback(4)
-        assert loaded == []
 
 
 def test_feedback_initial_deadlock_gets_at_most_two_gnn_sampling_retries(monkeypatch):
@@ -2008,78 +1774,12 @@ def test_joint_sampling_uses_softmax_for_both_heads_and_a_local_seed(monkeypatch
         assert all(robot_is_eligible(blocks[b],route.robot_id,CONFIG) for b in route.block_ids)
 
 
-def test_joint_training_rollout_matches_sample_and_has_both_policy_gradients():
-    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn,rollout_joint_repair
-    torch.manual_seed(20261027)
-    model=JointInsertionGNN();reference=_joint_simple_reference()
-    args=(reference,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
-    inference=construct_or_repair_with_gnn(*args,decode_mode='sample',seed=20261027)
-    before=torch.get_rng_state().clone()
-    rollout=rollout_joint_repair(*args,seed=20261027)
-    assert rollout.completion.solution is not None
-    assert rollout.completion.actions==inference.actions and rollout.completion.directions==inference.directions
-    assert len(rollout.parent_log_probs)==len(rollout.insertion_log_probs)==2
-    assert torch.equal(before,torch.get_rng_state())
-    assert all(v.requires_grad for v in rollout.parent_log_probs+rollout.insertion_log_probs)
-    assert torch.equal(rollout.log_prob,torch.stack(rollout.parent_log_probs+rollout.insertion_log_probs).sum())
-    (-.25*rollout.log_prob).backward()
-    for head in ('layer1','layer2','parent_head','insertion_head'):
-        assert any(p.grad is not None and bool(p.grad.abs().sum()>0) for p in getattr(model,head).parameters())
 
 
-def test_joint_training_rollout_rejects_numeric_and_data_errors(monkeypatch):
-    from mrta_search.gnn_constructor import JointInsertionGNN,rollout_joint_repair
-    reference=_joint_simple_reference();model=JointInsertionGNN()
-    args=(reference,((),(),(),()),((),(),(),()),tuple(p.parent_id for p in reference.parents),model,CONFIG)
-    with pytest.raises(ValueError,match='remove each pending parent'):
-        rollout_joint_repair(reference,((),(),(),()),((),(),(),()),('joint-a',),model,CONFIG)
-    monkeypatch.setattr(model,'parent_logits',lambda graph,embeddings,ids,features:torch.full((len(ids),),float('nan')))
-    with pytest.raises(ValueError,match='NONFINITE_PARENT_LOGITS'):
-        rollout_joint_repair(*args)
-    with torch.inference_mode(),pytest.raises(RuntimeError,match='inference_mode'):
-        rollout_joint_repair(*args)
 
 
-def test_joint_training_dead_end_retains_sampled_prefix(monkeypatch):
-    from mrta_search import lns
-    from mrta_search.gnn_constructor import JointInsertionGNN,rollout_joint_repair
-    original=lns.joint_block_candidates;count=0
-    def candidates(*args,**kwargs):
-        nonlocal count
-        if not kwargs.get('first_only'):
-            count+=1
-            if count==2:return ()
-        return original(*args,**kwargs)
-    monkeypatch.setattr(lns,'joint_block_candidates',candidates)
-    model=JointInsertionGNN();reference=_joint_simple_reference()
-    result=rollout_joint_repair(reference,((),(),(),()),((),(),(),()),('joint-a','joint-b'),model,CONFIG,seed=17)
-    assert result.completion.solution is None and result.completion.rejection_reason=='NO_LEGAL_CHILD_INSERTION'
-    assert len(result.completion.actions)==len(result.insertion_log_probs)==1
-    assert len(result.parent_log_probs)==2 and result.log_prob.requires_grad
 
 
-def test_cmax_return_and_pair_budget_use_real_status_without_fake_cost(monkeypatch):
-    from types import SimpleNamespace as NS
-    import run_gnn_cmax_finetune as rl
-    from mrta_search.gnn_constructor import JointInsertionGNN,construct_or_repair_with_gnn
-    def feasible(cmax):return NS(schedule=NS(status=ScheduleStatus.FEASIBLE,cmax=cmax))
-    assert rl.terminal_return(feasible(80),100)==pytest.approx(20/180)
-    assert rl.terminal_return(feasible(120),100)==pytest.approx(-20/220)
-    assert rl.terminal_return(None,100)==-1
-    assert rl.terminal_return(NS(schedule=NS(status=ScheduleStatus.DEADLOCK,cmax=None)),100)==-1
-    with pytest.raises(ValueError,match='positive finite Cmax'):
-        rl.terminal_return(feasible(float('nan')),100)
-    reference=_joint_simple_reference()
-    result=construct_or_repair_with_gnn(reference,((),(),(),()),((),(),(),()),('joint-a','joint-b'),JointInsertionGNN(),CONFIG)
-    calls=[]
-    monkeypatch.setattr(rl.pilot.oriented,'schedule_explicit',lambda *args:(calls.append(args) or feasible(80)))
-    outcomes,budget=rl.score_pair(result,result,100)
-    assert budget==len(calls)==1 and outcomes[0][0] is outcomes[1][0]
-    assert outcomes[0][1]-outcomes[1][1]==0
-    def broken(*args):raise ValueError('numeric/data failure')
-    monkeypatch.setattr(rl.pilot.oriented,'schedule_explicit',broken)
-    with pytest.raises(ValueError,match='numeric/data failure'):
-        rl.score_pair(result,result,100)
 
 
 def test_multi4_reuses_duplicate_schedules_and_keeps_best_feasible(monkeypatch):
@@ -3137,7 +2837,7 @@ def test_real_mrv_rule_guided_decode_bypasses_parent_head_and_preserves_legal_po
 def test_rule_guided_dataset_loader_never_opens_reserved_holdout(monkeypatch):
     import run_rule_guided_gnn as experiment
     def forbidden(*args,**kwargs):raise AssertionError('reserved workbook was opened')
-    monkeypatch.setattr(experiment,'load_ppo_platform_instance',forbidden)
+    monkeypatch.setattr(experiment,'load_platform_instance',forbidden)
     with pytest.raises(ValueError,match='not development inputs'):
         experiment.load_entry(dict(purpose='holdout',role='V2_TRAIN_POOL'))
     with pytest.raises(ValueError,match='not development inputs'):
@@ -4558,125 +4258,20 @@ def test_eg_train_split_is_layout_disjoint_and_true_cmax_drives_preferences():
     assert scores.grad[1]<0 and scores.grad[0]>0
 
 
-def test_ppo_scale_initial_actor_is_exact_and_critic_shares_two_gat_layers():
-    import run_gnn_weld_layout as e
-    from mrta_ranker.model import SparseGATLayer
-    e.configure_cpu()
-    model=e.ppo_model();actor=e.feedback_model()
-    assert sum(isinstance(m,SparseGATLayer) for m in model.modules())==2
-    assert all(torch.equal(v,model.state_dict()[k]) for k,v in actor.state_dict().items())
-    _,c,parents,_=_feedback_fixture()
-    space=c.parent_assignment_space(parents,CONFIG)
-    assert torch.allclose(model.encode_static(space.graph),actor.encode_static(space.graph),atol=2e-6)
-    assert model.policy[0].out_features==64 and model.layer1.heads==model.layer2.heads==4
-    assert torch.equal(model.value_head[-1].weight,torch.zeros_like(model.value_head[-1].weight))
 
 
-def test_ppo_scale_terminal_gae_and_legal_action_mask_are_exact():
-    import run_gnn_weld_layout as e
-    advantage,returns=e.ppo_gae(torch.tensor([.5,.4,.2]),-1.)
-    assert advantage.tolist()==pytest.approx([-1.373,-1.34,-1.2])
-    assert returns.tolist()==pytest.approx([-.873,-.94,-1.])
-    scores=torch.tensor([1.,2.,999.],requires_grad=True)
-    d=e.ppo_distribution(scores,torch.tensor([True,True,False]))
-    assert d.probs.tolist()==pytest.approx([.26894142,.73105858,0.])
-    assert torch.isfinite(d.entropy())
-    with pytest.raises(ArithmeticError):e.ppo_distribution(scores,torch.zeros(3,dtype=torch.bool))
 
 
-def _ppo_scale_fixture(monkeypatch):
-    import run_gnn_weld_layout as e
-    from mrta_search import gnn_constructor as c
-    from mrta_reference.model import ScheduleResult,ScheduleStatus
-    e.configure_cpu();torch.manual_seed(71)
-    parents=(ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(9.,9.),(10.,9.)),
-             ParentWeld('c',(2.,3.),(3.,3.)),ParentWeld('d',(13.,3.),(14.,3.)))
-    model=c.PPOJointInsertionGNN(16,4)
-    def evaluated(result,seen):
-        assert result.solution is not None
-        return ScheduleResult(ScheduleStatus.FEASIBLE,cmax=1000.,directions=result.directions),True
-    monkeypatch.setattr(e,'evaluate_once',evaluated)
-    return e,c,model,('fixture',parents)
 
 
-def test_ppo_scale_replays_same_complete_joint_distribution_and_updates_shared_actor_critic(monkeypatch):
-    e,c,model,layout=_ppo_scale_fixture(monkeypatch)
-    before={k:v.clone() for k,v in model.state_dict().items()}
-    episodes=[e.ppo_rollout(model,layout,seed) for seed in (7,8)]
-    import pickle
-    episodes=[pickle.loads(pickle.dumps(episode)) for episode in episodes]
-    for episode in episodes:
-        assert episode['reward'] is not None and episode['row']['coordination_calls']==1
-        assert len(episode['trace'])==len(layout[1])
-        embeddings=model.encode_static(episode['space'].graph)
-        for step in episode['trace']:
-            scores=model.feedback_scores(episode['space'],embeddings,step['inputs'])
-            d=e.ppo_distribution(scores,step['mask'])
-            assert torch.allclose(d.probs,step['old_probabilities'],atol=2e-6)
-            assert float(d.log_prob(torch.tensor(step['choice'])))==pytest.approx(step['old_log_probability'],abs=2e-6)
-            assert len(step['action_keys'])==len(scores) and step['mask'].all()
-    optimizer=torch.optim.AdamW(model.parameters(),lr=1e-3)
-    statistics=e.ppo_update(model,episodes,optimizer)
-    assert statistics['updates']==8 and statistics['replay_probability_max_error']<2e-6
-    assert statistics['gradient_norm']>0 and math.isfinite(statistics['loss'])
-    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('layer1.'))
-    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('policy.'))
-    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('insertion_head.'))
-    assert any(not torch.equal(v,model.state_dict()[k]) for k,v in before.items() if k.startswith('value_head.'))
 
 
-def test_ppo_scale_detects_wrong_candidate_normalizer_before_update(monkeypatch):
-    e,c,model,layout=_ppo_scale_fixture(monkeypatch)
-    episode=e.ppo_rollout(model,layout,3)
-    episode['trace'][0]['old_probabilities'][0]+=.01
-    with pytest.raises(RuntimeError,match='probability mismatch'):
-        e.ppo_update(model,[episode],torch.optim.AdamW(model.parameters()))
 
 
-def test_ppo_scale_numeric_failure_is_skipped_and_deadlock_is_distinct(monkeypatch):
-    from mrta_reference.model import ScheduleResult,ScheduleStatus
-    e,c,model,layout=_ppo_scale_fixture(monkeypatch)
-    monkeypatch.setattr(e,'evaluate_once',lambda *a:(ScheduleResult(ScheduleStatus.NUMERIC_FAILURE),True))
-    numerical=e.ppo_rollout(model,layout,2)
-    assert numerical['row']['status']=='NUMERIC_FAILURE' and numerical['reward'] is None
-    assert e.ppo_update(model,[numerical],torch.optim.AdamW(model.parameters()))['updates']==0
-    monkeypatch.setattr(e,'evaluate_once',lambda *a:(ScheduleResult(ScheduleStatus.DEADLOCK),True))
-    deadlock=e.ppo_rollout(model,layout,2)
-    assert deadlock['row']['status']=='DEADLOCK' and deadlock['reward']==-5.
 
 
-def test_ppo_scale_twenty_representatives_are_stratified_before_any_outcome(monkeypatch):
-    import run_gnn_weld_layout as e
-    rows=[];layouts=[(f'v_{i:03}',[None]*(40+i)) for i in range(100)]
-    monkeypatch.setattr(e,'ppo_layouts',lambda split:layouts)
-    monkeypatch.setattr(e,'read_rows',lambda path:rows)
-    monkeypatch.setattr(e,'ppo_write',lambda new:rows.extend(new))
-    selected=e.ppo_representatives()
-    assert [int(name.split('_')[1]) for name,_ in selected]==list(range(2,100,5))
-    assert len(rows)==20 and all(r['stage']=='selection' for r in rows)
-    assert e.ppo_representatives()==selected
-    rows.clear();rows.append(dict(stage='validation'))
-    with pytest.raises(ValueError,match='before viewing'):e.ppo_representatives()
 
 
-def test_ppo_scale_summary_does_not_allow_test_for_incomplete_or_worse_validation(monkeypatch):
-    import run_gnn_weld_layout as e
-    monkeypatch.setattr(e,'read_rows',lambda path:[])
-    assert not e.ppo_summary()['test_decision']['passed']
-    rows=[]
-    for i in range(100):
-        for size,score,pmax in ((0,120.,100.),(120,110.,99.),(500,108.,98.),(1000,107.,97.)):
-            rows.append(dict(stage='validation',size=str(size),layout_id=f'v{i}',seed='7',status='FEASIBLE',
-                cmax_s=str(score),max_processing_s=str(pmax),move_s='10',wait_s='0',runtime_s='1',coordination_calls='1'))
-        if i<20:
-            rows.append(dict(stage='selection',layout_id=f'v{i}'))
-            for method in ('WAG+VNS','HGA'):
-                rows.append(dict(stage='baseline',method=method,layout_id=f'v{i}',seed='7',status='FEASIBLE',
-                    cmax_s='100',runtime_s='10',coordination_calls='1'))
-    monkeypatch.setattr(e,'read_rows',lambda path:rows)
-    result=e.ppo_summary()['test_decision']
-    assert result['complete'] and result['processing_passed'] and result['time_passed']
-    assert not result['quality_passed'] and not result['passed']
 
 
 def _imitation_fixture():
@@ -4795,7 +4390,7 @@ def test_imitation_resume_reuses_completed_coordination_after_csv_permission_fai
     monkeypatch.setattr(e,'imitation_saved',lambda:saved)
     monkeypatch.setattr(e,'imitation_model',lambda *a,**k:model)
     monkeypatch.setattr(e,'imitation_references',lambda:None)
-    monkeypatch.setattr(e,'ppo_layouts',lambda split:[(name,parents) for name in e.IMITATION_CASES])
+    monkeypatch.setattr(e,'scale_layouts',lambda split:[(name,parents) for name in e.IMITATION_CASES])
     monkeypatch.setattr(e,'read_rows',lambda path:[])
     monkeypatch.setattr(e,'imitation_save',lambda state:None)
     monkeypatch.setattr(e,'imitation_summary',lambda:{})
@@ -4914,7 +4509,7 @@ def test_routeaware_history_skips_old_text_notes_and_reuses_known_plan_without_t
     row=dict(layout_id='fixture',status='FEASIBLE',cmax_s='1000.',
              diagnostic=json.dumps(dict(solution=record['plan'])))
     monkeypatch.setattr(e,'read_rows',lambda path:[dict(row,diagnostic='old failure note'),row]
-                        if path==e.PPO_RESULTS else [])
+                        if path==e.BASELINE_REFERENCE_RESULTS else [])
     seen,blockers,records=e.routeaware_history('fixture',parents,space)
     result=e.deadlock_plan(parents,record['plan'],space)
     key=e.plan_key(result.solution,result.directions)

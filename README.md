@@ -8,7 +8,7 @@
 | Adapted-HGA | 独立文献对照组，保留既有210次旧口径正式结果 |
 | GNN-VNS-BR | 本项目方法：监督学习的GNN候选排序与变邻域瓶颈重构 |
 
-固定任务集GNN-PPO的210次失败实验保留在原CSV和报告中，不再作为主算法，也不继续训练。
+主方法使用GNN监督学习排序，结合固定任务域上的瓶颈重构与原生调度评价。
 
 ## 固定任务域与调度
 
@@ -40,6 +40,8 @@ M1也可沿已有原子边界迁移合并作业的端部原子，再按新归属
 
 ## 数据、结果与执行
 
+平台Excel读取、几何转换与原有哈希校验集中在 `src/mrta_data/platform_instances.py`；workbook/family角色与访问检查集中在 `src/mrta_data/dataset_split.py`。`data/manifests/`采用中性文件名；已保存的身份字段、历史几何路径和哈希保持原样。仓库外`../ppo`仅作为历史几何数据及生成工具的来源，现有算法不调用其中的训练代码。
+
 - 原始排样：data/weld_layout/train.jsonl、validation.jsonl、test.jsonl。
 - 固定任务及原始结果：[results/fixed_euclidean_split/](results/fixed_euclidean_split/)。
 - 新方法统一入口：[scripts/run_gnn_vns_br.py](scripts/run_gnn_vns_br.py)。
@@ -59,7 +61,7 @@ M1也可沿已有原子边界迁移合并作业的端部原子，再按新归属
 
 历史VALIDATION矩阵为原始10排样×3种子×3模型，以及新100排样×1种子的Full GNN。旧B32终评不能与新原生结果配对。后续原生口径输出路径为results/native_priority/fixed_euclidean_split/与results/native_priority/new_dataset_final/，按数据、排样、种子和模型复用完整记录，包括完整失败记录；本轮未创建这些结果CSV。既有准入判断只读取新口径结果，不将历史B32基线混入比较。
 
-既有WAG/HGA、GNN-PPO和旧23维VALIDATION不重跑。此前3条TRAIN Smoke仍保存在results/new_dataset_final/gnn_vns_br_edgeaware.csv；历史数据直接查阅旧CSV和既有实验报告。当前summary打印原生路径中的汇总，不重写历史报告。
+既有WAG/HGA和旧23维VALIDATION不重跑。此前3条TRAIN Smoke仍保存在results/new_dataset_final/gnn_vns_br_edgeaware.csv；历史数据直接查阅旧CSV和既有实验报告。当前summary打印原生路径中的汇总，不重写历史报告。
 
 动态拆分的激活、取消与切分点切换已从候选执行、生成及活动算子中移除；相关旧动态GNN搜索入口停用，必要的历史读取、几何校验和WAG/HGA共享函数保留。Scope仅移除恢复政策元数据，现有几何校验继续保留；它不能用于改变固定原子边界。
 

@@ -2452,11 +2452,9 @@ def owner_cf_experiment(workers):
           'acceptance', json.dumps(saved['acceptance']), flush=True)
 
 
-FEEDBACK_MODEL = ROOT / 'models' / 'gnn_schedule_feedback.pt'
-FEEDBACK_TRAIN_CSV = FINAL_RESULTS / 'gnn_schedule_feedback_training_validation.csv'
-FEEDBACK_TEST_CSV = FINAL_RESULTS / 'gnn_schedule_feedback_test.csv'
-FEEDBACK_SOURCE = 'SCHEDULE_FEEDBACK_REINFORCE'
-FEEDBACK_METHOD = 'GNN_SCHEDULE_FEEDBACK'
+FEEDBACK_TRAIN_CSV = FINAL_RESULTS / 'gnn_supervised_construction_feedback.csv'
+FEEDBACK_SOURCE = 'CHILD_BLOCK_NATIVE_PAIRWISE_TRAIN_V1'
+FEEDBACK_METHOD = 'GNN_CHILD_LEVEL_FEEDBACK'
 FEEDBACK_RECONSTRUCTIONS = 500
 FEEDBACK_FULL_SOURCE = 'CMAX_FEEDBACK_ADAPTIVE_500'
 FEEDBACK_FIELDS = ('stage', 'epoch', 'layout_id', 'seed', 'method', 'status', 'cmax_s',
@@ -2466,29 +2464,20 @@ FEEDBACK_FIELDS = ('stage', 'epoch', 'layout_id', 'seed', 'method', 'status', 'c
     'loss', 'steps', 'gradient_norm', 'max_processing_s', 'move_s', 'wait_s', 'diagnostic', 'source')
 
 
-def feedback_model(weights=None):
-    """Transfer the clean current-TRAIN model, excluding the HGA-taught final model."""
+def child_constructor_state():
+    """Read constructor tensors retained by the supervised child model.
+
+    They equal the former epoch-zero supervised initialization byte for byte;
+    The supervised model already retains every required constructor tensor.
+    """
+    saved = torch.load(CHILD_MODEL, map_location='cpu', weights_only=True)
+    return {key: value for key, value in saved['state_dict'].items()
+            if not key.startswith('child_transfer_')}
+
+
+def construction_model(weights=None):
     model = gnn.VNextGNN(workload_lookahead=True, joint_actions=True, schedule_feedback=True)
-    if weights is not None:
-        model.load_state_dict(weights)
-        return model
-    saved = torch.load(MODEL, map_location='cpu', weights_only=True)
-    training = saved['training']
-    if (saved['hidden_dim'], saved['heads'], training['layouts'], training['validation_layouts']) != (64, 4, 40, 10):
-        raise ValueError('initial weights do not describe the current weld-layout experiment')
-    source = saved['models']['GNN_VNEXT_WORKLOAD']['state_dict']
-    target = model.state_dict()
-    for key, value in source.items():
-        if target[key].shape == value.shape:
-            target[key].copy_(value)
-        elif key == 'policy.0.weight':
-            target[key].zero_()
-            target[key][:, :value.shape[1]].copy_(value)
-        elif key in ('assignment_mean', 'assignment_scale'):
-            target[key][:len(value)].copy_(value)
-        else:
-            raise ValueError(f'incompatible initial tensor: {key}')
-    model.load_state_dict(target)
+    model.load_state_dict(child_constructor_state() if weights is None else weights)
     return model
 
 
@@ -2504,14 +2493,6 @@ def feedback_write(path, rows):
         stream.flush()
 
 
-def feedback_reward(schedule, scale, *, incumbent=None):
-    if schedule is None or schedule.status is ScheduleStatus.NUMERIC_FAILURE:
-        return None
-    if schedule.status is ScheduleStatus.DEADLOCK:
-        return -5.
-    if not schedule.feasible:
-        return None
-    return -schedule.cmax / scale if incumbent is None else (incumbent.cmax - schedule.cmax) / scale
 
 
 def feedback_improves(candidate, incumbent):
@@ -2670,120 +2651,18 @@ def run_feedback_gnn(parents, model, seed, *, budget=None, reconstruction_limit=
             failure=diagnostic if best_schedule is None else '')), **final_metrics(best_schedule))
 
 
-def feedback_update(model, space, trace, advantage, optimizer):
-    if advantage is None or not trace:
-        return None, None
-    optimizer.zero_grad(set_to_none=True)
-    embeddings = model.encode_static(space.graph)
-    log_prob = torch.stack([model.feedback_scores(space, embeddings, inputs).log_softmax(0)[choice]
-                            for inputs, choice in trace]).sum()
-    loss = -float(advantage) * log_prob
-    loss.backward()
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-    optimizer.step()
-    return float(loss.detach()), float(norm)
 
 
-def feedback_train_layout(model, baseline, layout, epoch, optimizer, *, training_stage='train'):
-    name, parents = layout
-    space = gnn.parent_assignment_space(parents, CONFIG)
-    scale = max(1., sum(CONFIG.process_time(p.length) for p in parents) / 4.)
-    seen, blockers, rows = {}, {}, []
-    rng = Random(SEED + epoch * 1000 + int(name.rsplit('_', 1)[1]))
-
-    def construct(policy, state=None, selected=None, feedback=None, sample=False):
-        trace = []
-        with torch.no_grad():
-            result = gnn.construct_vnext_gnn(parents, policy, CONFIG, space=space, state=state,
-                selected=selected, feedback=feedback, rng=rng if sample else None,
-                policy_observer=(lambda inputs, choice: trace.append((inputs, choice))) if sample else None)
-        schedule, called = evaluate_once(result, seen, blocker_cache=blockers)
-        return result, schedule, trace, int(called)
-
-    def update(phase, sampled, greedy, started, incumbent=None):
-        result, schedule, trace, calls = sampled
-        _, base_schedule, _, base_calls = greedy
-        reward = feedback_reward(schedule, scale, incumbent=incumbent)
-        base_reward = feedback_reward(base_schedule, scale, incumbent=incumbent)
-        advantage = None if reward is None or base_reward is None else reward - base_reward
-        loss, norm = feedback_update(model, space, trace, advantage, optimizer)
-        rows.append(dict(stage=training_stage + '_' + phase, epoch=epoch, layout_id=name, seed=SEED,
-            status=schedule.status.value if schedule else 'CONSTRUCTION_FAILED',
-            cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-            baseline_status=base_schedule.status.value if base_schedule else 'CONSTRUCTION_FAILED',
-            baseline_cmax_s=base_schedule.cmax if base_schedule is not None and base_schedule.feasible else None,
-            initial_cmax_s=incumbent.cmax if incumbent else None, runtime_s=time.perf_counter() - started,
-            coordination_calls=calls + base_calls, cache_hits=int(not calls and result.solution is not None),
-            deadlocks=sum(s is not None and s.status is ScheduleStatus.DEADLOCK for s in (schedule, base_schedule)),
-            numeric_failures=sum(s is not None and s.status is ScheduleStatus.NUMERIC_FAILURE for s in (schedule, base_schedule)),
-            reward=reward, advantage=advantage, loss=loss, steps=len(trace), gradient_norm=norm,
-            diagnostic=result.rejection_reason or (' | '.join(schedule.diagnostics) if schedule is not None and not schedule.feasible else '')))
-
-    started = time.perf_counter()
-    greedy = construct(baseline)
-    sampled = construct(model, sample=True)
-    update('construct', sampled, greedy, started)
-    incumbent_result, incumbent_schedule = (sampled[:2] if feedback_improves(sampled[1], greedy[1]) else greedy[:2])
-    if incumbent_schedule is not None and incumbent_schedule.feasible:
-        for q in (4, 8):
-            started = time.perf_counter()
-            feedback = lns.schedule_feedback_summary(incumbent_result.solution, incumbent_schedule,
-                blockers.get(plan_key(incumbent_result.solution, incumbent_result.directions), ()), CONFIG)
-            state, selected = feedback_prefix(incumbent_result, space, feedback, q, rng.randrange(2**32))
-            greedy = construct(baseline, state, selected, feedback)
-            sampled = construct(model, state, selected, feedback, sample=True)
-            update('repair' + str(q), sampled, greedy, started, incumbent_schedule)
-            for result, schedule, _, _ in (greedy, sampled):
-                if feedback_improves(schedule, incumbent_schedule):
-                    incumbent_result, incumbent_schedule = result, schedule
-    return rows
 
 
 def configure_feedback_worker(serialized):
     configure_cpu()
     global worker_feedback_model
-    worker_feedback_model = feedback_model(pickle.loads(serialized)).eval()
+    worker_feedback_model = construction_model(pickle.loads(serialized)).eval()
 
 
-def feedback_job(job):
-    name, parents, seed, stage, epoch, *limits = job
-    print(json.dumps(dict(event='feedback_start', stage=stage, epoch=epoch,
-                          layout_id=name, seed=seed)), flush=True)
-    options = dict(budget=None, reconstruction_limit=limits[0]) if limits else {}
-    options['progress_observer'] = lambda progress: print(json.dumps(dict(
-        event='feedback_progress', layout_id=name, seed=seed, **progress)), flush=True)
-    row = dict(stage=stage, epoch=epoch, layout_id=name, seed=seed,
-               **run_feedback_gnn(parents, worker_feedback_model, seed, **options))
-    if limits:
-        row['source'] = FEEDBACK_FULL_SOURCE
-    return row
 
 
-def feedback_evaluate(model, layouts, epoch, workers, *, split='validation', reconstruction_limit=None):
-    path = FEEDBACK_TEST_CSV if split == 'test' else FEEDBACK_TRAIN_CSV
-    seeds = TEST_SEEDS if split == 'test' or reconstruction_limit is not None else (SEED,)
-    stage = 'full_validation' if split == 'validation' and reconstruction_limit is not None else split
-    extra = () if reconstruction_limit is None else (reconstruction_limit,)
-    jobs = [(name, parents, seed, stage, epoch, *extra) for name, parents in layouts for seed in seeds]
-    expected = {(job[0], job[2]) for job in jobs}
-    retained = [r for r in read_rows(path) if r['stage'] == stage and int(r['epoch']) == epoch
-                and (reconstruction_limit is None or r['source'] == FEEDBACK_FULL_SOURCE)
-                and (r['layout_id'], int(r['seed'])) in expected]
-    completed = {(r['layout_id'], int(r['seed'])) for r in retained}
-    jobs = [job for job in jobs if (job[0], job[2]) not in completed]
-    print(json.dumps(dict(stage=stage, source=FEEDBACK_FULL_SOURCE if extra else FEEDBACK_SOURCE,
-                          completed=len(retained), remaining=len(jobs))), flush=True)
-    if not jobs:
-        return retained
-    with ProcessPoolExecutor(max_workers=workers, initializer=configure_feedback_worker,
-                             initargs=(pickle.dumps(model.state_dict()),)) as pool:
-        futures = [pool.submit(feedback_job, job) for job in jobs]
-        for future in as_completed(futures):
-            row = future.result()
-            print(json.dumps(row, ensure_ascii=False), flush=True)
-            feedback_write(path, [row])
-            retained.append(row)
-    return retained
 
 
 def feedback_summary(rows):
@@ -2817,154 +2696,12 @@ def feedback_paired(rows, reference):
         degraded_layouts=sum(change is not None and change > 1e-7 for change in layout_changes.values()))
 
 
-def train_feedback(workers, rounds, *, expanded=False):
-    configure_cpu(); torch.manual_seed(SEED)
-    base_layouts = load_layouts('train')
-    layouts = load_layouts('train_expanded') if expanded else base_layouts
-    validation = load_layouts('validation')
-    expected = (120, 11267, 10, 936) if expanded else (40, 3749, 10, 936)
-    if (len(layouts), sum(len(p) for _, p in layouts), len(validation), sum(len(p) for _, p in validation)) != expected:
-        raise ValueError('the requested packed weld-layout split was not loaded')
-    if expanded and layouts[:len(base_layouts)] != base_layouts:
-        raise ValueError('expanded packed layouts must preserve the original 40 examples')
-    model = feedback_model().eval()
-    selected = copy.deepcopy(model.state_dict())
-    saved = dict(state_dict=selected, initial_state_dict=selected, selected_epoch=0, seed=SEED,
-        hidden_dim=64, heads=4, workload_lookahead=True, joint_actions=True, schedule_feedback=True,
-        initialization='models/gnn_weld_layout.pt:GNN_VNEXT_WORKLOAD',
-        excluded_initialization='gnn_weld_layout_final.pt used HGA teachers',
-        training_layouts=[name for name, _ in layouts], training_parents=expected[1],
-        validation_layouts=[name for name, _ in validation], budget_s=EQUAL_TIME_LIMIT,
-        learning_rate=1e-4, deadlock_reward=-5., max_initial_attempts=3, removal_sizes=(4, 8),
-        history=[], test_eligible=False, training_complete=False)
-    start_epoch = 1
-    if expanded:
-        saved = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
-        if not saved['training_complete'] or FEEDBACK_TEST_CSV.exists():
-            raise ValueError('continue before formal TEST and after the current training round has finished')
-        start_epoch = saved['completed_epoch'] + 1
-        if start_epoch > rounds:
-            print('The requested total number of feedback rounds is already complete.', flush=True)
-            return saved
-        selected = saved['state_dict']
-        model = feedback_model(selected).eval()
-        saved.setdefault('forty_layout_state_dict', saved['last_state_dict'])
-        saved.setdefault('original_training_layouts', saved['training_layouts'])
-        saved.update(training_layouts=[name for name, _ in layouts], training_parents=expected[1],
-                     training_dataset='data/weld_layout/train_expanded.jsonl',
-                     continued_from_selected_epoch=saved['selected_epoch'], training_complete=False)
-        selected_rows = [r for r in read_rows(FEEDBACK_TRAIN_CSV)
-                         if r['stage'] == 'validation' and int(r['epoch']) == saved['selected_epoch']]
-        if len(selected_rows) != len(validation):
-            raise ValueError('the selected model must retain its complete original validation results')
-    elif FEEDBACK_MODEL.exists():
-        previous = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
-        if previous.get('training_complete') or previous.get('history'):
-            raise ValueError('the recorded feedback training already has results; preserve that experiment')
-        # Resume an interrupted initial validation from its unchanged weights.
-        saved = previous
-        selected = saved['state_dict']
-        model = feedback_model(selected).eval()
-    torch.save(saved, FEEDBACK_MODEL)
-    if not expanded:
-        initial_rows = feedback_evaluate(model, validation, 0, workers)
-        selected_rows = initial_rows
-        saved['history'].append(dict(epoch=0, **feedback_summary(initial_rows)))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    for epoch in range(start_epoch, rounds + 1):
-        baseline = feedback_model(selected).eval().requires_grad_(False)
-        model.train()
-        ordered = list(layouts); Random(SEED + epoch).shuffle(ordered)
-        for index, layout in enumerate(ordered):
-            rows = feedback_train_layout(model, baseline, layout, epoch, optimizer,
-                                         training_stage='train_expanded' if expanded else 'train')
-            feedback_write(FEEDBACK_TRAIN_CSV, rows)
-            print(json.dumps(dict(epoch=epoch, trained=index + 1, layout_id=layout[0], updates=len(rows),
-                                  coordination_calls=sum(r['coordination_calls'] for r in rows)), ensure_ascii=False), flush=True)
-        model.eval()
-        rows = feedback_evaluate(model, validation, epoch, workers)
-        summary = feedback_summary(rows); previous = feedback_summary(selected_rows)
-        pair = feedback_paired(rows, selected_rows)
-        improved = summary['feasible'] >= previous['feasible'] and pair['common'] > 0 and (
-            pair['median_change_pct'] < 0. or (summary['feasible'] > previous['feasible'] and pair['median_change_pct'] <= 0.))
-        saved['history'].append(dict(epoch=epoch, training_layouts=len(layouts),
-                                     training_parents=expected[1], paired_to_selected=pair, improved=improved, **summary))
-        saved['last_state_dict'] = copy.deepcopy(model.state_dict())
-        saved['completed_epoch'] = epoch
-        if improved:
-            selected = copy.deepcopy(model.state_dict()); selected_rows = rows
-            saved.update(state_dict=selected, selected_epoch=epoch, test_eligible=True)
-        saved.update(training_complete=True)
-        torch.save(saved, FEEDBACK_MODEL)
-        print(json.dumps(dict(history=saved['history'], test_eligible=saved['test_eligible']), ensure_ascii=False), flush=True)
-        if not improved:
-            break
-    return saved
 
 
-def test_feedback(workers):
-    validation = summarize_feedback(split='validation')
-    if not validation['test_eligible']:
-        print('The 30-run adaptive VALIDATION did not meet all four requirements; no TEST is run.', flush=True)
-        return
-    saved = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
-    if not saved['training_complete']:
-        raise ValueError('formal evaluation requires the completed selected checkpoint')
-    model = feedback_model(saved['state_dict']).eval()
-    feedback_evaluate(model, load_layouts('test'), saved['selected_epoch'], workers, split='test',
-                      reconstruction_limit=FEEDBACK_RECONSTRUCTIONS)
 
 
-def validate_feedback_complete(workers):
-    """Run the selected fixed policy on the original ten layouts, three seeds."""
-    saved = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
-    if not saved['training_complete']:
-        raise ValueError('formal evaluation requires the completed selected checkpoint')
-    layouts = load_layouts('validation')
-    feedback_evaluate(feedback_model(saved['state_dict']).eval(), layouts, saved['selected_epoch'], workers,
-                      reconstruction_limit=FEEDBACK_RECONSTRUCTIONS)
-    return summarize_feedback(split='validation')
 
 
-def summarize_feedback(*, split='test'):
-    """Only the new 500-attempt source and completed original WAG/HGA runs."""
-    path = FEEDBACK_TEST_CSV if split == 'test' else FEEDBACK_TRAIN_CSV
-    stage = 'test' if split == 'test' else 'full_validation'
-    rows = [r for r in read_rows(path) if r['source'] == FEEDBACK_FULL_SOURCE and r['stage'] == stage]
-    keys = {(r['layout_id'], int(r['seed'])) for r in rows}
-    references = {}
-    for method, (_, _, filename) in BASELINES.items():
-        references[method] = [r for r in read_rows(FINAL_RESULTS / filename)
-                              if (r['layout_id'], int(r['seed'])) in keys and completed_baseline_row(r)]
-    summary = dict(split=split, source=FEEDBACK_FULL_SOURCE,
-                   gnn=feedback_summary(rows), baselines={name: feedback_summary(group) for name, group in references.items()},
-                   paired={name: feedback_paired(rows, group) for name, group in references.items()})
-    gains = []
-    for row in rows:
-        if row['status'] != 'FEASIBLE':
-            continue
-        before = float(row['initial_cmax_s']) if row['initial_cmax_s'] else None
-        if row.get('diagnostic', '').startswith('{'):
-            before = json.loads(row['diagnostic']).get('initial_incumbent_cmax_s', before)
-        if before is not None:
-            gains.append((float(row['cmax_s']) / before - 1.) * 100.)
-    summary['search'] = dict(initial_greedy_feasible=sum(r['initial_status'] == 'FEASIBLE' for r in rows),
-        gain_pairs=len(gains), median_cmax_change_from_first_incumbent_pct=median(gains) if gains else None,
-        coordination_calls=sum(int(r['coordination_calls']) for r in rows), cache_hits=sum(int(r['cache_hits']) for r in rows),
-        reconstruction_attempts=sum(int(r['reconstruction_attempts']) for r in rows),
-        runs_reaching_500=sum(int(r['reconstruction_attempts']) == FEEDBACK_RECONSTRUCTIONS for r in rows),
-        reconstructions=sum(int(r['reconstructions']) for r in rows), accepted=sum(int(r['accepted']) for r in rows),
-        incomplete=sum(int(r['incomplete']) for r in rows), deadlocks=sum(int(r['deadlocks']) for r in rows),
-        numeric_failures=sum(int(r['numeric_failures']) for r in rows),
-        max_runtime_s=max((float(r['runtime_s']) for r in rows), default=None))
-    if split == 'validation':
-        summary['test_eligible'] = (len(rows) == len(keys) == 30 and summary['gnn']['feasible'] == 30
-            and all(len(references[method]) == 30 and pair['common'] > 0
-                    and pair['median_change_pct'] < 0. and pair['wins'] > pair['losses']
-                    and pair['improved_layouts'] > pair['degraded_layouts']
-                    for method, pair in summary['paired'].items()))
-    print(json.dumps(summary, ensure_ascii=False), flush=True)
-    return summary
 
 
 CHILD_MODEL = ROOT / 'models' / 'gnn_child_level_feedback.pt'
@@ -2975,8 +2712,8 @@ CHILD_METHOD = 'GNN_CHILD_LEVEL_FEEDBACK'
 
 
 def child_feedback_model(weights=None):
-    original = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
-    model = feedback_model(original['state_dict']).requires_grad_(False)
+    original = dict(state_dict=child_constructor_state())
+    model = construction_model(original['state_dict']).requires_grad_(False)
     model.enable_child_transfer_head()
     if weights is not None:
         model.load_state_dict(weights)
@@ -3116,7 +2853,7 @@ def collect_child_preferences(workers):
                 if r['source'] == CHILD_TRAIN_SOURCE and r['stage'] == 'child_train_group']
     completed = {(r['layout_id'], int(r['seed'])) for r in retained}
     pending = [layout for layout in layouts if (layout[0], SEED) not in completed]
-    original = torch.load(FEEDBACK_MODEL, map_location='cpu', weights_only=True)
+    original = dict(state_dict=child_constructor_state())
     print(json.dumps(dict(event='child_collection',completed=len(retained),remaining=len(pending))),flush=True)
     if pending:
         with ProcessPoolExecutor(max_workers=workers, initializer=configure_feedback_worker,
@@ -3293,7 +3030,7 @@ def child_feedback_experiment(workers):
         records=collect_child_preferences(workers)
         model=child_feedback_model().eval()
         training=fit_child_head(model,records)
-        saved=dict(state_dict=copy.deepcopy(model.state_dict()),seed=SEED,initialization='gnn_schedule_feedback.pt:state_dict',
+        saved=dict(state_dict=copy.deepcopy(model.state_dict()),seed=SEED,initialization='gnn_child_level_feedback.pt:constructor_state',
             base_selected_epoch=0,hidden_dim=64,heads=4,training=training,training_complete=training['status']=='TRAINED')
         feedback_write(FEEDBACK_TRAIN_CSV,[dict(stage='child_train_fit',epoch=1,layout_id='TRAIN_120',seed=SEED,
             source=CHILD_TRAIN_SOURCE,method=CHILD_METHOD,status=training['status'],loss=training.get('final_loss'),
@@ -3326,361 +3063,14 @@ def child_feedback_experiment(workers):
     return saved
 
 
-PPO_DATA = DATA/'scale1000'
-PPO_MODELS = ROOT/'models/gnn_ppo_scale'
-PPO_RESULTS = FINAL_RESULTS/'gnn_ppo_scale.csv'
-PPO_SEED = 20261119
-PPO_OPTIONS = dict(epochs=3,rollout_batch=4,update_epochs=4,learning_rate=1e-4,
-    gamma=1.,gae_lambda=.95,clip=.2,value_coefficient=.5,entropy_coefficient=.01,max_gradient_norm=.5)
-PPO_FIELDS = ('stage','size','epoch','index','layout_id','parent_count','seed','method','status',
-    'cmax_s','runtime_s','max_processing_s','move_s','wait_s','coordination_calls','steps','reward',
-    'loss','gradient_norm','diagnostic','source')
+SCALE_DATA = DATA/'scale1000'
+BASELINE_REFERENCE_RESULTS = FINAL_RESULTS/'scale1000_baseline_references.csv'
 
 
-def ppo_write(rows):
-    """One existing CSV; an ordinary byte lock permits concurrent training/baseline jobs."""
-    import msvcrt
-    with PPO_RESULTS.open('a+',encoding='utf-8',newline='') as stream:
-        stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_LOCK,1)
-        try:
-            stream.seek(0,2)
-            writer=csv.DictWriter(stream,fieldnames=PPO_FIELDS)
-            if stream.tell()==0:writer.writeheader()
-            for row in rows:writer.writerow(dict(source='GNN_PPO_SCALE_V1',**row))
-            stream.flush()
-        finally:
-            stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_UNLCK,1)
-
-
-def ppo_layouts(split):
-    rows=[json.loads(s) for s in (PPO_DATA/f'{split}.jsonl').read_text(encoding='utf-8').splitlines()]
+def scale_layouts(split):
+    rows=[json.loads(s) for s in (SCALE_DATA/f'{split}.jsonl').read_text(encoding='utf-8').splitlines()]
     return [(r['layout_id'],tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end']))
             for p in r['parents'])) for r in rows]
-
-
-def ppo_model(weights=None):
-    torch.manual_seed(PPO_SEED)
-    actor=feedback_model() if weights is None else None
-    model=gnn.PPOJointInsertionGNN(64,4)
-    if weights is None:
-        missing,extra=model.load_state_dict(actor.state_dict(),strict=False)
-        if set(missing)!={f'value_head.{layer}.{part}' for layer in (0,2) for part in ('weight','bias')} or extra:
-            raise ValueError('initial actor parameters do not match the existing joint GNN')
-    else:model.load_state_dict(weights)
-    return model
-
-
-def ppo_distribution(scores,mask):
-    if not mask.any() or not torch.isfinite(scores[mask]).all():
-        raise ArithmeticError('invalid masked joint policy scores')
-    return torch.distributions.Categorical(logits=scores.masked_fill(~mask,-math.inf))
-
-
-def ppo_gae(values,reward,*,gamma=1.,gae_lambda=.95):
-    advantage=torch.zeros_like(values);last=values.new_zeros(())
-    for i in range(len(values)-1,-1,-1):
-        following=values[i+1] if i+1<len(values) else values.new_zeros(())
-        delta=(reward if i==len(values)-1 else 0.)+gamma*following-values[i]
-        last=delta+gamma*gae_lambda*last
-        advantage[i]=last
-    return advantage,advantage+values
-
-
-def ppo_rollout(model,layout,seed):
-    started=time.perf_counter();name,parents=layout
-    space=gnn.parent_assignment_space(parents,CONFIG)
-    trace=[];pending_state={}
-    with torch.no_grad():
-        embeddings=model.encode_static(space.graph)
-        def observe_state(state,selected,plans,scores):
-            features=model.partial_value_features(space,state,selected)
-            pending_state.update(features=features,value=float(model.state_value(space,embeddings,features)),
-                scores=scores.detach().clone(),routes=state.routes,directions=state.directions,
-                action_keys=tuple((p.assignment_index,tuple((a.block_id,a.robot,a.position,a.direction,
-                    a.neighbour_changes) for a in p.actions)) for p in plans))
-        def observe_policy(inputs,choice):
-            mask=torch.ones(len(pending_state['scores']),dtype=torch.bool)
-            distribution=ppo_distribution(pending_state['scores'],mask)
-            trace.append(dict(inputs={k:v.detach().clone() for k,v in inputs.items()},choice=choice,mask=mask,
-                old_log_probability=float(distribution.log_prob(torch.tensor(choice))),
-                old_probabilities=distribution.probs.detach().clone(),**pending_state))
-        try:
-            result=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,embeddings=embeddings,
-                rng=Random(seed),step_observer=observe_state,policy_observer=observe_policy)
-        except ArithmeticError as error:
-            return dict(space=space,trace=trace,reward=None,row=dict(layout_id=name,parent_count=len(parents),
-                seed=seed,status='NUMERIC_FAILURE',runtime_s=time.perf_counter()-started,coordination_calls=0,
-                steps=len(trace),diagnostic=str(error)))
-        schedule,called=evaluate_once(result,{})
-    reward=feedback_reward(schedule,max(1.,sum(CONFIG.process_time(p.length) for p in parents)/4.))
-    status=schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED'
-    row=dict(layout_id=name,parent_count=len(parents),seed=seed,status=status,
-        cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-        runtime_s=time.perf_counter()-started,coordination_calls=int(called),steps=len(trace),reward=reward,
-        diagnostic=result.rejection_reason or (' | '.join(schedule.diagnostics) if schedule is not None and not schedule.feasible else ''),
-        **final_metrics(schedule))
-    if reward is not None and trace:
-        values=torch.tensor([t['value'] for t in trace])
-        advantage,returns=ppo_gae(values,reward,gamma=PPO_OPTIONS['gamma'],gae_lambda=PPO_OPTIONS['gae_lambda'])
-        for t,a,target in zip(trace,advantage,returns):t.update(advantage=a,return_value=target)
-    return dict(space=space,trace=trace,reward=reward,row=row)
-
-
-def ppo_update(model,episodes,optimizer):
-    valid=[e for e in episodes if e['reward'] is not None and e['trace']]
-    if not valid:return dict(updates=0,loss=None,gradient_norm=None)
-    for episode in valid:
-        trace=episode['trace']
-        episode['batch_inputs']={k:torch.cat([t['inputs'][k] for t in trace]) for k in trace[0]['inputs']}
-        episode['candidate_counts']=[len(t['mask']) for t in trace]
-    # Replay the same candidate tensors before any update, including the full normalizer.
-    replay_error=0.
-    with torch.no_grad():
-        for episode in valid:
-            embeddings=model.encode_static(episode['space'].graph)
-            scores=model.feedback_scores(episode['space'],embeddings,episode['batch_inputs'])
-            for step,scores in zip(episode['trace'],scores.split(episode['candidate_counts'])):
-                d=ppo_distribution(scores,step['mask'])
-                replay_error=max(replay_error,float((d.probs-step['old_probabilities']).abs().max()))
-    if replay_error>2e-6:raise RuntimeError(f'joint policy replay probability mismatch: {replay_error}')
-    all_advantages=torch.stack([t['advantage'] for e in valid for t in e['trace']])
-    center,spread=all_advantages.mean(),all_advantages.std(unbiased=False).clamp_min(1e-8)
-    measures=[]
-    for _ in range(PPO_OPTIONS['update_epochs']):
-        for episode in valid:
-            optimizer.zero_grad(set_to_none=True)
-            space=episode['space'];embeddings=model.encode_static(space.graph)
-            actor_losses=[];targets=[];entropies=[];ratios=[]
-            scores=model.feedback_scores(space,embeddings,episode['batch_inputs'])
-            for step,scores in zip(episode['trace'],scores.split(episode['candidate_counts'])):
-                distribution=ppo_distribution(scores,step['mask'])
-                log_probability=distribution.log_prob(torch.tensor(step['choice']))
-                ratio=torch.exp(log_probability-step['old_log_probability'])
-                advantage=(step['advantage']-center)/spread
-                actor_losses.append(-torch.minimum(ratio*advantage,
-                    ratio.clamp(1.-PPO_OPTIONS['clip'],1.+PPO_OPTIONS['clip'])*advantage))
-                entropies.append(distribution.entropy());ratios.append(ratio)
-                targets.append(step['return_value'])
-            actor_loss=torch.stack(actor_losses).mean()
-            values=model.state_value(space,embeddings,torch.stack([t['features'] for t in episode['trace']]))
-            value_loss=F.mse_loss(values,torch.stack(targets))
-            entropy=torch.stack(entropies).mean()
-            loss=actor_loss+PPO_OPTIONS['value_coefficient']*value_loss-PPO_OPTIONS['entropy_coefficient']*entropy
-            if not torch.isfinite(loss):raise ArithmeticError('nonfinite PPO loss; not a NATIVE DEADLOCK')
-            loss.backward()
-            norm=torch.nn.utils.clip_grad_norm_(model.parameters(),PPO_OPTIONS['max_gradient_norm'])
-            if not torch.isfinite(norm):raise ArithmeticError('nonfinite PPO gradient; not a NATIVE DEADLOCK')
-            optimizer.step()
-            measures.append((float(loss.detach()),float(norm),float(actor_loss.detach()),
-                float(value_loss.detach()),float(entropy.detach()),
-                float((torch.stack(ratios).detach()-1.).abs().gt(PPO_OPTIONS['clip']).float().mean())))
-    means=[sum(m[i] for m in measures)/len(measures) for i in range(6)]
-    return dict(zip(('loss','gradient_norm','actor_loss','value_loss','entropy','clip_fraction'),means),
-                updates=len(measures),replay_probability_max_error=replay_error)
-
-
-def ppo_rollout_job(job):
-    configure_cpu()
-    serialized,layout,seed=job
-    model=ppo_model(pickle.loads(serialized)).eval()
-    # A single byte payload avoids one multiprocessing handle per trace tensor.
-    return pickle.dumps(ppo_rollout(model,layout,seed),protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def ppo_train_size(size,workers=4):
-    configure_cpu()
-    started=time.perf_counter();layouts=ppo_layouts('train')[:size]
-    if len(layouts)!=size:raise ValueError('the requested nested TRAIN prefix is not available')
-    path=PPO_MODELS/f'ppo_{size}.pt';PPO_MODELS.mkdir(parents=True,exist_ok=True)
-    model=ppo_model().train()
-    optimizer=torch.optim.AdamW(model.parameters(),lr=PPO_OPTIONS['learning_rate'],weight_decay=1e-5)
-    saved=dict(size=size,seed=PPO_SEED,settings=dict(PPO_OPTIONS),completed_episodes=0,history=[],
-        initial_state_dict=copy.deepcopy(model.state_dict()),training_complete=False,elapsed_s=0.,
-        initialization='models/gnn_weld_layout.pt:models.GNN_VNEXT_WORKLOAD',training_dataset=str(PPO_DATA/'train.jsonl'))
-    if path.exists():
-        saved=torch.load(path,map_location='cpu',weights_only=True)
-        if saved['settings']!=PPO_OPTIONS or saved['size']!=size:raise ValueError('existing PPO run has different settings')
-        model.load_state_dict(saved['state_dict']);optimizer.load_state_dict(saved['optimizer_state_dict'])
-    existing={(r['size'],r['epoch'],r['index']) for r in read_rows(PPO_RESULTS) if r['stage']=='train'}
-    ppo_write([r for r in saved['history'] if (str(r['size']),str(r['epoch']),str(r['index'])) not in existing])
-    if saved['training_complete']:return saved['history']
-    order=[]
-    for epoch in range(1,PPO_OPTIONS['epochs']+1):
-        indices=list(range(size));Random(PPO_SEED+epoch).shuffle(indices)
-        order.extend((epoch,i) for i in indices)
-    previous_elapsed=saved['elapsed_s']
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        while saved['completed_episodes']<len(order):
-            first=saved['completed_episodes'];batch=[]
-            active=order[first:first+PPO_OPTIONS['rollout_batch']]
-            serialized=pickle.dumps(model.state_dict(),protocol=pickle.HIGHEST_PROTOCOL)
-            jobs=[(serialized,layouts[index],PPO_SEED+epoch*1000000+index) for epoch,index in active]
-            for (epoch,index),payload in zip(active,pool.map(ppo_rollout_job,jobs)):
-                episode=pickle.loads(payload)
-                episode['row'].update(stage='train',size=size,epoch=epoch,index=index,method='GNN_PPO')
-                batch.append(episode)
-            update=ppo_update(model,batch,optimizer)
-            for episode in batch:
-                row=episode['row'];row.update(loss=update['loss'],gradient_norm=update['gradient_norm'])
-                row['diagnostic']=json.dumps(dict(outcome=row['diagnostic'],ppo=update),ensure_ascii=False)
-                saved['history'].append(row)
-            saved.update(completed_episodes=first+len(batch),elapsed_s=previous_elapsed+time.perf_counter()-started,
-                state_dict=model.state_dict(),optimizer_state_dict=optimizer.state_dict(),
-                training_complete=first+len(batch)==len(order))
-            torch.save(saved,path)
-            ppo_write([e['row'] for e in batch])
-            print('PPO_TRAIN_PROGRESS',json.dumps(dict(size=size,completed=saved['completed_episodes'],total=len(order),
-                elapsed_s=saved['elapsed_s'],last_status=batch[-1]['row']['status'],**update)),flush=True)
-    return saved['history']
-
-
-def ppo_train(workers):
-    for size in (120,500,1000):ppo_train_size(size,workers)
-
-
-def ppo_representatives():
-    layouts=ppo_layouts('validation')
-    if len(layouts)!=100:raise ValueError('select the 20 cases after the full 100 VALIDATION layouts are generated')
-    ordered=sorted(layouts,key=lambda row:(len(row[1]),row[0]))
-    selected=[ordered[5*i+2] for i in range(20)]
-    rows=[r for r in read_rows(PPO_RESULTS) if r['stage']=='selection']
-    if rows:
-        if [r['layout_id'] for r in rows]!=[name for name,_ in selected]:
-            raise ValueError('saved representative cases differ from the original parent-count strata')
-    else:
-        if any(r['stage'] in ('validation','baseline') for r in read_rows(PPO_RESULTS)):
-            raise ValueError('representative cases must be recorded before viewing validation results')
-        ppo_write([dict(stage='selection',size=0,epoch=0,index=i,layout_id=name,parent_count=len(parents),
-            seed=SEED,method='PARENT_COUNT_STRATUM',diagnostic='middle case in sorted stratum of five')
-            for i,(name,parents) in enumerate(selected)])
-    return selected
-
-
-def ppo_baseline_job(job):
-    configure_cpu()
-    layout,method=job
-    row=baseline_job((layout,method,SEED))
-    output={k:row[k] for k in ('layout_id','seed','method','status','cmax_s','runtime_s','move_s','wait_s','coordination_calls') if k in row}
-    loads=[row.get(f'processing_r{r}_s') for r in range(4)]
-    output.update(stage='baseline',size=0,parent_count=len(layout[1]),
-        max_processing_s=max(loads) if all(p is not None for p in loads) else None,
-        diagnostic=json.dumps(row,ensure_ascii=False))
-    return output
-
-
-def ppo_baselines(workers):
-    layouts=ppo_representatives()
-    done={(r['layout_id'],r['method']) for r in read_rows(PPO_RESULTS) if r['stage']=='baseline'}
-    jobs=[(layout,method) for method in ('HGA','WAG+VNS') for layout in layouts if (layout[0],method) not in done]
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        for future in as_completed([pool.submit(ppo_baseline_job,job) for job in jobs]):
-            row=future.result();ppo_write([row]);print('PPO_BASELINE_RESULT',json.dumps(row),flush=True)
-
-
-def ppo_inference_job(job):
-    configure_cpu();size,layout=job
-    started=time.perf_counter()
-    if size:
-        saved=torch.load(PPO_MODELS/f'ppo_{size}.pt',map_location='cpu',weights_only=True)
-        if not saved['training_complete']:raise ValueError('PPO training is incomplete')
-        model=ppo_model(saved['state_dict']).eval()
-    else:model=ppo_model().eval()
-    model_loaded=time.perf_counter()
-    name,parents=layout;space=gnn.parent_assignment_space(parents,CONFIG)
-    seen={};calls=deadlocks=numeric=0;result=schedule=None;failures=[]
-    with torch.no_grad():
-        embeddings=model.encode_static(space.graph)
-        for attempt in range(3):
-            try:
-                result=gnn.construct_vnext_gnn(parents,model,CONFIG,space=space,embeddings=embeddings,
-                    rng=None if attempt==0 else Random(SEED+attempt))
-            except ArithmeticError as error:
-                numeric+=1;failures.append(str(error));break
-            schedule,called=evaluate_once(result,seen);calls+=int(called)
-            if schedule is not None:
-                numeric+=schedule.status is ScheduleStatus.NUMERIC_FAILURE
-                deadlocks+=schedule.status is ScheduleStatus.DEADLOCK
-                if schedule.feasible or schedule.status is ScheduleStatus.NUMERIC_FAILURE:break
-    status=('NUMERIC_FAILURE' if numeric else schedule.status.value if schedule is not None else 'CONSTRUCTION_FAILED')
-    return dict(stage='validation',size=size,epoch=PPO_OPTIONS['epochs'] if size else 0,layout_id=name,
-        parent_count=len(parents),seed=SEED,method='GNN_PPO' if size else 'GNN_INITIAL',status=status,
-        cmax_s=schedule.cmax if schedule is not None and schedule.feasible else None,
-        runtime_s=time.perf_counter()-started,coordination_calls=calls,
-        diagnostic=json.dumps(dict(model_loading_s=model_loaded-started,attempts=attempt+1,
-            deadlocks=deadlocks,numeric_failures=numeric,failures=failures,
-            schedule_diagnostic=list(schedule.diagnostics) if schedule is not None else None,
-            solution=(dict(patterns=[p.pattern_id for p in result.solution.patterns],
-                routes=[list(r.block_ids) for r in result.solution.routes],directions=result.directions)
-                if result is not None and result.solution is not None else None)),ensure_ascii=False),**final_metrics(schedule))
-
-
-def ppo_validation(workers,size=None):
-    ppo_representatives()
-    layouts=ppo_layouts('validation')
-    sizes=(size,) if size is not None else (0,120,500,1000)
-    done={(int(r['size']),r['layout_id']) for r in read_rows(PPO_RESULTS) if r['stage']=='validation'}
-    jobs=[(n,layout) for n in sizes for layout in layouts if (n,layout[0]) not in done]
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        for future in as_completed([pool.submit(ppo_inference_job,job) for job in jobs]):
-            row=future.result();ppo_write([row]);print('PPO_VALIDATION_RESULT',json.dumps({k:v for k,v in row.items() if k!='diagnostic'}),flush=True)
-
-
-def ppo_summary():
-    rows=read_rows(PPO_RESULTS);output={}
-    for size in (0,120,500,1000):
-        selected=[r for r in rows if r['stage']=='validation' and int(r['size'])==size]
-        if not selected:continue
-        good=[r for r in selected if r['status']=='FEASIBLE']
-        info=feedback_summary(selected)
-        for key in ('max_processing_s','move_s','wait_s'):
-            info['median_'+key]=median(float(r[key]) for r in good) if good else None
-        for other in (0,120,500):
-            ref=[r for r in rows if r['stage']=='validation' and int(r['size'])==other]
-            if other!=size and ref:
-                info[f'paired_to_{other}']=feedback_paired(selected,ref)
-                lookup={(r['layout_id'],r['seed']):r for r in ref}
-                changes=[100*(float(r['max_processing_s'])/float(lookup[r['layout_id'],r['seed']]['max_processing_s'])-1)
-                    for r in good if (r['layout_id'],r['seed']) in lookup
-                    and lookup[r['layout_id'],r['seed']]['status']=='FEASIBLE']
-                info[f'paired_to_{other}']['median_pmax_change_pct']=median(changes) if changes else None
-        for method in ('WAG+VNS','HGA'):
-            ref=[r for r in rows if r['stage']=='baseline' and r['method']==method]
-            if ref:info[method]=dict(summary=feedback_summary(ref),paired=feedback_paired(selected,ref))
-        output[size]=info
-    chosen=[r for r in rows if r['stage']=='validation' and int(r['size'])==1000]
-    representative_ids={r['layout_id'] for r in rows if r['stage']=='selection'}
-    subset=[r for r in chosen if r['layout_id'] in representative_ids]
-    compared={m:[r for r in rows if r['stage']=='baseline' and r['method']==m] for m in ('WAG+VNS','HGA')}
-    complete=len(chosen)==100 and len(subset)==20 and all(len(v)==20 for v in compared.values())
-    quality=complete and all(
-        sum(r['status']=='FEASIBLE' for r in subset)>=sum(r['status']=='FEASIBLE' for r in ref)
-        and sum(r['status']=='FEASIBLE' for r in chosen)*len(ref)>=sum(r['status']=='FEASIBLE' for r in ref)*len(chosen)
-        and feedback_paired(subset,ref)['common']>0
-        and feedback_paired(subset,ref)['median_change_pct']<0
-        and feedback_paired(subset,ref)['wins']>feedback_paired(subset,ref)['losses']
-        for ref in compared.values())
-    # Predeclared before any new validation outcomes: material Pmax improvement
-    # means a paired median reduction of at least 1% versus both initial and 120.
-    processing=complete and all(output[1000].get(f'paired_to_{n}',{}).get('median_pmax_change_pct') is not None
-        and output[1000][f'paired_to_{n}']['median_pmax_change_pct']<=-1. for n in (0,120))
-    efficient=complete and median(float(r['runtime_s']) for r in subset)<=median(float(r['runtime_s']) for r in compared['WAG+VNS'])
-    output['test_decision']=dict(complete=complete,quality_passed=quality,
-        processing_passed=processing,time_passed=efficient,passed=complete and quality and processing and efficient)
-    print('PPO_SCALE_SUMMARY',json.dumps(output,ensure_ascii=False),flush=True)
-    return output
-
-
-def ppo_smoke():
-    configure_cpu();model=ppo_model().train()
-    lookup=dict(ppo_layouts('train'))
-    episodes=[ppo_rollout(model,(name,lookup[name]),PPO_SEED+i) for i,name in enumerate(('train_15','train_34'))]
-    optimizer=torch.optim.AdamW(model.parameters(),lr=PPO_OPTIONS['learning_rate'])
-    update=ppo_update(model,episodes,optimizer)
-    for episode in episodes:
-        row=episode['row'];row.update(stage='smoke',size=0,epoch=0,method='GNN_PPO',
-            loss=update['loss'],gradient_norm=update['gradient_norm'],diagnostic=json.dumps(update))
-        ppo_write([row])
-    print('PPO_SMOKE',json.dumps(update),flush=True)
 
 
 IMITATION_MODEL = ROOT/'models/gnn_weld_layout_imitation.pt'
@@ -3694,14 +3084,14 @@ IMITATION_FIELDS = ('stage','layout_id','parent_count','seed','method','status',
 
 
 def imitation_model(weights=None, *, balance=True):
-    # The original workload Actor has no Critic or schedule-feedback head.
+    # The original supervised workload model has no schedule-feedback head.
     model = joint_model(weights)
     model.imitation_balance = balance
     return model
 
 
 def imitation_hga_selection():
-    rows = [json.loads(line) for line in (PPO_DATA/'train.jsonl').read_text(encoding='utf-8').splitlines()]
+    rows = [json.loads(line) for line in (SCALE_DATA/'train.jsonl').read_text(encoding='utf-8').splitlines()]
     ordered = sorted(rows, key=lambda r:(len(r['parents']),r['layout_id']))
     selected = []
     for k in range(4):
@@ -3719,7 +3109,7 @@ def imitation_saved():
         return torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)
     source = torch.load(EXPANDED_MODEL,map_location='cpu',weights_only=True)
     expanded = dict(load_layouts('train_expanded'))
-    training = dict(ppo_layouts('train'))
+    training = dict(scale_layouts('train'))
     teachers = []
     for sample in source['teachers']:
         name = sample['layout_id']
@@ -3775,7 +3165,7 @@ def imitation_teachers(workers):
     saved = imitation_saved()
     imitation_save(saved)
     done = {r['layout_id'] for r in saved['hga_records']}
-    training = dict(ppo_layouts('train'))
+    training = dict(scale_layouts('train'))
     jobs = [(r['layout_id'],training[r['layout_id']]) for r in saved['hga_selection'] if r['layout_id'] not in done]
     print('IMITATION_TEACHERS_RECOVERED',len(saved['teachers']),
           len({r['layout_id'] for r in saved['teachers']}),'HGA_SELECTION',saved['hga_selection'],flush=True)
@@ -3968,7 +3358,7 @@ def imitation_choice_loss(logits, choices):
 
 def imitation_validation_layouts():
     # Six requested pilot cases are kept out of epoch selection.
-    ordered = sorted((r for r in ppo_layouts('validation') if r[0] not in IMITATION_CASES),
+    ordered = sorted((r for r in scale_layouts('validation') if r[0] not in IMITATION_CASES),
                      key=lambda r:(len(r[1]),r[0]))
     return [ordered[(2*i+1)*len(ordered)//16] for i in range(8)]
 
@@ -3980,7 +3370,7 @@ def imitation_train(prepared_samples=None):
         print('IMITATION_TRAIN_ALREADY_COMPLETE',saved['selected_epoch'],flush=True);return saved
     if len(saved['hga_records'])!=4:
         raise ValueError('finish the four already-selected complete HGA teachers before joint imitation')
-    training = dict(ppo_layouts('train'))
+    training = dict(scale_layouts('train'))
     teachers = imitation_best_teachers(saved)
     model = imitation_model(saved.get('last_state_dict',saved['initial_state_dict'])).train()
     optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4,weight_decay=1e-4)
@@ -4098,14 +3488,14 @@ def imitation_write(rows):
 
 
 def imitation_references():
-    """Reuse the recorded PPO/classical NATIVE results; evaluate the raw GNN once."""
-    layouts = dict(ppo_layouts('validation'))
+    """Reuse recorded classical NATIVE results; evaluate the raw supervised GNN once."""
+    layouts = dict(scale_layouts('validation'))
     done = {(r['layout_id'],r['method']) for r in read_rows(IMITATION_RESULTS)}
-    old = read_rows(PPO_RESULTS)
+    old = read_rows(BASELINE_REFERENCE_RESULTS)
     for name in IMITATION_CASES:
         parents = layouts[name]
         space = None
-        for method in ('WAG+VNS','HGA','PPO_1000','GNN_ORIGINAL'):
+        for method in ('WAG+VNS','HGA','GNN_ORIGINAL'):
             if (name,method) in done:
                 continue
             if method=='GNN_ORIGINAL':
@@ -4115,26 +3505,19 @@ def imitation_references():
                 row = imitation_evaluate((name,parents),original,method=method)
                 row['source']='GNN_VNEXT_WORKLOAD original checkpoint; original feature/scoring semantics'
             else:
-                matches = [r for r in old if r['layout_id']==name and (
-                    r['stage']=='baseline' and r['method']==method or
-                    method=='PPO_1000' and r['stage']=='validation' and r['size']=='1000')]
+                matches = [r for r in old if r['layout_id']==name and
+                    r['stage']=='baseline' and r['method']==method]
                 if len(matches)!=1:
                     raise ValueError(f'{name}: expected exactly one existing {method} reference')
                 source = matches[0]
                 detail = json.loads(source['diagnostic'])
                 row = {k:source.get(k) for k in ('status','cmax_s','runtime_s','move_s','wait_s','max_processing_s')}
                 row.update(layout_id=name,parent_count=len(parents),seed=SEED,method=method,coordination_calls=0,
-                           source='reused gnn_ppo_scale.csv; no repeated search or NATIVE')
-                if method=='PPO_1000':
-                    space = gnn.parent_assignment_space(parents,CONFIG) if space is None else space
-                    plan = unpack_directed_plan(parents,detail['solution'],space)
-                    row.update(beam_validation_metrics(plan))
-                    row.update({f'robot_task_count_r{r}':len(route.block_ids) for r,route in enumerate(plan.solution.routes)})
-                else:
-                    row.update({f'processing_r{r}_s':detail.get(f'processing_r{r}_s') for r in range(4)})
-                    # These historical rows did not save routes. Task counts
-                    # cannot be inferred from workload sums without inventing data.
-                    detail['task_count_missing_reason']='historical baseline row has processing totals but no full routes; baseline rerun prohibited'
+                           source='reused scale1000_baseline_references.csv; no repeated search or NATIVE')
+                row.update({f'processing_r{r}_s':detail.get(f'processing_r{r}_s') for r in range(4)})
+                # These historical rows did not save routes. Task counts
+                # cannot be inferred from workload sums without inventing data.
+                detail['task_count_missing_reason']='historical baseline row has processing totals but no full routes; baseline rerun prohibited'
                 row['diagnostic']=json.dumps(detail,ensure_ascii=False)
                 row['wait_for_graph']='[]' if source['status']=='FEASIBLE' else None
             row.update(stage='pilot_reference',parent_count=len(parents))
@@ -4152,7 +3535,7 @@ def imitation_pilot():
     if not saved['training_complete']:
         raise ValueError('complete joint imitation before the six-case pilot')
     imitation_references()
-    layouts = dict(ppo_layouts('validation'))
+    layouts = dict(scale_layouts('validation'))
     model = imitation_model(saved['state_dict']).eval()
     done = {r['layout_id'] for r in read_rows(IMITATION_RESULTS) if r['method']=='GNN_IMITATION'}
     retained = {r['layout_id']:r for r in saved['pilot']}
@@ -4175,7 +3558,7 @@ def imitation_pilot():
 def imitation_summary():
     rows = read_rows(IMITATION_RESULTS)
     grouped = {method:[r for r in rows if r['method']==method and r['layout_id'] in IMITATION_CASES]
-               for method in ('GNN_ORIGINAL','PPO_1000','GNN_IMITATION','WAG+VNS','HGA')}
+               for method in ('GNN_ORIGINAL','GNN_IMITATION','WAG+VNS','HGA')}
     def numeric_median(values,key):
         numbers=[float(r[key]) for r in values if r.get(key) not in (None,'')]
         return median(numbers) if numbers else None
@@ -4191,7 +3574,7 @@ def imitation_summary():
                   int(r[f'robot_task_count_r{i}'])>0 for i in range(4))
                   for r in new if r['four_robot_cover_possible']=='True')
     paired = {}
-    for method in ('GNN_ORIGINAL','PPO_1000','WAG+VNS','HGA'):
+    for method in ('GNN_ORIGINAL','WAG+VNS','HGA'):
         lookup = {r['layout_id']:r for r in grouped[method]}
         pairs = [(r,lookup[r['layout_id']]) for r in new if r['layout_id'] in lookup]
         wins = [r['layout_id'] for r,ref in pairs if r['status']=='FEASIBLE' and
@@ -4203,7 +3586,7 @@ def imitation_summary():
     pmax = summary['GNN_IMITATION']['median_pmax_s']
     # Quantify 'clearly lower' before pilot outcomes: at least 10% lower median.
     processing = pmax is not None and all(summary[m]['median_pmax_s'] is not None and
-                     pmax<=.9*summary[m]['median_pmax_s'] for m in ('GNN_ORIGINAL','PPO_1000'))
+                     pmax<=.9*summary[m]['median_pmax_s'] for m in ('GNN_ORIGINAL',))
     quality = complete and all(len(paired[m]['wins'])>=4 and
         summary['GNN_IMITATION']['median_cmax_s']<summary[m]['median_cmax_s'] for m in ('WAG+VNS','HGA'))
     output = dict(methods=summary,paired=paired,all_six_feasible=complete,four_robot_coverage=covered,
@@ -4428,7 +3811,7 @@ def imitation_deadlock_pilot(*, resume_unresolved=False):
     saved=torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)
     model=imitation_model(saved['state_dict'],balance=True).eval()
     source={r['layout_id']:r for r in read_rows(IMITATION_RESULTS) if r['method']=='GNN_IMITATION'}
-    layouts=dict(ppo_layouts('validation'))
+    layouts=dict(scale_layouts('validation'))
     final=[deadlock_repair_case(name,layouts[name],source[name],model,resume_unresolved=resume_unresolved)
            for name in IMITATION_CASES]
     print('DEADLOCK_PILOT_SUMMARY',json.dumps(dict(feasible=sum(r['status']=='FEASIBLE' for r in final),
@@ -4534,7 +3917,7 @@ def routeaware_history(name,parents,space,*,extra_rows=()):
     """Use existing (patterns,routes,directions) keys across both experiments."""
     seen={};blockers={};records={}
     sources=[]
-    for path in (PPO_RESULTS,IMITATION_RESULTS):
+    for path in (BASELINE_REFERENCE_RESULTS,IMITATION_RESULTS):
         for row in read_rows(path):
             if row.get('layout_id')!=name:
                 continue
@@ -4748,7 +4131,7 @@ def imitation_routeaware_pilot():
     torch.manual_seed(SEED)
     saved=torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)
     model=imitation_model(saved['state_dict']).eval()
-    layouts=dict(ppo_layouts('validation'))
+    layouts=dict(scale_layouts('validation'))
     finals=[]
     for method in ('GNN-Original','GNN-RouteAware'):
         for name in IMITATION_CASES:
@@ -4839,7 +4222,7 @@ def imitation_loadfirst_pilot(*,screen_only=False):
     routeaware_write([],path=LOADFIRST_RESULTS)
     loadfirst_references()
     model=imitation_model(torch.load(IMITATION_MODEL,map_location='cpu',weights_only=True)['state_dict']).eval()
-    layouts=dict(ppo_layouts('validation'))
+    layouts=dict(scale_layouts('validation'))
     screens=loadfirst_screen(model,layouts)
     if screen_only:
         return screens
@@ -4932,7 +4315,7 @@ def priority_result_row(name,plan,schedule,progress,**values):
 def priority_history_diagnosis():
     """Rescore saved complete LoadFirst genes; no GNN, NATIVE or certification."""
     configure_cpu();priority_write([])
-    layouts=dict(ppo_layouts('validation'))
+    layouts=dict(scale_layouts('validation'))
     spaces={n:gnn.parent_assignment_space(layouts[n],CONFIG) for n in IMITATION_CASES}
     caches={n:priority_cache(n,layouts[n],spaces[n]) for n in IMITATION_CASES}
     done={n:set() for n in IMITATION_CASES};catalog={n:{} for n in IMITATION_CASES}
@@ -5129,11 +4512,11 @@ def priority_vnd_case(name,seed,initial,space,cache,*,budget=100):
 
 def priority_pilot():
     priority_history_diagnosis()
-    layouts=dict(ppo_layouts('validation'));source=read_rows(LOADFIRST_RESULTS)
+    layouts=dict(scale_layouts('validation'));source=read_rows(LOADFIRST_RESULTS)
     starts={r['layout_id']:r for r in source if r['stage']=='screen' and r['method']==loadfirst_method(.25)}
     originals={r['layout_id']:r for r in read_rows(IMITATION_RESULTS) if r['method']=='GNN_IMITATION'}
     native_refs={}
-    for r in read_rows(PPO_RESULTS):
+    for r in read_rows(BASELINE_REFERENCE_RESULTS):
         if r['stage']=='baseline' and r['layout_id'] in IMITATION_CASES:
             detail=json.loads(r['diagnostic']);native_refs[r['layout_id'],int(r['seed']),r['method']]=detail
     done={(r['stage'],r['layout_id'],r['seed'],r['method']) for r in read_rows(PRIORITY_RESULTS)}
@@ -5154,7 +4537,7 @@ def priority_pilot():
                 priority_write([dict(stage='reference',layout_id=name,seed=seed,method=method,evaluator='historical priority_schedule native_cmax_s',
                     status='FEASIBLE' if detail and detail.get('native_cmax_s') not in (None,'') else 'MISSING',
                     cmax_s=detail.get('native_cmax_s') if detail else None,native_calls=0,
-                    diagnostic=json.dumps(dict(source='gnn_ppo_scale.csv native_cmax_s',
+                    diagnostic=json.dumps(dict(source='scale1000_baseline_references.csv native_cmax_s',
                         reason='historical native scalar only; no saved routes/directions; missing seeds left blank; no full baseline search')))])
             finals.append(priority_vnd_case(name,seed,initial,space,cache))
     print('PRIORITY_PILOT_SUMMARY',json.dumps(dict(feasible=sum(r['status']=='FEASIBLE' for r in finals),total=len(finals))),flush=True)
@@ -5494,7 +4877,7 @@ def imitation_cycle_train():
     if saved.get('optimizer_state_dict'):
         optimizer.load_state_dict(saved['optimizer_state_dict'])
     teachers = imitation_best_teachers(imitation_saved())
-    training = dict(ppo_layouts('train'))
+    training = dict(scale_layouts('train'))
     # A fixed size-stratified set of existing TRAIN instances, not a new dataset
     # and never VALIDATION/TEST. It bounds ranking collection without changing
     # the available legal receivers or using NATIVE labels.
@@ -5735,7 +5118,7 @@ def cycle_transfer_case(name, parents, seed, model, references, *, budget=100, m
 def imitation_cycle_transfer_pilot():
     saved = imitation_cycle_train()
     references = read_rows(IMITATION_RESULTS)
-    layouts = dict(ppo_layouts('validation'))
+    layouts = dict(scale_layouts('validation'))
     model = imitation_model(saved['state_dict']).eval()
     model.requires_grad_(False)
     model.load_first_lambda = None
@@ -6195,7 +5578,7 @@ def imitation_conflict_core_pilot():
     configure_cpu()
     conflict_write([])
     references = read_rows(IMITATION_RESULTS)
-    layouts = dict(ppo_layouts('validation'))
+    layouts = dict(scale_layouts('validation'))
     model = imitation_model(torch.load(IMITATION_MODEL, map_location='cpu', weights_only=True)['state_dict']).eval()
     model.requires_grad_(False)
     # No LoadFirst/Pareto branch or new learned parameters in this experiment.
@@ -6215,7 +5598,7 @@ def imitation_conflict_load_pilot():
     configure_cpu()
     conflict_write([], path=CONFLICT_LOAD_RESULTS)
     references = read_rows(IMITATION_RESULTS)
-    layouts = dict(ppo_layouts('validation'))
+    layouts = dict(scale_layouts('validation'))
     model = imitation_model(torch.load(IMITATION_MODEL, map_location='cpu', weights_only=True)['state_dict']).eval()
     model.requires_grad_(False)
     model.load_first_lambda = None
@@ -6291,7 +5674,7 @@ CMAX_METHOD = 'Cmax-Conflict-GNN-MultiRobot'
 CMAX_BEAM = 8
 JOINT3_FORBIDDEN_SOURCES = frozenset((
     'IMITATION_MODEL', 'CYCLE_MODEL', 'EXPANDED_MODEL', 'IMITATION_RESULTS', 'CYCLE_RESULTS',
-    'CONFLICT_RESULTS', 'CONFLICT_LOAD_RESULTS', 'LOADFIRST_RESULTS', 'ROUTEAWARE_RESULTS', 'PPO_RESULTS',
+    'CONFLICT_RESULTS', 'CONFLICT_LOAD_RESULTS', 'LOADFIRST_RESULTS', 'ROUTEAWARE_RESULTS', 'BASELINE_REFERENCE_RESULTS',
     'imitation_saved', 'imitation_best_teachers', 'imitation_cycle_train', 'imitation_train',
     'imitation_model', 'imitation_replay', 'imitation_evaluate', 'conflict_initial_hints',
     'conflict_compensation', 'conflict_construct', 'conflict_core_case', 'cycle_transfer_case',
@@ -7348,7 +6731,7 @@ def joint3_train():
     initial_state = copy.deepcopy(model.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=JOINT3_LEARNING_RATE, weight_decay=1e-4)
     references = joint3_references()
-    training = dict(ppo_layouts('train'))
+    training = dict(scale_layouts('train'))
     ordered = sorted(training, key=lambda name: (len(training[name]), name))
     names = [ordered[round(index*(len(ordered)-1)/(JOINT3_TRAIN_LAYOUTS-1))]
              for index in range(JOINT3_TRAIN_LAYOUTS)]
@@ -7520,7 +6903,7 @@ def joint3b_job(payload):
 
 def joint3b_train_stage(workers=1, seeds=(SEED,), budget=JOINT3_BUDGET):
     """Stage 1: six TRAIN layouts, original Joint3 against the load-keeping variant."""
-    layouts = dict(ppo_layouts('train'))
+    layouts = dict(scale_layouts('train'))
     missing = [name for name in JOINT3B_TRAIN_CASES if name not in layouts]
     if missing:
         raise ValueError(f'missing TRAIN layouts: {missing}')
@@ -7923,7 +7306,7 @@ def joint4_model(weights=None):
 
 def joint4_train_stage(workers=1, seeds=(SEED,), budget=JOINT3_BUDGET):
     """Stage 1: six TRAIN layouts, Joint3B against the bottleneck cross-robot Joint4."""
-    layouts = dict(ppo_layouts('train'))
+    layouts = dict(scale_layouts('train'))
     missing = [name for name in JOINT3B_TRAIN_CASES if name not in layouts]
     if missing:
         raise ValueError(f'missing TRAIN layouts: {missing}')
@@ -8070,7 +7453,7 @@ def joint4_fit(workers=1, *, cmax_driven=False):
              .enable_conflict_graph() if cmax_driven else joint4_model()).train()
     initial_state = copy.deepcopy(model.state_dict())
     optimizer = torch.optim.AdamW(model.parameters(), lr=JOINT3_LEARNING_RATE, weight_decay=1e-4)
-    training = dict(load_layouts('train') if cmax_driven else ppo_layouts('train'))
+    training = dict(load_layouts('train') if cmax_driven else scale_layouts('train'))
     ordered = sorted(training, key=lambda name: (len(training[name]), name))
     names = [ordered[round(index*(len(ordered)-1)/(JOINT4_TRAIN_LAYOUTS-1))]
              for index in range(JOINT4_TRAIN_LAYOUTS)]
@@ -9559,7 +8942,7 @@ def child_joint_evaluate(phase='independent'):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'summary', 'baseline-summary', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'feedback-summary', 'ppo-scale-summary', 'imitation-summary', 'joint3-audit', 'joint3-summary', 'joint3b-summary', 'joint4-summary', 'cmax-summary', 'bvns-summary', 'bvns-trained-summary', 'bvns-formal-summary', 'child-joint-summary', 'child-joint-formal-summary', 'child-construct-summary'))
+    parser.add_argument('stage', choices=('baselines', 'summary', 'baseline-summary', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'imitation-summary', 'joint3-audit', 'joint3-summary', 'joint3b-summary', 'joint4-summary', 'cmax-summary', 'bvns-summary', 'bvns-trained-summary', 'bvns-formal-summary', 'child-joint-summary', 'child-joint-formal-summary', 'child-construct-summary'))
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('train', 'validation', 'test'), default='validation', help='baseline dataset')
@@ -9598,10 +8981,6 @@ def main():
         print('JOINT4_SUMMARY', json.dumps(joint4_summary(phase=args.split), ensure_ascii=False), flush=True)
     elif args.stage == 'imitation-summary':
         imitation_summary()
-    elif args.stage == 'ppo-scale-summary':
-        ppo_summary()
-    elif args.stage == 'feedback-summary':
-        summarize_feedback(split=args.split)
     elif args.stage == 'baselines':
         run_baselines(args.workers, args.method, split=args.split, representative=args.representative,
                       time_limit=args.time_limit)

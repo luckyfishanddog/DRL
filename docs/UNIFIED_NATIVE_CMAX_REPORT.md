@@ -9,10 +9,10 @@
 - `scheduler.py`：删除 `FormalReferenceEvaluator`、`reference_schedule_formal()`、`reference_schedule_from_templates_formal()`、`_bounded_dispatch_recovery()`、slow/optimized limited-discrepancy 恢复及其别名。
 - `dispatch_recovery.py`：删除 `_FrontierItem`、`RecoverySummary`、`limited_discrepancy_recovery()` 和恢复前沿/去重搜索；保留通用 Python 参考工具仍依赖的派工状态、单次追踪及 `run_dispatch_rollout()`。文件名保留，不再包含 bounded 或 limited-discrepancy 恢复引擎。
 - `scope.py`、`model.py`、`SchedulerProfile`、公共 accounting/stats：删除恢复政策常量、状态/rollout 预算、恢复计次、expanded/frontier/exhaustion/discrepancy 等专属字段。现有 Scope 几何校验与认证检查保留；现有政策标记改为 `NATIVE_PRIORITY_FOUR_ROBOTS`，不回写历史记录的 Scope 或政策字段。
-- WAG、HGA、GNN-VNS-BR、旧 PPO、SAEAX、EAX-NSGA2、BC-ECS、RC-IG、CRF-DP、CEM、Joint-MIP、Route-Columns，以及公共构造、排序器、实验脚本的 B32 引用均已迁移。候选评价次数限制仍是候选预算，未将其误删为派工恢复预算；相关计数改名为原生协调评价计数。
+- WAG、HGA、GNN-VNS-BR、SAEAX、EAX-NSGA2、BC-ECS、RC-IG、CRF-DP、CEM、Joint-MIP、Route-Columns，以及公共构造、排序器、实验脚本的 B32 引用均已迁移。候选评价次数限制仍是候选预算，未将其误删为派工恢复预算；相关计数改名为原生协调评价计数。
 - 删除 multi-initial 的 sparse-recovery-budget、recovery-stratified、recovery-summary CLI 分支及其恢复试验函数、未使用的恢复预算和辅助认证函数；保留与构造、路线下界等其他功能共用的代码。
 - 删除旧恢复预算选择/采样测试；原混合测试文件中的几何、合并、内核、缓存与认证检查继续保留，部分恢复专属测试改为原生政策和通用 Python 工具回归。
-- 删除无其他测试引用的旧 `tests/test_ppo_instances.py`，以及只包含旧 B32 二次筛选补丁的 `joint4_native_gnn_diversity.patch`。未整包删除共用模块。
+- 平台读取和几何校验继续由现有测试覆盖；删除只包含旧B32二次筛选补丁的 `joint4_native_gnn_diversity.patch`。未整包删除共用模块。
 
 最终检索：`src/`、`scripts/`、`tests/`、`weld_data/` 的活动 Python 代码没有 B32 名称或已删除入口的调用。历史 CSV、checkpoint、旧实验报告中的 B32 文本和原始值保留。
 
@@ -84,7 +84,7 @@ GNN 的 `candidate_actions()`、`local_graph()`、`BottleneckGAT`、`ActionMLP`�
 
 ## 历史产物和输出管理
 
-对本轮开始时记录的 **75 个历史模型、结果和实验文档**复核文件大小、修改时间，均未改变。包括旧 23 维/40 TRAIN/scale1000 checkpoint，WAG/HGA/PPO CSV、旧 60 条验证、3 条 Smoke、190 条 scale1000 验证，以及 `docs/FIXED_EUCLIDEAN_SPLIT_EXPERIMENT.md`。
+对本轮开始时记录的 **75 个历史模型、结果和实验文档**复核文件大小、修改时间，均未改变。包括旧 23 维/40 TRAIN/scale1000 checkpoint，WAG/HGA CSV、旧 60 条验证、3 条 Smoke、190 条 scale1000 验证，以及 `docs/FIXED_EUCLIDEAN_SPLIT_EXPERIMENT.md`。
 
 旧数据保留原 B32 终评口径，不更新字段，不与新原生结果混合配对。原始固定任务集仍从历史 `tasksets.json` 读取，没有生成重复文件。后续原生结果路径改为 `results/native_priority/` 下的分类目录；本轮该目录和其中 CSV 未创建。现用两个主实验入口的 summary 只打印汇总，不重写历史报告或本报告。
 
@@ -99,7 +99,7 @@ src/mrta_reference/{scheduler,dispatch_recovery,scope,model,__init__}.py
 src/mrta_baselines/{common,wag_vns,hga}.py
 src/mrta_search/{gnn_vns_br,stats,pipeline,initialization,lns,vns}.py
 src/mrta_search/{bc_ecs,crf_dp,eax_nsga2,gnn_cem,gnn_constructor,gnn_joint_mip,
-                gnn_ppo,gnn_route_columns,rc_ig,saeax}.py
+                gnn_route_columns,rc_ig,saeax}.py
 src/mrta_ranker/{dataset,ranking}.py
 ```
 
@@ -113,7 +113,7 @@ scripts/run_joint_oriented_repair_pilot.py
 scripts/run_gnn_multi_initial.py
 scripts/run_gnn_{cem,cmax_finetune,construct_vns_pilot,initial_mode_new,joint_mip,
                  joint_repair_pilot,route_columns,shared_construction}.py
-scripts/run_{crf_dp,eax_nsga2,eg_gnn_pvnd,ppo_smoke,rc_ig,rule_guided_gnn,saeax}.py
+scripts/run_{crf_dp,eax_nsga2,eg_gnn_pvnd,rc_ig,rule_guided_gnn,saeax}.py
 scripts/train_mlp_ranker.py
 ```
 

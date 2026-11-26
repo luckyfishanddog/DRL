@@ -7518,7 +7518,7 @@ SciPy等式边际按顺序为tau（父模式）、pi（子覆盖）、sigma（�
 
 第9节既定20个续训排样与EG-GNN-PVND的20排样实际相同；再排除04/26/16/03/14/10六个开发排样和旧算法34，剩余13个为：30(71父)、20(75)、08(78)、12(82)、35(85)、23(86)、13(90)、05(98)、21(99)、25(101)、09(114)、07(119)、36(121)。
 
-但 `gnn_cmax_value_results.csv` 已含全部40个TRAIN的真实构造反事实记录；`gnn_expanded_dagger.csv`、`gnn_ppo_scale.csv`、`gnn_schedule_feedback_training_validation.csv` 也覆盖全部40个编号。第9.3节已经明确基础GNN历史使用过正式40个TRAIN。因此严格“从未被上述GNN训练、旧开发及相关试验使用”的可选数是0，不能将上述13个包装成从未使用的新排样。
+但 `gnn_cmax_value_results.csv` 已含全部40个TRAIN的真实构造反事实记录；`gnn_expanded_dagger.csv`及既有监督开发记录也覆盖全部40个编号。第9.3节已经明确基础GNN历史使用过正式40个TRAIN。因此严格“从未被上述GNN训练、旧开发及相关试验使用”的可选数是0，不能将上述13个包装成从未使用的新排样。
 
 已提出train_30(71父)、train_13(90父)、train_36(121父)作为避开指定20/6/3的本轮筛查范围，用户明确回复“接受”后才执行真实训练和实验。这是用户接受的历史暴露例外，不称为严格从未使用的三个新TRAIN。三例在原HGA/WAG优化正式CSV及 `gnn_results.csv` 中均无同排样记录，已有SAEAX/BC/RC/CRF也只有15/34/28三例TRAIN。因此不能构造这三例相对正式HGA/WAG或旧算法的同实例同种子历史胜负。早期teacher、owner_branch、train_repair等构造反事实不等同于正式同预算算法结果。
 

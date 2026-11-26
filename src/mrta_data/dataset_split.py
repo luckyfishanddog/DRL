@@ -150,7 +150,7 @@ def _summary(
     return result
 
 
-def build_phase3_split_manifest(
+def build_dataset_split_manifest(
     dataset_manifest: Mapping[str, Any],
     development_consumed_workbooks: Sequence[str],
 ) -> dict[str, Any]:
@@ -251,7 +251,7 @@ def build_phase3_split_manifest(
     return payload
 
 
-def validate_phase3_split_manifest(payload: Mapping[str, Any]) -> None:
+def validate_dataset_split_manifest(payload: Mapping[str, Any]) -> None:
     workbooks = list(payload["workbooks"])
     paths = [str(item["relative_path"]) for item in workbooks]
     if len(paths) != len(set(paths)):
@@ -337,7 +337,7 @@ def assert_v2_solver_access_allowed(
             )
 
 
-def build_phase3_diagnostic_set(
+def build_development_diagnostic_set(
     dataset_manifest: Mapping[str, Any], split_manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Select two DEVELOPMENT_CONSUMED instances per size tier without solver data."""
@@ -406,7 +406,7 @@ def build_phase3_diagnostic_set(
     return payload
 
 
-def validate_phase3_diagnostic_set(
+def validate_development_diagnostic_set(
     payload: Mapping[str, Any], split_manifest: Mapping[str, Any]
 ) -> None:
     instances = list(payload["instances"])

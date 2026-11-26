@@ -1,5 +1,6 @@
 """Score replacement only: preserve production C2 family coverage and C4 rotation."""
 from __future__ import annotations
+from mrta_data.platform_instances import (load_development_range_entries, load_entry_parent_welds, read_development_selection, select_c2_development_entries, external_geometry_dataset)
 import json
 import time
 import math
@@ -414,12 +415,6 @@ SCI_FORMAL_SEEDS=(20261611,20261612,20261613,20261614,20261615)
 SCI_METHODS=('HEURISTIC','MLP_V05','GAT_V05','HGA_V2','WAG_VNS_V2')
 
 
-def _final_smoke_module(root):
-    import importlib.util,sys
-    path=Path(root)/'scripts/run_ppo_smoke.py';name='_c4_final_smoke_module'
-    if name in sys.modules:return sys.modules[name]
-    spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec)
-    sys.modules[name]=module;spec.loader.exec_module(module);return module
 
 
 def _final_worker_init(masks):
@@ -430,7 +425,7 @@ def _final_worker_init(masks):
 
 def _final_online_worker(job):
     from . import dataset as data
-    entry,seed,method,root=job;smoke=_final_smoke_module(root);parents=smoke._range_parents(entry,data.PPO)
+    entry,seed,method,root=job;parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     budget_started_at=time.perf_counter()
     if method=='HEURISTIC':ranker=None
     elif method=='GAT_V05':ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05')
@@ -447,8 +442,8 @@ def run_final_c4_online(root=None,workers=4):
     from concurrent.futures import ProcessPoolExecutor,as_completed
     import multiprocessing as mp,json
     from . import dataset as data
-    root=Path(__file__).resolve().parents[2] if root is None else Path(root);smoke=_final_smoke_module(root)
-    entries=smoke._c2_entries(root);roles={r['relative_path']:r['new_v2_role'] for r in data.read(root/'data/manifests/PPO_V2_DATA_ROLES_V1.json')['workbooks']}
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root)
+    entries=select_c2_development_entries(root);roles={r['relative_path']:r['new_v2_role'] for r in data.read(root/'data/manifests/dataset_roles_v2.json')['workbooks']}
     if len(entries)!=6 or any(roles.get(e['relative_path'])!='V2_MODEL_DEVELOPMENT_CONSUMED' for e in entries):raise PermissionError('Final matrix requires exactly six consumed-development workbooks')
     methods=('HEURISTIC','GAT_V05','GAT_V05_C4_RANKED');db=data.connect(data.DATABASE_V05)
     existing=[json.loads(r[0]) for r in db.execute("SELECT payload FROM experiments WHERE experiment='c4_final_runs'")]
@@ -473,7 +468,7 @@ def run_final_c4_online(root=None,workers=4):
 def _final_baseline_worker(job):
     from . import dataset as data
     from mrta_baselines import AdaptedHGAConfig,AdaptedWAGConfig,run_adapted_hga_v2,run_adapted_wag_vns_v2
-    entry,method,root=job;smoke=_final_smoke_module(root);parents=smoke._range_parents(entry,data.PPO)
+    entry,method,root=job;parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     if method=='HGA':result=run_adapted_hga_v2(parents,data.CONFIG_V05,AdaptedHGAConfig(),seed=FINAL_BASELINE_SMOKE_SEED,time_limit=60.)
     elif method=='WAG':result=run_adapted_wag_vns_v2(parents,data.CONFIG_V05,AdaptedWAGConfig(),seed=FINAL_BASELINE_SMOKE_SEED,time_limit=60.)
     else:raise ValueError(method)
@@ -492,7 +487,7 @@ def run_final_baseline_smoke(root=None,workers=2):
     from concurrent.futures import ProcessPoolExecutor,as_completed
     import multiprocessing as mp
     from . import dataset as data
-    root=Path(__file__).resolve().parents[2] if root is None else Path(root);entries=_final_smoke_module(root)._c2_entries(root)
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);entries=select_c2_development_entries(root)
     selected=(entries[0],entries[4]);db=data.connect(data.DATABASE_V05)
     done={r[0] for r in db.execute("SELECT item_id FROM experiments WHERE experiment='c4_final_baseline_smoke'")};db.close();jobs=[]
     for entry in selected:
@@ -581,11 +576,11 @@ def run_sci_dev_baselines(root=None,workers=4):
     from concurrent.futures import ProcessPoolExecutor,as_completed
     import multiprocessing as mp
     from . import dataset as data
-    root=Path(__file__).resolve().parents[2] if root is None else Path(root);entries=_final_smoke_module(root)._c2_entries(root)
+    root=Path(__file__).resolve().parents[2] if root is None else Path(root);entries=select_c2_development_entries(root)
     if tuple(e['label'] for e in entries)!=('N35_S2','N35_S3','N55_I5','N55_I6','N85_I9','N85_I12'):
         raise AssertionError('Development instance matrix changed')
     db=data.connect(data.DATABASE_V05);done={r[0] for r in db.execute("SELECT item_id FROM experiments WHERE experiment='sci_dev_baseline_runs'")};db.close();jobs=[]
-    loaded={entry['instance_id']:_final_smoke_module(root)._range_parents(entry,data.PPO) for entry in entries}
+    loaded={entry['instance_id']:load_entry_parent_welds(entry,data.PLATFORM_ROOT) for entry in entries}
     for entry_index,entry in enumerate(entries):
         for seed_index,seed in enumerate(SCI_DEV_SEEDS):
             methods=('HGA_V2','WAG_VNS_V2');offset=(entry_index+seed_index)%2
@@ -732,15 +727,15 @@ def freeze_sci_formal_matrix(root=None):
 
 def _load_sci_formal_parents(root,matrix):
     from . import dataset as data
-    from mrta_data.phase3_split import assert_v2_solver_access_allowed
-    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    from mrta_data.dataset_split import assert_v2_solver_access_allowed
+    from mrta_data.platform_instances import load_platform_instance,instance_geometry_hash,to_parent_welds
     assert_v2_solver_access_allowed(data.read(data.ROLES),[entry['relative_path'] for entry in matrix['entries']],allowed_roles=('ID_TEST_SEALED',))
     loaded={};db=data.connect(data.DATABASE_V05)
     for entry in matrix['entries']:
         cached=db.execute('SELECT parents FROM instances WHERE instance_id=?',(entry['instance_id'],)).fetchone()
         if cached is not None:parents=data.unpack(cached[0])
         else:
-            instance=load_ppo_platform_instance(data.PPO/entry['relative_path'],entry['sheet_name'],ppo_root=data.PPO,instance_id=entry['instance_id'])
+            instance=load_platform_instance(data.PLATFORM_ROOT/entry['relative_path'],entry['sheet_name'],platform_root=data.PLATFORM_ROOT,instance_id=entry['instance_id'])
             if instance.raw_file_sha256!=entry['raw_file_sha256'] or instance_geometry_hash(instance)!=entry['instance_geometry_hash']:
                 raise ValueError('Sealed workbook identity differs from frozen static manifest')
             parents=to_parent_welds(instance)
@@ -1225,11 +1220,10 @@ REGION_INITIALIZATION_METHODS=(
 
 def _region_initialization_entries(root):
     """Fixed consumed-development cases; selection never reads solver outcomes."""
-    from mrta_data.phase3_split import assert_v2_solver_access_allowed
+    from mrta_data.dataset_split import assert_v2_solver_access_allowed
     from . import dataset as data
-    smoke=_final_smoke_module(root)
-    small=smoke._small30_read(root/'docs/YX_SPLIT_RANGE_05_CHANGE.md')['entries']
-    old=smoke._range_entries(root)
+    small=read_development_selection(root/'docs/YX_SPLIT_RANGE_05_CHANGE.md')['entries']
+    old=load_development_range_entries(root)
     search=(
         dict(small[0],label='N35_S1',tier='N35'),
         dict(small[1],label='N35_S2',tier='N35'),
@@ -1276,8 +1270,8 @@ def _region_initialization_zero_worker(job):
     from mrta_reference.scope import FORMAL_SCOPE_V2
     from mrta_reference.solution import block_map,official_metrics
     from mrta_search.pipeline import run_sa_oi_alns_v2
-    entry,variant,root=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO);config=data.CONFIG_V05
+    entry,variant,root=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT);config=data.CONFIG_V05
     search=replace(data.search_config(),max_iterations=0,time_limit=None,checkpoints=(),
         initialization_region_cooperative=variant=='REGION')
     started=time.perf_counter()
@@ -1355,8 +1349,8 @@ def run_region_initialization_zero(root=None,workers=4):
 def _region_initialization_online_worker(job):
     from dataclasses import replace
     from . import dataset as data
-    entry,seed,method,root=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO)
+    entry,seed,method,root=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     region=method.startswith('REGION_');gat=method.endswith('GAT_V05')
     budget_started_at=time.perf_counter()
     search=replace(data.search_config(),initialization_region_cooperative=region)
@@ -1472,8 +1466,8 @@ def _crrr_smoke_worker(job):
     from mrta_reference.solution import official_metrics
     from mrta_search.direction import optimize_directions_with_initial_feasibility
     from mrta_search.pipeline import run_sa_oi_alns_v2
-    entry,root=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO);captured=[]
+    entry,root=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT);captured=[]
     def observer(event,value):
         if event=='crrr_attempt' and value[1].candidate is not None:
             captured.append(value[1].candidate)
@@ -1541,8 +1535,8 @@ def run_crrr_smoke(root=None,workers=4):
 def _crrr_online_worker(job):
     from dataclasses import replace
     from . import dataset as data
-    entry,seed,method,root=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO)
+    entry,seed,method,root=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     search=replace(data.search_config(),initialization_region_cooperative=True,enable_crrr=True)
     budget_started_at=time.perf_counter()
     ranker=HybridRanker(root,c2_method='GAT_V05',c4_method='GAT_V05') if method.endswith('GAT_V05') else None
@@ -1690,8 +1684,8 @@ def _crrr_access_offline_worker(job):
     from mrta_search.direction import optimize_directions_with_initial_feasibility
     from mrta_search.pipeline import (CRRR_ACCESS_C2,DECISION_FAMILIES,
         decision_family,run_sa_oi_alns_v2,select_c2_by_family,select_c2_crrr_access)
-    entry,root,known_crrr=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO);captured={}
+    entry,root,known_crrr=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT);captured={}
     def observer(event,value):
         if event=='boundary' and 'solution' not in captured:
             captured.update(solution=value['solution'],schedule=value['schedule'])
@@ -1821,7 +1815,7 @@ def _crrr_access_online_worker(job):
     from dataclasses import replace
     from . import dataset as data
     from mrta_search.pipeline import CRRR_ACCESS_C2
-    entry,seed,root=job;smoke=_final_smoke_module(root);parents=smoke._range_parents(entry,data.PPO)
+    entry,seed,root=job;parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     search=replace(data.search_config(),initialization_region_cooperative=True,
         enable_crrr=True,c2_mode=CRRR_ACCESS_C2)
     record,_=data.run_trajectory(entry,seed,parents=parents,config=data.CONFIG_V05,search=search)
@@ -1921,8 +1915,8 @@ def _lns_acceleration_online_worker(job):
     """One fixed-budget run; the only method difference is LNS score caching."""
     from dataclasses import replace
     from . import dataset as data
-    entry,seed,method,root=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO)
+    entry,seed,method,root=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     accelerated=method=='REGION_LNS_INCREMENTAL_HEURISTIC'
     search=replace(data.search_config(),initialization_region_cooperative=True,
         enable_crrr=False,c2_mode='BASELINE_C2',lns_incremental_scoring=accelerated)
@@ -2057,17 +2051,12 @@ def upgraded_search_config(method):
         c2_mode='BASELINE_C2',enable_two_opt_star=False,m_atomic=144)
 
 
-def _ppo_dataset_module(root):
-    import sys
-    ppo_src=Path(root).resolve().parent/'ppo'/'src'
-    if str(ppo_src) not in sys.path:sys.path.insert(0,str(ppo_src))
-    from laces_weld_slim import dataset as ppo_dataset
-    return ppo_dataset
+
 
 
 def _upgraded_static_geometry_choices(root):
     """Select 5/5/5 scales using only generated geometry counts, before solving."""
-    ppo_dataset=_ppo_dataset_module(root);generator=ppo_dataset._load_allowed_generator_module()
+    geometry_dataset=external_geometry_dataset(root);generator=geometry_dataset._load_allowed_generator_module()
     source=Path(generator.DEFAULT_SOURCE_EXCEL).resolve()
     groups,_,_=generator.read_and_prepare_groups(str(source),None,'mm',0.01,min_weld_length_m=0.5)
     targets=(35,55,85);choices={}
@@ -2103,7 +2092,7 @@ def prepare_upgraded_independent_matrix(root=None,*,node_executable=None,artifac
     """Generate exactly 15 selected XLSX files and freeze their identities in SQLite."""
     import hashlib
     from . import dataset as data
-    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    from mrta_data.platform_instances import load_platform_instance,instance_geometry_hash,to_parent_welds
     root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
     db=data.connect(data.DATABASE_V05,readonly=True);existing=db.execute(
         'SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
@@ -2116,25 +2105,25 @@ def prepare_upgraded_independent_matrix(root=None,*,node_executable=None,artifac
     if node_executable is None or artifact_node_modules is None:
         raise ValueError('node_executable and artifact_node_modules are required for verified XLSX writing')
     selections,source,total_distance=_upgraded_static_geometry_choices(root)
-    ppo_dataset=_ppo_dataset_module(root);project_root=root.parent
+    geometry_dataset=external_geometry_dataset(root);project_root=root.parent
     config_path=project_root/'ppo'/'config'/'scientific_model_v9.json'
     historical=data.read(data.DATASET);historical_hashes={row['instance_geometry_hash'] for row in historical['instances']}
     serialized_history=json.dumps(historical,ensure_ascii=False)
     if any(str(seed) in serialized_history for seed in UPGRADED_INDEPENDENT_GEOMETRY_SEEDS):
         raise RuntimeError('a proposed upgraded geometry seed already appears in the historical dataset manifest')
     historical_book=next((project_root/'ppo'/'data'/'PPO_TRAIN').glob('*.xlsx'))
-    historical_family=ppo_dataset.load_seed_family_workbook(historical_book).manifest
+    historical_family=geometry_dataset.load_seed_family_workbook(historical_book).manifest
     output_dir=root/'data'/'independent'/'upgraded_grc';entries=[];new_hashes=set()
     for selected in selections:
         seed=selected['geometry_seed'];destination=output_dir/f'seed_{seed:010d}.xlsx'
         if destination.exists():
-            loaded_family=ppo_dataset.load_seed_family_workbook(destination)
+            loaded_family=geometry_dataset.load_seed_family_workbook(destination)
             manifest=loaded_family.manifest
         else:
-            build=ppo_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+            build=geometry_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
                 requested_group_counts=(selected['requested_group_count'],),source_excel=source,
                 scientific_config_path=config_path)
-            ppo_dataset._write_workbook_with_artifact_tool(build,destination,
+            geometry_dataset._write_workbook_with_artifact_tool(build,destination,
                 node_executable=node_executable,artifact_node_modules=artifact_node_modules,preview_directory=None)
             manifest=build.manifest
         if manifest.dataset_generation_seed!=seed or len(manifest.sheets)!=1:
@@ -2143,7 +2132,7 @@ def prepare_upgraded_independent_matrix(root=None,*,node_executable=None,artifac
         if sheet.requested_group_count!=selected['requested_group_count'] or sheet.actual_N!=selected['actual_N']:
             raise RuntimeError(f'static selection changed during generation for seed {seed}')
         relative=destination.relative_to(root).as_posix();instance_id=f"{destination.with_suffix('').relative_to(root).as_posix()}::{sheet.sheet_name}"
-        instance=load_ppo_platform_instance(destination,sheet.sheet_name,ppo_root=root,instance_id=instance_id)
+        instance=load_platform_instance(destination,sheet.sheet_name,platform_root=root,instance_id=instance_id)
         parents=to_parent_welds(instance);geometry_hash=instance_geometry_hash(instance)
         if len(parents)!=selected['actual_N'] or geometry_hash in historical_hashes or geometry_hash in new_hashes:
             raise RuntimeError(f'generated geometry is invalid, historical, or duplicated: {seed}')
@@ -2153,7 +2142,7 @@ def prepare_upgraded_independent_matrix(root=None,*,node_executable=None,artifac
             'generator_geometry_hash':sheet.geometry_hash,'geometry_content_hash':sheet.geometry_content_hash,
             'family_hash':manifest.family_hash,'total_weld_length':sum(parent.length for parent in parents)})
     if historical_family.generator_source_sha256!=manifest.generator_source_sha256 or historical_family.source_excel_sha256!=manifest.source_excel_sha256:
-        raise RuntimeError('current generator/source is not the one recorded by historical PPO families')
+        raise RuntimeError('current generator/source is not the one recorded by historical platform families')
     sha=lambda path:hashlib.sha256(Path(path).read_bytes()).hexdigest()
     matrix={'selection_frozen_before_solver_access':True,
         'selection_rule':'seeds 20262001..20262015; group counts 15..45; one sheet per seed; exact 5/5/5 assignment minimizing total |actual_N-target| for targets 35/55/85; ties by group count then tier tuple; geometry only',
@@ -2179,11 +2168,11 @@ def prepare_upgraded_independent_matrix(root=None,*,node_executable=None,artifac
 
 
 def _load_upgraded_independent_parents(root,matrix):
-    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    from mrta_data.platform_instances import load_platform_instance,instance_geometry_hash,to_parent_welds
     loaded={}
     for entry in matrix['entries']:
-        instance=load_ppo_platform_instance(root/entry['relative_path'],entry['sheet_name'],
-            ppo_root=root,instance_id=entry['instance_id'])
+        instance=load_platform_instance(root/entry['relative_path'],entry['sheet_name'],
+            platform_root=root,instance_id=entry['instance_id'])
         if instance.raw_file_sha256!=entry['raw_file_sha256'] or instance_geometry_hash(instance)!=entry['instance_geometry_hash']:
             raise ValueError('upgraded independent workbook differs from frozen SQLite identity')
         parents=to_parent_welds(instance)
@@ -2198,7 +2187,7 @@ def run_upgraded_gat_compatibility(root=None):
     from . import dataset as data
     from mrta_search.pipeline import run_sa_oi_alns_v2
     root=Path(__file__).resolve().parents[2] if root is None else Path(root);_,entries=_region_initialization_entries(root)
-    entry=next(row for row in entries if row['label']=='N35_S1');parents=_final_smoke_module(root)._range_parents(entry,data.PPO)
+    entry=next(row for row in entries if row['label']=='N35_S1');parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     rows=[]
     for accelerated in (False,True):
         trace={'c2':[],'c4':[]}
@@ -2415,8 +2404,8 @@ def _jrrb_development_diagnostic_worker(job):
     from mrta_reference.solution import block_map,official_metrics
     from mrta_search.direction import optimize_directions_with_initial_feasibility
     from mrta_search.pipeline import run_sa_oi_alns_v2
-    entry,root=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO);captured={}
+    entry,root=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT);captured={}
     def observer(event,value):
         if event in ('jrrb_pool','jrrb_evaluation'):captured[event]=value
     search=replace(data.search_config(),initialization_region_cooperative=True,
@@ -2552,8 +2541,8 @@ def _coordination_route_online_worker(job):
     """One paired 60-second run; only the initialization route slot differs."""
     from dataclasses import replace
     from . import dataset as data
-    entry,seed,method,root=job;smoke=_final_smoke_module(root)
-    parents=smoke._range_parents(entry,data.PPO)
+    entry,seed,method,root=job
+    parents=load_entry_parent_welds(entry,data.PLATFORM_ROOT)
     budget_started_at=time.perf_counter()
     search=replace(data.search_config(),initialization_region_cooperative=True,
         initialization_same_rail_boundary_rebalance=False,
@@ -2604,12 +2593,12 @@ def _same_rail_high_workload_states(root):
     """Build six fixed development geometries in memory, without solver selection."""
     from . import dataset as data
     from mrta_reference.model import ParentWeld
-    ppo_data=_ppo_dataset_module(root);generator=ppo_data._load_allowed_generator_module()
+    geometry_dataset=external_geometry_dataset(root);generator=geometry_dataset._load_allowed_generator_module()
     source=Path(generator.DEFAULT_SOURCE_EXCEL).resolve()
     config_path=Path(root).resolve().parent/'ppo'/'config'/'scientific_model_v9.json'
     result=[]
     for seed in SAME_RAIL_HIGH_WORKLOAD_SEEDS:
-        build=ppo_data.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+        build=geometry_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
             requested_group_counts=(45,),source_excel=source,scientific_config_path=config_path)
         sheet=build.manifest.sheets[0];rows=build.rows_by_sheet[sheet.sheet_name]
         parents=tuple(ParentWeld(row.weld_id,(row.x1,row.y1),(row.x2,row.y2)) for row in rows)
@@ -2623,8 +2612,8 @@ def _same_rail_high_workload_states(root):
 
 def _same_rail_development_states(root):
     from . import dataset as data
-    smoke=_final_smoke_module(root);_,entries=_region_initialization_entries(root)
-    result=[(entry,smoke._range_parents(entry,data.PPO)) for entry in entries]
+    _,entries=_region_initialization_entries(root)
+    result=[(entry,load_entry_parent_welds(entry,data.PLATFORM_ROOT)) for entry in entries]
     return result+_same_rail_high_workload_states(root)
 
 
@@ -2899,7 +2888,7 @@ def final_coordination_search_config(method):
 
 def _final_coordination_static_geometry_choices(root):
     """Apply the prior 5/5/5 count-only rule to the new fixed 15-seed pool."""
-    ppo_dataset=_ppo_dataset_module(root);generator=ppo_dataset._load_allowed_generator_module()
+    geometry_dataset=external_geometry_dataset(root);generator=geometry_dataset._load_allowed_generator_module()
     source=Path(generator.DEFAULT_SOURCE_EXCEL).resolve()
     groups,_,_=generator.read_and_prepare_groups(str(source),None,'mm',0.01,min_weld_length_m=0.5)
     targets=(35,55,85);choices={}
@@ -2935,7 +2924,7 @@ def _final_coordination_static_geometry_choices(root):
 def prepare_final_coordination_matrix(root=None,*,node_executable=None,artifact_node_modules=None):
     """Create 20 solver-unseen workbooks using geometry-only selection and save the matrix."""
     from . import dataset as data
-    from mrta_data.ppo_instances import load_ppo_platform_instance,instance_geometry_hash,to_parent_welds
+    from mrta_data.platform_instances import load_platform_instance,instance_geometry_hash,to_parent_welds
     root=Path(__file__).resolve().parents[2] if root is None else Path(root).resolve()
     db=data.connect(data.DATABASE_V05,readonly=True);existing=db.execute(
         'SELECT payload FROM experiments WHERE experiment=? AND item_id=?',
@@ -2948,10 +2937,10 @@ def prepare_final_coordination_matrix(root=None,*,node_executable=None,artifact_
     if node_executable is None or artifact_node_modules is None:
         raise ValueError('node_executable and artifact_node_modules are required')
     selections,source,total_distance=_final_coordination_static_geometry_choices(root)
-    ppo_dataset=_ppo_dataset_module(root);config_path=root.parent/'ppo'/'config'/'scientific_model_v9.json'
+    geometry_dataset=external_geometry_dataset(root);config_path=root.parent/'ppo'/'config'/'scientific_model_v9.json'
     high_builds=[]
     for seed in FINAL_COORDINATION_HIGH_WORKLOAD_SEEDS:
-        build=ppo_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+        build=geometry_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
             requested_group_counts=(45,),source_excel=source,scientific_config_path=config_path)
         sheet=build.manifest.sheets[0];rows=build.rows_by_sheet[sheet.sheet_name]
         if sheet.generation_status!='SUCCESS':raise RuntimeError(f'high-workload seed {seed} is not legal')
@@ -2972,13 +2961,13 @@ def prepare_final_coordination_matrix(root=None,*,node_executable=None,artifact_
     for selected in selections:
         seed=selected['geometry_seed'];destination=output_dir/f'seed_{seed:010d}.xlsx'
         build=selected.pop('_build',None)
-        if destination.exists():manifest=ppo_dataset.load_seed_family_workbook(destination).manifest
+        if destination.exists():manifest=geometry_dataset.load_seed_family_workbook(destination).manifest
         else:
             if build is None:
-                build=ppo_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
+                build=geometry_dataset.build_group_count_seed_family_data(dataset_role='DEV_ONLY',family_seed=seed,
                     requested_group_counts=(selected['requested_group_count'],),source_excel=source,
                     scientific_config_path=config_path)
-            ppo_dataset._write_workbook_with_artifact_tool(build,destination,
+            geometry_dataset._write_workbook_with_artifact_tool(build,destination,
                 node_executable=node_executable,artifact_node_modules=artifact_node_modules,preview_directory=None)
             manifest=build.manifest
         if manifest.dataset_generation_seed!=seed or len(manifest.sheets)!=1:
@@ -2988,7 +2977,7 @@ def prepare_final_coordination_matrix(root=None,*,node_executable=None,artifact_
             raise RuntimeError(f'generated workbook failed static contract for seed {seed}')
         relative=destination.relative_to(root).as_posix()
         instance_id=f"{destination.with_suffix('').relative_to(root).as_posix()}::{sheet.sheet_name}"
-        instance=load_ppo_platform_instance(destination,sheet.sheet_name,ppo_root=root,instance_id=instance_id)
+        instance=load_platform_instance(destination,sheet.sheet_name,platform_root=root,instance_id=instance_id)
         parents=to_parent_welds(instance);geometry_hash=instance_geometry_hash(instance)
         if len(parents)!=selected['actual_N'] or geometry_hash in known or geometry_hash in new_hashes:
             raise RuntimeError(f'geometry is historical, duplicated, or changed for seed {seed}')

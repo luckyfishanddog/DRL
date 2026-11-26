@@ -1220,9 +1220,9 @@ def grc_v2_offline():
 
 def _grc_v2_worker(job):
     if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
-    from run_ppo_smoke import _range_parents
+    from mrta_data.platform_instances import load_entry_parent_welds
     from mrta_ranker.ranking import V05MLPRanker,GATRanker
-    entry,seed,method=job;parents=_range_parents(entry,d.PPO)
+    entry,seed,method=job;parents=load_entry_parent_welds(entry,d.PLATFORM_ROOT)
     if method=='HEURISTIC':ranker=None
     elif method=='MLP_V05':ranker=V05MLPRanker(ROOT)
     elif method=='GAT_V05':ranker=GATRanker(ROOT,model_version='v05')
@@ -1235,8 +1235,8 @@ def _grc_v2_worker(job):
 
 def grc_v2_run(workers=4,*,pilot=False):
     if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
-    from run_ppo_smoke import _c2_entries
-    entries=_c2_entries(ROOT);roles={r['relative_path']:r['new_v2_role'] for r in d.read(ROOT/'data/manifests/PPO_V2_DATA_ROLES_V1.json')['workbooks']}
+    from mrta_data.platform_instances import select_c2_development_entries
+    entries=select_c2_development_entries(ROOT);roles={r['relative_path']:r['new_v2_role'] for r in d.read(ROOT/'data/manifests/dataset_roles_v2.json')['workbooks']}
     if len(entries)!=6 or any(roles.get(e['relative_path'])!='V2_MODEL_DEVELOPMENT_CONSUMED' for e in entries):raise PermissionError('Online V2 matrix must use six consumed-development workbooks only')
     selected=(entries[0],entries[4]) if pilot else entries;methods=('HEURISTIC','MLP_V05','GAT_V05','GAT_V06')
     db=d.connect(d.DATABASE_V05);done={r[0] for r in db.execute("SELECT item_id FROM experiments WHERE experiment='grc_v2_runs'")};db.close();jobs=[]
@@ -1406,9 +1406,9 @@ def grc_offline():
 
 def _grc_smoke_worker(job):
     if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
-    from run_ppo_smoke import _range_parents
+    from mrta_data.platform_instances import load_entry_parent_welds
     from mrta_ranker.ranking import V05MLPRanker,GATRanker
-    entry,seed,method=job;parents=_range_parents(entry,d.PPO)
+    entry,seed,method=job;parents=load_entry_parent_welds(entry,d.PLATFORM_ROOT)
     ranker=None if method=='HEURISTIC' else V05MLPRanker(ROOT) if method=='MLP' else GATRanker(ROOT)
     record,_=d.run_trajectory(entry,seed,parents=parents,ranker=ranker,config=d.CONFIG_V05)
     return {'instance':entry['label'],'tier':entry['tier'],'instance_id':entry['instance_id'],'seed':seed,'method':method,**record}
@@ -1420,8 +1420,8 @@ def _grc_smoke_init(mask_list):
 
 def grc_smoke(workers=3):
     if str(ROOT/'scripts') not in sys.path:sys.path.insert(0,str(ROOT/'scripts'))
-    from run_ppo_smoke import _c2_entries
-    entries=_c2_entries(ROOT);entries=[entries[0],entries[2],entries[4]]
+    from mrta_data.platform_instances import select_c2_development_entries
+    entries=select_c2_development_entries(ROOT);entries=[entries[0],entries[2],entries[4]]
     db=d.connect(d.DATABASE_V05);done={r[0] for r in db.execute("SELECT item_id FROM experiments WHERE experiment='grc_smoke'")}
     jobs=[]
     for entry in entries:

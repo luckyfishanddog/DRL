@@ -29,7 +29,7 @@
 | `joint3b_relative_limits()` | TRAIN 阶段用 `Pmax<=1.01*初始Pmax`、`spread<=初始极差+20s` 的相对保护（沿用原训练标签规则） | TRAIN 没有 HGA/WAG 冻结参考；两个版本用同一把尺子，比较才公平 |
 | `joint3_case` 计数修复 | 去掉 `entries` 的重复 append（候选被 `evaluate` 和 `extend` 各计一次） | 上一阶段报告里的「4306 个候选」是重复计数，真实为 **2168**（2168 行 = 30 initial + 2138 candidate）；本轮所有统计改为按 CSV 行计数 |
 
-没有改动：`gnn_constructor.py`、`hga.py`、`wag_vns.py`、B32 调度器、方向优化、负载阈值公式；没有新增网络、PPO、独立认证或哈希框架。
+没有改动：`gnn_constructor.py`、`hga.py`、`wag_vns.py`、B32 调度器、方向优化、负载阈值公式；没有新增网络、独立认证或哈希框架。
 
 ## 2. 负载与 Cmax 的取舍规则（先定规则，再看结果）
 

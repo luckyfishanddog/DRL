@@ -1,4 +1,4 @@
-"""Fail-closed intake for historical frozen PPO platform workbooks.
+"""Fail-closed intake for historical frozen platform workbooks.
 
 Excel support is intentionally imported only inside workbook-facing functions,
 so importing :mod:`mrta_reference` or :mod:`mrta_data` does not require it.
@@ -17,9 +17,6 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 DATASET_MANIFEST_ID = "PPO_DATASET_MANIFEST_V1"
-PHASE3_SMOKESET_ID = "PPO_PHASE3_SMOKESET_V1"
-PHASE3_SMOKESET_V2_ID = "PPO_PHASE3_SMOKESET_V2"
-INIT_BOOTSTRAP_DEVSET_ID = "PPO_INIT_BOOTSTRAP_DEVSET_V1"
 CURRENT_SCHEMA_ID = "PPO_FROZEN_FAMILY_SCHEMA_V1"
 LEGACY_SCHEMA_ID = "PPO_LEGACY_FROZEN_FAMILY_SCHEMA_V1"
 UNRECOGNIZED_SCHEMA_ID = "UNRECOGNIZED"
@@ -93,7 +90,7 @@ Z_TOLERANCE_M = 1.0e-9
 XY_TOLERANCE_M = 1.0e-12
 
 
-class PPOInstanceError(ValueError):
+class PlatformInstanceError(ValueError):
     """Stable fail-closed data error."""
 
     def __init__(self, code: str, message: str):
@@ -151,7 +148,7 @@ class WeldRow:
 
 
 @dataclass(frozen=True)
-class PPOPlatformInstance:
+class PlatformInstance:
     instance_id: str
     workbook_path: Path
     relative_path: str
@@ -179,9 +176,9 @@ def _openpyxl():
     try:
         import openpyxl
     except ImportError as exc:  # pragma: no cover - environment-dependent
-        raise PPOInstanceError(
+        raise PlatformInstanceError(
             "EXCEL_DEPENDENCY_MISSING",
-            "PPO Excel intake requires the optional openpyxl dependency",
+            "Platform Excel intake requires the optional openpyxl dependency",
         ) from exc
     return openpyxl
 
@@ -222,8 +219,8 @@ def _relative_path(path: Path, root: Path | None) -> str:
     try:
         return resolved.relative_to(root.resolve()).as_posix()
     except ValueError as exc:
-        raise PPOInstanceError(
-            "WORKBOOK_OUTSIDE_PPO_ROOT", f"{resolved} is outside {root.resolve()}"
+        raise PlatformInstanceError(
+            "WORKBOOK_OUTSIDE_PLATFORM_ROOT", f"{resolved} is outside {root.resolve()}"
         ) from exc
 
 
@@ -231,12 +228,12 @@ def _instance_id(relative_path: str, sheet_name: str) -> str:
     return f"{Path(relative_path).with_suffix('').as_posix()}::{sheet_name}"
 
 
-def discover_ppo_instances(ppo_root: str | Path) -> tuple[Path, ...]:
-    """Return every Excel workbook below ``ppo_root`` in stable order."""
+def discover_platform_instances(platform_root: str | Path) -> tuple[Path, ...]:
+    """Return every Excel workbook below ``platform_root`` in stable order."""
 
-    root = Path(ppo_root).resolve()
+    root = Path(platform_root).resolve()
     if not root.is_dir():
-        raise PPOInstanceError("PPO_ROOT_NOT_FOUND", str(root))
+        raise PlatformInstanceError("PLATFORM_ROOT_NOT_FOUND", str(root))
     return tuple(
         sorted(
             (
@@ -257,13 +254,13 @@ def _schema_from(meta_columns: tuple[str, ...], raw_columns: Sequence[tuple[str,
     return UNRECOGNIZED_SCHEMA_ID
 
 
-def inspect_ppo_workbook(
-    path: str | Path, *, ppo_root: str | Path | None = None
+def inspect_platform_workbook(
+    path: str | Path, *, platform_root: str | Path | None = None
 ) -> WorkbookInspection:
     """Inspect sheets, columns, row counts, metadata and file identity read-only."""
 
     workbook_path = Path(path).resolve()
-    root = None if ppo_root is None else Path(ppo_root).resolve()
+    root = None if platform_root is None else Path(platform_root).resolve()
     relative = _relative_path(workbook_path, root)
     if workbook_path.suffix.lower() != ".xlsx":
         return WorkbookInspection(
@@ -341,26 +338,26 @@ def _float(value: Any, *, field: str, location: str) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError) as exc:
-        raise PPOInstanceError("NON_NUMERIC_COORDINATE", f"{location}:{field}") from exc
+        raise PlatformInstanceError("NON_NUMERIC_COORDINATE", f"{location}:{field}") from exc
     if not math.isfinite(result):
-        raise PPOInstanceError("NON_FINITE_COORDINATE", f"{location}:{field}")
+        raise PlatformInstanceError("NON_FINITE_COORDINATE", f"{location}:{field}")
     return result
 
 
-def load_ppo_platform_instance(
+def load_platform_instance(
     path: str | Path,
     sheet_name: str,
     *,
-    ppo_root: str | Path | None = None,
+    platform_root: str | Path | None = None,
     instance_id: str | None = None,
-) -> PPOPlatformInstance:
+) -> PlatformInstance:
     """Load one frozen platform sheet without generation, filtering or movement."""
 
-    inspection = inspect_ppo_workbook(path, ppo_root=ppo_root)
+    inspection = inspect_platform_workbook(path, platform_root=platform_root)
     if inspection.schema_id == UNRECOGNIZED_SCHEMA_ID:
-        raise PPOInstanceError("UNRECOGNIZED_SCHEMA", inspection.relative_path)
+        raise PlatformInstanceError("UNRECOGNIZED_SCHEMA", inspection.relative_path)
     if sheet_name == "META" or sheet_name not in {item.name for item in inspection.sheets}:
-        raise PPOInstanceError("INSTANCE_SHEET_NOT_FOUND", sheet_name)
+        raise PlatformInstanceError("INSTANCE_SHEET_NOT_FOUND", sheet_name)
 
     openpyxl = _openpyxl()
     workbook = openpyxl.load_workbook(inspection.path, read_only=True, data_only=False)
@@ -379,18 +376,18 @@ def _load_sheet(
     worksheet,
     *,
     instance_id: str | None = None,
-) -> PPOPlatformInstance:
+) -> PlatformInstance:
     sheet_name = worksheet.title
     values = worksheet.iter_rows(values_only=False)
     header_cells = next(values, ())
     columns = tuple("" if cell.value is None else str(cell.value) for cell in header_cells)
     if columns != RAW_COLUMNS:
-        raise PPOInstanceError("INVALID_WELD_COLUMNS", sheet_name)
+        raise PlatformInstanceError("INVALID_WELD_COLUMNS", sheet_name)
     rows: list[WeldRow] = []
     identifier = instance_id or _instance_id(inspection.relative_path, sheet_name)
     for ordinal, cells in enumerate(values):
         if any(cell.data_type == "f" for cell in cells):
-            raise PPOInstanceError("FORMULA_FORBIDDEN", f"{sheet_name}:row={ordinal + 2}")
+            raise PlatformInstanceError("FORMULA_FORBIDDEN", f"{sheet_name}:row={ordinal + 2}")
         raw = dict(zip(columns, (cell.value for cell in cells)))
         stable_id = (
             str(raw["weld_id"]).strip()
@@ -414,7 +411,7 @@ def _load_sheet(
                 coordinates["z2"],
             )
         )
-    return PPOPlatformInstance(
+    return PlatformInstance(
         identifier,
         inspection.path,
         inspection.relative_path,
@@ -435,7 +432,7 @@ def _load_sheet(
     )
 
 
-def validate_ppo_platform_instance(instance: PPOPlatformInstance) -> ValidationResult:
+def validate_platform_instance(instance: PlatformInstance) -> ValidationResult:
     errors: list[str] = []
     seen_ids: set[str] = set()
     z_values: list[float] = []
@@ -480,12 +477,12 @@ def validate_ppo_platform_instance(instance: PPOPlatformInstance) -> ValidationR
     )
 
 
-def to_parent_welds(instance: PPOPlatformInstance):
+def to_parent_welds(instance: PlatformInstance):
     """Project validated planar rows to the current formal XY model."""
 
-    validation = validate_ppo_platform_instance(instance)
+    validation = validate_platform_instance(instance)
     if validation.status != "VALID":
-        raise PPOInstanceError("INVALID_PLATFORM_INSTANCE", ";".join(validation.errors))
+        raise PlatformInstanceError("INVALID_PLATFORM_INSTANCE", ";".join(validation.errors))
     from mrta_reference.model import ParentWeld
 
     return tuple(
@@ -500,7 +497,7 @@ def _canonical_segment(row: WeldRow) -> tuple[float, ...]:
     return (*min(start, end), *max(start, end))
 
 
-def instance_geometry_hash(instance: PPOPlatformInstance) -> str:
+def instance_geometry_hash(instance: PlatformInstance) -> str:
     payload = sorted(_canonical_segment(row) for row in instance.rows)
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -509,7 +506,7 @@ def _crosses(a: float, b: float, boundary: float, epsilon: float = 1.0e-9) -> bo
     return (a - boundary) * (b - boundary) < -(epsilon * epsilon)
 
 
-def geometry_metrics(instance: PPOPlatformInstance) -> dict[str, float | int]:
+def geometry_metrics(instance: PlatformInstance) -> dict[str, float | int]:
     rows = instance.rows
     xs = [value for row in rows for value in (row.x1, row.x2)]
     ys = [value for row in rows for value in (row.y1, row.y2)]
@@ -572,7 +569,7 @@ def geometry_metrics(instance: PPOPlatformInstance) -> dict[str, float | int]:
     }
 
 
-def formal_compatibility_metrics(instance: PPOPlatformInstance) -> dict[str, int | str]:
+def formal_compatibility_metrics(instance: PlatformInstance) -> dict[str, int | str]:
     from mrta_reference.geometry import (
         blocks_for_pattern,
         generate_y_split_patterns,
@@ -623,7 +620,7 @@ def formal_compatibility_metrics(instance: PPOPlatformInstance) -> dict[str, int
     return result
 
 
-def x_split_geometry_metrics(instance: PPOPlatformInstance) -> dict[str, object]:
+def x_split_geometry_metrics(instance: PlatformInstance) -> dict[str, object]:
     """Return solver-independent finite X_SPLIT opportunity metadata."""
     from mrta_reference.geometry import x_split_geometry_metadata
     from mrta_reference.model import ScientificConfig
@@ -631,8 +628,8 @@ def x_split_geometry_metrics(instance: PPOPlatformInstance) -> dict[str, object]
     return x_split_geometry_metadata(to_parent_welds(instance), ScientificConfig())
 
 
-def _manifest_entry(instance: PPOPlatformInstance) -> dict[str, Any]:
-    validation = validate_ppo_platform_instance(instance)
+def _manifest_entry(instance: PlatformInstance) -> dict[str, Any]:
+    validation = validate_platform_instance(instance)
     metrics = geometry_metrics(instance)
     formal: dict[str, Any] = {
         "n_whole_upper_only": 0,
@@ -682,12 +679,12 @@ def _distribution(values: Sequence[float | int]) -> dict[str, float | int | None
     }
 
 
-def build_dataset_manifest(ppo_root: str | Path) -> dict[str, Any]:
+def build_dataset_manifest(platform_root: str | Path) -> dict[str, Any]:
     """Inspect and validate every recognized frozen platform sheet."""
 
-    root = Path(ppo_root).resolve()
-    paths = discover_ppo_instances(root)
-    inspections = [inspect_ppo_workbook(path, ppo_root=root) for path in paths]
+    root = Path(platform_root).resolve()
+    paths = discover_platform_instances(root)
+    inspections = [inspect_platform_workbook(path, platform_root=root) for path in paths]
     inventory: list[dict[str, Any]] = []
     entries: list[dict[str, Any]] = []
     for inspection in inspections:
@@ -723,7 +720,7 @@ def build_dataset_manifest(ppo_root: str | Path) -> dict[str, Any]:
                 try:
                     instance = _load_sheet(inspection, workbook[sheet.name])
                     entries.append(_manifest_entry(instance))
-                except PPOInstanceError as exc:
+                except PlatformInstanceError as exc:
                     identifier = _instance_id(inspection.relative_path, sheet.name)
                     entries.append(
                         {
@@ -875,56 +872,6 @@ def build_dataset_manifest(ppo_root: str | Path) -> dict[str, Any]:
     }
 
 
-def select_phase3_smokeset(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    valid = [
-        dict(entry)
-        for entry in manifest["instances"]
-        if entry["validation_status"] == "VALID" and entry.get("duplicate_of") is None
-    ]
-    if len(valid) < 3:
-        raise PPOInstanceError(
-            "INSUFFICIENT_VALID_UNIQUE_INSTANCES", f"found {len(valid)}, require at least 3"
-        )
-    ordered = sorted(
-        valid, key=lambda entry: (entry["actual_weld_count"], entry["instance_geometry_hash"])
-    )
-    small = ordered[0]
-    remaining = [entry for entry in valid if entry["instance_id"] != small["instance_id"]]
-    large = min(
-        remaining,
-        key=lambda entry: (-entry["actual_weld_count"], entry["instance_geometry_hash"]),
-    )
-    remaining = [entry for entry in remaining if entry["instance_id"] != large["instance_id"]]
-    median_n = statistics.median(entry["actual_weld_count"] for entry in valid)
-    medium = min(
-        remaining,
-        key=lambda entry: (
-            abs(entry["actual_weld_count"] - median_n),
-            entry["instance_geometry_hash"],
-        ),
-    )
-
-    def record(tier: str, entry: Mapping[str, Any]) -> dict[str, Any]:
-        return {
-            "tier": tier,
-            "instance_id": entry["instance_id"],
-            "relative_path": entry["relative_path"],
-            "sheet_name": entry["sheet_name"],
-            "actual_weld_count": entry["actual_weld_count"],
-            "instance_geometry_hash": entry["instance_geometry_hash"],
-        }
-
-    return {
-        "smokeset_id": PHASE3_SMOKESET_ID,
-        "dataset_manifest_id": manifest["dataset_manifest_id"],
-        "dataset_manifest_hash": manifest["dataset_manifest_hash"],
-        "selection_policy": (
-            "small=min N; medium=closest to median N; large=max N; ties by "
-            "instance_geometry_hash; selections distinct"
-        ),
-        "median_weld_count": median_n,
-        "instances": [record("small", small), record("medium", medium), record("large", large)],
-    }
 
 
 def _valid_unique_entries(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -961,169 +908,8 @@ def main_experimental_range_summary(
     }
 
 
-def select_phase3_smokeset_v2(manifest: Mapping[str, Any]) -> dict[str, Any]:
-    valid = [
-        entry
-        for entry in _valid_unique_entries(manifest)
-        if entry["actual_weld_count"] <= 90
-    ]
-    if len(valid) < 3:
-        raise PPOInstanceError(
-            "INSUFFICIENT_MAIN_RANGE_INSTANCES", f"found {len(valid)}, require at least 3"
-        )
-    ordered = sorted(
-        valid,
-        key=lambda entry: (entry["actual_weld_count"], entry["instance_geometry_hash"]),
-    )
-    small = ordered[0]
-    remaining = [entry for entry in valid if entry["instance_id"] != small["instance_id"]]
-    large = min(
-        remaining,
-        key=lambda entry: (-entry["actual_weld_count"], entry["instance_geometry_hash"]),
-    )
-    remaining = [entry for entry in remaining if entry["instance_id"] != large["instance_id"]]
-    median_n = statistics.median(entry["actual_weld_count"] for entry in valid)
-    medium = min(
-        remaining,
-        key=lambda entry: (
-            abs(entry["actual_weld_count"] - median_n),
-            entry["instance_geometry_hash"],
-        ),
-    )
-
-    def record(tier: str, entry: Mapping[str, Any]) -> dict[str, Any]:
-        return {
-            "tier": tier,
-            "instance_id": entry["instance_id"],
-            "relative_path": entry["relative_path"],
-            "sheet_name": entry["sheet_name"],
-            "actual_weld_count": entry["actual_weld_count"],
-            "instance_geometry_hash": entry["instance_geometry_hash"],
-        }
-
-    return {
-        "smokeset_id": PHASE3_SMOKESET_V2_ID,
-        "dataset_manifest_id": manifest["dataset_manifest_id"],
-        "dataset_manifest_hash": manifest["dataset_manifest_hash"],
-        "main_range_maximum_weld_count": 90,
-        "selection_policy": (
-            "among VALID unique N<=90: small=min N; medium=closest to median N; "
-            "large=max N; ties by instance_geometry_hash; selections distinct"
-        ),
-        "median_weld_count": median_n,
-        "instances": [
-            record("small", small),
-            record("medium", medium),
-            record("large", large),
-        ],
-    }
 
 
-def select_init_bootstrap_devset(
-    manifest: Mapping[str, Any],
-    historical_smokeset: Mapping[str, Any],
-    *,
-    additional_consumed_smokesets: Sequence[Mapping[str, Any]] = (),
-    per_stratum: int = 5,
-) -> dict[str, Any]:
-    if per_stratum < 1:
-        raise ValueError("per_stratum must be positive")
-    strata = (
-        ("N10_30", 10, 30),
-        ("N31_50", 31, 50),
-        ("N51_70", 51, 70),
-        ("N71_90", 71, 90),
-    )
-    valid = _valid_unique_entries(manifest)
-    selected: list[dict[str, Any]] = []
-    stratum_records: list[dict[str, Any]] = []
-    globally_used_workbooks: set[str] = set()
-    for stratum_id, lower, upper in strata:
-        candidates = sorted(
-            (
-                entry
-                for entry in valid
-                if lower <= entry["actual_weld_count"] <= upper
-            ),
-            key=lambda entry: (entry["instance_geometry_hash"], entry["instance_id"]),
-        )
-        chosen: list[dict[str, Any]] = []
-        for entry in candidates:
-            if entry["relative_path"] in globally_used_workbooks:
-                continue
-            chosen.append(entry)
-            globally_used_workbooks.add(entry["relative_path"])
-            if len(chosen) == per_stratum:
-                break
-        if len(chosen) < per_stratum:
-            chosen_ids = {entry["instance_id"] for entry in chosen}
-            for entry in candidates:
-                if entry["instance_id"] in chosen_ids:
-                    continue
-                chosen.append(entry)
-                if len(chosen) == per_stratum:
-                    break
-        if len(chosen) < per_stratum:
-            raise PPOInstanceError(
-                "INSUFFICIENT_BOOTSTRAP_STRATUM",
-                f"{stratum_id}: found {len(chosen)}, require {per_stratum}",
-            )
-        records = [
-            {
-                "stratum": stratum_id,
-                "instance_id": entry["instance_id"],
-                "relative_path": entry["relative_path"],
-                "sheet_name": entry["sheet_name"],
-                "actual_weld_count": entry["actual_weld_count"],
-                "instance_geometry_hash": entry["instance_geometry_hash"],
-            }
-            for entry in chosen
-        ]
-        selected.extend(records)
-        stratum_records.append(
-            {
-                "stratum": stratum_id,
-                "minimum_weld_count": lower,
-                "maximum_weld_count": upper,
-                "instances": records,
-            }
-        )
-    smoke_workbooks = {
-        str(entry["relative_path"])
-        for entry in historical_smokeset["instances"]
-    }
-    for smokeset in additional_consumed_smokesets:
-        smoke_workbooks.update(
-            str(entry["relative_path"]) for entry in smokeset["instances"]
-        )
-    consumed = sorted(
-        {
-            entry["relative_path"] for entry in selected
-        }
-        | smoke_workbooks
-    )
-    return {
-        "devset_id": INIT_BOOTSTRAP_DEVSET_ID,
-        "dataset_manifest_id": manifest["dataset_manifest_id"],
-        "dataset_manifest_hash": manifest["dataset_manifest_hash"],
-        "selection_policy": (
-            "solver-independent four strata N=10..30,31..50,51..70,71..90; "
-            "five per stratum; stable instance_geometry_hash order; prefer distinct "
-            "workbooks and use at most one per workbook when possible"
-        ),
-        "future_split_isolation_policy": (
-            "all instances from a development-consumed workbook/generation-seed family "
-            "are excluded from untouched TEST"
-        ),
-        "per_stratum": per_stratum,
-        "instances": selected,
-        "strata": stratum_records,
-        "development_consumed_workbooks": consumed,
-        "historical_smoke_workbooks": sorted(
-            {str(entry["relative_path"]) for entry in historical_smokeset["instances"]}
-        ),
-        "all_consumed_smoke_workbooks": sorted(smoke_workbooks),
-    }
 
 
 def write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
@@ -1134,3 +920,55 @@ def write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
         + "\n",
         encoding="utf-8",
     )
+
+
+def load_development_range_entries(root):
+    from mrta_data.dataset_split import assert_v2_solver_access_allowed
+    selected = json.loads((root / "data/manifests/development_x_split_set_v1.json").read_text(encoding="utf-8"))
+    entries = [e for e in selected["instances"] if e["selection_ordinal"] in (2, 3, 5, 6, 9, 12)]
+    entries.sort(key=lambda e: e["selection_ordinal"])
+    roles = json.loads((root / "data/manifests/dataset_roles_v2.json").read_text(encoding="utf-8"))
+    assert_v2_solver_access_allowed(roles, [e["relative_path"] for e in entries],
+                                    allowed_roles=("V2_MODEL_DEVELOPMENT_CONSUMED",))
+    return entries
+
+def load_entry_parent_welds(entry, platform_root):
+    return to_parent_welds(load_platform_instance(
+        platform_root / entry["relative_path"], entry["sheet_name"], platform_root=platform_root,
+        instance_id=entry["instance_id"]))
+
+def read_development_selection(report):
+    content=report.read_text(encoding="utf-8")
+    return json.loads(content.split("<!-- SMALL30_RESULTS -->"+"\n```json\n",1)[1].split("\n```",1)[0])
+
+def select_c2_development_entries(root):
+    small=read_development_selection(root/'docs/YX_SPLIT_RANGE_05_CHANGE.md')['entries'];old=load_development_range_entries(root)
+    entries=[dict(small[1],label='N35_S2',tier='N35'),dict(small[2],label='N35_S3',tier='N35'),
+        dict(next(e for e in old if e['selection_ordinal']==5),label='N55_I5',tier='N55'),
+        dict(next(e for e in old if e['selection_ordinal']==6),label='N55_I6',tier='N55'),
+        dict(next(e for e in old if e['selection_ordinal']==9),label='N85_I9',tier='N85'),
+        dict(next(e for e in old if e['selection_ordinal']==12),label='N85_I12',tier='N85')]
+    from mrta_data.dataset_split import assert_v2_solver_access_allowed
+    roles=json.loads((root/'data/manifests/dataset_roles_v2.json').read_text(encoding='utf-8'))
+    assert_v2_solver_access_allowed(roles,[e['relative_path'] for e in entries],allowed_roles=('V2_MODEL_DEVELOPMENT_CONSUMED',))
+    return entries
+
+
+def external_geometry_dataset(root):
+    """Read external geometry primitives without running their package initializer.
+
+    The historical package initializer imports training and environment modules.
+    A private namespace exposes only dataset/configuration/model source files.
+    """
+    import importlib
+    import sys
+    from types import ModuleType
+
+    namespace = '_mrta_platform_geometry'
+    package_dir = Path(root).resolve().parent / 'ppo' / 'src' / 'laces_weld_slim'
+    if namespace not in sys.modules:
+        package = ModuleType(namespace)
+        package.__path__ = [str(package_dir)]
+        package.__package__ = namespace
+        sys.modules[namespace] = package
+    return importlib.import_module(namespace + '.dataset')

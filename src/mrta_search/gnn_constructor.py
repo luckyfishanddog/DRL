@@ -1141,12 +1141,6 @@ class _JointActionUnavailable(ValueError):
     """An ordinary policy dead end, distinct from corrupt inputs/numerics."""
 
 
-@dataclass(frozen=True)
-class JointTrainingRollout:
-    completion: JointCompletionResult
-    parent_log_probs: tuple[torch.Tensor, ...]
-    insertion_log_probs: tuple[torch.Tensor, ...]
-    log_prob: torch.Tensor
 
 
 def mrv_parent(state, parent_ids, blocks, patterns, config, *, insertion_limit=8):
@@ -1532,7 +1526,7 @@ def construct_or_repair_with_gnn(reference, routes, directions, pending_parent_i
     parent_selection_mode changes only parent ordering: learned head or cheap
     deterministic MRV-LPT. Both retain the same insertion head and action pool.
     action_selection_mode='rule_guided' fuses neural/rule ranks at inference;
-    the default gnn path and differentiable training rollout stay unchanged.
+    the default gnn path remain unchanged.
     'rule' and 'gnn_rank' are controlled ranking ablations using the same
     negative ordinal sampling scale and the complete original candidate pool.
     'rule_anchored' tests neural tie-breaking within the original rule costs.
@@ -2521,36 +2515,6 @@ class VNextGNN(_JointAssignmentGNN):
         return torch.cat((rows, torch.stack(extras)), dim=1)
 
 
-class PPOJointInsertionGNN(VNextGNN):
-    """Existing joint actor plus one partial-state critic on the same GAT."""
-    def __init__(self, hidden_dim=64, heads=4):
-        super().__init__(hidden_dim, heads, workload_lookahead=True,
-                         joint_actions=True, schedule_feedback=True)
-        self.value_head = nn.Sequential(nn.Linear(2*hidden_dim+13, hidden_dim),
-                                        nn.Tanh(), nn.Linear(hidden_dim, 1))
-        nn.init.zeros_(self.value_head[-1].weight)
-        nn.init.zeros_(self.value_head[-1].bias)
-
-    def encode_static(self, graph):
-        # Same two GAT layers/parameters, using the existing equivalent scatter kernel.
-        h = nn.functional.elu(_vnd_attention(self.layer1, graph.node_features,
-                                            graph.edge_index, graph.edge_type))
-        return (_vnd_attention(self.layer2,h,graph.edge_index,graph.edge_type)
-                + self.geometry_skip(graph.node_features))
-
-    @staticmethod
-    def partial_value_features(space, state, selected):
-        n = max(1,len(space.parent_ids))
-        return torch.tensor([*(p/2500. for p in state.loads),
-            *(sum(arcs)/2500. for arcs in state.arc_costs),
-            *(len(route)/n for route in state.routes),1.-len(selected)/n],dtype=torch.float32)
-
-    def state_value(self, space, embeddings, features):
-        offset = space.graph.robot_offset
-        pooled = torch.cat((embeddings[:offset].mean(0),embeddings[offset:].mean(0)))
-        if features.ndim == 1:
-            return self.value_head(torch.cat((pooled,features))).squeeze()
-        return self.value_head(torch.cat((pooled.expand(len(features),-1),features),dim=1)).squeeze(-1)
 
 
 def _sample_directed_positions(states, robot, endpoints, weld_seconds, config, times):
@@ -3990,31 +3954,6 @@ def construct_complete_parent_gnn(parents,model,config,*,seed=None,space=None,st
         return JointCompletionResult(solution,state.directions,tuple(actions),time.perf_counter()-started,oriented_state=state)
 
 
-def rollout_joint_repair(reference, routes, directions, pending_parent_ids,
-                         model: JointInsertionGNN, config, *, insertion_limit=8, seed=0):
-    """Differentiable temperature-1 sampling of the SAME executable actions.
-
-    Only sampled indices are discrete. Both heads' selected log-softmax values
-    retain the graph through the GAT. Numeric/data errors propagate to the caller;
-    a genuine missing legal action preserves the sampled prefix for failure return.
-    """
-    if torch.is_inference_mode_enabled():
-        raise RuntimeError('training rollout cannot run inside inference_mode')
-    generator=torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
-    logs={'parent':[],'insertion':[]}
-    def choose(logits,kind):
-        index=int(torch.multinomial(torch.softmax(logits,dim=0),1,generator=generator).item())
-        logs[kind].append(torch.log_softmax(logits,dim=0)[index])
-        return index
-    # There is no stochastic dropout in this policy. Eval also makes the
-    # self-critical baseline and sampled branch use the same model semantics.
-    model.eval()
-    with torch.enable_grad():
-        completion=_decode_joint(reference,routes,directions,pending_parent_ids,model,config,
-                                 insertion_limit=insertion_limit,choose=choose)
-        terms=logs['parent']+logs['insertion']
-        log_prob=torch.stack(terms).sum() if terms else next(model.parameters()).new_zeros(())
-    return JointTrainingRollout(completion,tuple(logs['parent']),tuple(logs['insertion']),log_prob)
 
 
 def _home(robot: int, config: ScientificConfig) -> tuple[float, float]:

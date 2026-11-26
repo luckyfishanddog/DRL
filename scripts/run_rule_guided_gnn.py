@@ -29,7 +29,7 @@ from mrta_reference.model import ParentWeld, SplitPattern, SplitKind, Rail, Sche
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.solution import canonicalize, block_map
 from mrta_reference.scheduler import SchedulerProfile, native_schedule
-from mrta_data.ppo_instances import load_ppo_platform_instance, to_parent_welds
+from mrta_data.platform_instances import load_platform_instance, to_parent_welds
 
 CONFIG = study.CONFIG_05
 CSV = ROOT / 'results/native_priority/gnn_rule_guided.csv'
@@ -287,8 +287,8 @@ def run_benchmark(phase, workers):
 
 
 def data_catalog():
-    manifest = json.loads((ROOT / 'data/manifests/PPO_DATASET_MANIFEST_V1.json').read_text(encoding='utf-8'))
-    overlay = json.loads((ROOT / 'data/manifests/PPO_V2_DATA_ROLES_V1.json').read_text(encoding='utf-8'))
+    manifest = json.loads((ROOT / 'data/manifests/platform_dataset_manifest_v1.json').read_text(encoding='utf-8'))
+    overlay = json.loads((ROOT / 'data/manifests/dataset_roles_v2.json').read_text(encoding='utf-8'))
     roles = {e['relative_path']: e['new_v2_role'] for e in overlay['workbooks']}
     counts = defaultdict(Counter)
     usable = []
@@ -400,25 +400,25 @@ def build_dataset():
             writer.writeheader()
             writer.writerows(rows)
     if not any(r['phase'] == 'data_audit' for r in read_results()):
-        save(dict(phase='data_audit', instance='PPO_DATA', method='STATIC_SELECTION', status='READY',
+        save(dict(phase='data_audit', instance='PLATFORM_DATA', method='STATIC_SELECTION', status='READY',
                   payload=dict(workbook_roles=dict(Counter(roles.values())), sheet_counts=counts,
                                selected_counts=dict(Counter(r['purpose'] for r in rows)),
-                               historical_gnn_books=len(consumed), ppo_root=str(ppo_root()),
-                               source='existing PPO only; metadata-selected holdout never opened; no new Excel')))
+                               historical_gnn_books=len(consumed), platform_root=str(platform_root()),
+                               source='existing platform geometry only; metadata-selected holdout never opened; no new Excel')))
     return rows
 
 
-def ppo_root():
-    return Path(os.environ.get('MRTA_PPO_ROOT') or ROOT.parent / 'ppo').resolve()
+def platform_root():
+    return Path(os.environ.get('MRTA_PLATFORM_ROOT') or ROOT.parent / 'ppo').resolve()
 
 
 def load_entry(entry):
     if entry['purpose'] == 'holdout' or entry['role'] == 'ID_TEST_SEALED':
         raise ValueError('holdout/sealed geometries are not development inputs')
-    instance = load_ppo_platform_instance(ppo_root() / entry['workbook'], entry['sheet'], ppo_root=ppo_root())
+    instance = load_platform_instance(platform_root() / entry['workbook'], entry['sheet'], platform_root=platform_root())
     parents = to_parent_welds(instance)
     if len(parents) != int(entry['N']):
-        raise ValueError('PPO workbook count differs from the selected sheet')
+        raise ValueError('Platform workbook count differs from the selected sheet')
     return parents
 
 
@@ -652,7 +652,7 @@ def run_teachers(workers):
     for entry in entries:
         key = geometry_key(load_entry(entry))
         if key in seen or key in old_geometries:
-            raise ValueError('selected PPO training sheet duplicates retained training geometry')
+            raise ValueError('selected platform training sheet duplicates retained training geometry')
         seen.add(key)
     existing = read_results()
     if not any(r['phase'] == 'teacher_plan' for r in existing):
@@ -709,7 +709,7 @@ def run_training():
         retained_geometry_count=21, additional_teacher_geometry_count=len(new_names),
         teacher_source='NATIVE FEASIBLE states retained in results/gnn_rule_guided.csv and original 21-geometry training rows',
         inference=dict(parent_selection_mode='mrv',action_selection_mode='rule_guided',use_learned_modes=False),
-        holdout='8 reserved PPO sheets never opened; no validation teacher or normalization input')
+        holdout='8 reserved platform sheets never opened; no validation teacher or normalization input')
     payload['refinement_candidate'] = candidate
     with TRAINED_CHECKPOINT.open('xb') as stream:
         shared.save_neural_checkpoint(payload, stream)
@@ -787,7 +787,7 @@ def report():
     if data:
         info = data[-1]['payload']
         lines += ['## PPO数据审查和扩充', '',
-                  'MRTA_PPO_ROOT未设置时使用项目ppo目录。数据用途由既有角色文件决定，不能按物理目录名判断。',
+                  'MRTA_PLATFORM_ROOT未设置时使用项目ppo目录。数据用途由既有角色文件决定，不能按物理目录名判断。',
                   '未打开ID_TEST_SEALED工作簿；保留holdout只从未被历史GNN和上一轮正式比较消费的V2_TRAIN_POOL工作簿中静态选择，'
                   '其Excel不载入、不运行算法、不用于模型选择。训练、验证、holdout按工作簿隔离。', '',
                   '|既有角色|工作簿数|sheet数|有效唯一sheet数|', '|---|---:|---:|---:|']
