@@ -398,21 +398,6 @@ def fit():
     print('EG_MODEL_SAVED',str(MODEL),'seconds',training_s,flush=True)
     return checkpoint
 
-def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage',choices=('collect','fit','all','summary'))
-    parser.add_argument('--workers',type=int,default=4)
-    args=parser.parse_args()
-    if args.workers<1:parser.error('--workers must be positive')
-    if args.stage in ('collect','all'):collect(args.workers)
-    if args.stage in ('fit','all'):fit()
-    if args.stage=='summary':
-        source=records()
-        print('EG_DATA_SUMMARY',len(source),sum(len(r['groups']) for r in source))
-        if MODEL.exists():
-            checkpoint=torch.load(MODEL,map_location='cpu',weights_only=False)
-            current=checkpoint.get('offline_full_decision',checkpoint['offline'])
-            print('EG_OFFLINE_SUMMARY',json.dumps(current['summary']))
-            for row in current['layouts']:print('EG_OFFLINE_LAYOUT',json.dumps(row))
-
-if __name__=='__main__':main()
+# Historical readers/helpers remain importable; dynamic-search CLI retired.
+if __name__ == '__main__':
+    raise SystemExit('Retired dynamic-split experiment; use scripts/run_gnn_vns_br.py for fixed tasks.')

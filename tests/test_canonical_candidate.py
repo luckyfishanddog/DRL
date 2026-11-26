@@ -297,48 +297,24 @@ def test_all_route_move_types_are_complete_atomic_transforms() -> None:
     assert starred.routes[1].block_ids == ("c::whole", "b::whole")
 
 
-def test_split_activate_switch_deactivate_and_canonical_duplicate_detection() -> None:
-    from dataclasses import replace
-    # This historical transform fixture has 0.4 m children. Keep its numeric
-    # domain explicit while preserving the current 0.50 m rejection.
-    historical_config = replace(CONFIG, min_child_length=0.20)
-    solution = _whole_solution()
-    activated_pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.4, "x40", rail=Rail.UPPER)
-    activate = CandidateMove(
-        _key(MoveType.SPLIT_ACTIVATE, ("a",), 0, 0, (0,), (0, 0), pattern=activated_pattern),
-        split_pattern=activated_pattern,
-    )
-    with pytest.raises(ValueError, match='split child shorter than Lmin'):
-        apply_candidate(solution, activate, CONFIG, x_split_validator=_allow_test_x_split)
-    split_solution = apply_candidate(
-        solution, activate, historical_config, x_split_validator=_allow_test_x_split
-    )
-    assert split_solution.routes[0].block_ids == ("a::0", "b::whole")
-    assert split_solution.routes[1].block_ids[0] == "a::1"
-
-    switched_pattern = SplitPattern("a", SplitKind.X_SPLIT, 0.6, "x60", rail=Rail.UPPER)
-    switch = CandidateMove(
-        _key(MoveType.SPLIT_POINT_SWITCH, ("a",), None, None, (), (), revision=1, pattern=switched_pattern),
-        split_pattern=switched_pattern,
-    )
-    switched = apply_candidate(
-        split_solution, switch, historical_config, x_split_validator=_allow_test_x_split
-    )
-    assert next(pattern for pattern in switched.patterns if pattern.parent_id == "a") == switched_pattern
-
-    deactivate = CandidateMove(
-        _key(MoveType.SPLIT_DEACTIVATE, ("a",), None, 0, (), (0,), revision=2)
-    )
-    whole_again = apply_candidate(
-        switched, deactivate, historical_config, x_split_validator=_allow_test_x_split
-    )
-    assert whole_again.canonical_hash == solution.canonical_hash
-
-    noop_a = CandidateMove(_key(MoveType.INTRA_RELOCATE, ("a",), 0, 0, (0,), (0,)), ("a::whole",))
-    noop_b = CandidateMove(_key(MoveType.INTRA_RELOCATE, ("a",), 0, 0, (0,), (1,)), ("a::whole",))
-    deduplicated = deduplicate_candidates(solution, (noop_a, noop_a, noop_b), historical_config)
-    assert len(deduplicated) == 1
-    assert deduplicated[0][1].canonical_hash == solution.canonical_hash
+def test_fixed_tasks_reject_retired_split_actions_and_keep_route_deduplication():
+    from mrta_reference.fixed_taskset import generate_taskset
+    previous=_whole_solution()
+    ts=generate_taskset(previous.parents,CONFIG)
+    owners={b.split('::')[0]:r.robot_id for r in previous.routes for b in r.block_ids}
+    solution=canonicalize(ts.parents,ts.patterns,
+        {r:tuple(t.task_id for t in ts.tasks if owners[t.source_parent_id]==r) for r in range(4)},CONFIG)
+    pattern=SplitPattern('a',SplitKind.X_SPLIT,.4,'x40',rail=Rail.UPPER)
+    for kind in (MoveType.SPLIT_ACTIVATE,MoveType.SPLIT_POINT_SWITCH,MoveType.SPLIT_DEACTIVATE):
+        concrete=pattern if kind is not MoveType.SPLIT_DEACTIVATE else None
+        move=CandidateMove(_key(kind,('a',),0,0,(0,),(0,),pattern=concrete),split_pattern=concrete)
+        with pytest.raises(ValueError,match='retired|unsupported'):
+            apply_candidate(solution,move,CONFIG)
+        assert solution.patterns==ts.patterns
+    noop_a=CandidateMove(_key(MoveType.INTRA_RELOCATE,('a',),0,0,(0,),(0,)),('a::seg_000',))
+    noop_b=CandidateMove(_key(MoveType.INTRA_RELOCATE,('a',),0,0,(0,),(1,)),('a::seg_000',))
+    deduplicated=deduplicate_candidates(solution,(noop_a,noop_a,noop_b),CONFIG)
+    assert len(deduplicated)==1 and deduplicated[0][1].canonical_hash==solution.canonical_hash
 
 
 def test_candidate_key_requires_sorted_parent_identity() -> None:

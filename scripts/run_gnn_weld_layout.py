@@ -9558,114 +9558,49 @@ def child_joint_evaluate(phase='independent'):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('baselines', 'train', 'test', 'summary', 'beam-validation', 'baseline-summary', 'cmax-value', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'expanded-teachers', 'expanded-dagger', 'owner-cf', 'feedback-train','feedback-continue','feedback-full-validation','feedback-test','feedback-summary','child-feedback','ppo-scale-smoke','ppo-scale-train','ppo-scale-baselines','ppo-scale-validation','ppo-scale-summary','imitation-teachers','imitation-train','imitation-select','imitation-references','imitation-pilot','imitation-summary','imitation-deadlock-pilot','imitation-routeaware-pilot','imitation-loadfirst-screen','imitation-loadfirst-pilot','imitation-priority-diagnosis','imitation-priority-vnd','imitation-conflict-core-pilot','imitation-conflict-load-pilot','imitation-cycle-transfer-pilot','joint3-audit','joint3-train','joint3-validation','joint3-summary','joint3b-train','joint3b-validation','joint3b-summary','joint4-fit','joint4-train','joint4-validation','joint4-summary','cmax-fit','cmax-independent','cmax-validation','cmax-test','cmax-summary','bvns-pilot','bvns-summary','bvns-fit','bvns-trained-train','bvns-trained-summary','bvns-validation','bvns-test','bvns-formal-summary','child-joint-fit','child-joint-independent','child-joint-validation','child-joint-test','child-joint-summary','child-joint-formal-summary','child-construct-fit','child-construct-independent','child-construct-validation','child-construct-summary'))
-    parser.add_argument('--size',type=int,choices=(0,120,500,1000),help='PPO validation model; 0 is the unchanged initialization')
+    parser.add_argument('stage', choices=('baselines', 'summary', 'baseline-summary', 'wag-deadlock-diagnosis', 'hga-alpha-sensitivity', 'hga-alpha-full-budget', 'hga-route-vnd', 'feedback-summary', 'ppo-scale-summary', 'imitation-summary', 'joint3-audit', 'joint3-summary', 'joint3b-summary', 'joint4-summary', 'cmax-summary', 'bvns-summary', 'bvns-trained-summary', 'bvns-formal-summary', 'child-joint-summary', 'child-joint-formal-summary', 'child-construct-summary'))
     parser.add_argument('--workers', type=int, default=4, help='parallel runs or TRAIN teacher processes')
-    parser.add_argument('--resume-unresolved',action='store_true',help='continue unresolved deadlock cases within the original 12-candidate budget')
     parser.add_argument('--method', choices=tuple(BASELINES), help='limit the baseline stage to one method')
     parser.add_argument('--split', choices=('train', 'validation', 'test'), default='validation', help='baseline dataset')
     parser.add_argument('--representative', action='store_true', help='small/median/large layouts, first seed only')
-    parser.add_argument('--rounds', type=int, choices=(1, 2, 3), default=3, help='maximum feedback rounds; stop if validation does not improve')
     parser.add_argument('--time-limit', type=float, choices=(EQUAL_TIME_LIMIT,),
                         help='120-second TEST comparison; omit for the original full iteration budget')
     args = parser.parse_args()
     if args.time_limit is not None and args.stage not in ('baselines', 'baseline-summary'):
         parser.error('--time-limit is only supported by baselines and baseline-summary')
     configure_cpu()
-    if args.stage=='child-construct-fit':
-        child_joint_fit(construction_supervised=True)
-    elif args.stage in ('child-construct-independent','child-construct-validation'):
-        child_construct_evaluate(args.stage.removeprefix('child-construct-'))
-    elif args.stage=='child-construct-summary':
+    if args.stage=='child-construct-summary':
         print('CHILD_CONSTRUCT_SUMMARY',json.dumps(child_construct_summary(),ensure_ascii=False),flush=True)
-    elif args.stage=='child-joint-fit':
-        child_joint_fit()
-    elif args.stage in ('child-joint-independent','child-joint-validation','child-joint-test'):
-        child_joint_evaluate(args.stage.removeprefix('child-joint-'))
     elif args.stage=='child-joint-summary':
         print('CHILD_JOINT_SUMMARY',json.dumps(child_joint_summary(),ensure_ascii=False),flush=True)
     elif args.stage=='child-joint-formal-summary':
         if args.split=='train':parser.error('child-joint formal summary requires validation or test')
         print('CHILD_JOINT_FORMAL_SUMMARY',json.dumps(bvns_formal_summary(args.split,
             results_path=CHILD_JOINT_RESULTS,method=CHILD_JOINT_METHODS[1]),ensure_ascii=False),flush=True)
-    elif args.stage == 'bvns-pilot':
-        bvns_pilot()
     elif args.stage == 'bvns-summary':
         print('BVNS_SUMMARY',json.dumps(bvns_summary(),ensure_ascii=False),flush=True)
-    elif args.stage == 'bvns-fit':
-        bvns_fit()
-    elif args.stage == 'bvns-trained-train':
-        bvns_trained_train()
     elif args.stage == 'bvns-trained-summary':
         print('BVNS_TRAINED_SUMMARY',json.dumps(bvns_trained_summary(),ensure_ascii=False),flush=True)
-    elif args.stage in ('bvns-validation','bvns-test'):
-        bvns_formal_evaluate(args.stage.removeprefix('bvns-'))
     elif args.stage == 'bvns-formal-summary':
         if args.split=='train':parser.error('BVNS formal summary requires validation or test')
         print('BVNS_FORMAL_SUMMARY',json.dumps(bvns_formal_summary(args.split),ensure_ascii=False),flush=True)
-    elif args.stage == 'cmax-fit':
-        joint4_fit(args.workers, cmax_driven=True)
-    elif args.stage in ('cmax-independent', 'cmax-validation', 'cmax-test'):
-        cmax_evaluate(args.stage.removeprefix('cmax-'))
     elif args.stage == 'cmax-summary':
         print('CMAX_SUMMARY', json.dumps(cmax_summary('independent' if args.split == 'train' else args.split),
                                        ensure_ascii=False), flush=True)
     elif args.stage == 'joint3-audit':
         print('JOINT3_AUDIT', json.dumps(joint3_provenance(), ensure_ascii=False), flush=True)
-    elif args.stage == 'joint3-train':
-        joint3_train()
-    elif args.stage == 'joint3-validation':
-        joint3_validation(args.workers)
     elif args.stage == 'joint3-summary':
         print('JOINT3_SUMMARY', json.dumps(joint3_summary(), ensure_ascii=False), flush=True)
-    elif args.stage == 'joint3b-train':
-        joint3b_train_stage(args.workers)
-    elif args.stage == 'joint3b-validation':
-        joint3b_validation(args.workers)
     elif args.stage == 'joint3b-summary':
         print('JOINT3B_SUMMARY', json.dumps(joint3b_summary(phase=args.split), ensure_ascii=False), flush=True)
-    elif args.stage == 'joint4-fit':
-        joint4_fit(args.workers)
-    elif args.stage == 'joint4-train':
-        joint4_train_stage(args.workers)
-    elif args.stage == 'joint4-validation':
-        joint4_validation(args.workers)
     elif args.stage == 'joint4-summary':
         print('JOINT4_SUMMARY', json.dumps(joint4_summary(phase=args.split), ensure_ascii=False), flush=True)
-    elif args.stage == 'imitation-cycle-transfer-pilot':imitation_cycle_transfer_pilot()
-    elif args.stage == 'imitation-conflict-load-pilot':imitation_conflict_load_pilot()
-    elif args.stage == 'imitation-conflict-core-pilot':imitation_conflict_core_pilot()
-    elif args.stage in ('imitation-priority-vnd','imitation-deadlock-pilot'):priority_pilot()
-    elif args.stage == 'imitation-priority-diagnosis':priority_history_diagnosis()
-    elif args.stage == 'imitation-loadfirst-screen':imitation_loadfirst_pilot(screen_only=True)
-    elif args.stage == 'imitation-loadfirst-pilot':imitation_loadfirst_pilot()
-    elif args.stage == 'imitation-routeaware-pilot':imitation_routeaware_pilot()
-    elif args.stage == 'imitation-teachers':imitation_teachers(args.workers)
-    elif args.stage == 'imitation-train':imitation_train()
-    elif args.stage == 'imitation-select':imitation_select()
-    elif args.stage == 'imitation-references':imitation_references()
-    elif args.stage == 'imitation-pilot':imitation_pilot()
-    elif args.stage == 'imitation-summary':imitation_summary()
-    elif args.stage == 'ppo-scale-smoke':ppo_smoke()
-    elif args.stage == 'ppo-scale-train':ppo_train(args.workers)
-    elif args.stage == 'ppo-scale-baselines':ppo_baselines(args.workers)
-    elif args.stage == 'ppo-scale-validation':ppo_validation(args.workers,args.size)
-    elif args.stage == 'ppo-scale-summary':ppo_summary()
-    elif args.stage == 'child-feedback':
-        saved=child_feedback_experiment(args.workers)
-        if not CHILD_MODEL.exists() and saved['training_complete']:
-            with CHILD_MODEL.open('xb') as stream:
-                torch.save(saved,stream)
-    elif args.stage == 'feedback-train':
-        train_feedback(args.workers, args.rounds)
-    elif args.stage == 'feedback-continue':
-        train_feedback(args.workers, args.rounds, expanded=True)
-    elif args.stage == 'feedback-full-validation':
-        validate_feedback_complete(args.workers)
+    elif args.stage == 'imitation-summary':
+        imitation_summary()
+    elif args.stage == 'ppo-scale-summary':
+        ppo_summary()
     elif args.stage == 'feedback-summary':
         summarize_feedback(split=args.split)
-    elif args.stage == 'feedback-test':
-        test_feedback(args.workers)
     elif args.stage == 'baselines':
         run_baselines(args.workers, args.method, split=args.split, representative=args.representative,
                       time_limit=args.time_limit)
@@ -9675,24 +9610,10 @@ def main():
         hga_alpha_sensitivity(full_budget=True)
     elif args.stage == 'hga-route-vnd':
         hga_route_vnd_experiment()
-    elif args.stage == 'train':
-        train(args.workers)
-    elif args.stage == 'test':
-        test(args.workers)
-    elif args.stage == 'beam-validation':
-        beam_validation(args.workers)
     elif args.stage == 'baseline-summary':
         summarize_optimized_baselines(time_limit=args.time_limit)
     elif args.stage == 'wag-deadlock-diagnosis':
         diagnose_wag_deadlocks(args.workers)
-    elif args.stage == 'cmax-value':
-        cmax_value_experiment(args.workers)
-    elif args.stage == 'expanded-teachers':
-        expanded_teachers(args.workers)
-    elif args.stage == 'expanded-dagger':
-        expanded_dagger_experiment(args.workers)
-    elif args.stage == 'owner-cf':
-        owner_cf_experiment(args.workers)
     else:
         write_comparison()
 

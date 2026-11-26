@@ -35,12 +35,12 @@ def apply_candidate(
     destination = key.destination_robot_id
     if candidate.split_pattern is None:
         if key.split_pattern_id is not None or key.split_point_id is not None:
-            raise ValueError("candidate key declares split identity without a split pattern")
-    elif (
-        key.split_pattern_id != candidate.split_pattern.pattern_id
-        or key.split_point_id != candidate.split_pattern.point_id
-    ):
-        raise ValueError("candidate split identity does not match CandidateKey")
+            raise ValueError('candidate key declares split identity without a split pattern')
+    elif (key.split_pattern_id != candidate.split_pattern.pattern_id
+          or key.split_point_id != candidate.split_pattern.point_id):
+        raise ValueError('candidate split identity does not match CandidateKey')
+    if candidate.split_pattern is not None:
+        raise ValueError('dynamic split search is retired; task boundaries cannot change')
 
     if key.move_type in (MoveType.INTRA_RELOCATE, MoveType.INTER_RELOCATE):
         if source is None or destination is None or len(key.source_positions) != 1 or len(key.destination_positions) != 1:
@@ -78,59 +78,12 @@ def apply_candidate(
             (_parent_id(block) for block in routes[source][a:] + routes[destination][b:]),
         )
         routes[source][a:], routes[destination][b:] = routes[destination][b:], routes[source][a:]
-    elif key.move_type is MoveType.SPLIT_ACTIVATE:
-        pattern = candidate.split_pattern
-        if pattern is None or pattern.kind is SplitKind.WHOLE or source is None or destination is None:
-            raise ValueError("split activation requires a concrete non-WHOLE pattern and destinations")
-        required_destinations = 2 if pattern.kind is SplitKind.X_SPLIT else 1
-        if len(key.source_positions) != 1 or len(key.destination_positions) != required_destinations:
-            raise ValueError("split activation requires exact positions")
-        _require_affected(candidate, (pattern.parent_id,))
-        whole = f"{pattern.parent_id}::whole"
-        if routes[source][key.source_positions[0]] != whole:
-            raise ValueError("split activation source is not the parent WHOLE block")
-        if pattern.kind is SplitKind.X_SPLIT:
-            routes[source].pop(key.source_positions[0])
-            assert pattern.rail is not None
-            left_robot, right_robot = ((0, 1) if pattern.rail.value == "UPPER" else (2, 3))
-            routes[left_robot].insert(key.destination_positions[0], f"{pattern.parent_id}::0")
-            routes[right_robot].insert(key.destination_positions[1], f"{pattern.parent_id}::1")
-        else:
-            routes[source][key.source_positions[0]] = f"{pattern.parent_id}::0"
-            routes[destination].insert(key.destination_positions[0], f"{pattern.parent_id}::1")
-    elif key.move_type is MoveType.SPLIT_DEACTIVATE:
-        parent_id = key.affected_parent_ids[0]
-        _require_affected(candidate, (parent_id,))
-        occurrences: list[tuple[int, int]] = []
-        for robot, route in enumerate(routes):
-            for position, block_id in enumerate(route):
-                if block_id in (f"{parent_id}::0", f"{parent_id}::1"):
-                    occurrences.append((robot, position))
-        if len(occurrences) != 2 or destination is None or len(key.destination_positions) != 1:
-            raise ValueError("split deactivation requires both children and one exact destination")
-        for robot, position in sorted(occurrences, reverse=True):
-            routes[robot].pop(position)
-        routes[destination].insert(key.destination_positions[0], f"{parent_id}::whole")
-    elif key.move_type is MoveType.SPLIT_POINT_SWITCH:
-        pattern = candidate.split_pattern
-        if pattern is None or pattern.kind is SplitKind.WHOLE:
-            raise ValueError("split point switch requires a concrete split pattern")
-        _require_affected(candidate, (pattern.parent_id,))
-        # Canonical child identities remain rank-based; only geometry changes.
     else:
         raise ValueError(f"unsupported move type: {key.move_type}")
 
-    patterns = {pattern.parent_id: pattern for pattern in solution.patterns}
-    if key.move_type in (MoveType.SPLIT_ACTIVATE, MoveType.SPLIT_POINT_SWITCH):
-        assert candidate.split_pattern is not None
-        patterns[candidate.split_pattern.parent_id] = candidate.split_pattern
-    elif key.move_type is MoveType.SPLIT_DEACTIVATE:
-        parent_id = key.affected_parent_ids[0]
-        patterns[parent_id] = SplitPattern(parent_id, SplitKind.WHOLE)
-
     return canonicalize(
         solution.parents,
-        tuple(patterns.values()),
+        solution.patterns,
         tuple(Route(robot, tuple(routes[robot])) for robot in range(4)),
         config,
         revision=solution.revision + 1,

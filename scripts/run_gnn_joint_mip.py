@@ -220,11 +220,10 @@ def run_experiment():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('pilot', 'summary'))
+    parser.add_argument('command', choices=('summary',))
     parser.add_argument('--split', choices=('pilot', 'validation'), default='pilot')
     args = parser.parse_args()
-    if args.command == 'summary': summarize(args.split)
-    else: run_experiment()
+    summarize(args.split)
 
 
 if __name__ == '__main__': main()

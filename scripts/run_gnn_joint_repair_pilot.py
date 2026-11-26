@@ -887,49 +887,6 @@ def evaluate_parent_selection(model,args,*,previous_rows=()):
     print('Saved',output,'and appended',REPORT,flush=True)
     return rows
 
-
-def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--phase',choices=('all','data','train','eval','wait-eval','parent-eval'),default='all')
-    parser.add_argument('--parent-allow-current-initial',action='store_true',
-                        help='allow a current Beam initial differing from the historical V2 input')
-    parser.add_argument('--seed',type=int,default=20261027)
-    parser.add_argument('--epochs',type=int,default=30)
-    parser.add_argument('--train-attempts',type=int,default=3)
-    parser.add_argument('--eval-attempts',type=int,default=8)
-    parser.add_argument('--dev-instances',nargs='+',choices=oriented.NAMES,default=list(oriented.NAMES))
-    args=parser.parse_args()
-    torch.set_num_threads(1)
-    torch.manual_seed(args.seed);random.seed(args.seed)
-    records=None;generation=[];smoke=[]
-    if args.phase in ('all','data'):
-        records,generation,smoke=generate_data(args)
-        print('DATA FINISHED',len(records),'trajectories',flush=True)
-        if args.phase=='data':
-            return
-    if args.phase in ('all','train'):
-        if records is None:
-            records=[json.loads(line) for line in DATA.read_text(encoding='utf-8').splitlines() if line.strip()]
-            if REPORT.exists() and '```json\n' in REPORT.read_text(encoding='utf-8'):
-                generation=json.loads(REPORT.read_text(encoding='utf-8').split('```json\n',1)[1].split('\n```',1)[0])['generation']
-        model,stats=train_model(records,args,args.epochs)
-        checkpoint=dict(state_dict=model.state_dict(),hidden_dim=64,heads=4,seed=args.seed,epochs=args.epochs,
-                        insertion_limit=8,normalize_inputs=True,training=stats,generation=generation,smoke=smoke)
-        torch.save(checkpoint,MODEL)
-        print('MODEL SAVED',MODEL,flush=True)
-        if args.phase=='train':
-            return
-    else:
-        checkpoint=torch.load(MODEL,map_location='cpu',weights_only=True)
-        model=JointInsertionGNN(checkpoint['hidden_dim'],checkpoint['heads'],normalize_inputs=checkpoint.get('normalize_inputs',False))
-        model.load_state_dict(checkpoint['state_dict'])
-    if args.phase=='wait-eval':
-        evaluate_wait(model,args)
-    elif args.phase=='parent-eval':
-        evaluate_parent_selection(model,args)
-    else:
-        evaluate(model,checkpoint,args)
-
-
-if __name__=='__main__':
-    main()
+# Historical readers/helpers remain importable; dynamic-search CLI retired.
+if __name__ == '__main__':
+    raise SystemExit('Retired dynamic-split experiment; use scripts/run_gnn_vns_br.py for fixed tasks.')

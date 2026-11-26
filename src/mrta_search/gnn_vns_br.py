@@ -22,6 +22,7 @@ from mrta_baselines.hga import (
     _oriented_route_cost, _put_oriented, _repair_oriented_first,
 )
 from mrta_baselines.wag_vns import _priority_arrays
+from mrta_reference.fixed_taskset import FixedTaskset
 from mrta_reference.model import ScientificConfig
 from mrta_reference.scope import FORMAL_SCOPE_V2
 
@@ -31,7 +32,7 @@ class BRConfig:
     alpha: int = 8
     anchors: int = 12
     candidates: int = 40
-    top_k: int = 8
+    top_k: int = 3
     max_rounds: int = 200
     perturbations: int = 3
     initial_attempts: int = 10
@@ -83,6 +84,7 @@ class LocalGraph:
     nodes: torch.Tensor
     edges: torch.Tensor
     relations: torch.Tensor
+    edge_attr: torch.Tensor
     action_nodes: torch.Tensor
     action_features: torch.Tensor
 
@@ -90,11 +92,11 @@ class LocalGraph:
 # Each column is a physical quantity or a one-hot categorical observation.
 NODE_FEATURES = (
     'is_job', 'is_robot', 'start_x', 'start_y', 'end_x', 'end_y',
-    'center_x', 'center_y', 'length', 'processing_time',
-    'eligible_0', 'eligible_1', 'eligible_2', 'eligible_3',
-    'owner_0', 'owner_1', 'owner_2', 'owner_3', 'route_position',
-    'direction', 'robot_processing_load', 'robot_completion', 'robot_empty_time',
+    'length', 'route_position', 'direction',
+    'robot_id_0', 'robot_id_1', 'robot_id_2', 'robot_id_3',
+    'robot_processing_load', 'robot_completion', 'robot_empty_time',
 )
+EDGE_FEATURES = ('can_execute', 'is_current_owner', 'directed_empty_time')
 ACTION_FEATURES = (
     'M1', 'M2', 'M3', 'M4', 'M5', 'M6',
     'source_load', 'target_load', 'source_completion', 'target_completion',
@@ -115,20 +117,21 @@ class SparseGATLayer(nn.Module):
         self.linear = nn.Linear(input_dim, hidden, bias=False)
         self.source = nn.Parameter(torch.empty(heads, self.width))
         self.destination = nn.Parameter(torch.empty(heads, self.width))
-        # self, reachability, assignment, parent adjacency, route, geometry
+        # self, job-robot, parent adjacency, successor, predecessor, spatial
         self.relation = nn.Embedding(6, heads)
+        self.edge_bias = nn.Linear(len(EDGE_FEATURES), heads, bias=False)
         self.bias = nn.Parameter(torch.zeros(hidden))
         nn.init.xavier_uniform_(self.source)
         nn.init.xavier_uniform_(self.destination)
         nn.init.zeros_(self.relation.weight)
 
-    def forward(self, x, edges, relations):
+    def forward(self, x, edges, relations, edge_attr):
         h = self.linear(x).reshape(len(x), self.heads, self.width)
         source, destination = edges
         logits = F.leaky_relu(
             (h[source] * self.source).sum(-1)
             + (h[destination] * self.destination).sum(-1)
-            + self.relation(relations), .2)
+            + self.relation(relations) + self.edge_bias(edge_attr), .2)
         index = destination[:, None].expand(-1, self.heads)
         maximum = logits.new_full((len(x), self.heads), -torch.inf)
         maximum.scatter_reduce_(0, index, logits.detach(), reduce='amax', include_self=True)
@@ -153,8 +156,8 @@ class BottleneckGAT(nn.Module):
             nn.Linear(hidden, 1))
 
     def encode(self, graph):
-        h = F.elu(self.layer1(graph.nodes, graph.edges, graph.relations))
-        return F.elu(self.layer2(h, graph.edges, graph.relations))
+        h = F.elu(self.layer1(graph.nodes, graph.edges, graph.relations, graph.edge_attr))
+        return F.elu(self.layer2(h, graph.edges, graph.relations, graph.edge_attr))
 
     def score(self, graph, embedding):
         involved = embedding[graph.action_nodes].flatten(1)
@@ -168,6 +171,8 @@ class FixedWorkspace:
     """Reuse static fixed-task numeric tables, never HGA's search routines."""
 
     def __init__(self, taskset, config=ScientificConfig()):
+        if not isinstance(taskset, FixedTaskset):
+            raise TypeError('GNN-VNS-BR requires a FixedTaskset with immutable atom boundaries')
         self.taskset, self.config = taskset, config
         self.numeric = _HGAWorkspace(taskset.parents, config, FORMAL_SCOPE_V2,
                                      patterns=taskset.patterns)
@@ -365,75 +370,134 @@ class FixedWorkspace:
 
 
 def candidate_actions(workspace, state, settings, rng):
-    """Bounded spatial proposals, with no exhaustive route-pair enumeration."""
+    """Bounded round-robin budgets across neighborhoods, robots and anchors.
+
+    Directed travel orders each robot's local neighbors. A low route-cost
+    proxy never removes a proposal before GNN scoring and native evaluation.
+    """
     w = workspace.numeric
     heavy = state.bottleneck
-    location = {int(n): (r, i) for r in range(4) for i, n in enumerate(state.routes[r])}
     route = state.routes[heavy]
     if not len(route):
         return []
-    anchor_positions = {0, len(route) - 1}
+    anchors = {0, len(route) - 1}
     longest = sorted(range(len(route)), key=lambda i: (-w.processing[route[i]], i))
-    anchor_positions.update(longest[:max(1, settings.anchors // 3)])
-    remaining = [i for i in range(len(route)) if i not in anchor_positions]
-    anchor_positions.update(rng.sample(remaining, min(len(remaining), max(0, settings.anchors - len(anchor_positions)))))
-    proposals = [[] for _ in range(6)]
-    active = np.array(list(location), np.int64)
-    for iu in sorted(anchor_positions):
-        u = int(route[iu])
-        distance = w.travel[u, active].min(axis=(1, 2))
-        nearest = sorted(zip(distance, active), key=lambda pair: (pair[0], int(pair[1])))
-        same = [int(n) for _, n in nearest if location[int(n)][0] == heavy and int(n) != u][:settings.alpha]
-        other = [int(n) for _, n in nearest if location[int(n)][0] != heavy][:settings.alpha]
-        for v in same:
-            _, iv = location[v]
-            proposals[3].append((heavy, iu, heavy, iv, False, 0))
-        for v in other:
-            rv, iv = location[v]
-            for move in (1, 2, 3, 5, 6):
-                proposals[move - 1].append((heavy, iu, rv, iv, False, 0))
-            proposals[0].append((heavy, iu, rv, iv, True, 0))
-            if w.fixed_stops[u] - w.fixed_starts[u] > 1:
-                for portion in (-1, 1):
-                    for flip in (False, True):
-                        proposals[0].append((heavy, iu, rv, iv, flip, portion))
-            if iv == 0:
-                proposals[0].append((heavy, iu, rv, -1, False, 0))
+    anchors.update(longest[:max(1, settings.anchors // 3)])
+    remaining = [i for i in range(len(route)) if i not in anchors]
+    anchors.update(rng.sample(remaining, min(len(remaining), max(0, settings.anchors - len(anchors)))))
+    anchors = sorted(anchors)
+    # Each target owns one proposal stream per source anchor. Rotating these
+    # streams gives every reachable target/anchor a chance before a repeat.
+    buckets = [dict() for _ in range(6)]
+    def offer(move, rv, iu, iv, flip=False, portion=0):
+        buckets[move - 1].setdefault(rv, {}).setdefault(iu, []).append(
+            (heavy, iu, rv, iv, flip, portion))
+
+    for ordinal, iu in enumerate(anchors):
+        u, du = int(route[iu]), int(state.bits[heavy][iu])
         for rv in range(4):
-            if rv != heavy and not len(state.routes[rv]):
-                proposals[0].append((heavy, iu, rv, -1, False, 0))
-                if w.fixed_stops[u] - w.fixed_starts[u] > 1:
-                    proposals[0].append((heavy, iu, rv, -1, False, 1))
-                    proposals[0].append((heavy, iu, rv, -1, False, -1))
+            target = state.routes[rv]
+            if len(target):
+                distance = w.travel[u, target, du, state.bits[rv]]
+                indices = sorted(range(len(target)), key=lambda j: (float(distance[j]), int(target[j])))
+                if rv == heavy:
+                    for iv in [j for j in indices if j != iu][:settings.alpha]:
+                        offer(4, rv, iu, iv)
+                    continue
+                # Eligibility is considered per operator below. In particular
+                # a movable end atom can have broader eligibility than its job.
+                nearest = indices[:settings.alpha]
+            else:
+                if rv == heavy:
+                    continue
+                nearest = [-1]
+            lo, hi = int(w.fixed_starts[u]), int(w.fixed_stops[u])
+            variants = [(False, 0), (True, 0)]
+            if hi - lo > 1:
+                variants += [(False, 1), (False, -1), (True, 1), (True, -1)]
+            shift = (ordinal + rv) % len(variants)
+            variants = variants[shift:] + variants[:shift]
+            for iv in nearest:
+                for flip, portion in variants:
+                    moved = u if not portion else int(
+                        w.fixed_lookup[lo, lo + 1] if portion == 1 else w.fixed_lookup[hi - 1, hi])
+                    if w.eligible[moved, rv]:
+                        offer(1, rv, iu, iv, flip, portion)
+            if len(target):
+                if w.eligible[u, rv]:
+                    legal = [j for j in indices if w.eligible[target[j], heavy]]
+                    for iv in legal[:settings.alpha]:
+                        offer(2, rv, iu, iv)
+                if iu + 1 < len(route) and np.all(w.eligible[route[iu:iu + 2], rv]):
+                    legal = [j for j in indices if j + 1 < len(target)
+                             and np.all(w.eligible[target[j:j + 2], heavy])]
+                    for iv in legal[:settings.alpha]:
+                        offer(3, rv, iu, iv)
+                if np.all(w.eligible[route[iu + 1:], rv]):
+                    prefix = np.logical_and.accumulate(w.eligible[target, heavy])
+                    suffix = np.logical_and.accumulate(w.eligible[target[::-1], heavy])[::-1]
+                    for iv in [j for j in indices if prefix[j]][:settings.alpha]:
+                        offer(5, rv, iu, iv)
+                    for iv in [j for j in indices if j + 1 == len(target) or suffix[j + 1]][:settings.alpha]:
+                        offer(6, rv, iu, iv)
+                # Retain insertion before the current first job as well.
+                for flip, portion in variants:
+                    moved = u if not portion else int(
+                        w.fixed_lookup[lo, lo + 1] if portion == 1 else w.fixed_lookup[hi - 1, hi])
+                    if w.eligible[moved, rv]:
+                        offer(1, rv, iu, -1, flip, portion)
+
     output = []
-    for move, raw in enumerate(proposals, 1):
-        rng.shuffle(raw)
+    for move, by_target in enumerate(buckets, 1):
+        targets = sorted(by_target)
+        if not targets:
+            continue
+        rotation = rng.randrange(len(targets))
+        targets = targets[rotation:] + targets[:rotation]
+        streams = {rv: {iu: iter(raw) for iu, raw in by_target[rv].items()} for rv in targets}
+        anchor_order = {rv: list(by_target[rv]) for rv in targets}
+        cursors = {rv: 0 for rv in targets}
         candidates, seen = [], set()
-        for ru, iu, rv, iv, flip, portion in raw[:3 * settings.candidates]:
-            action = workspace.apply(state, move, ru, iu, rv, iv, flip, portion)
-            if action is None:
-                continue
-            key = tuple((tuple(r), tuple(d)) for r, d in zip(action.routes, action.bits))
-            if key not in seen:
-                seen.add(key); candidates.append(action)
-        # Cheap local physics provides diversity reduction before GNN scoring;
-        # half the budget remains random so training sees inferior actions.
-        candidates.sort(key=lambda a: (max(a.costs), sum(a.costs)))
-        half = min(len(candidates), (settings.candidates + 1) // 2)
-        selected = candidates[:half]
-        remaining = candidates[half:]
-        selected += rng.sample(remaining, min(len(remaining), settings.candidates - half))
-        output.extend(selected)
+        attempts = 0
+        # This cap bounds array construction even when most transfers are
+        # illegal. Failed proposals still rotate to the next target and anchor.
+        while len(candidates) < settings.candidates and attempts < 8 * settings.candidates:
+            advanced = False
+            for rv in targets:
+                order = anchor_order[rv]
+                descriptor = None
+                while order:
+                    k = cursors[rv] % len(order)
+                    iu = order[k]
+                    descriptor = next(streams[rv][iu], None)
+                    if descriptor is None:
+                        order.pop(k)
+                    else:
+                        cursors[rv] = k + 1
+                        break
+                if descriptor is None:
+                    continue
+                advanced = True; attempts += 1
+                action = workspace.apply(state, move, *descriptor)
+                if action is not None:
+                    key = tuple((tuple(r), tuple(d)) for r, d in zip(action.routes, action.bits))
+                    if key not in seen:
+                        seen.add(key); candidates.append(action)
+                if len(candidates) >= settings.candidates or attempts >= 8 * settings.candidates:
+                    break
+            if not advanced:
+                break
+        output.extend(candidates)
     return output
 
 
 def local_graph(workspace, state, actions):
+    """The shared 16-node-feature/3-edge-feature training/inference path."""
     w = workspace.numeric
     location = {int(n): (r, i) for r in range(4) for i, n in enumerate(state.routes[r])}
     included = set(map(int, state.routes[state.bottleneck]))
     included.update(a.u for a in actions)
     included.update(a.v for a in actions if a.v >= 0)
-    # Include actual predecessors/successors of every scored endpoint.
     for n in tuple(included):
         r, i = location[n]
         included.update(map(int, state.routes[r][max(0, i - 1):i + 2]))
@@ -442,34 +506,46 @@ def local_graph(workspace, state, actions):
     robot_base = len(nodes)
     x = np.zeros((len(nodes) + 4, len(NODE_FEATURES)), np.float32)
     completion = state.completion if state.feasible else state.costs
+    c = workspace.config
+    origin = np.array([c.workspace_x[0], c.workspace_y[0]])
+    span = np.array([c.workspace_x[1] - c.workspace_x[0], c.workspace_y[1] - c.workspace_y[0]])
+    directions = {n: int(state.bits[r][i]) for n, (r, i) in location.items()}
     for n, j in index.items():
         r, i = location[n]
-        x[j, :2] = (1, 0)
-        x[j, 2:8] = np.concatenate((w.points[n].flatten(), workspace.centers[n])) / np.array([20, 12, 20, 12, 20, 12])
-        x[j, 8:10] = (workspace.lengths[n] / 24., w.processing[n] / workspace.scale)
-        x[j, 10:14] = w.eligible[n]
-        x[j, 14 + r] = 1
-        x[j, 18:20] = (i / max(1, len(state.routes[r]) - 1), state.bits[r][i])
-        x[j, 20:23] = np.array([state.loads[r], completion[r], state.costs[r] - state.loads[r]]) / workspace.scale
+        x[j, 0] = 1.
+        x[j, 2:6] = ((w.points[n] - origin) / span).flatten()
+        x[j, 6:9] = (workspace.lengths[n] / 24.,
+                     i / max(1, len(state.routes[r]) - 1), directions[n])
+        # Robot identity and robot state stay zero on every job node.
     for r in range(4):
-        x[robot_base + r, 1] = 1
-        x[robot_base + r, 10 + r] = x[robot_base + r, 14 + r] = 1
-        x[robot_base + r, 20:23] = np.array([state.loads[r], completion[r], state.costs[r] - state.loads[r]]) / workspace.scale
-    edges = {(i, i, 0) for i in range(len(x))}
-    def connect(a, b, relation):
-        edges.add((a, b, relation)); edges.add((b, a, relation))
+        x[robot_base + r, 1] = 1.
+        x[robot_base + r, 9 + r] = 1.
+        x[robot_base + r, 13:16] = np.array([
+            state.loads[r], completion[r], state.costs[r] - state.loads[r]]) / workspace.scale
+
+    edges = {(i, i, 0): (0., 0., 0.) for i in range(len(x))}
+    def job_edge(a, b, relation):
+        travel = float(w.travel[a, b, directions[a], directions[b]]) / workspace.scale
+        edges[index[a], index[b], relation] = (0., 0., travel)
+
     for n, j in index.items():
         r, i = location[n]
-        for robot in np.flatnonzero(w.eligible[n]):
-            connect(j, robot_base + int(robot), 1)
-        connect(j, robot_base + r, 2)
+        # All four robots, including ineligible robots, have explicit edges.
+        for robot in range(4):
+            attr = (float(w.eligible[n, robot]), float(r == robot), 0.)
+            edges[j, robot_base + robot, 1] = attr
+            edges[robot_base + robot, j, 1] = attr
         if i and int(state.routes[r][i - 1]) in index:
-            connect(j, index[int(state.routes[r][i - 1])], 4)
-        neighbors = sorted((float(np.linalg.norm(workspace.centers[n] - workspace.centers[m])), m)
-                           for m in nodes if m != n)[:4]
-        for _, m in neighbors:
-            connect(j, index[m], 5)
-    # Parent adjacency is geometric atom adjacency, irrespective of route order.
+            previous = int(state.routes[r][i - 1])
+            job_edge(previous, n, 3)  # route successor
+            job_edge(n, previous, 4)  # route predecessor, its own directed cost
+        # Sparse spatial transitions use the current exit/entry directions.
+        nearest = sorted((float(w.travel[n, m, directions[n], directions[m]]), m)
+                         for m in nodes if m != n)[:4]
+        for _, m in nearest:
+            job_edge(n, m, 5)
+            job_edge(m, n, 5)  # recompute; the reverse cost is not copied
+
     by_parent = {}
     for n in nodes:
         by_parent.setdefault(int(w.parent_index[n]), []).append(n)
@@ -477,15 +553,18 @@ def local_graph(workspace, state, actions):
         group.sort(key=lambda n: int(w.fixed_starts[n]))
         for a, b in zip(group, group[1:]):
             if w.fixed_stops[a] == w.fixed_starts[b]:
-                connect(index[a], index[b], 3)
+                edges[index[a], index[b], 2] = (0., 0., 0.)
+                edges[index[b], index[a], 2] = (0., 0., 0.)
     ordered = sorted(edges)
     involved = [[index[a.u], index[a.v] if a.v >= 0 else robot_base + a.rv,
                  robot_base + a.ru, robot_base + a.rv] for a in actions]
-    return LocalGraph(torch.from_numpy(x),
-                      torch.tensor([(a, b) for a, b, _ in ordered], dtype=torch.long).t().contiguous(),
-                      torch.tensor([r for _, _, r in ordered], dtype=torch.long),
-                      torch.tensor(involved, dtype=torch.long).reshape(-1, 4),
-                      torch.tensor(np.array([a.features for a in actions]), dtype=torch.float32).reshape(-1, len(ACTION_FEATURES)))
+    return LocalGraph(
+        torch.from_numpy(x),
+        torch.tensor([(a, b) for a, b, _ in ordered], dtype=torch.long).t().contiguous(),
+        torch.tensor([relation for _, _, relation in ordered], dtype=torch.long),
+        torch.tensor([edges[key] for key in ordered], dtype=torch.float32),
+        torch.tensor(involved, dtype=torch.long).reshape(-1, 4),
+        torch.tensor(np.array([a.features for a in actions]), dtype=torch.float32).reshape(-1, len(ACTION_FEATURES)))
 
 
 def ranking_pairs(values, rng, limit=256):
@@ -573,10 +652,10 @@ def run_gnn_vns_br(taskset, model, *, seed, settings=BRConfig(), config=Scientif
         encodings += 1
         improved = False
         evaluated = {}
+        winner = None
         for move in range(1, 7):
             indices = [i for i, a in enumerate(actions) if a.move == move]
             indices.sort(key=lambda i: (-float(scores[i]), i))
-            winner = None
             for i in indices[:settings.top_k]:
                 if time.perf_counter() >= deadline:
                     break
@@ -588,11 +667,12 @@ def run_gnn_vns_br(taskset, model, *, seed, settings=BRConfig(), config=Scientif
                 if candidate.feasible and (not current.feasible or candidate.value < current.value - 1.e-7):
                     if winner is None or candidate.value < winner.value:
                         winner = candidate
-            if winner is not None:
-                current = winner; accepted += 1; improved = True
-                if best is None or current.value < best.value:
-                    best = current
-                break  # recompute bottleneck, encode once, restart at M1
+        if winner is not None:
+            # Compare the native Cmax of all six neighborhoods before moving.
+            # GNN scores determine only which bounded candidates are evaluated.
+            current = winner; accepted += 1; improved = True
+            if best is None or current.value < best.value:
+                best = current
         rounds += 1
         if progress is not None:
             progress(rounds, best.value if best else None, workspace.evaluations)

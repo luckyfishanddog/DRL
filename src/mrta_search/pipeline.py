@@ -314,7 +314,7 @@ def rerank_c3(
 
 
 def decision_family(candidate: CompleteSearchCandidate | ScreenedCandidate | CandidateMove) -> str:
-    """Classify the explicit transition, never patterns retained in the solution."""
+    """Read historical transition families; no split move is generated now."""
     if isinstance(candidate, CompleteSearchCandidate):
         move = candidate.atomic_move
     elif isinstance(candidate, ScreenedCandidate):

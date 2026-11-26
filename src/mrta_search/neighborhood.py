@@ -7,12 +7,7 @@ import time
 
 from mrta_reference.candidate import apply_candidate
 from mrta_reference.geometry import (
-    blocks_for_pattern,
-    build_legal_pattern_catalog,
     finite_x_split_validator,
-    frozen_handover_centers,
-    generate_x_split_patterns,
-    generate_y_split_patterns,
     oriented_endpoints,
     robot_is_eligible,
     whole_eligible_rails,
@@ -130,68 +125,6 @@ def applicable_move_mask(
             for second_robot, second_block in occurrences[index + 1 :]
         )
 
-    activate = False
-    deactivate = False
-    switch = False
-    child_robots = {
-        block_id: robot
-        for robot, route in enumerate(routes)
-        for block_id in route
-    }
-    catalog = (
-        build_legal_pattern_catalog(solution.parents, config, scope)
-        if scope is not None
-        else None
-    )
-    x_up, x_low = frozen_handover_centers(solution.parents, config)
-    for parent_id, pattern in patterns.items():
-        options = None if catalog is None else catalog[parent_id]
-        y_legal = tuple(
-            item for item in (options or generate_y_split_patterns(parents[parent_id], config))
-            if item.kind is SplitKind.Y_SPLIT
-        )
-        x_legal = (
-            tuple(item for item in options if item.kind is SplitKind.X_SPLIT)
-            if options is not None
-            else tuple(
-                    candidate
-                    for rail, center in ((robot_rail(0), x_up), (robot_rail(2), x_low))
-                    for candidate in generate_x_split_patterns(
-                        parents[parent_id], center, config, rail=rail
-                    )
-                )
-            if enable_x_split
-            else ()
-        )
-        legal = y_legal + x_legal
-        if pattern.kind is SplitKind.WHOLE and legal:
-            activate = True
-        elif pattern.kind is not SplitKind.WHOLE:
-            if not pattern.mandatory and whole_eligible_rails(
-                parents[parent_id].start, parents[parent_id].end, config
-            ):
-                deactivate = True
-            alternatives = (
-                y_legal
-                if pattern.kind is SplitKind.Y_SPLIT
-                else tuple(item for item in x_legal if item.rail is pattern.rail)
-            )
-            for alternative in alternatives:
-                if alternative.pattern_id == pattern.pattern_id:
-                    continue
-                alternative_blocks = blocks_for_pattern(
-                    parents[parent_id], alternative, config
-                )
-                if all(
-                    block.block_id in child_robots
-                    and robot_is_eligible(
-                        block, child_robots[block.block_id], config
-                    )
-                    for block in alternative_blocks
-                ):
-                    switch = True
-                    break
-
     return {
         MoveType.INTRA_RELOCATE: intra,
         MoveType.INTER_RELOCATE: inter,
@@ -201,9 +134,6 @@ def applicable_move_mask(
             len(routes[left]) + len(routes[right]) > 0
             for left, right in ((0, 1), (2, 3))
         ),
-        MoveType.SPLIT_ACTIVATE: activate,
-        MoveType.SPLIT_DEACTIVATE: deactivate,
-        MoveType.SPLIT_POINT_SWITCH: switch,
     }
 
 
@@ -226,32 +156,11 @@ def make_raw_candidate(
     enable_x_split: bool = False,
     scope: FormalScope | None = None,
 ) -> RawAttempt:
+    if move not in TRACKED_MOVE_TYPES:
+        return RawAttempt(move, None, "RETIRED_DYNAMIC_MOVE")
     rng = _local_rng(seed, solution.revision, move, ordinal)
     routes = [route.block_ids for route in solution.routes]
     occurrences = [(robot, position, block) for robot, route in enumerate(routes) for position, block in enumerate(route)]
-    parents = {parent.parent_id: parent for parent in solution.parents}
-    patterns = {pattern.parent_id: pattern for pattern in solution.patterns}
-    catalog = (
-        build_legal_pattern_catalog(solution.parents, config, scope)
-        if scope is not None
-        else None
-    )
-    x_up, x_low = frozen_handover_centers(solution.parents, config)
-
-    def x_patterns(parent_id: str) -> tuple[SplitPattern, ...]:
-        if not enable_x_split:
-            return ()
-        if catalog is not None:
-            return tuple(
-                item for item in catalog[parent_id] if item.kind is SplitKind.X_SPLIT
-            )
-        parent = parents[parent_id]
-        return tuple(
-            candidate
-            for rail, center in ((robot_rail(0), x_up), (robot_rail(2), x_low))
-            for candidate in generate_x_split_patterns(parent, center, config, rail=rail)
-        )
-
     def key(
         affected,
         source=None,
@@ -355,139 +264,6 @@ def make_raw_candidate(
                 (destination_cut,),
             )
         )
-    elif move is MoveType.SPLIT_ACTIVATE:
-        choices = []
-        for parent_id, pattern in patterns.items():
-            if pattern.kind is not SplitKind.WHOLE:
-                continue
-            alternatives = (
-                tuple(
-                    item for item in catalog[parent_id]
-                    if item.kind is not SplitKind.WHOLE
-                )
-                if catalog is not None
-                else generate_y_split_patterns(parents[parent_id], config) + x_patterns(parent_id)
-            )
-            if alternatives:
-                location = next(
-                    (
-                        (robot, position)
-                        for robot, route in enumerate(routes)
-                        for position, block in enumerate(route)
-                        if block == f"{parent_id}::whole"
-                    ),
-                    None,
-                )
-                if location is not None:
-                    choices.append((parent_id, alternatives, location))
-        if not choices:
-            return RawAttempt(move, None, "NO_OPTIONAL_Y_ACTIVATION")
-        families = tuple(
-            kind
-            for kind in (SplitKind.Y_SPLIT, SplitKind.X_SPLIT)
-            if any(any(item.kind is kind for item in choice[1]) for choice in choices)
-        )
-        target_kind = families[ordinal % len(families)]
-        family_choices = [
-            choice for choice in choices
-            if any(item.kind is target_kind for item in choice[1])
-        ]
-        parent_id, alternatives, (source_robot, source_position) = rng.choice(family_choices)
-        pattern = rng.choice(tuple(item for item in alternatives if item.kind is target_kind))
-        if pattern.kind is SplitKind.X_SPLIT:
-            assert pattern.rail is not None
-            left_robot, right_robot = ((0, 1) if pattern.rail.value == "UPPER" else (2, 3))
-            left_length = len(routes[left_robot]) - int(source_robot == left_robot)
-            right_length = len(routes[right_robot]) - int(source_robot == right_robot)
-            destination_robot = left_robot
-            destination_positions = (
-                rng.randrange(left_length + 1),
-                rng.randrange(right_length + 1),
-            )
-        else:
-            destination_robot = rng.randrange(4)
-            destination_positions = (rng.randrange(len(routes[destination_robot]) + 1),)
-        candidate = CandidateMove(
-            key(
-                (parent_id,),
-                source_robot,
-                destination_robot,
-                (source_position,),
-                destination_positions,
-                pattern,
-            ),
-            (f"{parent_id}::whole",),
-            pattern,
-        )
-    elif move is MoveType.SPLIT_DEACTIVATE:
-        choices = [
-            pattern
-            for pattern in solution.patterns
-            if pattern.kind is not SplitKind.WHOLE and not pattern.mandatory
-        ]
-        if not choices:
-            return RawAttempt(move, None, "NO_OPTIONAL_Y_DEACTIVATION")
-        pattern = rng.choice(choices)
-        eligible_robots = [
-            robot
-            for robot in range(4)
-            if robot_rail(robot)
-            in whole_eligible_rails(
-                parents[pattern.parent_id].start,
-                parents[pattern.parent_id].end,
-                config,
-            )
-        ]
-        destination_robot = rng.choice(eligible_robots)
-        destination_position = rng.randrange(len(routes[destination_robot]) + 1)
-        candidate = CandidateMove(
-            key(
-                (pattern.parent_id,),
-                None,
-                destination_robot,
-                (),
-                (destination_position,),
-            )
-        )
-    elif move is MoveType.SPLIT_POINT_SWITCH:
-        choices = []
-        for pattern in solution.patterns:
-            if pattern.kind is SplitKind.WHOLE:
-                continue
-            family = (
-                tuple(
-                    item for item in catalog[pattern.parent_id]
-                    if item.kind is not SplitKind.WHOLE
-                )
-                if catalog is not None
-                else (
-                    generate_y_split_patterns(parents[pattern.parent_id], config)
-                    if pattern.kind is SplitKind.Y_SPLIT
-                    else tuple(item for item in x_patterns(pattern.parent_id) if item.rail is pattern.rail)
-                )
-            )
-            alternatives = tuple(
-                item
-                for item in family
-                if item.pattern_id != pattern.pattern_id
-            )
-            if alternatives:
-                choices.append((pattern, alternatives))
-        if not choices:
-            return RawAttempt(move, None, "NO_Y_POINT_SWITCH")
-        families = tuple(
-            kind
-            for kind in (SplitKind.Y_SPLIT, SplitKind.X_SPLIT)
-            if any(any(item.kind is kind for item in choice[1]) for choice in choices)
-        )
-        target_kind = families[ordinal % len(families)]
-        family_choices = [
-            choice for choice in choices
-            if any(item.kind is target_kind for item in choice[1])
-        ]
-        old, alternatives = rng.choice(family_choices)
-        pattern = rng.choice(tuple(item for item in alternatives if item.kind is target_kind))
-        candidate = CandidateMove(key((old.parent_id,), pattern=pattern), split_pattern=pattern)
     else:
         return RawAttempt(move, None, "INACTIVE_MOVE")
     return RawAttempt(move, candidate)
@@ -628,37 +404,8 @@ def _obvious_move_error(
             and 0 <= destination_cut <= len(routes[destination])
         ):
             return "2-opt* cut index out of range"
-    elif key.move_type is MoveType.SPLIT_ACTIVATE:
-        required_destinations = (
-            2
-            if candidate.split_pattern is not None
-            and candidate.split_pattern.kind is SplitKind.X_SPLIT
-            else 1
-        )
-        if source is None or destination is None or len(key.source_positions) != 1 or len(key.destination_positions) != required_destinations:
-            return "bad split activation shape"
-        src = key.source_positions[0]
-        if src >= len(routes[source]):
-            return "split activation route index out of range"
-        if required_destinations == 2:
-            assert candidate.split_pattern is not None and candidate.split_pattern.rail is not None
-            left_robot, right_robot = ((0, 1) if candidate.split_pattern.rail.value == "UPPER" else (2, 3))
-            limits = (
-                len(routes[left_robot]) - int(source == left_robot),
-                len(routes[right_robot]) - int(source == right_robot),
-            )
-            if any(position > limit for position, limit in zip(key.destination_positions, limits)):
-                return "split activation route index out of range"
-        elif key.destination_positions[0] > len(routes[destination]):
-            return "split activation route index out of range"
-    elif key.move_type is MoveType.SPLIT_DEACTIVATE:
-        if destination is None or len(key.destination_positions) != 1:
-            return "bad split deactivation shape"
-        parent_id = key.affected_parent_ids[0]
-        child_ids = {f"{parent_id}::0", f"{parent_id}::1"}
-        remaining = sum(block not in child_ids for block in routes[destination])
-        if key.destination_positions[0] > remaining:
-            return "split deactivation route index out of range"
+    else:
+        return "retired dynamic or unsupported move"
     return None
 
 
@@ -692,6 +439,10 @@ def screen_raw_attempts(
         if candidate is None:
             emit(attempt, "RAW_REJECTED", attempt.rejection_reason)
             continue
+        if attempt.move_type not in TRACKED_MOVE_TYPES:
+            stats.rejection_reasons["RETIRED_DYNAMIC_MOVE"] += 1
+            emit(attempt, "CONSTRUCTION_REJECTED", "RETIRED_DYNAMIC_MOVE")
+            continue
         move_name = attempt.move_type.value
         if candidate.key in seen_keys:
             stats.duplicates += 1
@@ -705,24 +456,6 @@ def screen_raw_attempts(
             stats.rejection_reasons[f"CHEAP_INVALID:{obvious_error}"] += 1
             emit(attempt, "CONSTRUCTION_REJECTED", obvious_error)
             continue
-        if (
-            candidate.split_pattern is not None
-            and candidate.split_pattern.kind is SplitKind.X_SPLIT
-            and not enable_x_split
-        ):
-            stats.rejection_reasons["X_SPLIT_FORBIDDEN"] += 1
-            emit(attempt, "CONSTRUCTION_REJECTED", "X_SPLIT_FORBIDDEN")
-            continue
-        if candidate.key.move_type is MoveType.SPLIT_DEACTIVATE:
-            pattern = next(
-                item
-                for item in current.patterns
-                if item.parent_id == candidate.key.affected_parent_ids[0]
-            )
-            if pattern.mandatory:
-                stats.rejection_reasons["MANDATORY_Y_CANNOT_DEACTIVATE"] += 1
-                emit(attempt, "CONSTRUCTION_REJECTED", "MANDATORY_Y_CANNOT_DEACTIVATE")
-                continue
         try:
             provisional = apply_candidate(
                 current,

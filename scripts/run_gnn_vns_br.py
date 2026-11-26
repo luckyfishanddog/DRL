@@ -1,4 +1,4 @@
-"""TRAIN-only supervised GAT learning and independent GNN-VNS-BR experiments."""
+"""Edge-aware GNN-VNS-BR: TRAIN supervision and bounded TRAIN smoke runs."""
 from __future__ import annotations
 
 import argparse
@@ -28,7 +28,7 @@ from numba import set_num_threads
 from mrta_reference.scheduler import reference_schedule_formal
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_search.gnn_vns_br import (
-    ACTION_FEATURES, NODE_FEATURES, BRConfig, BottleneckGAT, FixedWorkspace,
+    ACTION_FEATURES, EDGE_FEATURES, NODE_FEATURES, BRConfig, BottleneckGAT, FixedWorkspace,
     candidate_actions, local_graph, ranking_pairs, run_gnn_vns_br, train_ranker,
 )
 from run_fixed_taskset_experiment import (
@@ -36,10 +36,10 @@ from run_fixed_taskset_experiment import (
     read_rows as read_baselines, solution_record,
 )
 
-WEIGHTS = ROOT / 'models/gnn_vns_br.pt'
-CSV = RESULTS / 'gnn_vns_br.csv'
+WEIGHTS = ROOT / 'models/gnn_vns_br_edgeaware.pt'
+CSV = ROOT / 'results/new_dataset_final/gnn_vns_br_edgeaware.csv'
 OUTPUT_FIELDS = ('trial', *FIELDS)
-SECTION = '\n## GNN-VNS-BR 监督排序与瓶颈重构\n'
+SECTION = '\n## GNN-VNS-BR 边特征与搜索改进（TRAIN Smoke）\n'
 
 
 def read_results():
@@ -64,12 +64,11 @@ def append_result(row):
         stream.flush()
 
 
-def build_supervision(*, seed=20261126, states_per_teacher=2, progress=print):
-    """Use best completed B32-feasible TRAIN rows from each existing method.
+def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig(), progress=print):
+    """Use TRAIN teachers, independent greedy starts, and one legal perturbation.
 
-    The second state is one legal neighborhood perturbation. Candidate labels
-    are actual native priority schedules. No VALIDATION/TEST labels are read.
-    Samples remain in memory; only training counts go into the checkpoint.
+    Candidate budgets and graph construction are identical to online search.
+    Labels stay in memory; no validation/test state is turned into a label.
     """
     rng = random.Random(seed)
     tasksets = {name: ts for split, name, ts in load_tasksets() if split == 'train'}
@@ -84,23 +83,29 @@ def build_supervision(*, seed=20261126, states_per_teacher=2, progress=print):
             old = teachers.get(key)
             if old is None or float(row['cmax_s']) < float(old['cmax_s']):
                 teachers[key] = row
-    settings = replace(BRConfig(), anchors=8, candidates=8)
     examples = []
-    stats = dict(source_split='train', teacher_solutions=0, states=0,
-                 candidate_labels=0, feasible_labels=0, infeasible_labels=0,
+    stats = dict(source_split='train', teacher_solutions=0, greedy_initializations=0,
+                 states=0, candidate_labels=0, feasible_labels=0, infeasible_labels=0,
                  pairs=0, duplicate_states_skipped=0, uninformative_states=0,
-                 layouts=[], source_methods=['wag_vns', 'hga'])
+                 layouts=[], state_sources={'wag_vns':0, 'hga':0, 'greedy':0},
+                 perturbed_states=0, candidate_parameters=asdict(settings))
     started = time.perf_counter()
     for name in sorted(tasksets):
         workspace = FixedWorkspace(tasksets[name], CONFIG)
         identities = set()
+        sources = []
         for method in ('wag_vns', 'hga'):
             row = teachers.get((name, method))
-            if row is None:
-                continue
-            current = workspace.restore(json.loads(row['solution']))
-            stats['teacher_solutions'] += 1
-            for perturbation in range(states_per_teacher):
+            if row is not None:
+                sources.append((method, workspace.restore(json.loads(row['solution']))))
+                stats['teacher_solutions'] += 1
+        greedy = workspace.initialize(rng, settings, time.perf_counter() + settings.time_limit)
+        if greedy is not None:
+            sources.append(('greedy', greedy))
+            stats['greedy_initializations'] += 1
+        for source, initial in sources:
+            current = initial
+            for perturbation in range(states_per_source):
                 actions = candidate_actions(workspace, current, settings, rng)
                 if perturbation and actions:
                     action = rng.choice(actions)
@@ -121,12 +126,13 @@ def build_supervision(*, seed=20261126, states_per_teacher=2, progress=print):
                 if not len(pairs):
                     stats['uninformative_states'] += 1
                     continue
-                graph = local_graph(workspace, current, actions)
-                examples.append((name, graph, pairs))
+                examples.append((name, local_graph(workspace, current, actions), pairs))
                 stats['states'] += 1
+                stats['state_sources'][source] += 1
+                stats['perturbed_states'] += int(perturbation > 0)
                 stats['pairs'] += len(pairs)
         stats['layouts'].append(name)
-        progress('BR_LABELS', name, {k: stats[k] for k in ('states', 'candidate_labels', 'pairs')},
+        progress('BR_LABELS', name, {k:stats[k] for k in ('states','candidate_labels','pairs')},
                  'elapsed_s', round(time.perf_counter() - started, 3))
     stats['label_generation_s'] = time.perf_counter() - started
     if not examples:
@@ -137,18 +143,17 @@ def build_supervision(*, seed=20261126, states_per_teacher=2, progress=print):
 def train(args):
     if WEIGHTS.exists() and not args.retrain:
         raise FileExistsError('model exists; use --retrain only for a documented TRAIN/VALIDATION correction')
-    if any(r['split'] == 'test' for r in read_results()):
-        raise ValueError('TEST has started: the evaluated model cannot be retrained')
     started = time.perf_counter()
-    examples, data = build_supervision(seed=args.training_seed)
+    settings = BRConfig()
+    examples, data = build_supervision(seed=args.training_seed, settings=settings)
     model, learning = train_ranker(examples, seed=args.training_seed, epochs=args.epochs)
     training = dict(data=data, learning=learning, seed=args.training_seed,
                     total_offline_s=time.perf_counter() - started,
                     training_s=time.perf_counter() - started - data['label_generation_s'],
                     validation_used_for_labels=False, test_used_for_labels=False)
     checkpoint = dict(model=model.state_dict(), training=training,
-                      settings=asdict(BRConfig()), node_features=NODE_FEATURES,
-                      action_features=ACTION_FEATURES)
+                      settings=asdict(settings), node_features=NODE_FEATURES,
+                      edge_features=EDGE_FEATURES, action_features=ACTION_FEATURES)
     # The one approved weight file contains the model and its actual training
     # record, with no optimizer, duplicate snapshots or sample sidecars.
     payload = io.BytesIO()
@@ -162,6 +167,9 @@ def train(args):
 
 def load_model():
     checkpoint = torch.load(WEIGHTS, map_location='cpu', weights_only=False)
+    if (tuple(checkpoint.get('node_features', ())) != NODE_FEATURES
+            or tuple(checkpoint.get('edge_features', ())) != EDGE_FEATURES):
+        raise ValueError('this entry requires the independent 16-node/3-edge-feature model')
     model = BottleneckGAT()
     model.load_state_dict(checkpoint['model'])
     model.eval()
@@ -169,6 +177,8 @@ def load_model():
 
 
 def run_one(split, name, taskset, seed, *, trial='main', time_limit=None, model=None, checkpoint=None):
+    if split != 'train':
+        raise ValueError('this round runs TRAIN smoke only; VALIDATION and TEST are untouched')
     started = time.perf_counter()
     if model is None:
         model, checkpoint = load_model()
@@ -188,9 +198,9 @@ def run_one(split, name, taskset, seed, *, trial='main', time_limit=None, model=
                       formal_diagnostics=schedule.diagnostics,
                       native_feasible=state.feasible, selected_epoch=checkpoint['training']['learning']['selected_epoch'],
                       offline_training_s=checkpoint['training']['total_offline_s'],
-                      input_adapter='INDEPENDENT_FIXED_GREEDY_GAT_BOTTLENECK_VNS',
+                      input_adapter='FIXED_EDGE_GAT_STRATIFIED_BEST_IMPROVEMENT',
                       single_thread=True, cold_jit_included=True)
-    row = dict(trial=trial, split=split, layout_id=name, seed=seed, method='gnn_vns_br',
+    row = dict(trial=trial, split=split, layout_id=name, seed=seed, method='gnn_vns_br_edgeaware',
                status=schedule.status.value, cmax_s=schedule.cmax if schedule.feasible else None,
                native_cmax_s=state.value if state.feasible else None,
                runtime_s=time.perf_counter() - started, iterations=diagnostic['rounds'],
@@ -201,107 +211,61 @@ def run_one(split, name, taskset, seed, *, trial='main', time_limit=None, model=
     return row
 
 
-def experiment(args, split):
-    if split == 'test':
-        comparison = compare('validation', trial=args.trial)
-        if not comparison['ready_for_test']:
-            raise ValueError('VALIDATION does not meet the requested continuation conditions; TEST is untouched')
-    model, checkpoint = load_model()
-    existing = read_results()
-    records = [(s, n, ts) for s, n, ts in load_tasksets() if s == split]
-    for s, name, taskset in records:
-        for seed in SEEDS:
-            key = args.trial, split, name, str(seed)
-            if any((r['trial'], r['split'], r['layout_id'], r['seed']) == key for r in existing):
-                continue
-            print('BR_START', split, name, seed, flush=True)
-            row = run_one(split, name, taskset, seed, trial=args.trial, model=model, checkpoint=checkpoint)
-            append_result(row); existing.append({k: str(v) for k, v in row.items()})
-            update_report()
-    print('BR_COMPARISON', json_text(compare(split, trial=args.trial)), flush=True)
 
 
-def compare(split, *, trial='main', result_rows=None):
-    records = read_results() if result_rows is None else result_rows
-    rows = [r for r in records if r['split'] == split and r['trial'] == trial]
-    feasible = [float(r['cmax_s']) for r in rows if r['status'] == 'FEASIBLE' and r['cmax_s']]
-    result = dict(split=split, trial=trial, runs=len(rows), feasible=len(feasible),
-                  cmax_mean_s=mean(feasible) if feasible else None,
-                  cmax_median_s=median(feasible) if feasible else None,
-                  runtime_median_s=median(float(r['runtime_s']) for r in rows) if rows else None,
-                  paired={})
-    for method in ('wag_vns', 'hga'):
-        baseline = {(r['layout_id'], r['seed']): r for r in read_baselines(method)
-                    if r['split'] == split and r['termination_reason'] == 'ITERATION_LIMIT'}
-        changes = []
-        for row in rows:
-            old = baseline.get((row['layout_id'], str(row['seed'])))
-            if row['status'] == 'FEASIBLE' and old and old['status'] == 'FEASIBLE':
-                changes.append((float(row['cmax_s']) - float(old['cmax_s'])) / float(old['cmax_s']))
-        times = [float(r['runtime_s']) for r in baseline.values()]
-        result['paired'][method] = dict(pairs=len(changes),
-            median_relative_cmax=median(changes) if changes else None,
-            baseline_runtime_median_s=median(times) if times else None,
-            runtime_ratio=result['runtime_median_s'] / median(times) if rows and times else None)
-    wag, hga = result['paired']['wag_vns'], result['paired']['hga']
-    # A 2% paired median margin makes 'competitive with HGA' explicit.
-    # This comparison controls only the requested one-time TEST continuation.
-    result['ready_for_test'] = bool(split == 'validation' and len(rows) == 30 and len(feasible) >= 28
-        and wag['median_relative_cmax'] is not None and wag['median_relative_cmax'] < 0
-        and hga['median_relative_cmax'] is not None and hga['median_relative_cmax'] <= .02
-        and wag['runtime_ratio'] <= 1.5 and hga['runtime_ratio'] < 1.)
-    return result
+
+
 
 
 def update_report(*, checkpoint=None, result_rows=None):
     text = REPORT.read_text(encoding='utf-8').split(SECTION)[0].rstrip()
-    lines = [SECTION, '\n当前正式路线为固定拆分→四机器人分配→连续原子任务合并→排序及方向→调度评价。',
-             'Adapted-WAG+VNS 与 Adapted-HGA 为保留原始结果的独立对照组；GNN-PPO 作为失败历史保留，不再训练。',
-             '\nGNN-VNS-BR 独立执行空间/插入贪心初始化，以原生调度完工时间识别瓶颈，',
-             '在瓶颈局部合并作业图上使用两层64维/4头GAT与一个标量候选动作头。',
-             'M1–M6 同时处理路线和方向；仅Top-K进入实际原生评价。',
-             '原子边界由已有FixedTaskset决定，动作仅迁移现有作业并强制合并连续归属原子。',
-             'B32 limited-discrepancy 调度政策保持现有FORMAL_SCOPE_V2。',
-             '\n监督标签仅来自已完成且B32可行的TRAIN对照方案及少量合法扰动，',
-             '采用实际priority_schedule候选Cmax构造pairwise ranking loss，不可行候选排在可行候选之后。',
-             'VALIDATION和TEST独立初始化；训练内部按TRAIN排样留出，不读取VALIDATION/TEST标签。']
     if checkpoint is None and WEIGHTS.exists():
         _, checkpoint = load_model()
+    rows = read_results() if result_rows is None else result_rows
+    lines = [SECTION,
+        '本轮仅使用TRAIN监督训练和约3个TRAIN排样单种子Smoke；未运行完整VALIDATION、TEST或WAG/HGA对照。',
+        '旧模型models/gnn_vns_br.pt及固定任务目录的gnn_vns_br.csv已从原进程内存保存，60条结果未重新计算。',
+        '旧权重与旧实验结果不覆盖；本轮权重和CSV分别位于models/gnn_vns_br_edgeaware.pt及results/new_dataset_final/gnn_vns_br_edgeaware.csv。',
+        '',
+        '节点输入16维：类型2维，作业端点4维、长度/位置/方向3维，机器人身份4维、负载/完工/空走3维。',
+        '作业节点只填作业特征，机器人状态仅放在机器人节点。',
+        '边输入3维：can_execute、is_current_owner、directed_empty_time。每个作业关联全部4个机器人，资格直接读取w.eligible。',
+        '后继、前驱和空间转移各按当前方向读取w.travel，再除以workspace.scale，与机器人时间状态使用同一归一化尺度；反向成本独立计算。空间邻居按有向转移时间稀疏选择。',
+        '连续边特征通过每层一个3→4线性映射直接进入注意力logits；仍为两层64维/4头共享GAT和单个动作评分头，18维动作特征保持。',
+        '',
+        '训练与推理共用BRConfig、candidate_actions和local_graph，alpha=8、anchors=12、每邻域最多40候选。',
+        'TRAIN来源包括既有WAG/HGA的B32可行完整方案、独立贪心初始化及少量合法扰动；按完整TRAIN排样留出，不使用VALIDATION/TEST标签。',
+        '候选按邻域、目标机器人、锚点轮转分配有限预算，先用真实资格排除非法转移；取消随机截断及路线代价的半数预淘汰。',
+        '每个邻域最多3个高分候选接受原生评价，在全部六邻域中取实际Cmax最小的可行改善。',
+        '有限M5/M6扰动及M1/M2回退保留全局可行最优；180秒上限、200轮和3次扰动预算保持。',
+        '',
+        '清理：删除3个无调用方旧脚本；删除候选执行/生成中的拆分激活、取消、点切换分支及活动算子注册。',
+        '旧主CLI移除53个动态GNN阶段；CEM/JN-MIP/RCG和MODE_NEW仅保留结果摘要/审计入口，旧PPO搜索CLI移除。',
+        '另移除cmax_finetune、joint_repair_pilot、joint_oriented_repair_pilot及eg_gnn_pvnd的动态搜索主入口，保留其历史读取及共享辅助函数。',
+        '保留历史枚举、几何校验和结果读取，以及WAG/HGA共享函数；FORMAL_SCOPE_V2、B32与对照算法主体没有修改。',
+    ]
     if checkpoint is not None:
         training = checkpoint['training']
-        lines += ['\n离线训练实测：', '```json', json.dumps({
-            'data': training['data'], 'selected_epoch': training['learning']['selected_epoch'],
-            'label_generation_s': training['data']['label_generation_s'],
-            'training_s': training['training_s'], 'total_offline_s': training['total_offline_s'],
-            'initial_trial_offline_s': checkpoint.get('initial_training', {}).get('total_offline_s'),
-            'experiment_notes': checkpoint.get('experiment_notes', [])},
-            ensure_ascii=False, indent=2), '```']
-    records = read_results() if result_rows is None else result_rows
-    trials = sorted({r['trial'] for r in records})
-    for trial in trials:
-        for split in ('validation', 'test'):
-            result = compare(split, trial=trial, result_rows=records)
-            if result['runs']:
-                lines += ['\n实测配对汇总（仅双方B32可行的同排样同种子计算Cmax变化，失败数量单独保留）：',
-                          '```json', json.dumps(result, ensure_ascii=False, indent=2), '```']
-    main_validation = compare('validation', result_rows=records)
-    if main_validation['runs'] == 30 and not main_validation['ready_for_test']:
-        lines += ['\n结论：完整VALIDATION未达到可行率与配对质量要求，TEST未运行。',
-                  '仅进行了一次针对性修正及TRAIN重训：M1允许迁移合并作业中的已有端部原子，',
-                  '对应轮数上限从100调至200；M5/M6无可行扰动时，在同一有限预算内回退到M1/M2。',
-                  '首轮结果以initial区分保留，没有重跑WAG/HGA，也没有改变B32或空间约束。']
-    lines += ['\n在线耗时包含独立初始化、GNN编码/推理、候选评价和唯一一次最终B32。',
-              '本轮批量串行、单线程，复用TRAIN标签生成和单例阶段已编译的内核；',
-              '首次冷JIT包含在初始离线标签计时内。单独启动实验入口时，首例运行计时也包含其编译。离线训练时间单独列示。',
-              'VALIDATION要求至少28/30可行、配对优于WAG、相对HGA配对中位退化不超过2%、',
-              '中位耗时≤WAG的1.5倍且低于HGA；未满足时不执行TEST。',
-              '\n复现入口（指定Python，在DRL目录执行）：', '```powershell',
+        lines += ['', '离线训练记录：', 'FENCEjson',
+            json.dumps(dict(data=training['data'], selected_epoch=training['learning']['selected_epoch'],
+                            training_s=training['training_s'], total_offline_s=training['total_offline_s']),
+                       ensure_ascii=False, indent=2), 'FENCE']
+    if rows:
+        lines += ['', '|排样|种子|原生可行|B32状态|B32 Cmax(s)|在线耗时(s)|',
+                      '|---|---:|---|---|---:|---:|']
+        for row in rows:
+            detail = json.loads(row['diagnostic'])
+            lines.append('|'+ '|'.join(map(str, (row['layout_id'],row['seed'],detail['native_feasible'],
+                                                row['status'],row['cmax_s'],row['runtime_s'])))+'|')
+        feasible = [float(r['cmax_s']) for r in rows if r['status']=='FEASIBLE' and r['cmax_s']]
+        lines += ['', f'Smoke原生可行{sum(json.loads(r["diagnostic"])["native_feasible"] for r in rows)}/{len(rows)}，'
+                      f'B32可行{len(feasible)}/{len(rows)}；这不是完整VALIDATION，也不据此宣称总体优于对照。']
+    lines += ['', '在线耗时包含独立初始化、图构造/GNN推理、候选评价及唯一一次最终B32。独立启动Smoke的首例含冷JIT，后两例复用进程内编译。',
+              '', '本轮复现入口（在本地DRL目录）：', 'FENCEpowershell',
               "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py train",
-              "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py smoke --layout train_01",
-              "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py validation",
-              "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py test",
-              '```']
-    output = text + '\n' + '\n'.join(lines) + '\n'
+              "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py smoke",
+              "& 'D:\\pybullet_test\\.venv\\Scripts\\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py summary", 'FENCE']
+    output = text + '\n' + '\n'.join(lines).replace('FENCE',chr(96)*3) + '\n'
     if len(output.encode('utf-8')) >= LIMIT:
         raise ValueError('existing report would exceed 100MB')
     REPORT.write_text(output, encoding='utf-8')
@@ -309,32 +273,37 @@ def update_report(*, checkpoint=None, result_rows=None):
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument('stage', choices=('train', 'smoke', 'validation', 'test', 'summary', 'all'))
+    parser.add_argument('stage', choices=('train', 'smoke', 'summary'))
     parser.add_argument('--training-seed', type=int, default=20261126)
     parser.add_argument('--epochs', type=int, default=24)
-    parser.add_argument('--layout', default='train_01')
+    parser.add_argument('--layouts', nargs='+', default=('train_01','train_12','train_30'))
     parser.add_argument('--seed', type=int, default=20261110)
-    parser.add_argument('--time-limit', type=float)
     parser.add_argument('--trial', default='main')
     parser.add_argument('--retrain', action='store_true')
     args = parser.parse_args()
     set_num_threads(1); torch.set_num_threads(1)
-    if args.stage in ('train', 'all'):
+    if args.stage == 'train':
         train(args)
-    if args.stage in ('smoke', 'all'):
-        split, name, taskset = next((s, n, ts) for s, n, ts in load_tasksets() if n == args.layout)
-        if split != 'train':
-            raise ValueError('smoke testing uses TRAIN only')
-        run_one(split, name, taskset, args.seed, time_limit=args.time_limit)
-    if args.stage in ('validation', 'all'):
-        experiment(args, 'validation')
-    if args.stage in ('test', 'all'):
-        if args.stage != 'all' or compare('validation', trial=args.trial)['ready_for_test']:
-            experiment(args, 'test')
-    if args.stage in ('summary', 'all'):
+    elif args.stage == 'smoke':
+        model, checkpoint = load_model()
+        tasksets = {name:ts for split,name,ts in load_tasksets() if split=='train'}
+        if len(args.layouts) != len(set(args.layouts)) or any(name not in tasksets for name in args.layouts):
+            raise ValueError('smoke layouts must be distinct existing TRAIN layouts')
+        existing = read_results()
+        for name in args.layouts:
+            previous = next((r for r in existing if r['trial']==args.trial and r['split']=='train'
+                             and r['layout_id']==name and int(r['seed'])==args.seed), None)
+            if previous is not None:
+                print('BR_SMOKE_REUSED',name,args.seed,previous['status'],previous['cmax_s'],flush=True)
+                continue
+            row = run_one('train',name,tasksets[name],args.seed,trial=args.trial,model=model,checkpoint=checkpoint)
+            append_result(row)
+            existing.append(row)
+            update_report(checkpoint=checkpoint,result_rows=existing)
+    else:
         update_report()
-        for split in ('validation', 'test'):
-            print('BR_SUMMARY', json_text(compare(split, trial=args.trial)), flush=True)
+        for row in read_results():
+            print('BR_SMOKE_SUMMARY',json_text({k:v for k,v in row.items() if k not in ('solution','diagnostic')}),flush=True)
 
 
 if __name__ == '__main__':

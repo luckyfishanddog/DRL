@@ -1403,8 +1403,8 @@ VALIDATION和TEST独立初始化；训练内部按TRAIN排样留出，不读取V
 
 结论：完整VALIDATION未达到可行率与配对质量要求，TEST未运行。
 验证：现有test_model_geometry.py完整56项通过，包含新增六邻域重建、原子覆盖、GAT梯度、方向序列化及未达标时禁止进入TEST的检查；清理前固定域相关31项亦通过。新算法的六邻域检查没有调用完整对照求解器。
-当前产物状态：两个新增代码文件已获用户确认并写入；权重models/gnn_vns_br.pt与结果results/fixed_euclidean_split/gnn_vns_br.csv的逐文件确认尚未收到，因此模型和两轮共60条完整方案暂保存在运行进程内存中，本报告已保存实测汇总。两处原始对照CSV和PPO失败CSV未改写。
-清理状态：README和正式研究描述已统一，原固定实验入口不再提供PPO训练/评价命令，PPO源码标记为失败历史；B32及原固定任务算法主体保持原样。核心动态兼容分支和旧GNN历史文件的彻底删除尚未完成：自动审批先后以“可能削弱核心校验”和“可能破坏HGA对照主体”为由拒绝删除，已向用户请求明确授权。没有绕过拒绝或宣称这部分已经清理完成。
+产物状态更新（2026-11-26）：用户已逐文件确认，旧权重models/gnn_vns_br.pt与两轮共60条完整结果results/fixed_euclidean_split/gnn_vns_br.csv均已从原进程内存保存，未重新实验。两处原始对照CSV和PPO失败CSV未改写。
+清理状态更新（2026-11-26）：早先批量删除因可能影响共享校验和HGA主体被自动审批拒绝。之后按具体分支和入口缩小修改范围，删除动态拆分生成、执行和活动算子，停用相关动态搜索CLI，并完成固定路线操作回归检查；详见下方本地清理清单。B32及WAG/HGA固定算法主体保持原样。
 仅进行了一次针对性修正及TRAIN重训：M1允许迁移合并作业中的已有端部原子，
 对应轮数上限从100调至200；M5/M6无可行扰动时，在同一有限预算内回退到M1/M2。
 首轮结果以initial区分保留，没有重跑WAG/HGA，也没有改变B32或空间约束。
@@ -1415,10 +1415,161 @@ VALIDATION和TEST独立初始化；训练内部按TRAIN排样留出，不读取V
 VALIDATION要求至少28/30可行、配对优于WAG、相对HGA配对中位退化不超过2%、
 中位耗时≤WAG的1.5倍且低于HGA；未满足时不执行TEST。
 
-复现入口（指定Python，在DRL目录执行）：
+上一阶段历史命令（对应旧23维版本，仅保留执行记录；当前入口不再提供validation/test阶段）：
 ```powershell
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py train
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py smoke --layout train_01
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py validation
 & 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py test
+```
+
+## 2026-11-26 本地清理与文件核对
+
+实际检查：现有test_model_geometry.py、test_canonical_candidate.py、test_search_neighborhood.py共88项通过；10项旧CLI拒绝动态搜索的进程检查通过。保存的3条TRAIN方案均可恢复原子覆盖、归属、合并路线和方向；每例只调用一次最终B32。没有重跑WAG/HGA、旧VALIDATION或完整TEST。
+
+拆分激活、取消和切分点切换已从候选执行、生成与活动算子注册中删除。历史枚举、Scope字段、几何校验、结果读取及WAG/HGA依赖的共享辅助函数保留；没有整包删除，也没有改变固定算法主体或B32政策。混合历史脚本中的读取和辅助函数仍保留，不宣称历史研究源码已全部删除。
+
+删除的3个无调用方脚本：
+
+- run_joint4_screen_ablation.py。
+- scripts/run_gnn_schedule_blocker_pilot.py。
+- scripts/run_bottleneck_neighborhood_pilot.py。
+
+修改的既有文件：
+
+- 新方法核心与统一入口：src/mrta_search/gnn_vns_br.py、scripts/run_gnn_vns_br.py。
+- 动态部分清理及历史语义说明：src/mrta_reference/candidate.py、src/mrta_reference/model.py、src/mrta_search/neighborhood.py、src/mrta_search/stats.py、src/mrta_search/pipeline.py。
+- 旧动态搜索入口：scripts/run_ppo_smoke.py、scripts/run_gnn_weld_layout.py、scripts/run_gnn_cem.py、scripts/run_gnn_joint_mip.py、scripts/run_gnn_route_columns.py、scripts/run_gnn_initial_mode_new.py、scripts/run_gnn_cmax_finetune.py、scripts/run_gnn_joint_repair_pilot.py、scripts/run_joint_oriented_repair_pilot.py、scripts/run_eg_gnn_pvnd.py。
+- 现有测试：tests/test_model_geometry.py、tests/test_canonical_candidate.py、tests/test_search_neighborhood.py。
+- 现有文档：README.md、docs/FIXED_EUCLIDEAN_SPLIT_EXPERIMENT.md。
+
+用户已确认的4个新增产物（无额外样本、模型快照或报告文件）：
+
+|文件|字节数|内容|
+|---|---:|---|
+|models/gnn_vns_br.pt|105913|旧23维模型，保留第24轮权重|
+|results/fixed_euclidean_split/gnn_vns_br.csv|2038929|旧initial/main各30条VALIDATION记录|
+|models/gnn_vns_br_edgeaware.pt|102067|新16维节点、3维边模型，第14轮权重|
+|results/new_dataset_final/gnn_vns_br_edgeaware.csv|86231|本轮3条TRAIN Smoke完整结果|
+
+所有新增产物位于本地DRL分类目录，单文件小于100MB。本轮没有GitHub提交、上传或推送。
+
+## GNN-VNS-BR 边特征与搜索改进（TRAIN Smoke）
+
+本轮仅使用TRAIN监督训练和约3个TRAIN排样单种子Smoke；未运行完整VALIDATION、TEST或WAG/HGA对照。
+旧模型models/gnn_vns_br.pt及固定任务目录的gnn_vns_br.csv已从原进程内存保存，60条结果未重新计算。
+旧权重与旧实验结果不覆盖；本轮权重和CSV分别位于models/gnn_vns_br_edgeaware.pt及results/new_dataset_final/gnn_vns_br_edgeaware.csv。
+
+节点输入16维：类型2维，作业端点4维、长度/位置/方向3维，机器人身份4维、负载/完工/空走3维。
+作业节点只填作业特征，机器人状态仅放在机器人节点。
+边输入3维：can_execute、is_current_owner、directed_empty_time。每个作业关联全部4个机器人，资格直接读取w.eligible。
+后继、前驱和空间转移各按当前方向读取w.travel，再除以workspace.scale，与机器人时间状态使用同一归一化尺度；反向成本独立计算。空间邻居按有向转移时间稀疏选择。
+连续边特征通过每层一个3→4线性映射直接进入注意力logits；仍为两层64维/4头共享GAT和单个动作评分头，18维动作特征保持。
+
+训练与推理共用BRConfig、candidate_actions和local_graph，alpha=8、anchors=12、每邻域最多40候选。
+TRAIN来源包括既有WAG/HGA的B32可行完整方案、独立贪心初始化及少量合法扰动；按完整TRAIN排样留出，不使用VALIDATION/TEST标签。
+候选按邻域、目标机器人、锚点轮转分配有限预算，先用真实资格排除非法转移；取消随机截断及路线代价的半数预淘汰。
+每个邻域最多3个高分候选接受原生评价，在全部六邻域中取实际Cmax最小的可行改善。
+有限M5/M6扰动及M1/M2回退保留全局可行最优；180秒上限、200轮和3次扰动预算保持。
+
+清理：删除3个无调用方旧脚本；删除候选执行/生成中的拆分激活、取消、点切换分支及活动算子注册。
+旧主CLI移除53个动态GNN阶段；CEM/JN-MIP/RCG和MODE_NEW仅保留结果摘要/审计入口，旧PPO搜索CLI移除。
+另移除cmax_finetune、joint_repair_pilot、joint_oriented_repair_pilot及eg_gnn_pvnd的动态搜索主入口，保留其历史读取及共享辅助函数。
+保留历史枚举、几何校验和结果读取，以及WAG/HGA共享函数；FORMAL_SCOPE_V2、B32与对照算法主体没有修改。
+
+离线训练记录：
+```json
+{
+  "data": {
+    "source_split": "train",
+    "teacher_solutions": 80,
+    "greedy_initializations": 40,
+    "states": 230,
+    "candidate_labels": 55971,
+    "feasible_labels": 24036,
+    "infeasible_labels": 31935,
+    "pairs": 58863,
+    "duplicate_states_skipped": 0,
+    "uninformative_states": 10,
+    "layouts": [
+      "train_01",
+      "train_02",
+      "train_03",
+      "train_04",
+      "train_05",
+      "train_06",
+      "train_07",
+      "train_08",
+      "train_09",
+      "train_10",
+      "train_11",
+      "train_12",
+      "train_13",
+      "train_14",
+      "train_15",
+      "train_16",
+      "train_17",
+      "train_18",
+      "train_19",
+      "train_20",
+      "train_21",
+      "train_22",
+      "train_23",
+      "train_24",
+      "train_25",
+      "train_26",
+      "train_27",
+      "train_28",
+      "train_29",
+      "train_30",
+      "train_31",
+      "train_32",
+      "train_33",
+      "train_34",
+      "train_35",
+      "train_36",
+      "train_37",
+      "train_38",
+      "train_39",
+      "train_40"
+    ],
+    "state_sources": {
+      "wag_vns": 79,
+      "hga": 78,
+      "greedy": 73
+    },
+    "perturbed_states": 112,
+    "candidate_parameters": {
+      "alpha": 8,
+      "anchors": 12,
+      "candidates": 40,
+      "top_k": 3,
+      "max_rounds": 200,
+      "perturbations": 3,
+      "initial_attempts": 10,
+      "time_limit": 180.0
+    },
+    "label_generation_s": 133.54181500000414
+  },
+  "selected_epoch": 14,
+  "training_s": 30.041635699919425,
+  "total_offline_s": 163.58345019991975
+}
+```
+
+|排样|种子|原生可行|B32状态|B32 Cmax(s)|在线耗时(s)|
+|---|---:|---|---|---:|---:|
+|train_01|20261110|True|FEASIBLE|5608.847272496346|16.505972599959932|
+|train_12|20261110|True|FEASIBLE|5047.62585763296|3.1459594999905676|
+|train_30|20261110|True|FEASIBLE|6100.618585242333|2.6524256999837235|
+
+Smoke原生可行3/3，B32可行3/3；这不是完整VALIDATION，也不据此宣称总体优于对照。
+
+在线耗时包含独立初始化、图构造/GNN推理、候选评价及唯一一次最终B32。独立启动Smoke的首例含冷JIT，后两例复用进程内编译。
+
+本轮复现入口（在本地DRL目录）：
+```powershell
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py train
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py smoke
+& 'D:\pybullet_test\.venv\Scripts\python.exe' -B -u -X utf8 scripts/run_gnn_vns_br.py summary
 ```

@@ -673,19 +673,22 @@ def test_removed_inner_cut_cannot_reenter_formal_catalog(axis):
         canonicalize((parent,),(pattern,),routes,CONFIG,scope=FORMAL_SCOPE_V2)
 
 
-def test_three_solvers_really_consume_same_expanded_catalog():
+def test_fixed_route_neighborhood_no_longer_builds_dynamic_split_catalog(monkeypatch):
     import mrta_reference.geometry as geometry
-    import mrta_search.neighborhood as alns
-    import mrta_baselines.hga as hga
-    import mrta_baselines.wag_vns as wag
+    from mrta_reference.model import MoveType
+    from mrta_search.neighborhood import applicable_move_mask, make_raw_candidate
     from mrta_reference.scope import FORMAL_SCOPE_V2
-    assert alns.build_legal_pattern_catalog is hga.build_legal_pattern_catalog is wag.build_legal_pattern_catalog is geometry.build_legal_pattern_catalog
-    parent=ParentWeld('p',(1.,8.),(5.,8.))
-    catalog=geometry.build_legal_pattern_catalog((parent,),CONFIG,FORMAL_SCOPE_V2)
-    assert {'BX_OUTER_LOWER','BX_OUTER_UPPER'}<={p.point_id for p in catalog['p']}
-    # Existing three-method access test executes all three production consumers.
-    from test_hga_baseline import test_v2_three_method_pattern_access_uses_one_catalog_hash
-    test_v2_three_method_pattern_access_uses_one_catalog_hash()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('fixed route candidates must not generate dynamic split alternatives')
+    monkeypatch.setattr(geometry, 'generate_y_split_patterns', forbidden)
+    monkeypatch.setattr(geometry, 'generate_x_split_patterns', forbidden)
+    w, state = _br_fixed_fixture()
+    solution = w.solution(state)
+    mask = applicable_move_mask(solution, w.config, scope=FORMAL_SCOPE_V2)
+    retired = (MoveType.SPLIT_ACTIVATE,MoveType.SPLIT_DEACTIVATE,MoveType.SPLIT_POINT_SWITCH)
+    assert not set(retired).intersection(mask)
+    for move in retired:
+        assert make_raw_candidate(solution,w.config,move,seed=7,ordinal=0).candidate is None
 
 
 
@@ -778,7 +781,8 @@ def test_br_shared_gat_pairwise_gradients_and_infeasible_label_order():
     rng = random.Random(17)
     actions = candidate_actions(w, state, BRConfig(candidates=6), rng)
     graph = local_graph(w, state, actions)
-    assert graph.nodes.shape[1] == 23
+    assert graph.nodes.shape[1] == 16
+    assert graph.edge_attr.shape[1] == 3
     assert graph.action_features.shape[1] == 18
     pairs = ranking_pairs([3., float('inf'), 2., 3.], rng)
     assert len(pairs) == 5
@@ -789,6 +793,7 @@ def test_br_shared_gat_pairwise_gradients_and_infeasible_label_order():
     loss.backward()
     for layer in (model.layer1, model.layer2):
         assert layer.linear.weight.grad.abs().sum() > 0
+        assert layer.edge_bias.weight.grad.abs().sum() > 0
     assert model.scorer[-1].out_features == 1
     assert {a.move for a in actions} == set(range(1, 7))
 
@@ -854,23 +859,208 @@ def test_br_m1_can_reassign_existing_end_atoms_inside_merged_jobs():
         assert candidate.patterns == old.patterns == w.taskset.patterns
 
 
-def test_br_insufficient_validation_feasibility_leaves_test_untouched(monkeypatch):
+def test_br_train_smoke_entry_leaves_validation_and_test_untouched(monkeypatch):
     import importlib
     from pathlib import Path
-    from types import SimpleNamespace
     import pytest
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / 'scripts'))
     runner = importlib.import_module('run_gnn_vns_br')
-    rows = [dict(trial='main', split='validation', layout_id=f'validation_{i // 3 + 1:02d}',
-                 seed=str(runner.SEEDS[i % 3]), status='FEASIBLE' if i < 25 else 'DEADLOCK',
-                 cmax_s='4900' if i < 25 else '', runtime_s='50') for i in range(30)]
-    baseline = [dict(r, status='FEASIBLE', cmax_s='5000', runtime_s='100',
-                     termination_reason='ITERATION_LIMIT') for r in rows]
-    monkeypatch.setattr(runner, 'read_results', lambda: rows)
-    monkeypatch.setattr(runner, 'read_baselines', lambda method: baseline)
     def forbidden():
-        raise AssertionError('a model/TEST instance must not be loaded')
+        raise AssertionError('no model or non-TRAIN instance should be loaded')
     monkeypatch.setattr(runner, 'load_model', forbidden)
-    assert not runner.compare('validation')['ready_for_test']
-    with pytest.raises(ValueError, match='TEST is untouched'):
-        runner.experiment(SimpleNamespace(trial='main'), 'test')
+    for split in ('validation','test'):
+        with pytest.raises(ValueError, match='TRAIN smoke only'):
+            runner.run_one(split,'unused',None,17)
+
+
+def test_br_edge_graph_has_separate_job_robot_features_and_directed_costs():
+    import random
+    import numpy as np
+    import pytest
+    from mrta_search.gnn_vns_br import BRConfig, NODE_FEATURES, EDGE_FEATURES, candidate_actions, local_graph
+    w, state = _br_fixed_fixture()
+    actions = candidate_actions(w,state,BRConfig(),random.Random(13))
+    graph = local_graph(w,state,actions)
+    assert len(NODE_FEATURES)==16 and len(EDGE_FEATURES)==3
+    robot_base = len(graph.nodes)-4
+    assert np.all(graph.nodes[:robot_base,9:].numpy()==0)
+    assert np.all(graph.nodes[:robot_base,0].numpy()==1)
+    assert np.all(graph.nodes[-4:,2:9].numpy()==0)
+    assert np.array_equal(graph.nodes[-4:,9:13].numpy(),np.eye(4))
+    assert np.allclose(graph.nodes[-4:,13].numpy(),state.loads/w.scale)
+    node_ids = {}
+    for action,row in zip(actions,graph.action_nodes.tolist()):
+        node_ids[row[0]]=action.u
+        if action.v>=0:node_ids[row[1]]=action.v
+    # All job endpoints are selected as anchors in this small fixture.
+    assert len(node_ids)==robot_base
+    location = {int(n):(r,i) for r in range(4) for i,n in enumerate(state.routes[r])}
+    seen_robot_edges = {j:set() for j in range(robot_base)}
+    attrs = {}
+    asymmetric = False
+    for (a,b),kind,attr in zip(graph.edges.t().tolist(),graph.relations.tolist(),graph.edge_attr.tolist()):
+        attrs[a,b,kind]=attr
+        if kind==1 and a<robot_base:
+            n=node_ids[a];r=b-robot_base
+            seen_robot_edges[a].add(r)
+            assert attr[0]==float(w.numeric.eligible[n,r])
+            assert attr[1]==float(location[n][0]==r)
+            assert attr[2]==0.
+        elif kind in (3,4,5):
+            n,m=node_ids[a],node_ids[b]
+            r,i=location[n];s,j=location[m]
+            expected=w.numeric.travel[n,m,state.bits[r][i],state.bits[s][j]]/w.scale
+            assert attr[2]==pytest.approx(expected)
+        elif kind==2:
+            assert attr==[0.,0.,0.]
+    assert all(robots==set(range(4)) for robots in seen_robot_edges.values())
+    for (a,b,kind),attr in attrs.items():
+        if kind==3:
+            reverse=attrs[b,a,4]
+            asymmetric |= abs(attr[2]-reverse[2])>1.e-7
+    assert asymmetric
+
+
+def test_br_job_robot_edges_use_inherited_eligibility_inside_shared_band():
+    import random
+    import numpy as np
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld,ScientificConfig
+    from mrta_search.gnn_vns_br import FixedWorkspace,BRConfig,candidate_actions,local_graph
+    c=ScientificConfig()
+    ts=generate_taskset((ParentWeld('upper',(0.,5.5),(12.,7.5)),))
+    w=FixedWorkspace(ts,c);n=w.index['upper::seg_000']
+    assert max(w.numeric.points[n,:,1])<c.by[1]
+    assert w.numeric.eligible[n].tolist()==[True,True,False,False]
+    raw=[w.numeric.atomic_nodes[:1],w.numeric.atomic_nodes[1:],np.empty(0,np.int64),np.empty(0,np.int64)]
+    ds=[np.zeros(len(r),np.int64) for r in raw]
+    from mrta_baselines.hga import _merge_fixed_arrays
+    raw,ds=_merge_fixed_arrays(raw,ds,w.numeric.fixed_starts,w.numeric.fixed_stops,w.numeric.fixed_lookup)
+    state=w.evaluate(raw,ds)
+    actions=candidate_actions(w,state,BRConfig(),random.Random(4))
+    graph=local_graph(w,state,actions);base=len(graph.nodes)-4
+    job_node=next(row[1] for action,row in zip(actions,graph.action_nodes.tolist()) if action.v==n)
+    for robot in range(4):
+        edge=next(k for k,(a,b) in enumerate(graph.edges.t().tolist()) if a==job_node and b==base+robot)
+        assert graph.edge_attr[edge,0].item()==float(robot<2)
+
+
+def test_br_edge_attributes_change_attention_and_receive_gradients():
+    import torch
+    from mrta_search.gnn_vns_br import SparseGATLayer
+    layer=SparseGATLayer(1,hidden=4,heads=1)
+    with torch.no_grad():
+        layer.linear.weight.fill_(1.)
+        layer.source.zero_();layer.destination.zero_();layer.relation.weight.zero_()
+        layer.edge_bias.weight.zero_();layer.edge_bias.weight[0,2]=2.
+    x=torch.tensor([[0.],[1.],[2.]])
+    edges=torch.tensor([[0,1],[2,2]])
+    relation=torch.tensor([5,5])
+    plain=torch.zeros((2,3))
+    changed=plain.clone();changed[1,2]=1.;changed.requires_grad_()
+    a=layer(x,edges,relation,plain)[2]
+    b=layer(x,edges,relation,changed)[2]
+    assert torch.all(b>a)
+    b.sum().backward()
+    assert changed.grad[:,2].abs().sum()>0
+    with torch.no_grad():
+        layer.edge_bias.weight.zero_();layer.edge_bias.weight[0,0]=2.
+    changed=plain.clone();changed[1,0]=1.
+    assert torch.all(layer(x,edges,relation,changed)[2]>a)
+
+
+def _br_shared_robot_fixture():
+    import numpy as np
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_reference.model import ParentWeld,ScientificConfig
+    from mrta_search.gnn_vns_br import FixedWorkspace
+    positions=(1.,3.,5.,8.,10.,12.,14.,16.,18.)
+    ts=generate_taskset(tuple(ParentWeld(f'p{i}',(x,6.),(x+.8,6.)) for i,x in enumerate(positions)))
+    w=FixedWorkspace(ts,ScientificConfig())
+    ids=w.numeric.atomic_nodes
+    routes=[ids[:3],ids[3:5],ids[5:7],ids[7:]]
+    return w,w.evaluate(routes,[np.zeros(len(r),np.int64) for r in routes])
+
+
+def test_br_candidates_cover_each_target_robot_and_empty_routes():
+    import random
+    import numpy as np
+    from mrta_search.gnn_vns_br import BRConfig,candidate_actions
+    w,state=_br_shared_robot_fixture();settings=BRConfig()
+    actions=candidate_actions(w,state,settings,random.Random(8))
+    assert {a.move for a in actions}==set(range(1,7))
+    assert len(actions)<=6*settings.candidates
+    heavy=state.bottleneck
+    counts={r:sum(a.move==1 and a.rv==r for a in actions) for r in range(4) if r!=heavy}
+    assert min(counts.values())>0 and max(counts.values())-min(counts.values())<=2
+    for action in actions:w.validate(action.routes,action.bits)
+    routes=[r.copy() for r in state.routes];bits=[d.copy() for d in state.bits]
+    routes[heavy]=np.concatenate((routes[heavy],routes[3]));routes[3]=np.empty(0,np.int64)
+    bits[heavy]=np.concatenate((bits[heavy],bits[3]));bits[3]=np.empty(0,np.int64)
+    empty_state=w.evaluate(routes,bits)
+    actions=candidate_actions(w,empty_state,settings,random.Random(8))
+    assert any(a.move==1 and a.rv==3 and a.v==-1 for a in actions)
+    for action in actions:w.validate(action.routes,action.bits)
+
+
+@pytest.mark.parametrize('initial_value,values,rounds,shakes,expected',[
+    (10.,[9.,8.,7.,6.,5.,4.],1,0,4.),
+    (float('inf'),[9.,8.,7.,6.,5.,4.],1,0,4.),
+    (10.,[11.,12.,13.,14.,15.,16.],2,1,10.),
+])
+def test_br_global_best_improvement_and_shaking_preserve_best(monkeypatch,initial_value,values,rounds,shakes,expected):
+    import numpy as np
+    import torch
+    from types import SimpleNamespace
+    import mrta_search.gnn_vns_br as br
+    def state(value):
+        return br.State([],[],value,np.full(4,value),np.ones(4),np.ones(4),[])
+    class Workspace:
+        def __init__(self,*args):self.evaluations=0;self.visited=[]
+        def initialize(self,*args):self.evaluations+=1;return state(initial_value)
+        def evaluate(self,route,bits):
+            self.evaluations+=1;self.visited.append(route)
+            return state(values[route-1])
+        def validate(self,*args):return True
+    class Model:
+        def eval(self):return self
+        def __call__(self,graph):return torch.tensor([6.,5.,4.,3.,2.,1.])
+    actions=[SimpleNamespace(move=m,routes=m,bits=[]) for m in range(1,7)]
+    monkeypatch.setattr(br,'FixedWorkspace',Workspace)
+    monkeypatch.setattr(br,'candidate_actions',lambda *args:actions)
+    monkeypatch.setattr(br,'local_graph',lambda *args:None)
+    w,best,record=br.run_gnn_vns_br(None,Model(),seed=4,
+        settings=br.BRConfig(max_rounds=rounds,perturbations=shakes,initial_attempts=1))
+    assert best.value==expected
+    assert w.visited[:6]==list(range(1,7))
+    assert record['native_evaluations']<=1+18*rounds
+    if shakes:assert record['perturbations']==1
+
+
+def test_br_supervision_uses_online_budgets_greedy_states_and_train_only(monkeypatch):
+    import importlib
+    import json
+    from pathlib import Path
+    from mrta_search.gnn_vns_br import BRConfig,candidate_actions,local_graph
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    w,state=_br_fixed_fixture()
+    payload=runner.solution_record(w.solution(state),state.bits)
+    teacher=dict(split='train',layout_id='train_A',status='FEASIBLE',termination_reason='ITERATION_LIMIT',
+                 b32_calls='1',cmax_s='100',solution=json.dumps(payload))
+    forbidden=dict(teacher,split='validation',layout_id='validation_A',solution='must not parse')
+    test=dict(teacher,split='test',layout_id='test_A',solution='must not parse')
+    monkeypatch.setattr(runner,'load_tasksets',lambda:[('train','train_A',w.taskset),
+        ('validation','validation_A',w.taskset),('test','test_A',w.taskset)])
+    monkeypatch.setattr(runner,'read_baselines',lambda method:[teacher,forbidden,test])
+    observed=[]
+    def generate(workspace,current,settings,rng):
+        observed.append((settings.alpha,settings.anchors,settings.candidates))
+        return candidate_actions(workspace,current,settings,rng)
+    monkeypatch.setattr(runner,'candidate_actions',generate)
+    examples,stats=runner.build_supervision(seed=4,states_per_source=1,progress=lambda *a:None)
+    assert examples and observed and set(observed)=={(8,12,40)}
+    assert stats['layouts']==['train_A'] and stats['greedy_initializations']==1
+    assert all(name=='train_A' and graph.nodes.shape[1]==16 and graph.edge_attr.shape[1]==3
+               for name,graph,pairs in examples)
+    assert stats['candidate_parameters']==runner.asdict(BRConfig())

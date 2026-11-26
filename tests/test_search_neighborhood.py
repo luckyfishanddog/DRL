@@ -74,48 +74,16 @@ def test_four_route_moves_preserve_coverage_and_replay_and_reject_old_revision()
             apply_candidate(first, move, FAST)
 
 
-def test_three_y_moves_valid_boundary_and_deterministic_replay() -> None:
-    parent = ParentWeld("p", (0.0, 5.9), (4.0, 7.0))
-    whole = canonicalize(
-        (parent,),
-        (SplitPattern("p", SplitKind.WHOLE),),
-        {0: ("p::whole",)},
-        FAST,
-    )
-    patterns = generate_y_split_patterns(parent, FAST)
-    activate = CandidateMove(
-        _key(0, MoveType.SPLIT_ACTIVATE, ("p",), 0, 1, (0,), (0,), patterns[0]),
-        ("p::whole",),
-        patterns[0],
-    )
-    split = apply_candidate(whole, activate, FAST)
-    assert split == apply_candidate(whole, activate, FAST)
-    assert split.patterns[0].kind is SplitKind.Y_SPLIT
-
-    switch = CandidateMove(
-        _key(1, MoveType.SPLIT_POINT_SWITCH, ("p",), pattern=patterns[1]),
-        split_pattern=patterns[1],
-    )
-    switched = apply_candidate(split, switch, FAST)
-    assert switched == apply_candidate(split, switch, FAST)
-    assert switched.patterns[0].pattern_id == patterns[1].pattern_id
-
-    deactivate = CandidateMove(
-        _key(1, MoveType.SPLIT_DEACTIVATE, ("p",), None, 0, (), (0,))
-    )
-    deactivated = apply_candidate(split, deactivate, FAST)
-    assert deactivated.patterns[0].kind is SplitKind.WHOLE
-    assert deactivated == apply_candidate(split, deactivate, FAST)
-
-    illegal_point = SplitPattern("p", SplitKind.Y_SPLIT, 0.51, "invented")
-    invalid = CandidateMove(
-        _key(1, MoveType.SPLIT_POINT_SWITCH, ("p",), pattern=illegal_point),
-        split_pattern=illegal_point,
-    )
-    with pytest.raises(ValueError, match="deterministic legal"):
-        apply_candidate(split, invalid, FAST)
-    with pytest.raises(ValueError, match="revision"):
-        apply_candidate(switched, switch, FAST)
+def test_retired_y_moves_are_rejected_without_changing_saved_patterns():
+    from mrta_search.neighborhood import make_raw_candidate
+    solution,patterns=_split_pair()
+    for kind in (MoveType.SPLIT_ACTIVATE,MoveType.SPLIT_POINT_SWITCH,MoveType.SPLIT_DEACTIVATE):
+        pattern=patterns[1] if kind is not MoveType.SPLIT_DEACTIVATE else None
+        candidate=CandidateMove(_key(0,kind,('p',),0,1,(0,),(0,),pattern),split_pattern=pattern)
+        with pytest.raises(ValueError,match='retired|unsupported'):
+            apply_candidate(solution,candidate,FAST)
+        assert make_raw_candidate(solution,FAST,kind,seed=3,ordinal=0).candidate is None
+    assert solution.patterns==(patterns[0],)
 
 
 def test_mandatory_y_deactivation_is_cheap_rejected_not_scheduler_infeasible() -> None:
@@ -140,7 +108,7 @@ def test_mandatory_y_deactivation_is_cheap_rejected_not_scheduler_infeasible() -
         stats,
     )
     assert screened == ()
-    assert stats.rejection_reasons["MANDATORY_Y_CANNOT_DEACTIVATE"] == 1
+    assert stats.rejection_reasons["RETIRED_DYNAMIC_MOVE"] == 1
     assert stats.nref == 0
 
 
@@ -170,9 +138,9 @@ def test_state_aware_applicable_mask_balances_only_possible_moves_and_keeps_hard
     assert mask[MoveType.INTER_RELOCATE]
     assert mask[MoveType.SWAP]
     assert mask[MoveType.TWO_OPT]
-    assert not mask[MoveType.SPLIT_ACTIVATE]
-    assert not mask[MoveType.SPLIT_DEACTIVATE]
-    assert not mask[MoveType.SPLIT_POINT_SWITCH]
+    assert MoveType.SPLIT_ACTIVATE not in mask
+    assert MoveType.SPLIT_DEACTIVATE not in mask
+    assert MoveType.SPLIT_POINT_SWITCH not in mask
 
     stats = SearchStats("EXACT_Y_SCOPE_CURRENT_SEMANTICS", 17)
     attempts = generate_raw_attempts(solution, FAST, m=23, seed=17, stats=stats)
@@ -194,7 +162,7 @@ def test_state_aware_applicable_mask_balances_only_possible_moves_and_keeps_hard
         {0: ("optional::whole",)},
         FAST,
     )
-    assert applicable_move_mask(whole, FAST)[MoveType.SPLIT_ACTIVATE]
+    assert MoveType.SPLIT_ACTIVATE not in applicable_move_mask(whole, FAST)
 
     patterns = generate_y_split_patterns(optional, FAST)
     split = canonicalize(
@@ -204,8 +172,8 @@ def test_state_aware_applicable_mask_balances_only_possible_moves_and_keeps_hard
         FAST,
     )
     split_mask = applicable_move_mask(split, FAST)
-    assert split_mask[MoveType.SPLIT_DEACTIVATE]
-    assert split_mask[MoveType.SPLIT_POINT_SWITCH]
+    assert MoveType.SPLIT_DEACTIVATE not in split_mask
+    assert MoveType.SPLIT_POINT_SWITCH not in split_mask
 
 
 def test_two_opt_star_swaps_same_rail_suffixes_without_pattern_mutation():
@@ -262,41 +230,12 @@ def test_two_opt_star_is_deterministic_ablatable_same_rail_and_cheap_rejects_cro
     assert first_stats.rejection_reasons["CHEAP_INVALID:bad same-rail 2-opt* shape"] == 1
 
 
-def test_finite_x_pattern_switch_uses_fixed_same_rail_spatial_assignment() -> None:
-    parent = ParentWeld("x", (1.0, 8.0), (5.0, 8.0))
-    solution = canonicalize(
-        (parent,),
-        (SplitPattern("x", SplitKind.WHOLE),),
-        {0: ("x::whole",)},
-        FAST,
-    )
-    directions = optimize_directions_with_initial_feasibility(solution, FAST).directions
-    stats = SearchStats("EXPERIMENTAL_X_SPLIT_SCOPE_V1", 20261004)
-    attempts = generate_raw_attempts(
-        solution,
-        FAST,
-        m=14,
-        seed=20261004,
-        stats=stats,
-        enable_x_split=True,
-    )
-    x_attempts = tuple(
-        item
-        for item in attempts
-        if item.candidate is not None
-        and item.candidate.split_pattern is not None
-        and item.candidate.split_pattern.kind is SplitKind.X_SPLIT
-    )
-    assert x_attempts
-    screened = screen_raw_attempts(
-        solution,
-        directions,
-        x_attempts,
-        FAST,
-        stats,
-        enable_x_split=True,
-    )
-    assert screened
-    for item in screened:
-        assert "x::0" in item.solution.routes[0].block_ids
-        assert "x::1" in item.solution.routes[1].block_ids
+def test_old_x_enable_flag_cannot_reactivate_split_search():
+    parent=ParentWeld('x',(1.,8.),(5.,8.))
+    solution=canonicalize((parent,),(SplitPattern('x',SplitKind.WHOLE),),{0:('x::whole',)},FAST)
+    stats=SearchStats('HISTORICAL_METADATA',20261004)
+    attempts=generate_raw_attempts(solution,FAST,m=14,seed=20261004,stats=stats,enable_x_split=True)
+    assert len(attempts)==14
+    assert all(item.candidate is None or item.candidate.split_pattern is None for item in attempts)
+    assert all(item.move_type in (MoveType.INTRA_RELOCATE,MoveType.INTER_RELOCATE,MoveType.SWAP,MoveType.TWO_OPT)
+               for item in attempts)

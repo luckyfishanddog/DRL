@@ -408,18 +408,12 @@ def summarize(entries, audit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--phase', choices=('audit', 'smoke', 'formal', 'summarize', 'all'), default='all')
+    parser.add_argument('--phase', choices=('audit', 'summarize'), default='audit')
     parser.add_argument('--workers', type=int, choices=(1, 2, 3, 4), default=4)
     args = parser.parse_args()
     entries, audit = prepare_entries()
     print('STATIC DATA AUDIT', json.dumps(audit, ensure_ascii=False), flush=True)
     summarize(entries, audit)
-    if args.phase in ('all', 'smoke'):
-        run_phase(entries, 'smoke', args.workers)
-        summarize(entries, audit)
-    if args.phase in ('all', 'formal'):
-        run_phase(entries, 'formal', args.workers)
-        summarize(entries, audit)
 
 
 if __name__ == '__main__':

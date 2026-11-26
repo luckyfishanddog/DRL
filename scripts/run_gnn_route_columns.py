@@ -208,15 +208,13 @@ def run_experiment(stage):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('audit', 'pilot', 'validation', 'summary'))
+    parser.add_argument('command', choices=('audit', 'summary'))
     parser.add_argument('--split', choices=('pilot', 'validation'), default='pilot')
     args = parser.parse_args()
     if args.command == 'audit':
         print(json.dumps(audit_train_usage(), ensure_ascii=False))
     elif args.command == 'summary':
         summarize(args.split)
-    else:
-        run_experiment(args.command)
 
 
 if __name__ == '__main__':

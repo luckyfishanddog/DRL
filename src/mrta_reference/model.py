@@ -52,6 +52,8 @@ class MoveType(str, Enum):
     SWAP = "SWAP"
     TWO_OPT = "TWO_OPT"
     TWO_OPT_STAR = "TWO_OPT_STAR"
+    # Historical result keys only; active move generation/execution excludes
+    # these three transitions and cannot change fixed atomic boundaries.
     SPLIT_ACTIVATE = "SPLIT_ACTIVATE"
     SPLIT_DEACTIVATE = "SPLIT_DEACTIVATE"
     SPLIT_POINT_SWITCH = "SPLIT_POINT_SWITCH"
