@@ -1,0 +1,1481 @@
+........................................................................ [  7%]
+........................................................................ [ 14%]
+..................F.F.......................................FF.F........ [ 21%]
+.................................................................F...... [ 29%]
+.....................................................................F.. [ 36%]
+....................F................................................... [ 43%]
+..............F.........F............................................... [ 50%]
+........................................................................ [ 58%]
+..............................FFF....................................... [ 65%]
+...................F.FF......................................F.......... [ 72%]
+........................................FF..................FFFFFFF.FFFF [ 79%]
+FFF....F....F.F...FF....F........FFFFFF..........................FF..FF. [ 87%]
+.FFF.F.............................................................FF.F. [ 94%]
+..F.F.FFFFF.....FFFFF...................................                 [100%]
+================================== FAILURES ===================================
+_ test_destroyed_head_conflict_can_be_repaired_without_accepting_illegal_final_start _
+tests\test_gnn_construct_vns.py:1683: in test_destroyed_head_conflict_can_be_repaired_without_accepting_illegal_final_start
+    assert certify_schedule(source,original.schedule,config,scope=FORMAL_SCOPE_V2).certified
+E   AssertionError: assert False
+E    +  where False = CertificationReport(certified=False, errors=('R2: operation/route precedence mismatch',), recomputed_cmax=500.7841830218614).certified
+E    +    where CertificationReport(certified=False, errors=('R2: operation/route precedence mismatch',), recomputed_cmax=500.7841830218614) = certify_schedule(CanonicalSolution(parents=(ParentWeld(parent_id='bridge', start=(2.0, 9.0), end=(2.0, 3.0)), ParentWeld(parent_id='kee...Route(robot_id=2, block_ids=('bridge::1', 'keep::whole')), Route(robot_id=3, block_ids=('right::whole',))), revision=0), ScheduleResult(status=<ScheduleStatus.FEASIBLE: 'FEASIBLE'>, operations=(Operation(operation_id='R0:NATIVE:0', robot_i...a825641e381f83f8de51adf3a1c37134c06b2528c76e1b1609c7d3cc4e1d1dc', deadlock_blockages=(), deadlock_evidence_source=None), ScientificConfig(workspace_x=(0.0, 20.0), workspace_y=(0.0, 12.0), weld_speed=0.0108, empty_speed=0.2, t_pre=20.0, t_post=30.0, min_child_length=0.5, delta_x=0.5, delta_y=0.5, interference_dx=0.5, interference_dy=0.5, numeric_epsilon=1e-10), scope=FormalScope(scope_id='FORMAL_SCOPE_V2', pattern_domain=('WHOLE', 'Y_SPLIT', 'X_SPLIT'), optional_x_split_policy='FINIT...ELD_POST_V1', x_split_shared_point_policy_id='NO_INTERFERENCE_EXCEPTION_V1', combined_xy_split_policy_id='EXCLUDED_V1'))
+E    +      where ScheduleResult(status=<ScheduleStatus.FEASIBLE: 'FEASIBLE'>, operations=(Operation(operation_id='R0:NATIVE:0', robot_i...a825641e381f83f8de51adf3a1c37134c06b2528c76e1b1609c7d3cc4e1d1dc', deadlock_blockages=(), deadlock_evidence_source=None) = DirectedSolution(solution=CanonicalSolution(parents=(ParentWeld(parent_id='bridge', start=(2.0, 9.0), end=(2.0, 3.0)),...825641e381f83f8de51adf3a1c37134c06b2528c76e1b1609c7d3cc4e1d1dc', deadlock_blockages=(), deadlock_evidence_source=None)).schedule
+_ test_fixed_route_bound_skips_only_nonimproving_candidates_and_keeps_real_evaluation _
+tests\test_gnn_construct_vns.py:1751: in test_fixed_route_bound_skips_only_nonimproving_candidates_and_keeps_real_evaluation
+    assert evaluated['certified'] and evaluated['reference_calls']==1
+E   assert (False)
+____________ test_same_seed_gnn_inference_and_vns_are_reproducible ____________
+tests\test_gnn_construct_vns.py:2676: in test_same_seed_gnn_inference_and_vns_are_reproducible
+    assert results[0].best is not None and results[1].best is not None
+E   AssertionError: assert (None is not None)
+E    +  where None = VNSResult(initial=None, best=None, stats=VNSStats(iterations=0, attempted={'N1_RELOCATE': 0, 'N2_SWAP': 0, 'N3_ROUTE':...', 'NUMERIC_FAILURE', 'DEADLOCK', 'DEADLOCK', 'DEADLOCK', 'NUMERIC_FAILURE', 'DEADLOCK'), elapsed=0.028997700079344213).best
+______ test_late_initial_certification_is_not_accepted_at_hard_deadline _______
+tests\test_gnn_construct_vns.py:2690: in test_late_initial_certification_is_not_accepted_at_hard_deadline
+    assert completed.status.value == "COMPLETED"
+E   AssertionError: assert 'NUMERIC_FAILURE' == 'COMPLETED'
+E     
+E     - COMPLETED
+E     + NUMERIC_FAILURE
+_____ test_assignment_change_diagnostic_ignores_route_order_only_changes ______
+tests\test_gnn_construct_vns.py:2747: in test_assignment_change_diagnostic_ignores_route_order_only_changes
+    assert initial.status.value == "COMPLETED"
+E   AssertionError: assert 'NUMERIC_FAILURE' == 'COMPLETED'
+E     
+E     - COMPLETED
+E     + NUMERIC_FAILURE
+___ test_weld_layout_writer_preserves_rows_when_extending_existing_columns ____
+tests\test_gnn_construct_vns.py:3824: in test_weld_layout_writer_preserves_rows_when_extending_existing_columns
+    experiment.write_rows(path, [latest], append=True)
+scripts\run_gnn_weld_layout.py:409: in write_rows
+    rows = read_rows(path) + list(rows)
+           ^^^^^^^^^^^^^^^
+scripts\run_gnn_weld_layout.py:398: in read_rows
+    with opener(path, 'rt', encoding='utf-8', newline='') as stream:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   TypeError: expected str, bytes or os.PathLike object, not Mock
+_ test_joint3_reconstruct_keeps_legal_distinct_complete_plans_from_the_joint_actor _
+tests\test_gnn_construct_vns.py:5508: in test_joint3_reconstruct_keeps_legal_distinct_complete_plans_from_the_joint_actor
+    removed=tuple(core.removed_parent_ids)
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'removed_parent_ids'
+___ test_joint3_old_path_still_reproduces_the_recorded_validation_01_final ____
+tests\test_gnn_construct_vns.py:5925: in test_joint3_old_path_still_reproduces_the_recorded_validation_01_final
+    row=e.joint3_case('validation_01',layouts['validation_01'],20261110,model,e.joint3_references(),
+                                                                              ^^^^^^^^^^^^^^^^^^^^^
+scripts\run_gnn_weld_layout.py:6382: in joint3_references
+    raise ValueError('the frozen HGA reference is missing')
+E   ValueError: the frozen HGA reference is missing
+___ test_generic_deadlock_evidence_does_not_add_alternative_dispatch_state ____
+tests\test_gnn_schedule_blocker_pilot.py:138: in test_generic_deadlock_evidence_does_not_add_alternative_dispatch_state
+    assert result.status is ScheduleStatus.DEADLOCK and result.cmax is None
+E   AssertionError: assert (<ScheduleStatus.INFEASIBLE: 'INFEASIBLE'> is <ScheduleStatus.DEADLOCK: 'DEADLOCK'>)
+E    +  where <ScheduleStatus.INFEASIBLE: 'INFEASIBLE'> = ScheduleResult(status=<ScheduleStatus.INFEASIBLE: 'INFEASIBLE'>, operations=(), cmax=None, robot_completion=(0.0, 0.0,...cy_id='DEVELOPMENT_NO_REPAIR_V1', scope_id=None, scope_hash=None, deadlock_blockages=(), deadlock_evidence_source=None).status
+E    +  and   <ScheduleStatus.DEADLOCK: 'DEADLOCK'> = ScheduleStatus.DEADLOCK
+__________ test_v2_three_method_pattern_access_uses_one_catalog_hash __________
+tests\test_hga_baseline.py:267: in test_v2_three_method_pattern_access_uses_one_catalog_hash
+    assert alns.candidate is not None
+E   AssertionError: assert None is not None
+E    +  where None = RawAttempt(move_type=<MoveType.SPLIT_ACTIVATE: 'SPLIT_ACTIVATE'>, candidate=None, rejection_reason='RETIRED_DYNAMIC_MOVE').candidate
+______ test_formal_task_horizon_empty_initial_post_and_same_rail_release ______
+tests\test_interference_scheduler.py:56: in test_formal_task_horizon_empty_initial_post_and_same_rail_release
+    assert schedule.canonical_json() == reference_schedule_slow(
+E   assert '{"cmax":11.0...or_graph":[]}' == '{"cmax":11.0...or_graph":[]}'
+E     
+E     Skipping 126 identical leading characters in diff, use -v to show
+E     - ","end":[2,10],"end_time":1.0,"id":"R0:B0:SETUP","kind":"SETUP","robot":0,"sequence":0,"start":[2,10],"start_time":0.0},{"block":"right::whole","end":[10,10],"end_time":1.0,"id":"R1:B0:SETUP","kind":"SETUP","robot":1,"sequence":0,"start":[10,10],"start_time":0.0},{"block":"left::whole","end":[3,10],"end_time":2.0,"id":"R0:B0:WELD","kind":"WELD","robot":0,"sequence":1,"start":[2,10],"start_time":1.0},{"block":"right::whole","end":[1,10],"end_time":10.0,"id":"R1:B0:WELD","kind":"WELD","robot":1,"sequence":...
+E     
+E     ...Full output truncated (2 lines hidden), use '-vv' to show
+___________ test_formal_x_excluded_even_with_valid_legacy_validator ___________
+tests\test_interference_scheduler.py:94: in test_formal_x_excluded_even_with_valid_legacy_validator
+    assert "EXCLUDED" in formal.diagnostics[0]
+E   AssertionError: assert 'EXCLUDED' in 'FORMAL_SCOPE_V1_1: pattern is absent from legal catalog: x:X_SPLIT:UPPER:explicit-x'
+____ test_experimental_x_scope_certifies_processing_and_shared_point_wait _____
+tests\test_interference_scheduler.py:140: in test_experimental_x_scope_certifies_processing_and_shared_point_wait
+    assert "EXCLUDED" in rejected.diagnostics[0]
+E   AssertionError: assert 'EXCLUDED' in 'FORMAL_SCOPE_V1_1: pattern is absent from legal catalog: xgate:X_SPLIT:UPPER:BX_CENTER'
+_____ test_new_y_cut_is_canonical_and_independently_certified[BY_CENTER] ______
+tests\test_model_geometry.py:612: in test_new_y_cut_is_canonical_and_independently_certified
+    assert schedule.status is ScheduleStatus.FEASIBLE
+E   AssertionError: assert <ScheduleStatus.DEADLOCK: 'DEADLOCK'> is <ScheduleStatus.FEASIBLE: 'FEASIBLE'>
+E    +  where <ScheduleStatus.DEADLOCK: 'DEADLOCK'> = ScheduleResult(status=<ScheduleStatus.DEADLOCK: 'DEADLOCK'>, operations=(Operation(operation_id='R0:NATIVE:0', robot_i...a825641e381f83f8de51adf3a1c37134c06b2528c76e1b1609c7d3cc4e1d1dc', deadlock_blockages=(), deadlock_evidence_source=None).status
+E    +  and   <ScheduleStatus.FEASIBLE: 'FEASIBLE'> = <enum 'ScheduleStatus'>.FEASIBLE
+__ test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies[5.8] __
+tests\test_model_geometry.py:629: in test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies
+    assert report.certified,report.errors
+E   AssertionError: ('schedule is not FEASIBLE',)
+E   assert False
+E    +  where False = CertificationReport(certified=False, errors=('schedule is not FEASIBLE',), recomputed_cmax=None).certified
+__ test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies[6.2] __
+tests\test_model_geometry.py:629: in test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies
+    assert report.certified,report.errors
+E   AssertionError: ('schedule is not FEASIBLE',)
+E   assert False
+E    +  where False = CertificationReport(certified=False, errors=('schedule is not FEASIBLE',), recomputed_cmax=None).certified
+___________ test_native_ranker_hook_preserves_budget_and_tie_policy ___________
+tests\test_phase3_validation.py:97: in test_native_ranker_hook_preserves_budget_and_tie_policy
+    assert learned.stats.raw_attempts==baseline.stats.raw_attempts==192
+E   AssertionError: assert 0 == 192
+E    +  where 0 = SearchStats(scope_id='FORMAL_SCOPE_V2', seed=20261121, iterations=0, scientific_identity=RunScientificIdentity(scope_i...ccepted': 0, 'global_best_update': 0})}, first_x_proposal_time=None, first_x_c2_time=None, first_x_reference_time=None).raw_attempts
+E    +    where SearchStats(scope_id='FORMAL_SCOPE_V2', seed=20261121, iterations=0, scientific_identity=RunScientificIdentity(scope_i...ccepted': 0, 'global_best_update': 0})}, first_x_proposal_time=None, first_x_c2_time=None, first_x_reference_time=None) = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.006438700016587973, termination_reason='NUMERIC_FAILURE').stats
+_____ test_y_split_empty_route_wait_and_same_rail_boundary_differentials ______
+tests\test_scheduler_equivalence.py:535: in test_y_split_empty_route_wait_and_same_rail_boundary_differentials
+    assert scheduler_module.native_schedule(
+E   assert '{"cmax":4.0,...or_graph":[]}' == '{"cmax":4.0,...or_graph":[]}'
+E     
+E     Skipping 156 identical leading characters in diff, use -v to show
+E     - ,"id":"R0:B0:SETUP","kind":"SETUP","robot":0,"sequence":0,"start":[0.0,6.0],"start_time":0.0},{"block":"optional::1","end":[2.0,6.0],"end_time":1.0,"id":"R3:B0:SETUP","kind":"SETUP","robot":3,"sequence":0,"start":[2.0,6.0],"start_time":0.0},{"block":"optional::0","end":[2.0,6.0],"end_time":3.0,"id":"R0:B0:WELD","kind":"WELD","robot":0,"sequence":1,"start":[0.0,6.0],"start_time":1.0},{"block":"optional::1","end":[4.0,6.0],"end_time":3.0,"id":"R3:B0:WELD","kind":"WELD","robot":3,"sequence":1,"start":[2.0,6...
+E     
+E     ...Full output truncated (2 lines hidden), use '-vv' to show
+__________________ test_phase2a_m1_m7_solution_differentials __________________
+tests\test_scheduler_equivalence.py:639: in test_phase2a_m1_m7_solution_differentials
+    assert scheduler_module.native_schedule(
+E   assert '{"cmax":4.0,...or_graph":[]}' == '{"cmax":4.0,...or_graph":[]}'
+E     
+E     Skipping 153 identical leading characters in diff, use -v to show
+E     - ,"id":"R2:B0:SETUP","kind":"SETUP","robot":2,"sequence":0,"start":[1.0,2.0],"start_time":0.0},{"block":"m1::whole","end":[3.0,2.0],"end_time":3.0,"id":"R2:B0:WELD","kind":"WELD","robot":2,"sequence":1,"start":[1.0,2.0],"start_time":1.0},{"block":"m1::whole","end":[3.0,2.0],"end_time":4.0,"id":"R2:B0:POST","kind":"POST","robot":2,"sequence":2,"start":[3.0,2.0],"start_time":3.0}],"status":"FEASIBLE","wait_for_graph":[]}
+E     ?           ^^^        ---------------                                                  ...
+E     
+E     ...Full output truncated (3 lines hidden), use '-vv' to show
+_____ test_coordination_only_experiment_skips_all_existing_certification ______
+tests\test_search_direction_refinement.py:37: in test_coordination_only_experiment_skips_all_existing_certification
+    assert result.best_schedule.feasible
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'feasible'
+______ test_refinement_certification_failure_is_effective_numeric_status ______
+tests\test_search_direction_refinement.py:50: in test_refinement_certification_failure_is_effective_numeric_status
+    result = refine_directions_bounded(
+src\mrta_search\direction.py:176: in refine_directions_bounded
+    if max_calls <= 0 or base_schedule.status is not ScheduleStatus.FEASIBLE:
+                         ^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'status'
+_ test_q3_bounded_single_flip_improves_direction_gap_to_current_scope_optimum _
+tests\test_search_direction_refinement.py:74: in test_q3_bounded_single_flip_improves_direction_gap_to_current_scope_optimum
+    assert baseline.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>, best_solution=None, best_directions..., 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0022090000566095114, termination_reason='INITIALIZATION_FAILED').best_solution
+_____________ test_refinement_status_isolated_and_budget_is_hard ______________
+tests\test_search_direction_refinement.py:98: in test_refinement_status_isolated_and_budget_is_hard
+    assert baseline.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>, best_solution=None, best_directions...e, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.001518600038252771, termination_reason='INITIALIZATION_FAILED').best_solution
+__ test_search_iteration_total_reference_cap_includes_refinement_and_replays __
+tests\test_search_direction_refinement.py:136: in test_search_iteration_total_reference_cap_includes_refinement_and_replays
+    assert first.best_solution.canonical_json == second.best_solution.canonical_json
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'canonical_json'
+___ test_formal_fixed_budget_replay_history_independence_and_shared_policy ____
+tests\test_search_direction_refinement.py:157: in test_formal_fixed_budget_replay_history_independence_and_shared_policy
+    assert result.final_certification.certified
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'certified'
+_ test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnostics _
+tests\test_search_direction_refinement.py:196: in test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnostics
+    result = refine_directions_bounded(
+src\mrta_search\direction.py:176: in refine_directions_bounded
+    if max_calls <= 0 or base_schedule.status is not ScheduleStatus.FEASIBLE:
+                         ^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'status'
+____________ test_formal_q1_q6_regression[Q1_assignment_trap-7.15] ____________
+tests\test_search_direction_refinement.py:235: in test_formal_q1_q6_regression
+    assert result.final_certification.certified
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'certified'
+____ test_formal_q1_q6_regression[Q2_route_order_trap-11.468135899374975] _____
+tests\test_search_direction_refinement.py:235: in test_formal_q1_q6_regression
+    assert result.final_certification.certified
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'certified'
+______ test_formal_q1_q6_regression[Q3_direction_trap-6.271416626834708] ______
+tests\test_search_direction_refinement.py:235: in test_formal_q1_q6_regression
+    assert result.final_certification.certified
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'certified'
+_________ test_formal_q1_q6_regression[Q4_optional_y_split_trap-4.0] __________
+tests\test_search_direction_refinement.py:236: in test_formal_q1_q6_regression
+    assert result.best_schedule.cmax == pytest.approx(expected)
+E   assert 6.0 == 4.0 ± 4.0e-06
+E     
+E     comparison failed
+E     Obtained: 6.0
+E     Expected: 4.0 ± 4.0e-06
+__ test_formal_q1_q6_regression[Q5_interference_wait_trap-6.271416626834708] __
+tests\test_search_direction_refinement.py:235: in test_formal_q1_q6_regression
+    assert result.final_certification.certified
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'certified'
+______ test_formal_q1_q6_regression[Q6_lns_basin_trap-3.557181856472053] ______
+tests\test_search_direction_refinement.py:235: in test_formal_q1_q6_regression
+    assert result.final_certification.certified
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'certified'
+_____ test_initialization_whole_mandatory_y_bounded_positions_and_replay ______
+tests\test_search_initialization.py:40: in test_initialization_whole_mandatory_y_bounded_positions_and_replay
+    assert first.status is InitializationStatus.SUCCESS
+E   AssertionError: assert <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> is <InitializationStatus.SUCCESS: 'SUCCESS'>
+E    +  where <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...R2: operation/route precedence mismatch',), duplicate=False, strategy='RAIL_SERIAL_BOOTSTRAP')), winning_strategy=None).status
+E    +  and   <InitializationStatus.SUCCESS: 'SUCCESS'> = InitializationStatus.SUCCESS
+_ test_v3_monotone_balanced_bootstrap_is_deterministic_canonical_and_certified _
+tests\test_search_initialization.py:234: in test_v3_monotone_balanced_bootstrap_is_deterministic_canonical_and_certified
+    assert result.status is InitializationStatus.SUCCESS
+E   AssertionError: assert <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> is <InitializationStatus.SUCCESS: 'SUCCESS'>
+E    +  where <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...n/route precedence mismatch',), duplicate=False, strategy='RAIL_MONOTONE_BALANCED_BOOTSTRAP'),), winning_strategy=None).status
+E    +  and   <InitializationStatus.SUCCESS: 'SUCCESS'> = InitializationStatus.SUCCESS
+_ test_clearance_accepted_initializations_are_independently_certified_and_repeatable _
+tests\test_search_initialization.py:325: in test_clearance_accepted_initializations_are_independently_certified_and_repeatable
+    assert result.status is InitializationStatus.SUCCESS
+E   AssertionError: assert <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> is <InitializationStatus.SUCCESS: 'SUCCESS'>
+E    +  where <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...n/route precedence mismatch',), duplicate=False, strategy='RAIL_MONOTONE_BALANCED_BOOTSTRAP'),), winning_strategy=None).status
+E    +  and   <InitializationStatus.SUCCESS: 'SUCCESS'> = InitializationStatus.SUCCESS
+__ test_region_cooperative_is_deterministic_balanced_eligible_and_certified ___
+tests\test_search_initialization.py:359: in test_region_cooperative_is_deterministic_balanced_eligible_and_certified
+    assert result.status is InitializationStatus.SUCCESS
+E   AssertionError: assert <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> is <InitializationStatus.SUCCESS: 'SUCCESS'>
+E    +  where <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,.../route precedence mismatch',), duplicate=False, strategy='REGION_COOPERATIVE_INITIALIZATION'),), winning_strategy=None).status
+E    +  and   <InitializationStatus.SUCCESS: 'SUCCESS'> = InitializationStatus.SUCCESS
+_______ test_same_rail_rebalance_default_off_replaces_only_x_order_slot _______
+tests\test_search_initialization.py:433: in test_same_rail_rebalance_default_off_replaces_only_x_order_slot
+    assert [row.strategy for row in enabled.attempts[:5]] == [
+E   AssertionError: assert ['SAME_RAIL_B...ITIALIZATION'] == ['LOAD_FIRST'...ED_BOOTSTRAP']
+E     
+E     At index 0 diff: 'SAME_RAIL_BOUNDARY_REBALANCED_INITIALIZATION' != 'LOAD_FIRST'
+E     Right contains 4 more items, first extra item: 'RAIL_BALANCED'
+E     Use -v to get more diff
+_ test_coordination_route_reorder_is_default_off_and_replaces_only_x_order_slot _
+tests\test_search_initialization.py:459: in test_coordination_route_reorder_is_default_off_and_replaces_only_x_order_slot
+    assert [row.strategy for row in enabled.attempts[:5]] == [
+E   AssertionError: assert ['REGION_COOR...TE_REORDERED'] == ['LOAD_FIRST'...ED_BOOTSTRAP']
+E     
+E     At index 0 diff: 'REGION_COORDINATION_ROUTE_REORDERED' != 'LOAD_FIRST'
+E     Right contains 4 more items, first extra item: 'RAIL_BALANCED'
+E     Use -v to get more diff
+________ test_jrrb_joint_boundary_pool_is_bounded_structural_and_legal ________
+tests\test_search_initialization.py:602: in test_jrrb_joint_boundary_pool_is_bounded_structural_and_legal
+    parents,initial=_jrrb_state()
+                    ^^^^^^^^^^^^^
+tests\test_search_initialization.py:597: in _jrrb_state
+    assert result.status is InitializationStatus.SUCCESS
+E   AssertionError: assert <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> is <InitializationStatus.SUCCESS: 'SUCCESS'>
+E    +  where <InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...on/route precedence mismatch',), duplicate=False, strategy='RAIL_MONOTONE_BALANCED_BOOTSTRAP')), winning_strategy=None).status
+E    +  and   <InitializationStatus.SUCCESS: 'SUCCESS'> = InitializationStatus.SUCCESS
+__ test_bottleneck_selection_is_closed_replayable_and_wait_optional[RANDOM] ___
+tests\test_search_lns.py:197: in test_bottleneck_selection_is_closed_replayable_and_wait_optional
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0034944000653922558, termination_reason='NUMERIC_FAILURE').best_solution
+___ test_bottleneck_selection_is_closed_replayable_and_wait_optional[LOAD] ____
+tests\test_search_lns.py:197: in test_bottleneck_selection_is_closed_replayable_and_wait_optional
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.003114700084552169, termination_reason='NUMERIC_FAILURE').best_solution
+__ test_bottleneck_selection_is_closed_replayable_and_wait_optional[TRAVEL] ___
+tests\test_search_lns.py:197: in test_bottleneck_selection_is_closed_replayable_and_wait_optional
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.003018600051291287, termination_reason='NUMERIC_FAILURE').best_solution
+_ test_bottleneck_selection_is_closed_replayable_and_wait_optional[WAIT_ANCHORED] _
+tests\test_search_lns.py:197: in test_bottleneck_selection_is_closed_replayable_and_wait_optional
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0030138000147417188, termination_reason='NUMERIC_FAILURE').best_solution
+_ test_bottleneck_selection_is_closed_replayable_and_wait_optional[SHARED_Y_PAIR] _
+tests\test_search_lns.py:197: in test_bottleneck_selection_is_closed_replayable_and_wait_optional
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0030130998929962516, termination_reason='NUMERIC_FAILURE').best_solution
+______ test_load_selector_includes_same_rail_mobility_without_cross_rail ______
+tests\test_search_lns.py:227: in test_load_selector_includes_same_rail_mobility_without_cross_rail
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0031168999848887324, termination_reason='NUMERIC_FAILURE').best_solution
+__ test_parent_destroy_repair_identity_replay_and_hard_budget[GREEDY_REPAIR] __
+tests\test_search_lns.py:753: in test_parent_destroy_repair_identity_replay_and_hard_budget
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0030377000803127885, termination_reason='NUMERIC_FAILURE').best_solution
+_ test_parent_destroy_repair_identity_replay_and_hard_budget[REGRET_2_REPAIR] _
+tests\test_search_lns.py:753: in test_parent_destroy_repair_identity_replay_and_hard_budget
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0030391999753192067, termination_reason='NUMERIC_FAILURE').best_solution
+______ test_bounded_initial_portfolio_closes_known_handover_n50_failure _______
+tests\test_search_lns.py:888: in test_bounded_initial_portfolio_closes_known_handover_n50_failure
+    assert result.best_schedule is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...x': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.06367359997238964, termination_reason='NUMERIC_FAILURE').best_schedule
+____________ test_atomic_and_lns_share_complete_candidate_pipeline ____________
+tests\test_search_lns.py:897: in test_atomic_and_lns_share_complete_candidate_pipeline
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0030091999797150493, termination_reason='NUMERIC_FAILURE').best_solution
+____ test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal _____
+tests\test_search_lns.py:1000: in test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...ax': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0043289999011904, termination_reason='NUMERIC_FAILURE').best_solution
+___ test_crrr_replaces_eight_original_lns_attempts_and_default_is_unchanged ___
+tests\test_search_lns.py:1054: in test_crrr_replaces_eight_original_lns_attempts_and_default_is_unchanged
+    initial = _initial()
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.003262000042013824, termination_reason='NUMERIC_FAILURE').best_solution
+________ test_crrr_access_c2_is_guarded_family_safe_and_limited_to_one ________
+tests\test_search_lns.py:1096: in test_crrr_access_c2_is_guarded_family_safe_and_limited_to_one
+    current = _initial().best_solution
+              ^^^^^^^^^^
+tests\test_search_lns.py:727: in _initial
+    assert result.best_solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0032757000299170613, termination_reason='NUMERIC_FAILURE').best_solution
+______ test_q6_destroy_repair_crosses_a_basin_atomic_short_budget_cannot ______
+tests\test_search_lns.py:1246: in test_q6_destroy_repair_crosses_a_basin_atomic_short_budget_cannot
+    assert atomic.best_schedule is not None and alns.best_schedule is not None
+E   AssertionError: assert (None is not None)
+E    +  where None = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.002256200066767633, termination_reason='NUMERIC_FAILURE').best_schedule
+____ test_yr_v1_default_remains_global_shortlist_and_identical_trajectory _____
+tests\test_search_sa.py:132: in test_yr_v1_default_remains_global_shortlist_and_identical_trajectory
+    assert default.best_solution.canonical_hash == legacy.best_solution.canonical_hash
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'canonical_hash'
+___________ test_yr_v2_funnel_monotone_caps_and_first_access_times ____________
+tests\test_search_sa.py:151: in test_yr_v2_funnel_monotone_caps_and_first_access_times
+    assert stats.decision_family_funnel["TARGET_X"]["C2_selected"] > 0
+E   assert 0 > 0
+_______________ test_explicit_iteration_safety_cap_is_reported ________________
+tests\test_search_sa.py:170: in test_explicit_iteration_safety_cap_is_reported
+    assert result.status is SearchStatus.COMPLETED
+E   AssertionError: assert <SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> is <SearchStatus.COMPLETED: 'COMPLETED'>
+E    +  where <SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0021863000001758337, termination_reason='NUMERIC_FAILURE').status
+E    +  and   <SearchStatus.COMPLETED: 'COMPLETED'> = SearchStatus.COMPLETED
+______ test_optional_y_activation_enters_search_and_improves_whole_only _______
+tests\test_search_sa.py:255: in test_optional_y_activation_enters_search_and_improves_whole_only
+    assert result.best_schedule.cmax == pytest.approx(4.0)
+E   assert 6.0 == 4.0 ± 4.0e-06
+E     
+E     comparison failed
+E     Obtained: 6.0
+E     Expected: 4.0 ± 4.0e-06
+_______ test_hard_reference_deadline_preserves_only_certified_incumbent _______
+tests\test_search_sa.py:290: in test_hard_reference_deadline_preserves_only_certified_incumbent
+    result = run_bounded_sa_oi(
+src\mrta_search\pipeline.py:1786: in run_bounded_sa_oi
+    result = _run_bounded_sa_oi_inner(
+src\mrta_search\pipeline.py:1433: in _run_bounded_sa_oi_inner
+    raise ValueError("initialization_override must be a matching certified seed")
+E   ValueError: initialization_override must be a matching certified seed
+________ test_hard_reference_worker_matches_direct_unexpired_schedule _________
+tests\test_search_sa.py:365: in test_hard_reference_worker_matches_direct_unexpired_schedule
+    assert direct.status is isolated.status is SearchStatus.COMPLETED
+E   AssertionError: assert <SearchStatus.COMPLETED: 'COMPLETED'> is <SearchStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>
+E    +  where <SearchStatus.COMPLETED: 'COMPLETED'> = SearchResult(status=<SearchStatus.COMPLETED: 'COMPLETED'>, best_solution=CanonicalSolution(parents=(ParentWeld(parent_...me=None, first_x_reference_time=None), anytime={}, runtime=0.0011158999986946583, termination_reason='ITERATION_LIMIT').status
+E    +  and   <SearchStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'> = SearchResult(status=<SearchStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>, best_solution=None, best_directions...t_x_c2_time=None, first_x_reference_time=None), anytime={}, runtime=5.024560599937104, termination_reason='TIME_LIMIT').status
+_______ test_jrrb_default_off_preserves_old_path_and_fixed_alns_budgets _______
+tests\test_search_sa.py:384: in test_jrrb_default_off_preserves_old_path_and_fixed_alns_budgets
+    assert first.best_solution.canonical_hash==second.best_solution.canonical_hash
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'canonical_hash'
+_ test_jrrb_macro_caps_certifies_and_does_not_consume_normal_iteration_slots __
+tests\test_search_sa.py:414: in test_jrrb_macro_caps_certifies_and_does_not_consume_normal_iteration_slots
+    assert result.status is SearchStatus.COMPLETED
+E   AssertionError: assert <SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> is <SearchStatus.COMPLETED: 'COMPLETED'>
+E    +  where <SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'> = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...ime=None, first_x_reference_time=None), anytime={}, runtime=0.009371299995109439, termination_reason='NUMERIC_FAILURE').status
+E    +  and   <SearchStatus.COMPLETED: 'COMPLETED'> = SearchStatus.COMPLETED
+________ test_jrrb_certifier_failure_cannot_replace_certified_current _________
+tests\test_search_sa.py:435: in test_jrrb_certifier_failure_cannot_replace_certified_current
+    current_metrics=official_metrics(initial.solution,initial.schedule,FAST)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\mrta_reference\solution.py:222: in official_metrics
+    raise ValueError("official metrics require a feasible schedule")
+E   ValueError: official metrics require a feasible schedule
+________ test_jrrb_late_certification_is_counted_but_never_backfilled _________
+tests\test_search_sa.py:458: in test_jrrb_late_certification_is_counted_but_never_backfilled
+    pool=build_joint_rail_region_rebuild_candidates(initial.solution,initial.directions,
+src\mrta_search\initialization.py:785: in build_joint_rail_region_rebuild_candidates
+    blocks = block_map(current, config)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+src\mrta_reference\solution.py:170: in block_map
+    if any(p.kind is SplitKind.FIXED for p in solution.patterns):
+                                              ^^^^^^^^^^^^^^^^^
+E   AttributeError: 'NoneType' object has no attribute 'patterns'
+____ test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q1_assignment] ____
+tests\test_search_sa.py:600: in test_q1_q5_nontrivial_initial_gap_and_backbone_quality
+    assert search.initialization.solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...fication: R1: operation/route precedence mismatch',), duplicate=False, strategy='LOAD_FIRST'),), winning_strategy=None).solution
+E    +    where InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...fication: R1: operation/route precedence mismatch',), duplicate=False, strategy='LOAD_FIRST'),), winning_strategy=None) = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0018480999860912561, termination_reason='NUMERIC_FAILURE').initialization
+___ test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q2_route_order] ____
+tests\test_search_sa.py:600: in test_q1_q5_nontrivial_initial_gap_and_backbone_quality
+    assert search.initialization.solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...fication: R1: operation/route precedence mismatch',), duplicate=False, strategy='LOAD_FIRST'),), winning_strategy=None).solution
+E    +    where InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...fication: R1: operation/route precedence mismatch',), duplicate=False, strategy='LOAD_FIRST'),), winning_strategy=None) = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...x': None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.00218079995829612, termination_reason='NUMERIC_FAILURE').initialization
+____ test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q3_direction] _____
+tests\test_search_sa.py:600: in test_q1_q5_nontrivial_initial_gap_and_backbone_quality
+    assert search.initialization.solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = InitializationResult(status=<InitializationStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>, solution=None, dire... bootstrap; reference evaluation skipped',), duplicate=True, strategy='RAIL_SERIAL_BOOTSTRAP')), winning_strategy=None).solution
+E    +    where InitializationResult(status=<InitializationStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>, solution=None, dire... bootstrap; reference evaluation skipped',), duplicate=True, strategy='RAIL_SERIAL_BOOTSTRAP')), winning_strategy=None) = SearchResult(status=<SearchStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>, best_solution=None, best_directions..., 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0022878999589011073, termination_reason='INITIALIZATION_FAILED').initialization
+____ test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q4_optional_y] ____
+tests\test_search_sa.py:618: in test_q1_q5_nontrivial_initial_gap_and_backbone_quality
+    assert final_gap.search_gap < initial_gap - 1.0e-6
+E   assert 2.0 < (2.0 - 1e-06)
+E    +  where 2.0 = MicroGapResult(c_star=4.0, c_coord=6.0, c_ref=6.0, search_gap=2.0, scheduler_gap=0.0, total_gap=2.0).search_gap
+_ test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q5_interference_wait] _
+tests\test_search_sa.py:600: in test_q1_q5_nontrivial_initial_gap_and_backbone_quality
+    assert search.initialization.solution is not None
+E   AssertionError: assert None is not None
+E    +  where None = InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...R0: operation/route precedence mismatch',), duplicate=False, strategy='RAIL_SERIAL_BOOTSTRAP')), winning_strategy=None).solution
+E    +    where InitializationResult(status=<InitializationStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, solution=None, directions=None,...R0: operation/route precedence mismatch',), duplicate=False, strategy='RAIL_SERIAL_BOOTSTRAP')), winning_strategy=None) = SearchResult(status=<SearchStatus.NUMERIC_FAILURE: 'NUMERIC_FAILURE'>, best_solution=None, best_directions=None, best_...: None, 'reason': 'NO_FEASIBLE_BEFORE_DEADLINE'}}, runtime=0.0029854999156668782, termination_reason='NUMERIC_FAILURE').initialization
+============================== warnings summary ===============================
+tests/test_baseline_common.py::test_unified_native_interface_calls_only_one_compiled_kernel
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\wag_vns.py:877: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_priority_pair_directions'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\wag_vns.py", line 933:[0m
+  [1m@njit
+  [1mdef _priority_pair_directions(routes, left, travel, processing, points, parameters):
+  [0m[1m^[0m[0m
+  [0m[0m
+    best, bit0, bit1 = _priority_pair_directions(routes, left, travel, processing, points, parameters)
+
+tests/test_baseline_common.py::test_unified_native_interface_calls_only_one_compiled_kernel
+tests/test_gnn_construct_vns.py::test_priority_native_evaluation_preserves_genes_caches_and_never_calls_coordination
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'fixed_directions' of function '_priority_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\wag_vns.py", line 851:[0m
+  [1m@njit
+  [1mdef _priority_arrays(routes, travel, processing, points, parameters, fixed_directions=None, pair_status=None):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_baseline_common.py::test_unified_native_interface_calls_only_one_compiled_kernel
+tests/test_baseline_common.py::test_precomputed_native_schedule_preserves_metrics_and_avoids_second_call
+tests/test_gnn_construct_vns.py::test_priority_native_evaluation_preserves_genes_caches_and_never_calls_coordination
+tests/test_hga_baseline.py::test_incremental_native_pair_reuse_matches_full_native_for_all_six_moves
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_priority_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\wag_vns.py", line 851:[0m
+  [1m@njit
+  [1mdef _priority_arrays(routes, travel, processing, points, parameters, fixed_directions=None, pair_status=None):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_vnd_graph_has_directed_routes_qualifications_and_no_outcome_leakage
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:1299: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_move_segments'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 413:[0m
+  [1m@njit
+  [1mdef _move_segments(routes, move, ru, iu, rv, iv):
+  [0m[1m^[0m[0m
+  [0m[0m
+    a,b = _move_segments(routes,move,ru,iu,rv,iv)
+
+tests/test_gnn_construct_vns.py::test_vnd_graph_has_directed_routes_qualifications_and_no_outcome_leakage
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_vnd_candidate_context'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1283:[0m
+  [1m@njit
+  [1mdef _vnd_candidate_context(routes, directions, actions, travel, processing, eligible,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_vnd_graph_has_directed_routes_qualifications_and_no_outcome_leakage
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_vnd_candidate_context'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1283:[0m
+  [1m@njit
+  [1mdef _vnd_candidate_context(routes, directions, actions, travel, processing, eligible,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_eg_teacher_native_labels_are_separate_from_hga_acceptance
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_materialize_segments'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 440:[0m
+  [1m@njit
+  [1mdef _materialize_segments(segments, routes):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_eg_teacher_native_labels_are_separate_from_hga_acceptance
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_materialize_directions'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1058:[0m
+  [1m@njit
+  [1mdef _materialize_directions(segments, directions):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_conflict_joint_reconstruction_can_change_mode_and_owner_without_touching_other_tasks
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_repair_first_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1882:[0m
+  [1m@njit
+  [1mdef _repair_first_arrays(routes, points, parameters):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_cycle_ranking_loss_backpropagates_to_existing_joint_actor
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\tests\test_gnn_construct_vns.py:5390: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+  Consider using tensor.detach() first. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\torch\csrc\autograd\generated\python_variable_methods.cpp:823.)
+    assert pairs>0 and math.isfinite(float(loss))
+
+tests/test_gnn_construct_vns.py::test_cem_dynamic_graph_contains_stable_parents_and_only_activated_children
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_heads_legal'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\saeax.py", line 109:[0m
+  [1m@njit
+  [1mdef _heads_legal(routes, directions, points, parameters):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_cem_dynamic_graph_contains_stable_parents_and_only_activated_children
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_heads_legal'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\saeax.py", line 109:[0m
+  [1m@njit
+  [1mdef _heads_legal(routes, directions, points, parameters):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_cem_dynamic_graph_contains_stable_parents_and_only_activated_children
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_route_statistics'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\saeax.py", line 97:[0m
+  [1m@njit
+  [1mdef _route_statistics(routes, directions, travel, processing):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_gnn_construct_vns.py::test_cem_dynamic_graph_contains_stable_parents_and_only_activated_children
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_route_statistics'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\saeax.py", line 97:[0m
+  [1m@njit
+  [1mdef _route_statistics(routes, directions, travel, processing):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_merged_insertion_matches_all_raw_positions_and_directions
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_merge_fixed_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1383:[0m
+  [1m@njit
+  [1mdef _merge_fixed_arrays(routes, directions, starts, stops, lookup):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_merged_insertion_matches_all_raw_positions_and_directions
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_merge_fixed_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1383:[0m
+  [1m@njit
+  [1mdef _merge_fixed_arrays(routes, directions, starts, stops, lookup):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_merged_insertion_matches_all_raw_positions_and_directions
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_put_oriented'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2335:[0m
+  [1m@njit
+  [1mdef _put_oriented(routes, directions, node, bit, robot, position):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_merged_insertion_matches_all_raw_positions_and_directions
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_put_oriented'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2335:[0m
+  [1m@njit
+  [1mdef _put_oriented(routes, directions, node, bit, robot, position):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_merged_insertion_matches_all_raw_positions_and_directions
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_insert_fixed_oriented'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1426:[0m
+  [1m@njit
+  [1mdef _insert_fixed_oriented(node, routes, directions, eligible, travel, processing,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_merged_insertion_matches_all_raw_positions_and_directions
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_insert_fixed_oriented'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1426:[0m
+  [1m@njit
+  [1mdef _insert_fixed_oriented(node, routes, directions, eligible, travel, processing,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_numeric_union_and_repair_preserve_atomic_coverage
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'inherited' of function '_repair_fixed_numeric'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1481:[0m
+  [1m@njit
+  [1mdef _repair_fixed_numeric(inherited, inherited_bits, atomic_nodes, starts, stops, lookup,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_numeric_union_and_repair_preserve_atomic_coverage
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'inherited_bits' of function '_repair_fixed_numeric'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1481:[0m
+  [1m@njit
+  [1mdef _repair_fixed_numeric(inherited, inherited_bits, atomic_nodes, starts, stops, lookup,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py: 10 warnings
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_vnd_oriented_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1545:[0m
+  [1m@njit
+  [1mdef _vnd_oriented_arrays(routes, directions, travel, processing, points, eligible, parent_index,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py: 10 warnings
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_vnd_oriented_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1545:[0m
+  [1m@njit
+  [1mdef _vnd_oriented_arrays(routes, directions, travel, processing, points, eligible, parent_index,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:1230: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_fixed_native_pair'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1177:[0m
+  [1m@njit
+  [1mdef _fixed_native_pair(routes, directions, left, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m[0m
+    value, o0, o1, a, b, forward, reverse = _fixed_native_pair(
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:1230: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'follows' of function '_fixed_native_pair'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1177:[0m
+  [1m@njit
+  [1mdef _fixed_native_pair(routes, directions, left, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m[0m
+    value, o0, o1, a, b, forward, reverse = _fixed_native_pair(
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:1230: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'nominal' of function '_fixed_native_pair'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1177:[0m
+  [1m@njit
+  [1mdef _fixed_native_pair(routes, directions, left, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m[0m
+    value, o0, o1, a, b, forward, reverse = _fixed_native_pair(
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:1230: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_fixed_native_pair'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1177:[0m
+  [1m@njit
+  [1mdef _fixed_native_pair(routes, directions, left, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m[0m
+    value, o0, o1, a, b, forward, reverse = _fixed_native_pair(
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:1239: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_native_cross_feasible'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 755:[0m
+  [1m@njit
+  [1mdef _native_cross_feasible(routes, directions, operations, points, parameters):
+  [0m[1m^[0m[0m
+  [0m[0m
+    if not _native_cross_feasible(routes, directions, ops, points, parameters):
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:1239: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_native_cross_feasible'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 755:[0m
+  [1m@njit
+  [1mdef _native_cross_feasible(routes, directions, operations, points, parameters):
+  [0m[1m^[0m[0m
+  [0m[0m
+    if not _native_cross_feasible(routes, directions, ops, points, parameters):
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+tests/test_hga_baseline.py::test_oriented_prefix_bounds_match_complete_native_search_with_waits[False]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_fixed_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1222:[0m
+  [1m@njit
+  [1mdef _fixed_native_update(routes, directions, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+tests/test_hga_baseline.py::test_oriented_prefix_bounds_match_complete_native_search_with_waits[False]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'follows' of function '_fixed_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1222:[0m
+  [1m@njit
+  [1mdef _fixed_native_update(routes, directions, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+tests/test_hga_baseline.py::test_oriented_prefix_bounds_match_complete_native_search_with_waits[False]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'nominal' of function '_fixed_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1222:[0m
+  [1m@njit
+  [1mdef _fixed_native_update(routes, directions, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+tests/test_hga_baseline.py::test_oriented_prefix_bounds_match_complete_native_search_with_waits[False]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'operations' of function '_fixed_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1222:[0m
+  [1m@njit
+  [1mdef _fixed_native_update(routes, directions, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_fixed_gene_native_updates_match_full_priority_for_all_six_moves
+tests/test_hga_baseline.py::test_oriented_prefix_bounds_match_complete_native_search_with_waits[False]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_fixed_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1222:[0m
+  [1m@njit
+  [1mdef _fixed_native_update(routes, directions, points, processing, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_fixed_hga_fast_path_matches_always_materialized_merged_moves[False]
+tests/test_hga_baseline.py::test_incremental_native_pair_reuse_matches_full_native_for_all_six_moves
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'iterable' of function 'list_constructor_iterable.<locals>.list_impl'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "..\..\..\..\..\..\..\.venv\Lib\site-packages\numba\cpython\listobj.py", line 468:[0m
+  [1m
+  [1m    def list_impl(iterable):
+  [0m    [1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_crossover_missing_insertion_minimizes_cycle_time_before_travel_delta
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_insert_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2245:[0m
+  [1m@njit
+  [1mdef _insert_arrays(node, routes, eligible, travel, processing, shortest, excluded=-1):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_unbounded_vnd_stops_only_after_all_six_neighborhoods_have_no_improvement
+tests/test_hga_baseline.py::test_m4_improves_coordinated_cmax_on_a_nonlongest_route
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_vnd_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 839:[0m
+  [1m@njit
+  [1mdef _vnd_arrays(routes, travel, processing, points, eligible, parent_index, nearest,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_unbounded_vnd_stops_only_after_all_six_neighborhoods_have_no_improvement
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_legal_first_arrays'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 534:[0m
+  [1m@njit
+  [1mdef _legal_first_arrays(routes, points, parameters):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_hga_retries_failed_child_without_spending_iteration_or_calling_coordination
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'inherited' of function '_repair_oriented_numeric'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2394:[0m
+  [1m@njit
+  [1mdef _repair_oriented_numeric(inherited, inherited_bits, selected, pattern_nodes, node_child, parent_index,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_hga_retries_failed_child_without_spending_iteration_or_calling_coordination
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'inherited_bits' of function '_repair_oriented_numeric'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2394:[0m
+  [1m@njit
+  [1mdef _repair_oriented_numeric(inherited, inherited_bits, selected, pattern_nodes, node_child, parent_index,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_hga_retries_failed_child_without_spending_iteration_or_calling_coordination
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_numeric_edges'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2660:[0m
+  [1m@njit
+  [1mdef _numeric_edges(routes, node_count):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_hga_retries_failed_child_without_spending_iteration_or_calling_coordination
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_insert_oriented'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2282:[0m
+  [1m@njit
+  [1mdef _insert_oriented(node, routes, directions, eligible, travel, processing,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_hga_retries_failed_child_without_spending_iteration_or_calling_coordination
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_insert_oriented'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2282:[0m
+  [1m@njit
+  [1mdef _insert_oriented(node, routes, directions, eligible, travel, processing,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_hga_retries_failed_child_without_spending_iteration_or_calling_coordination
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'edges' of function '_population_diversity'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2675:[0m
+  [1m@njit
+  [1mdef _population_diversity(edges):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_incremental_native_pair_reuse_matches_full_native_for_all_six_moves
+tests/test_hga_baseline.py::test_interval_head_selection_and_near_tie_fallback_match_full_native
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:791: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_native_pair'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 672:[0m
+  [1m@njit
+  [1mdef _native_pair(routes, left, travel, processing, points, parameters, incumbent,
+  [0m[1m^[0m[0m
+  [0m[0m
+    value, d0, d1, o0, o1 = _native_pair(routes, left, travel, processing, points, parameters,
+
+tests/test_hga_baseline.py::test_incremental_native_pair_reuse_matches_full_native_for_all_six_moves
+  D:\pybullet_test\MRTA_GA\DRL\results\diagnostics\cleanup_bcb1608\worktrees\before\src\mrta_baselines\hga.py:800: NumbaPendingDeprecationWarning: [1m[1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_native_cross_feasible'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 755:[0m
+  [1m@njit
+  [1mdef _native_cross_feasible(routes, directions, operations, points, parameters):
+  [0m[1m^[0m[0m
+  [0m[0m
+    if not _native_cross_feasible(routes, bits, ops, points, parameters):
+
+tests/test_hga_baseline.py::test_incremental_native_pair_reuse_matches_full_native_for_all_six_moves
+tests/test_hga_baseline.py::test_interval_head_selection_and_near_tie_fallback_match_full_native
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 778:[0m
+  [1m@njit
+  [1mdef _native_update(routes, travel, processing, points, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_incremental_native_pair_reuse_matches_full_native_for_all_six_moves
+tests/test_hga_baseline.py::test_interval_head_selection_and_near_tie_fallback_match_full_native
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'operations' of function '_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 778:[0m
+  [1m@njit
+  [1mdef _native_update(routes, travel, processing, points, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_incremental_native_pair_reuse_matches_full_native_for_all_six_moves
+tests/test_hga_baseline.py::test_interval_head_selection_and_near_tie_fallback_match_full_native
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_native_update'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 778:[0m
+  [1m@njit
+  [1mdef _native_update(routes, travel, processing, points, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_head_bound_never_discards_an_improving_neighborhood
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_pair_head_bound'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 578:[0m
+  [1m@njit
+  [1mdef _pair_head_bound(left, heads, head_costs, points, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_native_head_bound_never_discards_an_improving_neighborhood
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'native_ops' of function '_pair_head_bound'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 578:[0m
+  [1m@njit
+  [1mdef _pair_head_bound(left, heads, head_costs, points, parameters,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_interval_head_selection_and_near_tie_fallback_match_full_native
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_unique_pair_heads'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 639:[0m
+  [1m@njit
+  [1mdef _unique_pair_heads(routes, left, costs, points, parameters):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_oriented_prefix_bounds_match_complete_native_search_with_waits[False]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'nominal' of function '_fixed_prefix_reject'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1143:[0m
+  [1m@njit
+  [1mdef _fixed_prefix_reject(fixed, following, prefixes, changed, nominal, progress,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_oriented_prefix_bounds_match_complete_native_search_with_waits[False]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'progress' of function '_fixed_prefix_reject'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 1143:[0m
+  [1m@njit
+  [1mdef _fixed_prefix_reject(fixed, following, prefixes, changed, nominal, progress,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_saeax_crossover_recombines_both_parents_without_hga_route_repair
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_fragment_position'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\saeax.py", line 127:[0m
+  [1m@njit
+  [1mdef _fragment_position(fragment, bits, routes, directions, remaining, costs,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_saeax_crossover_recombines_both_parents_without_hga_route_repair
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_fragment_position'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\saeax.py", line 127:[0m
+  [1m@njit
+  [1mdef _fragment_position(fragment, bits, routes, directions, remaining, costs,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_saeax_natural_stop_accounting_and_coordination_selection_are_separate[8-5-3-5-STAGNATION]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'directions' of function '_repair_oriented_first'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2350:[0m
+  [1m@njit
+  [1mdef _repair_oriented_first(routes, directions, points, travel, parameters, universe, allow_reorder=True):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_saeax_natural_stop_accounting_and_coordination_selection_are_separate[8-5-3-5-STAGNATION]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_repair_oriented_first'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_baselines\hga.py", line 2350:[0m
+  [1m@njit
+  [1mdef _repair_oriented_first(routes, directions, points, travel, parameters, universe, allow_reorder=True):
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_rcig_joint_insertion_matches_existing_action_pool_and_full_cost[0]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'bits' of function '_insertion_choices'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\rc_ig.py", line 61:[0m
+  [1m@njit
+  [1mdef _insertion_choices(node, routes, bits, costs, travel, processing, eligible,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+tests/test_hga_baseline.py::test_rcig_joint_insertion_matches_existing_action_pool_and_full_cost[0]
+  D:\pybullet_test\.venv\Lib\site-packages\numba\core\ir_utils.py:2089: NumbaPendingDeprecationWarning: [1m
+  Encountered the use of a type that is scheduled for deprecation: type 'reflected list' found for argument 'routes' of function '_insertion_choices'.
+  
+  For more information visit https://numba.readthedocs.io/en/stable/reference/deprecation.html#deprecation-of-reflection-for-list-and-set-types
+  [1m
+  File "src\mrta_search\rc_ig.py", line 61:[0m
+  [1m@njit
+  [1mdef _insertion_choices(node, routes, bits, costs, travel, processing, eligible,
+  [0m[1m^[0m[0m
+  [0m
+    warnings.warn(NumbaPendingDeprecationWarning(msg, loc=loc))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_gnn_construct_vns.py::test_destroyed_head_conflict_can_be_repaired_without_accepting_illegal_final_start
+FAILED tests/test_gnn_construct_vns.py::test_fixed_route_bound_skips_only_nonimproving_candidates_and_keeps_real_evaluation
+FAILED tests/test_gnn_construct_vns.py::test_same_seed_gnn_inference_and_vns_are_reproducible
+FAILED tests/test_gnn_construct_vns.py::test_late_initial_certification_is_not_accepted_at_hard_deadline
+FAILED tests/test_gnn_construct_vns.py::test_assignment_change_diagnostic_ignores_route_order_only_changes
+FAILED tests/test_gnn_construct_vns.py::test_weld_layout_writer_preserves_rows_when_extending_existing_columns
+FAILED tests/test_gnn_construct_vns.py::test_joint3_reconstruct_keeps_legal_distinct_complete_plans_from_the_joint_actor
+FAILED tests/test_gnn_construct_vns.py::test_joint3_old_path_still_reproduces_the_recorded_validation_01_final
+FAILED tests/test_gnn_schedule_blocker_pilot.py::test_generic_deadlock_evidence_does_not_add_alternative_dispatch_state
+FAILED tests/test_hga_baseline.py::test_v2_three_method_pattern_access_uses_one_catalog_hash
+FAILED tests/test_interference_scheduler.py::test_formal_task_horizon_empty_initial_post_and_same_rail_release
+FAILED tests/test_interference_scheduler.py::test_formal_x_excluded_even_with_valid_legacy_validator
+FAILED tests/test_interference_scheduler.py::test_experimental_x_scope_certifies_processing_and_shared_point_wait
+FAILED tests/test_model_geometry.py::test_new_y_cut_is_canonical_and_independently_certified[BY_CENTER]
+FAILED tests/test_model_geometry.py::test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies[5.8]
+FAILED tests/test_model_geometry.py::test_midpoint_on_removed_y_line_keeps_its_new_identity_and_certifies[6.2]
+FAILED tests/test_phase3_validation.py::test_native_ranker_hook_preserves_budget_and_tie_policy
+FAILED tests/test_scheduler_equivalence.py::test_y_split_empty_route_wait_and_same_rail_boundary_differentials
+FAILED tests/test_scheduler_equivalence.py::test_phase2a_m1_m7_solution_differentials
+FAILED tests/test_search_direction_refinement.py::test_coordination_only_experiment_skips_all_existing_certification
+FAILED tests/test_search_direction_refinement.py::test_refinement_certification_failure_is_effective_numeric_status
+FAILED tests/test_search_direction_refinement.py::test_q3_bounded_single_flip_improves_direction_gap_to_current_scope_optimum
+FAILED tests/test_search_direction_refinement.py::test_refinement_status_isolated_and_budget_is_hard
+FAILED tests/test_search_direction_refinement.py::test_search_iteration_total_reference_cap_includes_refinement_and_replays
+FAILED tests/test_search_direction_refinement.py::test_formal_fixed_budget_replay_history_independence_and_shared_policy
+FAILED tests/test_search_direction_refinement.py::test_formal_refinement_certifier_failure_preserves_scope_and_numeric_diagnostics
+FAILED tests/test_search_direction_refinement.py::test_formal_q1_q6_regression[Q1_assignment_trap-7.15]
+FAILED tests/test_search_direction_refinement.py::test_formal_q1_q6_regression[Q2_route_order_trap-11.468135899374975]
+FAILED tests/test_search_direction_refinement.py::test_formal_q1_q6_regression[Q3_direction_trap-6.271416626834708]
+FAILED tests/test_search_direction_refinement.py::test_formal_q1_q6_regression[Q4_optional_y_split_trap-4.0]
+FAILED tests/test_search_direction_refinement.py::test_formal_q1_q6_regression[Q5_interference_wait_trap-6.271416626834708]
+FAILED tests/test_search_direction_refinement.py::test_formal_q1_q6_regression[Q6_lns_basin_trap-3.557181856472053]
+FAILED tests/test_search_initialization.py::test_initialization_whole_mandatory_y_bounded_positions_and_replay
+FAILED tests/test_search_initialization.py::test_v3_monotone_balanced_bootstrap_is_deterministic_canonical_and_certified
+FAILED tests/test_search_initialization.py::test_clearance_accepted_initializations_are_independently_certified_and_repeatable
+FAILED tests/test_search_initialization.py::test_region_cooperative_is_deterministic_balanced_eligible_and_certified
+FAILED tests/test_search_initialization.py::test_same_rail_rebalance_default_off_replaces_only_x_order_slot
+FAILED tests/test_search_initialization.py::test_coordination_route_reorder_is_default_off_and_replaces_only_x_order_slot
+FAILED tests/test_search_initialization.py::test_jrrb_joint_boundary_pool_is_bounded_structural_and_legal
+FAILED tests/test_search_lns.py::test_bottleneck_selection_is_closed_replayable_and_wait_optional[RANDOM]
+FAILED tests/test_search_lns.py::test_bottleneck_selection_is_closed_replayable_and_wait_optional[LOAD]
+FAILED tests/test_search_lns.py::test_bottleneck_selection_is_closed_replayable_and_wait_optional[TRAVEL]
+FAILED tests/test_search_lns.py::test_bottleneck_selection_is_closed_replayable_and_wait_optional[WAIT_ANCHORED]
+FAILED tests/test_search_lns.py::test_bottleneck_selection_is_closed_replayable_and_wait_optional[SHARED_Y_PAIR]
+FAILED tests/test_search_lns.py::test_load_selector_includes_same_rail_mobility_without_cross_rail
+FAILED tests/test_search_lns.py::test_parent_destroy_repair_identity_replay_and_hard_budget[GREEDY_REPAIR]
+FAILED tests/test_search_lns.py::test_parent_destroy_repair_identity_replay_and_hard_budget[REGRET_2_REPAIR]
+FAILED tests/test_search_lns.py::test_bounded_initial_portfolio_closes_known_handover_n50_failure
+FAILED tests/test_search_lns.py::test_atomic_and_lns_share_complete_candidate_pipeline
+FAILED tests/test_search_lns.py::test_crrr_wait_boundary_uses_adjacent_weld_and_joint_change_is_legal
+FAILED tests/test_search_lns.py::test_crrr_replaces_eight_original_lns_attempts_and_default_is_unchanged
+FAILED tests/test_search_lns.py::test_crrr_access_c2_is_guarded_family_safe_and_limited_to_one
+FAILED tests/test_search_lns.py::test_q6_destroy_repair_crosses_a_basin_atomic_short_budget_cannot
+FAILED tests/test_search_sa.py::test_yr_v1_default_remains_global_shortlist_and_identical_trajectory
+FAILED tests/test_search_sa.py::test_yr_v2_funnel_monotone_caps_and_first_access_times
+FAILED tests/test_search_sa.py::test_explicit_iteration_safety_cap_is_reported
+FAILED tests/test_search_sa.py::test_optional_y_activation_enters_search_and_improves_whole_only
+FAILED tests/test_search_sa.py::test_hard_reference_deadline_preserves_only_certified_incumbent
+FAILED tests/test_search_sa.py::test_hard_reference_worker_matches_direct_unexpired_schedule
+FAILED tests/test_search_sa.py::test_jrrb_default_off_preserves_old_path_and_fixed_alns_budgets
+FAILED tests/test_search_sa.py::test_jrrb_macro_caps_certifies_and_does_not_consume_normal_iteration_slots
+FAILED tests/test_search_sa.py::test_jrrb_certifier_failure_cannot_replace_certified_current
+FAILED tests/test_search_sa.py::test_jrrb_late_certification_is_counted_but_never_backfilled
+FAILED tests/test_search_sa.py::test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q1_assignment]
+FAILED tests/test_search_sa.py::test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q2_route_order]
+FAILED tests/test_search_sa.py::test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q3_direction]
+FAILED tests/test_search_sa.py::test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q4_optional_y]
+FAILED tests/test_search_sa.py::test_q1_q5_nontrivial_initial_gap_and_backbone_quality[Q5_interference_wait]
+68 failed, 924 passed, 49 deselected, 112 warnings in 433.69s (0:07:13)
+
+=== DIAGNOSTIC PROBES: pure model loading and one existing fixture; no training ===
+{
+  "child_existing_checkpoint": {
+    "ok": true,
+    "result": {
+      "model_type": "VNextGNN",
+      "state_entries": 31,
+      "checkpoint_exists": true
+    },
+    "elapsed_s": 0.018583200057037175
+  },
+  "child_output_absent_pure_constructor": {
+    "ok": true,
+    "result": {
+      "model_type": "VNextGNN",
+      "state_entries": 31
+    },
+    "elapsed_s": 0.0276024000486359
+  },
+  "joint3_fixture": {
+    "ok": true,
+    "result": {
+      "solution_exists": true,
+      "schedule_status": "DEADLOCK",
+      "schedule_diagnostics": [
+        "native fixed two-priority dispatch did not finish; this is not proof of physical infeasibility",
+        "incomplete native timeline; no formal Cmax"
+      ],
+      "core_is_none": true,
+      "core_details": {
+        "source": "NATIVE DEADLOCK",
+        "reason": "no mapped direct blocker core",
+        "operator": "conflict_core_partial"
+      },
+      "calls": true
+    },
+    "elapsed_s": 13.154728299938142
+  },
+  "joint3_reference_paths": {
+    "ok": true,
+    "result": {
+      "hga": {
+        "path": "D:\\pybullet_test\\MRTA_GA\\DRL\\results\\diagnostics\\cleanup_bcb1608\\worktrees\\before\\results\\native_priority\\new_dataset_final\\hga_results_optimized.csv",
+        "exists": false,
+        "rows": 0,
+        "legacy_path": "D:\\pybullet_test\\MRTA_GA\\DRL\\results\\diagnostics\\cleanup_bcb1608\\worktrees\\before\\results\\new_dataset_final\\hga_results_optimized.csv",
+        "legacy_exists": true
+      },
+      "wag": {
+        "path": "D:\\pybullet_test\\MRTA_GA\\DRL\\results\\diagnostics\\cleanup_bcb1608\\worktrees\\before\\results\\native_priority\\new_dataset_final\\wag_vns_results_optimized.csv",
+        "exists": false,
+        "rows": 0,
+        "legacy_path": "D:\\pybullet_test\\MRTA_GA\\DRL\\results\\diagnostics\\cleanup_bcb1608\\worktrees\\before\\results\\new_dataset_final\\wag_vns_results_optimized.csv",
+        "legacy_exists": true
+      },
+      "exception": "the frozen HGA reference is missing"
+    },
+    "elapsed_s": 0.0010554000036790967
+  },
+  "main_br_model_load": {
+    "ok": true,
+    "result": {
+      "original": {
+        "type": "BottleneckGAT",
+        "state_entries": 16,
+        "settings": {
+          "alpha": 8,
+          "anchors": 12,
+          "candidates": 40,
+          "top_k": 3,
+          "max_rounds": 200,
+          "perturbations": 3,
+          "initial_attempts": 10,
+          "time_limit": 180.0
+        },
+        "dataset_identity": null
+      },
+      "scale1000": {
+        "type": "BottleneckGAT",
+        "state_entries": 16,
+        "settings": {
+          "alpha": 8,
+          "anchors": 12,
+          "candidates": 40,
+          "top_k": 3,
+          "max_rounds": 200,
+          "perturbations": 3,
+          "initial_attempts": 10,
+          "time_limit": 180.0
+        },
+        "dataset_identity": null
+      }
+    },
+    "elapsed_s": 0.031139099970459938
+  }
+}
+
+=== DIAGNOSTIC PROBE: unchanged 5-second hard deadline, no assertion changes ===
+{
+  "native_cold_seconds": 10.979561199899763,
+  "native_cold_status": "FEASIBLE",
+  "budget_seconds": 5.0,
+  "direct": {
+    "status": "COMPLETED",
+    "elapsed_s": 0.0023551000049337745,
+    "termination_reason": "ITERATION_LIMIT",
+    "best_exists": true,
+    "stats": {
+      "init_reference_calls": 1,
+      "nref": 0,
+      "n_feasible": 0,
+      "n_numeric_failure": 0,
+      "hard_deadline_terminations": 0
+    },
+    "initialization": "InitializationResult(status=<InitializationStatus.SUCCESS: 'SUCCESS'>, solution=CanonicalSolution(parents=(ParentWeld(parent_id='one', start=(1.0, 2.0), end=(2.0, 2.0)),), patterns=(SplitPattern(parent_id='one', kind=<SplitKind.WHOLE: 'WHOLE'>, t=None, point_id=None, mandatory=False, rail=None),), routes=(Route(robot_id=0, block_ids=()), Route(robot_id=1, block_ids=()), Route(robot_id=2, block_ids=('one::whole',)), Route(robot_id=3, block_ids=())), revision=0), directions=((), (), (0,), ()), schedule=ScheduleResult(status=<ScheduleStatus.FEASIBLE: 'FEASIBLE'>, operations=(Operation(operation_id='R2:NATIVE:0', robot_id=2, kind=<OperationKind.SETUP: 'SETUP'>, start_time=0.0, end_time=1.0, start=(1.0, 2.0), end=(1.0, 2.0), sequence_index=0, block_id='one::whole'), Operation(operation_id='R2:NATIVE:1', robot_id=2, kind=<OperationKind.WELD: 'WELD'>, start_time=1.0, end_time=2.0, start=(1.0, 2.0), end=(2.0, 2.0), sequence_index=1, block_id='one::whole'), Operation(operation_id='R2:NATIVE:2', robot_id=2, kind=<OperationKind.POST: 'POST'>, start_time=2.0, end_time=3.0, start=(2.0, 2.0), end=(2.0, 2.0), sequence_index=2, block_id='one::whole')), cmax=3.0, robot_completion=(0.0, 0.0, 3.0, 0.0), wait_for_graph=(), diagnostics=(), directions=((), (), (0,), ()), source='BASELINE', reference_policy_id='NATIVE_PRIORITY_FOUR_ROBOTS', scope_id='FORMAL_SCOPE_V2', scope_hash='5a825641e381f83f8de51adf3a1c37134c06b2528c76e1b1609c7d3cc4e1d1dc', deadlock_blockages=(), deadlock_evidence_source=None), certification=CertificationReport(certified=True, errors=(), recomputed_cmax=3.0), attempts=(InitializationAttempt(construction_index=0, solution=CanonicalSolution(parents=(ParentWeld(parent_id='one', start=(1.0, 2.0), end=(2.0, 2.0)),), patterns=(SplitPattern(parent_id='one', kind=<SplitKind.WHOLE: 'WHOLE'>, t=None, point_id=None, mandatory=False, rail=None),), routes=(Route(robot_id=0, block_ids=()), Route(robot_id=1, block_ids=()), Route(robot_id=2, block_ids=('one::whole',)), Route(robot_id=3, block_ids=())), revision=0), directions=ConstrainedDirectionResult(status=<DirectionStatus.FEASIBLE: 'FEASIBLE'>, directions=((), (), (0,), ()), total_empty_travel=0.0, diagnostics=(), legal_first_combinations=2, route_dp_calls=2), schedule=ScheduleResult(status=<ScheduleStatus.FEASIBLE: 'FEASIBLE'>, operations=(Operation(operation_id='R2:NATIVE:0', robot_id=2, kind=<OperationKind.SETUP: 'SETUP'>, start_time=0.0, end_time=1.0, start=(1.0, 2.0), end=(1.0, 2.0), sequence_index=0, block_id='one::whole'), Operation(operation_id='R2:NATIVE:1', robot_id=2, kind=<OperationKind.WELD: 'WELD'>, start_time=1.0, end_time=2.0, start=(1.0, 2.0), end=(2.0, 2.0), sequence_index=1, block_id='one::whole'), Operation(operation_id='R2:NATIVE:2', robot_id=2, kind=<OperationKind.POST: 'POST'>, start_time=2.0, end_time=3.0, start=(2.0, 2.0), end=(2.0, 2.0), sequence_index=2, block_id='one::whole')), cmax=3.0, robot_completion=(0.0, 0.0, 3.0, 0.0), wait_for_graph=(), diagnostics=(), directions=((), (), (0,), ()), source='BASELINE', reference_policy_id='NATIVE_PRIORITY_FOUR_ROBOTS', scope_id='FORMAL_SCOPE_V2', scope_hash='5a825641e381f83f8de51adf3a1c37134c06b2528c76e1b1609c7d3cc4e1d1dc', deadlock_blockages=(), deadlock_evidence_source=None), certification=CertificationReport(certified=True, errors=(), recomputed_cmax=3.0), diagnostics=(), duplicate=False, strategy='LOAD_FIRST'),), winning_strategy='LOAD_FIRST')"
+  },
+  "isolated": {
+    "status": "INITIALIZATION_FAILED",
+    "elapsed_s": 5.014999400009401,
+    "termination_reason": "TIME_LIMIT",
+    "best_exists": false,
+    "stats": {
+      "init_reference_calls": 0,
+      "nref": 0,
+      "n_feasible": 0,
+      "n_numeric_failure": 0,
+      "hard_deadline_terminations": 1
+    },
+    "initialization": "InitializationResult(status=<InitializationStatus.INITIALIZATION_FAILED: 'INITIALIZATION_FAILED'>, solution=None, directions=None, schedule=None, certification=None, attempts=(InitializationAttempt(construction_index=0, solution=CanonicalSolution(parents=(ParentWeld(parent_id='one', start=(1.0, 2.0), end=(2.0, 2.0)),), patterns=(SplitPattern(parent_id='one', kind=<SplitKind.WHOLE: 'WHOLE'>, t=None, point_id=None, mandatory=False, rail=None),), routes=(Route(robot_id=0, block_ids=()), Route(robot_id=1, block_ids=()), Route(robot_id=2, block_ids=('one::whole',)), Route(robot_id=3, block_ids=())), revision=0), directions=ConstrainedDirectionResult(status=<DirectionStatus.FEASIBLE: 'FEASIBLE'>, directions=((), (), (0,), ()), total_empty_travel=0.0, diagnostics=(), legal_first_combinations=2, route_dp_calls=2), schedule=None, certification=None, diagnostics=('NATIVE reference evaluation exceeded run deadline',), duplicate=False, strategy='LOAD_FIRST'),), winning_strategy=None)"
+  }
+}
