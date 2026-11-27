@@ -38,10 +38,10 @@ from run_fixed_taskset_experiment import (
     read_rows as read_baselines, solution_record,
 )
 
-WEIGHTS = ROOT / 'models/gnn_vns_br_atomic.pt'
-CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_atomic.csv'
-SCALE_WEIGHTS = ROOT / 'models/gnn_vns_br_atomic_scale3000.pt'
-SCALE_CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_atomic_scale3000.csv'
+WEIGHTS = ROOT / 'models/gnn_vns_br_atomic_16d.pt'
+CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_atomic_16d.csv'
+SCALE_WEIGHTS = ROOT / 'models/gnn_vns_br_atomic_16d_scale3000.pt'
+SCALE_CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_atomic_16d_scale3000.csv'
 SCALE_DATA = ROOT / 'data/weld_layout/scale1000'
 OUTPUT_FIELDS = ('trial', *FIELDS)
 SCALE_FIELDS = ('dataset', 'variant', *OUTPUT_FIELDS)
@@ -86,6 +86,53 @@ def fit_training_normalization(dataset='scale1000'):
     return FeatureConfig(time_ref=max(1., median(loads)))
 
 
+def selected_training_tasksets(dataset='original', layouts=None):
+    """Validate an optional TRAIN-only selection before generating any labels."""
+    if layouts is None:
+        yield from training_tasksets(dataset)
+        return
+    requested = tuple(layouts)
+    if not requested or len(requested) != len(set(requested)):
+        raise ValueError('TRAIN layout selection must be nonempty and contain no duplicates')
+    selected = {}
+    for name, taskset in training_tasksets(dataset):
+        if name in requested:
+            if name in selected:
+                raise ValueError(f'duplicate TRAIN layout: {name}')
+            selected[name] = taskset
+    missing = sorted(set(requested) - selected.keys())
+    if missing:
+        raise ValueError(f'unknown TRAIN layouts: {missing}')
+    yield from ((name, selected[name]) for name in requested)
+
+
+def read_training_teachers(layouts=None):
+    """Read completed saved teachers; never substitute another Cmax field."""
+    teachers = {}
+    for method in ('wag_vns', 'hga'):
+        for row in read_baselines(method, historical=True):
+            if (row.get('split') != 'train' or row.get('status') != 'FEASIBLE'
+                    or row.get('termination_reason') != 'ITERATION_LIMIT'
+                    or (layouts is not None and row.get('layout_id') not in layouts)):
+                continue
+            try:
+                value = float(row.get('native_cmax_s') or 'nan')
+                payload = json.loads(row.get('solution') or '{}')
+                routes, directions = payload['routes'], payload['directions']
+                complete = (len(routes) == len(directions) == 4 and any(routes)
+                            and all(len(a) == len(b) and all(bit in (0, 1) for bit in b)
+                                    for a, b in zip(routes, directions)))
+            except (ValueError, TypeError, KeyError):
+                continue
+            if not complete or not math.isfinite(value) or value <= 0:
+                continue
+            key = row['layout_id'], method
+            old = teachers.get(key)
+            if old is None or value < float(old['native_cmax_s']):
+                teachers[key] = row
+    return teachers
+
+
 def read_results(dataset='original'):
     path = SCALE_CSV if dataset == 'scale1000' else CSV
     if not path.exists():
@@ -120,7 +167,7 @@ def append_result(row, dataset='original'):
 
 
 def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig(),
-                      dataset='original', normalization=None, progress=print):
+                      dataset='original', normalization=None, layouts=None, progress=print):
     """Use TRAIN teachers, independent greedy starts, and one legal perturbation.
 
     Candidate budgets and graph construction are identical to online search.
@@ -128,18 +175,12 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
     """
     rng = random.Random(seed)
     normalization = normalization or fit_training_normalization(dataset)
-    tasksets = training_tasksets(dataset)
-    teachers = {}
-    for method in ('wag_vns', 'hga'):
-        for row in read_baselines(method, historical=True):
-            if (row['split'] != 'train' or row['termination_reason'] != 'ITERATION_LIMIT'
-                    or not row['solution'] or not row.get('native_cmax_s')
-                    or not math.isfinite(float(row['native_cmax_s']))):
-                continue
-            key = row['layout_id'], method
-            old = teachers.get(key)
-            if old is None or float(row['native_cmax_s']) < float(old['native_cmax_s']):
-                teachers[key] = row
+    # Materialize only an explicit selection, so unknown IDs fail before any
+    # teacher restoration, initialization or candidate scheduling takes place.
+    tasksets = selected_training_tasksets(dataset, layouts)
+    if layouts is not None:
+        tasksets = list(tasksets)
+    teachers = read_training_teachers(layouts)
     examples = []
     stats = dict(source_split='train', dataset=dataset, teacher_solutions=0, greedy_initializations=0,
                  generated_states=0, states=0, candidate_labels=0, feasible_labels=0,
@@ -148,6 +189,11 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                  layouts=[], state_sources={'wag_vns':0, 'hga':0, 'greedy':0},
                  skipped_state_statuses={'INFEASIBLE':0, 'NUMERIC_FAILURE':0},
                  perturbed_states=0, candidate_parameters=asdict(settings))
+    stats.update(requested_layouts=list(layouts) if layouts is not None else None,
+                 teacher_solutions_by_method={'wag_vns': 0, 'hga': 0},
+                 skipped_teachers={'wag_vns': 0, 'hga': 0},
+                 teacher_state_statuses={status.value: 0 for status in ScheduleStatus},
+                 native_evaluations=0, candidate_native_evaluations=0)
     started = time.perf_counter()
     for name, taskset in tasksets:
         workspace = FixedWorkspace(taskset, CONFIG, normalization=normalization)
@@ -156,8 +202,18 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
         for method in ('wag_vns', 'hga'):
             row = teachers.get((name, method))
             if row is not None:
-                sources.append((method, workspace.restore(json.loads(row['solution']))))
+                try:
+                    restored = workspace.restore(json.loads(row['solution']))
+                except (ValueError, TypeError, KeyError, IndexError):
+                    stats['skipped_teachers'][method] += 1
+                    continue
+                stats['teacher_state_statuses'][restored.status.value] += 1
+                if restored.status not in (ScheduleStatus.FEASIBLE, ScheduleStatus.DEADLOCK):
+                    stats['skipped_teachers'][method] += 1
+                    continue
+                sources.append((method, restored))
                 stats['teacher_solutions'] += 1
+                stats['teacher_solutions_by_method'][method] += 1
         greedy = workspace.initialize(rng, settings, time.perf_counter() + settings.time_limit)
         if greedy is not None:
             sources.append(('greedy', greedy))
@@ -184,7 +240,9 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                 stats['generated_states'] += 1
                 if not actions:
                     continue
+                before = workspace.evaluations
                 evaluated = [workspace.evaluate(a.routes, a.bits) for a in actions]
+                stats['candidate_native_evaluations'] += workspace.evaluations - before
                 pairs = ranking_pairs(evaluated, rng)
                 stats['candidate_labels'] += len(evaluated)
                 stats['feasible_labels'] += sum(s.feasible for s in evaluated)
@@ -200,6 +258,7 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                 stats['perturbed_states'] += int(perturbation > 0)
                 stats['pairs'] += len(pairs)
         stats['layouts'].append(name)
+        stats['native_evaluations'] += workspace.evaluations
         progress('BR_LABELS', name, {k:stats[k] for k in ('states','candidate_labels','pairs')},
                  'elapsed_s', round(time.perf_counter() - started, 3))
     stats['label_generation_s'] = time.perf_counter() - started
@@ -223,7 +282,10 @@ def train(args):
     settings = BRConfig()
     normalization = fit_training_normalization(args.dataset)
     examples, data = build_supervision(seed=args.training_seed, settings=settings,
-                                      dataset=args.dataset, normalization=normalization)
+                                      dataset=args.dataset, normalization=normalization, layouts=args.layouts)
+    if args.layouts and {name for name, _, _ in examples} != set(args.layouts):
+        raise ValueError('some selected TRAIN layouts produced no informative Pairwise examples')
+    print('BR_LABEL_SUMMARY', json_text(data), flush=True)
     variants = (args.variant,)
     models, learning = {}, {}
     for variant in variants:
@@ -256,7 +318,21 @@ def train(args):
     with path.open('xb') as stream:
         stream.write(payload.getvalue())
     print('BR_TRAINED', json_text({k: v for k, v in training.items() if k != 'learning'}), flush=True)
-    (update_scale_report if args.dataset == 'scale1000' else update_report)()
+    # Reuse an already generated TRAIN graph; this does not schedule or search.
+    restored, saved = load_model(args.dataset, args.variant, path=path)
+    expected = models[args.variant]
+    actual = restored.state_dict()
+    if expected.keys() != actual.keys() or any(not torch.equal(expected[k], actual[k]) for k in expected):
+        raise RuntimeError('checkpoint parameters were not restored exactly')
+    name, graph, _ = examples[0]
+    with torch.inference_mode():
+        scores = restored(graph)
+    if scores.shape != (len(graph.action_features),) or not torch.isfinite(scores).all():
+        raise RuntimeError('reloaded checkpoint produced invalid TRAIN scores')
+    print('BR_CHECKPOINT_VERIFIED', json_text(dict(path=str(path), bytes=path.stat().st_size,
+        layout_id=name, node_features=len(NODE_FEATURES), robot_features=len(ROBOT_FEATURES),
+        edge_features=len(EDGE_FEATURES), action_features=len(ACTION_FEATURES),
+        parameters_restored=True, actions=len(scores), finite_scores=True)), flush=True)
 
 
 def check_model_features(checkpoint):
@@ -519,7 +595,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=24)
     parser.add_argument('--variant', choices=MODEL_VARIANTS, default='full_gnn')
     parser.add_argument('--weights', type=Path, help='new atomic-model checkpoint; historical weights are incompatible')
-    parser.add_argument('--layouts', nargs='+', default=('train_01','train_12','train_30'))
+    parser.add_argument('--layouts', nargs='+', help='distinct TRAIN layout IDs; omitted means all TRAIN for training')
     parser.add_argument('--seed', type=int, default=20261110)
     parser.add_argument('--trial', default='main')
     args = parser.parse_args()
@@ -537,10 +613,11 @@ def main():
             raise ValueError('the previous TRAIN smoke uses --dataset original; this round uses validation')
         model, checkpoint = load_model(variant=args.variant, path=args.weights)
         tasksets = {name:ts for split,name,ts in load_tasksets() if split=='train'}
-        if len(args.layouts) != len(set(args.layouts)) or any(name not in tasksets for name in args.layouts):
+        layouts = args.layouts or ('train_01', 'train_12', 'train_30')
+        if len(layouts) != len(set(layouts)) or any(name not in tasksets for name in layouts):
             raise ValueError('smoke layouts must be distinct existing TRAIN layouts')
         existing = read_results()
-        for name in args.layouts:
+        for name in layouts:
             previous = next((r for r in existing if r['trial']==args.trial and r['split']=='train'
                              and r['layout_id']==name and int(r['seed'])==args.seed), None)
             if previous is not None:

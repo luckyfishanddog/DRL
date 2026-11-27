@@ -781,7 +781,7 @@ def test_br_shared_gat_pairwise_gradients_and_infeasible_label_order():
     graph = local_graph(w, state, actions)
     assert graph.nodes.shape == (len(w.taskset.tasks) + 4, 12)
     assert graph.edge_attr.shape[1] == 4
-    assert graph.action_features.shape[1] == 22
+    assert graph.action_features.shape[1] == 16
     pairs = ranking_pairs([3., float('inf'), 2., 3.], rng)
     assert len(pairs) == 5
     assert all(b != 2 for a, b in pairs.tolist())
@@ -999,8 +999,8 @@ def test_br_joint_portions_map_only_the_transferred_atoms_and_refresh_state():
     for portion,task_id in ((1,'p::seg_000'),(-1,'p::seg_002')):
         action=w.apply(state,1,0,0,1,1,flip=True,portion=portion)
         assert action.joint==(1,0,0,1,1,True,portion)
-        assert action.features[18]==1 and action.features[19:22].sum()==1
-        assert action.features[20 if portion==1 else 21]==1
+        assert action.features[12]==1 and action.features[13:16].sum()==1
+        assert action.features[14 if portion==1 else 15]==1
         graph=local_graph(w,state,[action])
         source=graph.action_members[0,graph.action_members[1]==0].tolist()
         assert source==[graph.task_ids.index(task_id)]
@@ -1102,6 +1102,11 @@ def test_br_new_checkpoint_requires_both_node_types_relations_and_normalization(
         edge_relations=runner.EDGE_RELATIONS,edge_features=runner.EDGE_FEATURES,
         action_features=runner.ACTION_FEATURES,normalization=asdict(runner.FeatureConfig()))
     runner.check_model_features(checkpoint)
+    old22=dict(checkpoint,action_features=('M1','M2','M3','M4','M5','M6',
+        'source_load','target_load','source_completion','target_completion','source_processing_delta',
+        'target_processing_delta','source_empty_delta','target_empty_delta','route_peak_delta',
+        'source_route_delta','target_route_delta','source_job_fraction','flip','portion_none','portion_start','portion_end'))
+    with pytest.raises(ValueError,match='incompatible checkpoint'):runner.check_model_features(old22)
     for key in ('node_features','robot_features','edge_relations','edge_features','action_features','normalization'):
         old=dict(checkpoint);old.pop(key)
         with pytest.raises(ValueError,match='incompatible checkpoint'):runner.check_model_features(old)
@@ -1112,6 +1117,7 @@ def test_br_new_checkpoint_requires_both_node_types_relations_and_normalization(
     checkpoint['training']=dict(epochs=1,learning=dict(selected_epoch=1))
     model,_=runner.load_model(checkpoint=checkpoint)
     assert model.normalization==norm and model.trained
+    assert model.feedback_embedding.weight.shape==(2,64)
 
 
 def test_br_deadlock_features_and_four_status_pairs_use_no_fabricated_cmax():
@@ -1123,13 +1129,110 @@ def test_br_deadlock_features_and_four_status_pairs_use_no_fabricated_cmax():
     w,state=_br_fixed_fixture()
     deadlock=replace(state,value=float('inf'),completion=np.zeros(4),evaluation_status=ScheduleStatus.DEADLOCK)
     action=w.apply(deadlock,1,0,0,1,1)
-    assert action is not None and np.array_equal(action.features[8:10],[0.,0.])
+    assert action is not None
+    expected=((action.costs-action.loads)-(state.costs-state.loads))[[0,1]]/w.normalization.time_ref
+    assert np.allclose(action.features[8:10],expected)
     graph=local_graph(w,deadlock,[action])
     assert not graph.feedback_valid.any() and not graph.nodes[-4:,10].any()
     labels=[replace(state,value=3.,evaluation_status=ScheduleStatus.FEASIBLE),deadlock,
             replace(deadlock,evaluation_status=ScheduleStatus.INFEASIBLE),
             replace(deadlock,value=float('nan'),evaluation_status=ScheduleStatus.NUMERIC_FAILURE)]
     assert ranking_pairs(labels,random.Random(3)).tolist()==[[0,1],[0,2]]
+
+
+def test_br_action16_order_values_and_shared_gnn_mlp_description():
+    import numpy as np
+    from mrta_search.gnn_vns_br import ACTION_FEATURES,BottleneckGAT,ActionMLP,local_graph
+    assert ACTION_FEATURES==('M1','M2','M3','M4','M5','M6','source_processing_delta',
+        'target_processing_delta','source_empty_delta','target_empty_delta','route_peak_delta',
+        'source_job_fraction','flip','portion_none','portion_start','portion_end')
+    w,state=_br_fixed_fixture()
+    action=w.apply(state,1,0,0,1,1,flip=True,portion=1)
+    assert action is not None and action.features.shape==(16,)
+    expected=[action.loads[0]-state.loads[0],action.loads[1]-state.loads[1],
+        (action.costs[0]-action.loads[0])-(state.costs[0]-state.loads[0]),
+        (action.costs[1]-action.loads[1])-(state.costs[1]-state.loads[1]),
+        max(action.costs)-max(state.costs)]
+    assert np.allclose(action.features[6:11],np.array(expected)/w.normalization.time_ref)
+    assert action.features[11]==pytest.approx(w.numeric.processing[action.moved]/max(1.,state.loads[0]))
+    graph=local_graph(w,state,[action])
+    gnn,mlp=BottleneckGAT(),ActionMLP()
+    assert gnn.scorer[0].in_features==4*64+16 and mlp.scorer[0].in_features==16
+    assert gnn(graph).shape==mlp(graph).shape==(1,)
+
+
+def test_br_feedback_valid_masks_partial_times_and_changes_robot_embeddings():
+    from dataclasses import replace
+    import numpy as np
+    import torch
+    from mrta_reference.model import ScheduleStatus
+    from mrta_search.gnn_vns_br import BottleneckGAT,local_graph
+    torch.set_num_threads(1);torch.manual_seed(31)
+    w,state=_br_fixed_fixture()
+    action=w.apply(state,1,0,0,1,1)
+    partial_ops=[np.array([[2.,0.,0.,1.,0.,0.,2.,0.,0.],
+                          [3.,1.,0.,1.,0.,2.,5.,0.,4.]]) for _ in range(4)]
+    partial=replace(state,operations=partial_ops,completion=np.full(4,5.))
+    for status in (ScheduleStatus.DEADLOCK,ScheduleStatus.INFEASIBLE,ScheduleStatus.NUMERIC_FAILURE):
+        graph=local_graph(w,replace(partial,evaluation_status=status),[action])
+        assert graph.nodes.shape[1]==12 and graph.edge_attr.shape[1]==4
+        assert graph.feedback_valid.shape==(4,) and not graph.feedback_valid.any()
+        assert not graph.nodes[-4:,9:12].any()
+        assert np.allclose(graph.nodes[-4:,8],state.loads/w.normalization.time_ref)
+    feasible=local_graph(w,replace(partial,evaluation_status=ScheduleStatus.FEASIBLE),[action])
+    assert feasible.feedback_valid.all()
+    assert np.allclose(feasible.nodes[-4:,9:12],np.array([2.,5.,3.])/w.normalization.time_ref)
+    model=BottleneckGAT()
+    changed=replace(graph,feedback_valid=torch.ones(4,dtype=torch.bool))
+    assert not torch.allclose(model.encode(graph)[-4:],model.encode(changed)[-4:])
+    scores=model(graph);scores.square().mean().backward()
+    assert torch.isfinite(scores).all()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    assert model.feedback_embedding.weight.grad.abs().sum()>0
+
+
+def test_br_selected_train_layouts_validate_before_any_native_label_work(monkeypatch):
+    import importlib
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    a,b,c=object(),object(),object()
+    monkeypatch.setattr(runner,'training_tasksets',lambda dataset:iter([('train_A',a),('train_B',b),('train_C',c)]))
+    assert list(runner.selected_training_tasksets('scale1000',['train_C','train_A']))==[('train_C',c),('train_A',a)]
+    monkeypatch.setattr(runner,'fit_training_normalization',lambda *a:runner.FeatureConfig())
+    def forbidden(*a,**k):raise AssertionError('invalid selection reached teachers/scheduling')
+    monkeypatch.setattr(runner,'read_baselines',forbidden);monkeypatch.setattr(runner,'FixedWorkspace',forbidden)
+    for layouts in (['train_A','train_A'],[],['validation_A'],['test_A'],['absent']):
+        with pytest.raises(ValueError):runner.build_supervision(dataset='scale1000',layouts=layouts)
+
+
+def test_br_teachers_require_native_cmax_complete_routes_and_train_status(monkeypatch):
+    import importlib,json
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    solution=json.dumps(dict(routes=[['a'],[],[],[]],directions=[[0],[],[],[]]))
+    valid=dict(split='train',layout_id='train_A',status='FEASIBLE',termination_reason='ITERATION_LIMIT',
+               native_cmax_s='100',cmax_s='999',solution=solution)
+    rows=[valid,dict(valid,native_cmax_s='200',cmax_s='1')]
+    rows.extend(dict(valid,native_cmax_s=value) for value in ('','nan','inf','bad','0','-1'))
+    rows.extend([dict(valid,status='DEADLOCK'),dict(valid,termination_reason='ERROR'),
+                 dict(valid,split='validation',solution='do not parse'),dict(valid,split='test'),
+                 dict(valid,solution='{}'),dict(valid,solution=json.dumps(dict(routes=[['a']],directions=[[0]])))])
+    monkeypatch.setattr(runner,'read_baselines',lambda *a,**k:rows)
+    teachers=runner.read_training_teachers(['train_A'])
+    assert len(teachers)==2 and all(float(row['native_cmax_s'])==100 for row in teachers.values())
+
+
+def test_br_train_cli_passes_explicit_layout_selection(monkeypatch):
+    import importlib,sys
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br');observed=[]
+    monkeypatch.setattr(sys,'argv',['run_gnn_vns_br.py','train','--dataset','scale1000','--layouts','train_A','train_B'])
+    monkeypatch.setattr(runner,'train',lambda args:observed.append(args))
+    runner.main()
+    assert observed[0].layouts==['train_A','train_B'] and observed[0].variant=='full_gnn'
 
 
 def _br_shared_robot_fixture():

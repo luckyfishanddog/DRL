@@ -149,10 +149,9 @@ EDGE_RELATIONS = ('self', 'task_robot', 'parent_next', 'parent_prev',
 EDGE_FEATURES = ('relation_value_0', 'relation_value_1', 'relation_value_2', 'relation_value_3')
 ACTION_FEATURES = (
     'M1', 'M2', 'M3', 'M4', 'M5', 'M6',
-    'source_load', 'target_load', 'source_completion', 'target_completion',
     'source_processing_delta', 'target_processing_delta',
     'source_empty_delta', 'target_empty_delta', 'route_peak_delta',
-    'source_route_delta', 'target_route_delta', 'source_job_fraction',
+    'source_job_fraction',
     'flip', 'portion_none', 'portion_start', 'portion_end',
 )
 
@@ -203,6 +202,7 @@ class BottleneckGAT(nn.Module):
         self.normalization, self.trained = normalization, False
         self.task_projection = nn.Linear(len(NODE_FEATURES), hidden)
         self.robot_projection = nn.Linear(len(ROBOT_FEATURES), hidden)
+        self.feedback_embedding = nn.Embedding(2, hidden)
         self.layer1 = SparseGATLayer(hidden, hidden, heads)
         self.layer2 = SparseGATLayer(hidden, hidden, heads)
         self.scorer = nn.Sequential(
@@ -215,6 +215,9 @@ class BottleneckGAT(nn.Module):
         edge_attr = graph.edge_attr if self.use_edge_features else torch.zeros_like(graph.edge_attr)
         x = torch.where(graph.nodes[:, 1:2].bool(), self.robot_projection(graph.nodes),
                         self.task_projection(graph.nodes))
+        feedback = torch.zeros_like(x)
+        feedback[graph.nodes[:, 1].bool()] = self.feedback_embedding(graph.feedback_valid.long())
+        x = x + feedback
         h = F.elu(self.layer1(F.elu(x), graph.edges, graph.relations, edge_attr))
         return F.elu(self.layer2(h, graph.edges, graph.relations, edge_attr))
 
@@ -231,7 +234,7 @@ class BottleneckGAT(nn.Module):
 
 
 class ActionMLP(nn.Module):
-    """The existing control, using the same complete 22 action features."""
+    """The existing control, using the same complete 16 action features."""
 
     def __init__(self, hidden=64, *, normalization=FeatureConfig()):
         super().__init__()
@@ -630,17 +633,14 @@ class FixedWorkspace:
         costs, loads = self.costs(routes, bits)
         feature = np.zeros(len(ACTION_FEATURES), np.float32)
         feature[move - 1] = 1.
-        completion = np.where(np.isfinite(state.completion), state.completion, 0.)
         source_empty = (costs[ru] - loads[ru]) - (state.costs[ru] - state.loads[ru])
         target_empty = (costs[rv] - loads[rv]) - (state.costs[rv] - state.loads[rv])
-        feature[6:17] = np.array([
-            state.loads[ru], state.loads[rv], completion[ru], completion[rv],
+        feature[6:11] = np.array([
             loads[ru] - state.loads[ru], loads[rv] - state.loads[rv],
-            source_empty, target_empty, max(costs) - max(state.costs),
-            costs[ru] - state.costs[ru], costs[rv] - state.costs[rv]]) / self.normalization.time_ref
-        feature[17] = w.processing[moved] / max(1., state.loads[ru])
-        feature[18] = float(flip)
-        feature[19 + {0: 0, 1: 1, -1: 2}[portion]] = 1.
+            source_empty, target_empty, max(costs) - max(state.costs)]) / self.normalization.time_ref
+        feature[11] = w.processing[moved] / max(1., state.loads[ru])
+        feature[12] = float(flip)
+        feature[13 + {0: 0, 1: 1, -1: 2}[portion]] = 1.
         return Action(move, u, v, ru, rv, routes, bits, costs, loads, feature,
                       iu, iv, bool(flip), portion, moved)
 
@@ -807,9 +807,11 @@ def local_graph(workspace, state, actions):
         ops = state.operations[r] if len(state.operations) == 4 else np.empty((0, 9))
         empty = float((ops[ops[:, 8] == 0, 6] - ops[ops[:, 8] == 0, 5]).sum())
         waiting = float((ops[ops[:, 8] == 4, 6] - ops[ops[:, 8] == 4, 5]).sum())
-        # DEADLOCK can contain only a partial timeline. Its observations are
-        # retained as partial data, with validity recorded outside the input.
+        # Partial timelines are not complete observations. The validity bit
+        # is embedded separately, keeping both node types at twelve inputs.
         completion = float(state.completion[r]) if np.isfinite(state.completion[r]) else 0.
+        if not feedback[r]:
+            empty = completion = waiting = 0.
         x[robot_base + r, 8:12] = np.array([state.loads[r], empty, completion, waiting]) / norm.time_ref
 
     edges = {(i, i, 0): (0., 0., 0., 0.) for i in range(len(x))}
@@ -902,18 +904,23 @@ def train_ranker(examples, *, seed=20261126, epochs=24, learning_rate=3.e-4,
     history = []
     for epoch in range(1, epochs + 1):
         model.train(); rng.shuffle(training)
-        losses = []
+        losses, gradient_norms = [], []
         for _, graph, pairs in training:
             scores = model(graph)
             loss = F.softplus(scores[pairs[:, 1]] - scores[pairs[:, 0]]).mean()
+            if not torch.isfinite(scores).all() or not torch.isfinite(loss):
+                raise FloatingPointError(f'non-finite TRAIN scores/loss at epoch {epoch}')
             optimizer.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 5.)
+            gradient_norms.append(float(nn.utils.clip_grad_norm_(
+                model.parameters(), 5., error_if_nonfinite=True)))
             optimizer.step(); losses.append(float(loss.detach()))
         model.eval()
         with torch.no_grad():
             held_losses, correct, total = [], 0, 0
             for _, graph, pairs in held:
                 scores = model(graph)
+                if not torch.isfinite(scores).all():
+                    raise FloatingPointError(f'non-finite held-TRAIN scores at epoch {epoch}')
                 delta = scores[pairs[:, 0]] - scores[pairs[:, 1]]
                 held_losses.append(float(F.softplus(-delta).mean()))
                 correct += int((delta > 0).sum()); total += len(delta)
@@ -921,7 +928,8 @@ def train_ranker(examples, *, seed=20261126, epochs=24, learning_rate=3.e-4,
         if criterion < best_loss:
             best_loss, best_epoch, best_state = criterion, epoch, copy.deepcopy(model.state_dict())
         record = dict(epoch=epoch, train_loss=float(np.mean(losses)),
-                      held_train_loss=criterion, held_train_pair_accuracy=correct / max(1, total))
+                      held_train_loss=criterion, held_train_pair_accuracy=correct / max(1, total),
+                      max_gradient_norm=max(gradient_norms))
         history.append(record); progress('BR_EPOCH', dict(model=variant, **record))
     model.load_state_dict(best_state); model.eval(); model.trained = True
     return model, dict(variant=variant, selected_epoch=best_epoch, history=history,
