@@ -779,9 +779,9 @@ def test_br_shared_gat_pairwise_gradients_and_infeasible_label_order():
     rng = random.Random(17)
     actions = candidate_actions(w, state, BRConfig(candidates=6), rng)
     graph = local_graph(w, state, actions)
-    assert graph.nodes.shape[1] == 16
-    assert graph.edge_attr.shape[1] == 3
-    assert graph.action_features.shape[1] == 18
+    assert graph.nodes.shape == (len(w.taskset.tasks) + 4, 12)
+    assert graph.edge_attr.shape[1] == 4
+    assert graph.action_features.shape[1] == 22
     pairs = ranking_pairs([3., float('inf'), 2., 3.], rng)
     assert len(pairs) == 5
     assert all(b != 2 for a, b in pairs.tolist())
@@ -795,6 +795,10 @@ def test_br_shared_gat_pairwise_gradients_and_infeasible_label_order():
     for layer in (model.layer1, model.layer2):
         assert layer.linear.weight.grad.abs().sum() > 0
         assert layer.edge_bias.weight.grad.abs().sum() > 0
+    for projection in (model.task_projection, model.robot_projection):
+        assert projection.weight.grad.abs().sum() > 0
+    assert torch.isfinite(scores).all()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
     assert model.scorer[-1].out_features == 1
     assert {a.move for a in actions} == set(range(1, 7))
 
@@ -842,6 +846,8 @@ def test_br_final_result_reuses_native_arrays_without_another_scheduler(monkeypa
     checkpoint = dict(settings=runner.asdict(runner.BRConfig()),
                       node_features=runner.NODE_FEATURES,edge_features=runner.EDGE_FEATURES,
                       action_features=runner.ACTION_FEATURES,
+                      robot_features=runner.ROBOT_FEATURES,edge_relations=runner.EDGE_RELATIONS,
+                      normalization=runner.asdict(runner.FeatureConfig()),
                       training=dict(learning=dict(selected_epoch=1), total_offline_s=1.))
     checkpoint['learning'] = {variant:dict(selected_epoch=1)}
     row = runner.run_one('train', 'toy', w.taskset, 17, model=object(), checkpoint=checkpoint,
@@ -895,20 +901,14 @@ def test_br_edge_graph_has_separate_job_robot_features_and_directed_costs():
     w, state = _br_fixed_fixture()
     actions = candidate_actions(w,state,BRConfig(),random.Random(13))
     graph = local_graph(w,state,actions)
-    assert len(NODE_FEATURES)==16 and len(EDGE_FEATURES)==3
+    assert len(NODE_FEATURES)==12 and len(EDGE_FEATURES)==4
     robot_base = len(graph.nodes)-4
-    assert np.all(graph.nodes[:robot_base,9:].numpy()==0)
+    assert robot_base==len(w.taskset.tasks)
     assert np.all(graph.nodes[:robot_base,0].numpy()==1)
-    assert np.all(graph.nodes[-4:,2:9].numpy()==0)
-    assert np.array_equal(graph.nodes[-4:,9:13].numpy(),np.eye(4))
-    assert np.allclose(graph.nodes[-4:,13].numpy(),state.loads/w.scale)
-    node_ids = {}
-    for action,row in zip(actions,graph.action_nodes.tolist()):
-        node_ids[row[0]]=action.u
-        if action.v>=0:node_ids[row[1]]=action.v
-    # All job endpoints are selected as anchors in this small fixture.
-    assert len(node_ids)==robot_base
-    location = {int(n):(r,i) for r in range(4) for i,n in enumerate(state.routes[r])}
+    assert np.array_equal(graph.nodes[-4:,2:6].numpy(),np.eye(4))
+    assert np.allclose(graph.nodes[-4:,8].numpy(),state.loads/w.normalization.time_ref)
+    node_ids=dict(enumerate(graph.atom_nodes))
+    owners={j:r for r in range(4) for n in state.routes[r] for j in w.job_atoms[n]}
     seen_robot_edges = {j:set() for j in range(robot_base)}
     attrs = {}
     asymmetric = False
@@ -918,20 +918,29 @@ def test_br_edge_graph_has_separate_job_robot_features_and_directed_costs():
             n=node_ids[a];r=b-robot_base
             seen_robot_edges[a].add(r)
             assert attr[0]==float(w.numeric.eligible[n,r])
-            assert attr[1]==float(location[n][0]==r)
-            assert attr[2]==0.
-        elif kind in (3,4,5):
+            assert attr[1]==float(owners[a]==r)
+            tail,bit=int(state.routes[r][-1]),int(state.bits[r][-1])
+            assert attr[2:]==pytest.approx(w.numeric.travel[tail,n,bit,:]/w.normalization.time_ref)
+        elif kind==6:
             n,m=node_ids[a],node_ids[b]
-            r,i=location[n];s,j=location[m]
-            expected=w.numeric.travel[n,m,state.bits[r][i],state.bits[s][j]]/w.scale
-            assert attr[2]==pytest.approx(expected)
-        elif kind==2:
-            assert attr==[0.,0.,0.]
+            expected=w.numeric.travel[n,m].reshape(4)/w.normalization.time_ref
+            assert attr==pytest.approx(expected)
+        elif kind in (2,3):
+            assert attr==[0.,0.,0.,0.]
+            assert graph.parent_ids[a]==graph.parent_ids[b]
+            assert abs(a-b)==1
     assert all(robots==set(range(4)) for robots in seen_robot_edges.values())
-    for (a,b,kind),attr in attrs.items():
-        if kind==3:
-            reverse=attrs[b,a,4]
-            asymmetric |= abs(attr[2]-reverse[2])>1.e-7
+    assert set(graph.relations.tolist())==set(range(7))
+    for r in range(4):
+        for i in range(1,len(state.routes[r])):
+            a,b=map(int,state.routes[r][i-1:i+1]);da,db=map(int,state.bits[r][i-1:i+1])
+            aa=w.job_atoms[a][::1 if da==0 else -1]
+            bb=w.job_atoms[b][::1 if db==0 else -1]
+            forward=attrs[aa[-1],bb[0],4][2]
+            reverse=attrs[bb[-1],aa[0],5][2]
+            assert forward==pytest.approx(w.numeric.travel[a,b,da,db]/w.normalization.time_ref)
+            assert reverse==pytest.approx(w.numeric.travel[b,a,db,da]/w.normalization.time_ref)
+            asymmetric |= abs(forward-reverse)>1.e-7
     assert asymmetric
 
 
@@ -953,7 +962,7 @@ def test_br_job_robot_edges_use_inherited_eligibility_inside_shared_band():
     state=w.evaluate(raw,ds)
     actions=candidate_actions(w,state,BRConfig(),random.Random(4))
     graph=local_graph(w,state,actions);base=len(graph.nodes)-4
-    job_node=next(row[1] for action,row in zip(actions,graph.action_nodes.tolist()) if action.v==n)
+    job_node=graph.atom_nodes.index(n)
     for robot in range(4):
         edge=next(k for k,(a,b) in enumerate(graph.edges.t().tolist()) if a==job_node and b==base+robot)
         assert graph.edge_attr[edge,0].item()==float(robot<2)
@@ -970,7 +979,7 @@ def test_br_edge_attributes_change_attention_and_receive_gradients():
     x=torch.tensor([[0.],[1.],[2.]])
     edges=torch.tensor([[0,1],[2,2]])
     relation=torch.tensor([5,5])
-    plain=torch.zeros((2,3))
+    plain=torch.zeros((2,4))
     changed=plain.clone();changed[1,2]=1.;changed.requires_grad_()
     a=layer(x,edges,relation,plain)[2]
     b=layer(x,edges,relation,changed)[2]
@@ -981,6 +990,146 @@ def test_br_edge_attributes_change_attention_and_receive_gradients():
         layer.edge_bias.weight.zero_();layer.edge_bias.weight[0,0]=2.
     changed=plain.clone();changed[1,0]=1.
     assert torch.all(layer(x,edges,relation,changed)[2]>a)
+
+
+def test_br_joint_portions_map_only_the_transferred_atoms_and_refresh_state():
+    import numpy as np
+    from mrta_search.gnn_vns_br import local_graph
+    w,state=_br_fixed_fixture()
+    for portion,task_id in ((1,'p::seg_000'),(-1,'p::seg_002')):
+        action=w.apply(state,1,0,0,1,1,flip=True,portion=portion)
+        assert action.joint==(1,0,0,1,1,True,portion)
+        assert action.features[18]==1 and action.features[19:22].sum()==1
+        assert action.features[20 if portion==1 else 21]==1
+        graph=local_graph(w,state,[action])
+        source=graph.action_members[0,graph.action_members[1]==0].tolist()
+        assert source==[graph.task_ids.index(task_id)]
+        assert action.u!=action.moved
+        candidate=w.evaluate(action.routes,action.bits)
+        after=local_graph(w,candidate,[])
+        j=source[0]
+        old_owner=next(k for k,(a,b) in enumerate(graph.edges.t().tolist())
+                       if a==j and b==len(w.taskset.tasks))
+        new_owner=next(k for k,(a,b) in enumerate(after.edges.t().tolist())
+                       if a==j and b==len(w.taskset.tasks)+1)
+        assert graph.edge_attr[old_owner,1]==after.edge_attr[new_owner,1]==1
+        target_index=next(i for i,n in enumerate(candidate.routes[1]) if j in w.job_atoms[n])
+        # If it joins a neighboring owned interval, mandatory merging gives
+        # every atom the resulting job's actual execution direction.
+        assert after.nodes[j,11]==candidate.bits[1][target_index]
+        assert np.array_equal(graph.nodes[:len(w.taskset.tasks),2:9],after.nodes[:len(w.taskset.tasks),2:9])
+        assert not np.array_equal(graph.nodes[:,9:12],after.nodes[:,9:12])
+
+
+def test_br_complete_graph_retains_unassigned_tasks_without_rescheduling(monkeypatch):
+    from dataclasses import replace
+    import numpy as np
+    import mrta_search.gnn_vns_br as br
+    from mrta_reference.model import ScheduleStatus
+    w,state=_br_fixed_fixture()
+    assert w.evaluate(state.routes,state.bits) is state
+    calls=w.evaluations
+    def forbidden(*a,**k):raise AssertionError('graph construction must not schedule')
+    monkeypatch.setattr(br,'_priority_arrays',forbidden)
+    partial=replace(state,routes=[np.empty(0,np.int64) for _ in range(4)],
+        bits=[np.empty(0,np.int64) for _ in range(4)],value=float('inf'),
+        evaluation_status=ScheduleStatus.DEADLOCK,completion=np.zeros(4),loads=np.zeros(4),
+        operations=[np.empty((0,9)) for _ in range(4)])
+    graph=br.local_graph(w,partial,[])
+    assert len(graph.nodes)==len(w.taskset.tasks)+4 and not graph.feedback_valid.any()
+    assert not graph.nodes[:-4,9:12].any()
+    assert w.evaluations==calls and w.evaluate(state.routes,state.bits) is state
+    for r in range(4):
+        from mrta_baselines.wag_vns import _home
+        expected=2*np.array(_home(r,w.config))/np.array([20.,12.])-1
+        assert np.allclose(graph.nodes[-4+r,6:8],expected)
+    bad=[route.copy() for route in state.routes];bad[0][0]=-1
+    assert w.evaluate(bad,state.bits).status is ScheduleStatus.INFEASIBLE
+
+
+def test_br_robot_features_use_recorded_move_wait_and_actual_processing():
+    import numpy as np
+    from mrta_baselines.hga import _merge_fixed_arrays
+    from mrta_reference.fixed_taskset import generate_taskset
+    from mrta_search.gnn_vns_br import FeatureConfig,FixedWorkspace,local_graph
+    c=ScientificConfig(weld_speed=1.,empty_speed=100.,t_pre=1.,t_post=1.)
+    ts=generate_taskset((ParentWeld('a',(1.,9.),(2.,9.)),ParentWeld('b',(17.,9.),(18.,9.)),
+                        ParentWeld('c',(14.,9.),(20.,9.))),c)
+    w=FixedWorkspace(ts,c,normalization=FeatureConfig(time_ref=10.))
+    routes=[np.array([n for n in w.numeric.atomic_nodes if w.numeric.parent_index[n]<2]),
+            np.array([n for n in w.numeric.atomic_nodes if w.numeric.parent_index[n]==2]),
+            np.empty(0,np.int64),np.empty(0,np.int64)]
+    bits=[np.zeros(len(row),np.int64) for row in routes]
+    routes,bits=_merge_fixed_arrays(routes,bits,w.numeric.fixed_starts,w.numeric.fixed_stops,w.numeric.fixed_lookup)
+    state=w.evaluate(routes,bits)
+    assert state.feasible and sum(op[8]==4 for ops in state.operations for op in ops)>0
+    graph=local_graph(w,state,[])
+    for r,ops in enumerate(state.operations):
+        recorded=[sum(op[6]-op[5] for op in ops if op[8]==kind) for kind in (0,4)]
+        expected=[sum(c.process_time(w.lengths[n]) for n in state.routes[r]),recorded[0],state.completion[r],recorded[1]]
+        assert np.allclose(graph.nodes[-4+r,8:12],np.array(expected)/10.)
+    assert graph.feedback_valid.all()
+
+
+def test_br_small_mixed_initialization_and_uncertainty_are_bounded(monkeypatch):
+    import random,time
+    import numpy as np
+    from mrta_search.gnn_vns_br import BRConfig,BottleneckGAT,action_distribution,route_diversity
+    w,_=_br_fixed_fixture()
+    model=BottleneckGAT()
+    def forbidden(*a,**k):raise AssertionError('untrained weights cannot guide initialization')
+    monkeypatch.setattr(model,'forward',forbidden)
+    state=w.initialize(random.Random(27),BRConfig(candidates=4),time.perf_counter()+60.,model)
+    assert state is w.initial_candidates[0] and 1<=len(w.initial_candidates)<=6
+    assert w.initialization['uncertainty'] is None and not w.initialization['gnn_guidance']
+    assert w.initialization['diversity']==route_diversity(w.initial_candidates)
+    assert len({tuple((tuple(r),tuple(b)) for r,b in zip(s.routes,s.bits)) for s in w.initial_candidates})==len(w.initial_candidates)
+    assert w.evaluations<=7  # Includes the fixture's initial state.
+    feasible=[s for s in w.initial_candidates if s.feasible]
+    if feasible:assert state.value==min(s.value for s in feasible)
+    probability,u=action_distribution([0.,0.,0.]);assert np.allclose(probability,1/3) and u==pytest.approx(1.)
+    assert action_distribution([100.,0.,0.])[1]<.01
+    assert action_distribution([1.])[1]==0.
+
+
+def test_br_new_checkpoint_requires_both_node_types_relations_and_normalization(monkeypatch):
+    import importlib
+    from dataclasses import asdict
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    checkpoint=dict(node_features=runner.NODE_FEATURES,robot_features=runner.ROBOT_FEATURES,
+        edge_relations=runner.EDGE_RELATIONS,edge_features=runner.EDGE_FEATURES,
+        action_features=runner.ACTION_FEATURES,normalization=asdict(runner.FeatureConfig()))
+    runner.check_model_features(checkpoint)
+    for key in ('node_features','robot_features','edge_relations','edge_features','action_features','normalization'):
+        old=dict(checkpoint);old.pop(key)
+        with pytest.raises(ValueError,match='incompatible checkpoint'):runner.check_model_features(old)
+    norm=runner.FeatureConfig(time_ref=1234.)
+    checkpoint['normalization']=asdict(norm)
+    checkpoint['model']=runner.make_ranker(normalization=norm).state_dict()
+    with pytest.raises(ValueError,match='completed training record'):runner.load_model(checkpoint=checkpoint)
+    checkpoint['training']=dict(epochs=1,learning=dict(selected_epoch=1))
+    model,_=runner.load_model(checkpoint=checkpoint)
+    assert model.normalization==norm and model.trained
+
+
+def test_br_deadlock_features_and_four_status_pairs_use_no_fabricated_cmax():
+    from dataclasses import replace
+    import random
+    import numpy as np
+    from mrta_reference.model import ScheduleStatus
+    from mrta_search.gnn_vns_br import local_graph,ranking_pairs
+    w,state=_br_fixed_fixture()
+    deadlock=replace(state,value=float('inf'),completion=np.zeros(4),evaluation_status=ScheduleStatus.DEADLOCK)
+    action=w.apply(deadlock,1,0,0,1,1)
+    assert action is not None and np.array_equal(action.features[8:10],[0.,0.])
+    graph=local_graph(w,deadlock,[action])
+    assert not graph.feedback_valid.any() and not graph.nodes[-4:,10].any()
+    labels=[replace(state,value=3.,evaluation_status=ScheduleStatus.FEASIBLE),deadlock,
+            replace(deadlock,evaluation_status=ScheduleStatus.INFEASIBLE),
+            replace(deadlock,value=float('nan'),evaluation_status=ScheduleStatus.NUMERIC_FAILURE)]
+    assert ranking_pairs(labels,random.Random(3)).tolist()==[[0,1],[0,2]]
 
 
 def _br_shared_robot_fixture():
@@ -1030,7 +1179,7 @@ def test_br_global_best_improvement_and_shaking_preserve_best(monkeypatch,initia
     def state(value):
         return br.State([],[],value,np.full(4,value),np.ones(4),np.ones(4),[])
     class Workspace:
-        def __init__(self,*args):self.evaluations=0;self.visited=[]
+        def __init__(self,*args,**kwargs):self.evaluations=0;self.visited=[];self.initialization={}
         def initialize(self,*args):self.evaluations+=1;return state(initial_value)
         def evaluate(self,route,bits):
             self.evaluations+=1;self.visited.append(route)
@@ -1064,8 +1213,8 @@ def test_br_supervision_uses_online_budgets_greedy_states_and_train_only(monkeyp
                  native_cmax_s='100',solution=json.dumps(payload))
     forbidden=dict(teacher,split='validation',layout_id='validation_A',solution='must not parse')
     test=dict(teacher,split='test',layout_id='test_A',solution='must not parse')
-    monkeypatch.setattr(runner,'load_tasksets',lambda:[('train','train_A',w.taskset),
-        ('validation','validation_A',w.taskset),('test','test_A',w.taskset)])
+    monkeypatch.setattr(runner,'iter_tasksets',lambda split,dataset='original':
+        iter([('train_A',w.taskset)]) if split=='train' else (_ for _ in ()).throw(AssertionError('non-TRAIN read')))
     monkeypatch.setattr(runner,'read_baselines',lambda method,**kwargs:[teacher,forbidden,test])
     observed=[]
     def generate(workspace,current,settings,rng):
@@ -1075,7 +1224,7 @@ def test_br_supervision_uses_online_budgets_greedy_states_and_train_only(monkeyp
     examples,stats=runner.build_supervision(seed=4,states_per_source=1,progress=lambda *a:None)
     assert examples and observed and set(observed)=={(8,12,40)}
     assert stats['layouts']==['train_A'] and stats['greedy_initializations']==1
-    assert all(name=='train_A' and graph.nodes.shape[1]==16 and graph.edge_attr.shape[1]==3
+    assert all(name=='train_A' and graph.nodes.shape[1]==12 and graph.edge_attr.shape[1]==4
                for name,graph,pairs in examples)
     assert stats['candidate_parameters']==runner.asdict(BRConfig())
 

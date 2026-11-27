@@ -29,7 +29,8 @@ from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.fixed_taskset import generate_taskset
 from mrta_reference.model import ParentWeld, ScheduleStatus
 from mrta_search.gnn_vns_br import (
-    ACTION_FEATURES, EDGE_FEATURES, MODEL_VARIANTS, NODE_FEATURES, BRConfig, FixedWorkspace,
+    ACTION_FEATURES, EDGE_FEATURES, EDGE_RELATIONS, MODEL_VARIANTS, NODE_FEATURES, ROBOT_FEATURES,
+    BRConfig, FeatureConfig, FixedWorkspace,
     candidate_actions, local_graph, make_ranker, ranking_pairs, run_gnn_vns_br, train_ranker,
 )
 from run_fixed_taskset_experiment import (
@@ -37,10 +38,10 @@ from run_fixed_taskset_experiment import (
     read_rows as read_baselines, solution_record,
 )
 
-WEIGHTS = ROOT / 'models/gnn_vns_br_edgeaware.pt'
-CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_edgeaware.csv'
-SCALE_WEIGHTS = ROOT / 'models/gnn_vns_br_edgeaware_scale1000.pt'
-SCALE_CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_edgeaware_scale1000.csv'
+WEIGHTS = ROOT / 'models/gnn_vns_br_atomic.pt'
+CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_atomic.csv'
+SCALE_WEIGHTS = ROOT / 'models/gnn_vns_br_atomic_scale3000.pt'
+SCALE_CSV = ROOT / 'results/native_priority/new_dataset_final/gnn_vns_br_atomic_scale3000.csv'
 SCALE_DATA = ROOT / 'data/weld_layout/scale1000'
 OUTPUT_FIELDS = ('trial', *FIELDS)
 SCALE_FIELDS = ('dataset', 'variant', *OUTPUT_FIELDS)
@@ -50,12 +51,12 @@ SCALE_SECTION = '\n## GNN-VNS-BR scale1000训练、消融与正式实验\n'
 
 def iter_tasksets(split, dataset='original'):
     """Stream new layouts through the unchanged fixed splitter; no data copy."""
-    if dataset == 'original':
-        yield from ((name, ts) for s, name, ts in load_tasksets() if s == split)
-        return
-    if dataset != 'scale1000':
+    if split not in ('train', 'validation', 'test'):
+        raise ValueError(f'unknown split: {split}')
+    if dataset not in ('original', 'scale1000'):
         raise ValueError(f'unknown dataset: {dataset}')
-    with (SCALE_DATA / f'{split}.jsonl').open(encoding='utf-8') as stream:
+    base = SCALE_DATA if dataset == 'scale1000' else ROOT / 'data/weld_layout'
+    with (base / f'{split}.jsonl').open(encoding='utf-8') as stream:
         for line in stream:
             record = json.loads(line)
             parents = tuple(ParentWeld(p['parent_id'], tuple(p['start']), tuple(p['end']))
@@ -74,6 +75,15 @@ def training_tasksets(dataset='original'):
                 raise ValueError(f'scale TRAIN differs from the original layout with the same key: {name}')
             continue
         yield name, taskset
+
+
+def fit_training_normalization(dataset='scale1000'):
+    """One global reference fitted from TRAIN geometry, without scheduling."""
+    loads = [sum(CONFIG.process_time(t.length) for t in ts.tasks) / 4.
+             for _, ts in training_tasksets(dataset)]
+    if not loads:
+        raise ValueError('TRAIN is empty')
+    return FeatureConfig(time_ref=max(1., median(loads)))
 
 
 def read_results(dataset='original'):
@@ -110,13 +120,14 @@ def append_result(row, dataset='original'):
 
 
 def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig(),
-                      dataset='original', progress=print):
+                      dataset='original', normalization=None, progress=print):
     """Use TRAIN teachers, independent greedy starts, and one legal perturbation.
 
     Candidate budgets and graph construction are identical to online search.
     Labels stay in memory; no validation/test state is turned into a label.
     """
     rng = random.Random(seed)
+    normalization = normalization or fit_training_normalization(dataset)
     tasksets = training_tasksets(dataset)
     teachers = {}
     for method in ('wag_vns', 'hga'):
@@ -139,7 +150,7 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                  perturbed_states=0, candidate_parameters=asdict(settings))
     started = time.perf_counter()
     for name, taskset in tasksets:
-        workspace = FixedWorkspace(taskset, CONFIG)
+        workspace = FixedWorkspace(taskset, CONFIG, normalization=normalization)
         identities = set()
         sources = []
         for method in ('wag_vns', 'hga'):
@@ -174,7 +185,7 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                 if not actions:
                     continue
                 evaluated = [workspace.evaluate(a.routes, a.bits) for a in actions]
-                pairs = ranking_pairs([state.value for state in evaluated], rng)
+                pairs = ranking_pairs(evaluated, rng)
                 stats['candidate_labels'] += len(evaluated)
                 stats['feasible_labels'] += sum(s.feasible for s in evaluated)
                 stats['deadlock_labels'] += sum(s.status is ScheduleStatus.DEADLOCK for s in evaluated)
@@ -200,15 +211,20 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
 
 
 def train(args):
-    path = SCALE_WEIGHTS if args.dataset == 'scale1000' else WEIGHTS
+    path = args.weights or (SCALE_WEIGHTS if args.dataset == 'scale1000' else WEIGHTS)
+    path = path.resolve()
+    if not path.is_relative_to(ROOT):
+        raise ValueError('model outputs must stay inside DRL')
     if path.exists():
         check_model_features(torch.load(path, map_location='cpu', weights_only=False))
         print('BR_TRAIN_ALREADY_SAVED', str(path), flush=True)
         return
     started = time.perf_counter()
     settings = BRConfig()
-    examples, data = build_supervision(seed=args.training_seed, settings=settings, dataset=args.dataset)
-    variants = MODEL_VARIANTS if args.dataset == 'scale1000' else ('full_gnn',)
+    normalization = fit_training_normalization(args.dataset)
+    examples, data = build_supervision(seed=args.training_seed, settings=settings,
+                                      dataset=args.dataset, normalization=normalization)
+    variants = (args.variant,)
     models, learning = {}, {}
     for variant in variants:
         tick = time.perf_counter()
@@ -222,40 +238,55 @@ def train(args):
                     validation_used_for_labels=False, test_used_for_labels=False,
                     shared_supervision=True)
     checkpoint = dict(training=training, settings=asdict(settings), node_features=NODE_FEATURES,
+                      robot_features=ROBOT_FEATURES, edge_relations=EDGE_RELATIONS,
+                      normalization=asdict(normalization),
                       edge_features=EDGE_FEATURES, action_features=ACTION_FEATURES)
     if args.dataset == 'scale1000':
         checkpoint.update(models=models, learning=learning)
     else:
-        checkpoint['model'] = models['full_gnn']
-        training['learning'] = learning['full_gnn']
+        checkpoint['model'] = models[args.variant]
+        checkpoint['variant'] = args.variant
+        training['learning'] = learning[args.variant]
     # The one approved weight file contains the model and its actual training
     # record, with no optimizer, duplicate snapshots or sample sidecars.
     payload = io.BytesIO()
     torch.save(checkpoint, payload)
     if payload.tell() >= LIMIT:
         raise ValueError('model would exceed 100MB')
-    path.write_bytes(payload.getvalue())
+    with path.open('xb') as stream:
+        stream.write(payload.getvalue())
     print('BR_TRAINED', json_text({k: v for k, v in training.items() if k != 'learning'}), flush=True)
     (update_scale_report if args.dataset == 'scale1000' else update_report)()
 
 
 def check_model_features(checkpoint):
     if (tuple(checkpoint.get('node_features', ())) != NODE_FEATURES
+            or tuple(checkpoint.get('robot_features', ())) != ROBOT_FEATURES
+            or tuple(checkpoint.get('edge_relations', ())) != EDGE_RELATIONS
             or tuple(checkpoint.get('edge_features', ())) != EDGE_FEATURES
-            or tuple(checkpoint.get('action_features', ())) != ACTION_FEATURES):
-        raise ValueError('incompatible checkpoint: existing merged-job graph requires '
+            or tuple(checkpoint.get('action_features', ())) != ACTION_FEATURES
+            or 'normalization' not in checkpoint):
+        raise ValueError('incompatible checkpoint: atomic heterograph requires '
                          f'{len(NODE_FEATURES)} node/{len(EDGE_FEATURES)} edge/{len(ACTION_FEATURES)} action features; '
                          'historical weights are preserved, not adapted or overwritten')
+    FeatureConfig(**checkpoint['normalization'])
 
 
-def load_model(dataset='original', variant='full_gnn', *, checkpoint=None):
+def load_model(dataset='original', variant='full_gnn', *, checkpoint=None, path=None):
     if checkpoint is None:
-        checkpoint = torch.load(SCALE_WEIGHTS if dataset == 'scale1000' else WEIGHTS,
+        checkpoint = torch.load(path or (SCALE_WEIGHTS if dataset == 'scale1000' else WEIGHTS),
                                  map_location='cpu', weights_only=False)
     check_model_features(checkpoint)
-    model = make_ranker(variant)
+    if dataset == 'original' and checkpoint.get('variant', 'full_gnn') != variant:
+        raise ValueError('requested ranking variant differs from the saved model')
+    training = checkpoint.get('training', {})
+    learning = (checkpoint.get('learning', {}).get(variant, {}) if dataset == 'scale1000'
+                else training.get('learning', {}))
+    if training.get('epochs', 0) < 1 or learning.get('selected_epoch', 0) < 1:
+        raise ValueError('checkpoint has no completed training record')
+    model = make_ranker(variant, normalization=FeatureConfig(**checkpoint['normalization']))
     model.load_state_dict(checkpoint['models'][variant] if dataset == 'scale1000' else checkpoint['model'])
-    model.eval()
+    model.eval(); model.trained = True
     return model, checkpoint
 
 
@@ -281,9 +312,9 @@ def run_one(split, name, taskset, seed, *, trial='main', time_limit=None, model=
                       robot_waiting_s=schedule.robot_waiting_time,
                       native_feasible=state.feasible, selected_epoch=learning['selected_epoch'],
                       offline_training_s=checkpoint['training']['total_offline_s'],
-                      input_adapter='FIXED_MERGED_GAT_NATIVE_PRIORITY', evaluation_policy='NATIVE_PRIORITY_FOUR_ROBOTS',
+                      input_adapter='FIXED_ATOMIC_HETEROGAT_NATIVE_PRIORITY', evaluation_policy='NATIVE_PRIORITY_FOUR_ROBOTS',
                       single_thread=True, cold_jit_included=True)
-    method = f'gnn_vns_br_{variant}_scale1000' if dataset == 'scale1000' else 'gnn_vns_br_edgeaware'
+    method = f'gnn_vns_br_{variant}_atomic_scale3000' if dataset == 'scale1000' else 'gnn_vns_br_atomic'
     row = dict(trial=trial, split=split, layout_id=name, seed=seed, method=method,
                status=schedule.status.value, cmax_s=schedule.cmax if schedule.feasible else None,
                native_cmax_s=state.value if state.feasible else None,
@@ -375,7 +406,7 @@ def validation_admission(rows):
     return dict(ready_for_test=all(checks.values()), checks=checks, summary=summary, paired=paired)
 
 
-def run_experiment(split):
+def run_experiment(split, *, variant='full_gnn', weights=None):
     rows = read_results('scale1000')
     if split == 'test':
         admission = validation_admission(rows)
@@ -387,9 +418,9 @@ def run_experiment(split):
         raise ValueError('formal experiments use validation or test')
     models = {}
     checkpoint = None
-    variants = MODEL_VARIANTS if split == 'validation' else ('full_gnn',)
+    variants = (variant,) if split == 'validation' else ('full_gnn',)
     for variant in variants:
-        models[variant], checkpoint = load_model('scale1000', variant, checkpoint=checkpoint)
+        models[variant], checkpoint = load_model('scale1000', variant, checkpoint=checkpoint, path=weights)
     keys = [(r['dataset'], r['split'], r['layout_id'], int(r['seed']), r['variant'], r['trial']) for r in rows]
     if len(keys) != len(set(keys)):
         raise ValueError('duplicate saved model/layout/seed result keys')
@@ -447,27 +478,64 @@ def update_report(*, checkpoint=None, result_rows=None):
     return summary
 
 
+def prepare(args):
+    """One TRAIN layout: interface checks only, with no labels or weight writes."""
+    normalization = fit_training_normalization(args.dataset)
+    name, taskset = next(iter(training_tasksets(args.dataset)))
+    workspace = FixedWorkspace(taskset, CONFIG, normalization=normalization)
+    settings = BRConfig(candidates=4)
+    rng = random.Random(args.training_seed)
+    state = workspace.initialize(rng, settings, time.perf_counter() + settings.time_limit)
+    if state is None:
+        raise RuntimeError('no initial TRAIN state')
+    actions = candidate_actions(workspace, state, settings, rng)
+    graph = local_graph(workspace, state, actions)
+    if not actions:
+        raise RuntimeError('the selected TRAIN state has no legal actions')
+    evaluations = workspace.evaluations
+    model = make_ranker(normalization=normalization)
+    scores = model(graph)
+    scores.square().mean().backward()
+    finite = bool(torch.isfinite(scores).all() and all(
+        p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+    if not finite or len(graph.nodes) != len(taskset.tasks) + 4:
+        raise RuntimeError('invalid graph, outputs or gradients')
+    if workspace.evaluations != evaluations:
+        raise RuntimeError('graph construction/forward unexpectedly scheduled a candidate')
+    print('BR_PREPARED', json_text(dict(layout_id=name, split='train',
+        atomic_tasks=len(taskset.tasks), nodes=list(graph.nodes.shape),
+        edge_relations=[EDGE_RELATIONS[i] for i in sorted(set(graph.relations.tolist()))],
+        edges=list(graph.edge_attr.shape), actions=list(graph.action_features.shape),
+        finite_outputs_and_gradients=finite, normalization=asdict(normalization),
+        initialization=workspace.initialization, native_evaluations=evaluations,
+        graph_scheduler_calls=0, labels_generated=0, optimizer_steps=0, files_written=0)), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument('stage', choices=('train', 'validation', 'test', 'summary', 'smoke'))
+    parser.add_argument('stage', choices=('prepare', 'train', 'validation', 'test', 'summary', 'smoke'))
     parser.add_argument('--dataset', choices=('original', 'scale1000'), default='scale1000')
     parser.add_argument('--training-seed', type=int, default=20261126)
     parser.add_argument('--epochs', type=int, default=24)
+    parser.add_argument('--variant', choices=MODEL_VARIANTS, default='full_gnn')
+    parser.add_argument('--weights', type=Path, help='new atomic-model checkpoint; historical weights are incompatible')
     parser.add_argument('--layouts', nargs='+', default=('train_01','train_12','train_30'))
     parser.add_argument('--seed', type=int, default=20261110)
     parser.add_argument('--trial', default='main')
     args = parser.parse_args()
     set_num_threads(1); torch.set_num_threads(1)
-    if args.stage == 'train':
+    if args.stage == 'prepare':
+        prepare(args)
+    elif args.stage == 'train':
         train(args)
     elif args.stage in ('validation', 'test'):
         if args.dataset != 'scale1000':
             raise ValueError('formal stages use the new scale1000 checkpoint; old experiments are preserved')
-        run_experiment(args.stage)
+        run_experiment(args.stage, variant=args.variant, weights=args.weights)
     elif args.stage == 'smoke':
         if args.dataset != 'original':
             raise ValueError('the previous TRAIN smoke uses --dataset original; this round uses validation')
-        model, checkpoint = load_model()
+        model, checkpoint = load_model(variant=args.variant, path=args.weights)
         tasksets = {name:ts for split,name,ts in load_tasksets() if split=='train'}
         if len(args.layouts) != len(set(args.layouts)) or any(name not in tasksets for name in args.layouts):
             raise ValueError('smoke layouts must be distinct existing TRAIN layouts')

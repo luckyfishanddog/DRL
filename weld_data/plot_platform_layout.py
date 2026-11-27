@@ -50,6 +50,7 @@ MIN_WELD_LENGTH_MM = 50.0
 FIT_TOLERANCE_MM = 30.0
 FIT_SAMPLE_MM = 0.5
 GEOMETRY_TOLERANCE_M = 1e-6
+MAX_DATASET_BYTES = 100_000_000
 DATASET_SEEDS = {
     "train": (*range(2026111001, 2026111013), *range(2026111101, 2026111129)),
     "validation": tuple(range(2026111201, 2026111211)),
@@ -248,10 +249,18 @@ def split_free_space(free: list[Box], used: Box) -> list[Box]:
         if top < d - TOLERANCE_M:
             available.append((a, top, c, d))
     unique = list(dict.fromkeys(available))
-    return [r for i, r in enumerate(unique) if not any(
-        j != i and a <= r[0] and b <= r[1] and c >= r[2] and d >= r[3]
-        for j, (a, b, c, d) in enumerate(unique)
-    )]
+    if len(unique) < 2:
+        return unique
+    # The same containment predicate and stable rectangle order, evaluated
+    # together in NumPy. Packing choices and random calls are unchanged.
+    boxes = np.asarray(unique)
+    contains = ((boxes[:, None, 0] <= boxes[None, :, 0])
+                & (boxes[:, None, 1] <= boxes[None, :, 1])
+                & (boxes[:, None, 2] >= boxes[None, :, 2])
+                & (boxes[:, None, 3] >= boxes[None, :, 3]))
+    np.fill_diagonal(contains, False)
+    redundant = contains.any(axis=0)
+    return [rectangle for rectangle, remove in zip(unique, redundant) if not remove]
 
 
 def choose_position(part: LayoutPart, free: list[Box], spacing: float, rng: Random,
@@ -566,7 +575,7 @@ def check_scale_dataset(output_dir, parts):
                 raise ValueError('parent weld below the existing 50mm filter')
             geometry = layout_geometry(row)
             if any(same_layout(geometry,other) for other in current):
-                raise ValueError('duplicate geometry within the new 1200-layout dataset')
+                raise ValueError('duplicate geometry within the scale dataset')
             current.append(geometry)
             if row['layout_id'] in history and row == history[row['layout_id']]:
                 if split == 'test':raise ValueError('historical TEST reused as new TEST')
@@ -603,6 +612,8 @@ def export_scale_dataset(parts, workbook, output_dir, targets=(1000,100,100), wo
         if target < len(prefix[name]):raise ValueError('target smaller than the permitted historical prefix')
         path=output_dir/f'{name}.jsonl'
         if path.exists():
+            if path.stat().st_size >= MAX_DATASET_BYTES:
+                raise ValueError(f'{path}: dataset exceeds the 100MB file limit')
             rows=[json.loads(s) for s in path.read_text(encoding='utf-8').splitlines()]
         else:
             rows=list(prefix[name])
@@ -620,7 +631,9 @@ def export_scale_dataset(parts, workbook, output_dir, targets=(1000,100,100), wo
     with ProcessPoolExecutor(max_workers=workers,initializer=_scale_worker_init,initargs=(parts,workbook)) as pool:
         for name,target in zip(('train','validation','test'),targets):
             rows=datasets[name]
-            with (output_dir/f'{name}.jsonl').open('a',encoding='utf-8',newline='\n') as stream:
+            path = output_dir/f'{name}.jsonl'
+            size = path.stat().st_size
+            with path.open('a',encoding='utf-8',newline='\n') as stream:
                 failed=0
                 while len(rows)<target:
                     jobs=[]
@@ -635,8 +648,12 @@ def export_scale_dataset(parts, workbook, output_dir, targets=(1000,100,100), wo
                             continue
                         failed=0
                         record['layout_id']=f'scale_{name}_{len(rows)+1:04d}'
+                        line = json.dumps(record,ensure_ascii=False,allow_nan=False)+'\n'
+                        increment = len(line.encode('utf-8'))
+                        if size + increment >= MAX_DATASET_BYTES:
+                            raise ValueError(f'{path}: append would exceed the 100MB file limit')
                         rows.append(record);geometries.append(geometry)
-                        stream.write(json.dumps(record,ensure_ascii=False,allow_nan=False)+'\n');stream.flush()
+                        stream.write(line);stream.flush();size += increment
                     if len(rows)%20<workers*2 or len(rows)==target:
                         print('SCALE_DATA_PROGRESS',name,len(rows),'/',target,'duplicates',duplicates,flush=True)
     check_scale_dataset(output_dir,parts)
