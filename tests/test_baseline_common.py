@@ -11,6 +11,338 @@ from mrta_reference.scope import FORMAL_SCOPE_V1_1
 from mrta_reference.solution import canonicalize
 
 
+def _teacher_runner(monkeypatch):
+    import importlib
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    return importlib.import_module('run_fixed_taskset_experiment')
+
+
+def _teacher_row(runner, name='train_A', method='wag_vns', status='FEASIBLE', value=100, seed=1):
+    return dict(split='train',layout_id=name,method=method,seed=seed,status=status,
+        iterations=500 if method=='wag_vns' else 200000,termination_reason='ITERATION_LIMIT',
+        native_cmax_s=value if status=='FEASIBLE' else '',cmax_s=value if status=='FEASIBLE' else '',
+        diagnostic=runner.json_text(dict(input_adapter=runner.WAG_INPUT_ADAPTER if method=='wag_vns'
+                                        else runner.HGA_INPUT_ADAPTER)),
+        solution=runner.json_text(dict(routes=[['a'],[],[],[]],directions=[[0],[],[],[]])))
+
+
+def _scale_teacher_fixture():
+    from types import SimpleNamespace
+    rows=[(f'train_{i:02d}',SimpleNamespace(tasks=tuple(range(100+i)))) for i in range(40)]
+    rows += [(f'scale_train_{i:04d}',SimpleNamespace(tasks=tuple(range(80+i%140)))) for i in range(2960)]
+    return rows,{name for name,_ in rows[:40]}
+
+
+def test_scale_teacher_loader_and_ten_strata_keep_originals_unique(monkeypatch):
+    import pytest
+    runner=_teacher_runner(monkeypatch)
+    rows,originals=_scale_teacher_fixture()
+    original={name:ts for name,ts in rows if name in originals}
+    expanded=dict(rows)
+    monkeypatch.setattr(runner,'_train_file',lambda path:expanded if path.parent.name=='scale1000' else original)
+    loaded,old=runner.scale3000_tasksets()
+    assert len(loaded)==3000 and old==originals
+    chosen=runner.hga_training_selection(loaded,old)
+    assert len(chosen)==2000 and originals <= chosen
+    assert chosen==runner.hga_training_selection(list(reversed(loaded)),old)
+    ranked=sorted(loaded,key=lambda item:(len(item[1].tasks),item[0]))
+    previous=set(originals)
+    for i in range(10):
+        group=[name for name,_ in ranked[i*300:(i+1)*300] if name not in originals]
+        assert len(chosen & set(group))==196
+        previous.update(group[(2*k+1)*len(group)//192] for k in range(96))
+    assert len(previous)==1000 and previous <= chosen and len(chosen-previous)==1000
+    expanded['train_00']=object()
+    with pytest.raises(ValueError,match='differs'):
+        runner.scale3000_tasksets()
+
+
+def test_scale_teacher_train_file_rejects_duplicate_and_nontrain(monkeypatch,tmp_path):
+    import pytest
+    runner=_teacher_runner(monkeypatch)
+    record=dict(layout_id='train_A',split='train',parents=[dict(parent_id='p',start=[1.,9.],end=[2.,9.])])
+    path=tmp_path/'train.jsonl'
+    path.write_text(runner.json_text(record)+'\n'+runner.json_text(record)+'\n',encoding='utf-8')
+    with pytest.raises(ValueError,match='duplicate TRAIN'):
+        runner._train_file(path)
+    record['split']='test'
+    path.write_text(runner.json_text(record)+'\n',encoding='utf-8')
+    with pytest.raises(ValueError,match='non-TRAIN'):
+        runner._train_file(path)
+
+
+def test_scale_teacher_budget_and_native_teacher_eligibility(monkeypatch):
+    runner=_teacher_runner(monkeypatch)
+    for method,budget in [('wag_vns',500),('hga',200000)]:
+        row=_teacher_row(runner,method=method)
+        assert runner.complete_budget(row,method) and runner.feasible_teacher(row,method)
+        dead=dict(row,status='DEADLOCK',native_cmax_s='',solution='')
+        assert runner.complete_budget(dead,method) and not runner.feasible_teacher(dead,method)
+        for bad in [dict(row,iterations=budget-1),dict(row,termination_reason='TIME_LIMIT'),dict(row,status='ERROR'),
+                    dict(row,status='INCOMPLETE'),dict(row,split='validation'),dict(row,split='test')]:
+            assert not runner.complete_budget(bad,method)
+        for value in ('','nan','inf','0','-1'):
+            assert not runner.feasible_teacher(dict(row,native_cmax_s=value,cmax_s='1'),method)
+        assert not runner.feasible_teacher(dict(row,solution=runner.json_text(dict(
+            routes=[['a'],[],[],[]],directions=[[],[],[],[]]))),method)
+
+
+def test_scale_teacher_coverage_merges_history_recent_and_retry_results(monkeypatch,tmp_path):
+    runner=_teacher_runner(monkeypatch)
+    monkeypatch.setattr(runner,'HISTORICAL_RESULTS',tmp_path/'history')
+    monkeypatch.setattr(runner,'RESULTS',tmp_path/'recent')
+    monkeypatch.setattr(runner,'TEACHER_RESULTS',tmp_path/'new')
+    for row in [_teacher_row(runner,value=200),_teacher_row(runner,value=100,seed=2),
+                _teacher_row(runner,'train_B',status='DEADLOCK')]:
+        runner.append_row('wag_vns',row,directory=runner.HISTORICAL_RESULTS)
+    runner.append_row('wag_vns',_teacher_row(runner,'train_C'),directory=runner.RESULTS)
+    runner.append_row('wag_vns',dict(_teacher_row(runner,'train_D'),status='ERROR'),directory=runner.TEACHER_RESULTS)
+    targets={'train_A','train_B','train_C','train_D'}
+    completed,summary=runner.teacher_coverage('wag_vns',targets)
+    assert len(completed)==3 and summary['historical_reused']==3 and summary['missing']==['train_D']
+    assert summary['error_or_incomplete']==1 and completed['train_A']['native_cmax_s']=='100'
+    runner.append_row('wag_vns',_teacher_row(runner,value=80),directory=runner.TEACHER_RESULTS)
+    runner.append_row('wag_vns',_teacher_row(runner,'train_D',status='DEADLOCK'),directory=runner.TEACHER_RESULTS)
+    completed,summary=runner.teacher_coverage('wag_vns',targets)
+    assert len(completed)==4 and summary['DEADLOCK']==2 and summary['new_completed']==1
+    assert summary['error_or_incomplete']==0 and completed['train_A']['native_cmax_s']=='80'
+
+
+def test_scale_teacher_append_repairs_only_partial_tail_and_rotates(monkeypatch,tmp_path):
+    runner=_teacher_runner(monkeypatch)
+    monkeypatch.setattr(runner,'TEACHER_RESULTS',tmp_path)
+    runner.append_row('wag_vns',_teacher_row(runner),directory=tmp_path)
+    path=tmp_path/'wag_vns.csv'
+    with path.open('ab') as stream:stream.write(b'train,interrupted,"partial\xe4\xb8')
+    assert len(runner.read_rows('wag_vns',directory=tmp_path))==1
+    runner.append_row('wag_vns',_teacher_row(runner,'train_B'),directory=tmp_path)
+    size=path.stat().st_size
+    monkeypatch.setattr(runner,'LIMIT',size+10)
+    runner.append_row('wag_vns',_teacher_row(runner,'train_C'),directory=tmp_path)
+    assert path.stat().st_size==size
+    assert (tmp_path/'wag_vns_002.csv').stat().st_size<runner.LIMIT
+    assert [r['layout_id'] for r in runner.read_rows('wag_vns',directory=tmp_path)]==['train_A','train_B','train_C']
+
+
+def test_scale_teacher_batch_skips_completed_and_pairs_deterministic_seeds(monkeypatch):
+    runner=_teacher_runner(monkeypatch)
+    rows,originals=_scale_teacher_fixture();names={name for name,_ in rows}
+    selected=runner.hga_training_selection(rows,originals)
+    pending=sorted(selected)[:2];calls=[];saved=[]
+    monkeypatch.setattr(runner,'scale3000_tasksets',lambda:(rows,originals))
+    def coverage(method,targets):
+        done=targets-set(pending) if sum(c[0]==method for c in calls)<2 else targets
+        return {name:None for name in done},dict(method=method,missing=sorted(targets-done))
+    monkeypatch.setattr(runner,'teacher_coverage',coverage)
+    def job(item,**kwargs):
+        method,split,name,ts,seed=item;calls.append((method,name,seed,kwargs['purpose']))
+        return _teacher_row(runner,name,method,status='DEADLOCK',seed=seed)
+    monkeypatch.setattr(runner,'baseline_job',job)
+    monkeypatch.setattr(runner,'append_row',lambda method,row,**kwargs:saved.append(row))
+    runner.scale3000_teachers(workers=1)
+    assert len(calls)==len(saved)==4
+    assert [c[0] for c in calls]==['wag_vns','wag_vns','hga','hga']
+    assert {c[1]:c[2] for c in calls[:2]}=={c[1]:c[2] for c in calls[2:]}
+    for _,name,seed,purpose in calls:
+        assert seed==runner.BASE_SEED+sorted(names).index(name) and purpose=='scale3000_teachers'
+    calls.clear()
+    runner.scale3000_teachers(workers=56,check_only=True)
+    assert not calls
+
+
+def test_scale_teacher_baseline_job_preserves_exact_native_configuration(monkeypatch):
+    from types import SimpleNamespace
+    from mrta_reference.model import ScheduleStatus
+    runner=_teacher_runner(monkeypatch);observed=[]
+    def run(parents,config,settings,**kwargs):
+        observed.append((settings,kwargs))
+        schedule=SimpleNamespace(feasible=False,status=ScheduleStatus.DEADLOCK,robot_completion=(0.,)*4,
+                                 waiting_time=0.,diagnostics=())
+        return SimpleNamespace(schedule=schedule,solution=None,iterations=settings.imax if hasattr(settings,'imax')
+            else settings.max_iterations,termination_reason='ITERATION_LIMIT',reference_calls=1,status=ScheduleStatus.DEADLOCK,
+            accounting={},diagnostics=(),actual_runtime=0.,initialization_time=0.,search_time=0.)
+    monkeypatch.setattr(runner,'run_adapted_wag_vns',run);monkeypatch.setattr(runner,'run_adapted_hga',run)
+    ts=SimpleNamespace(parents=(),tasks=(1,))
+    for method in ('wag_vns','hga'):
+        result=runner.baseline_job((method,'train','train_A',ts,7),purpose='scale3000_teachers')
+        assert result['status']=='DEADLOCK' and runner.complete_budget(result,method)
+    wag,hga=observed[0][0],observed[1][0]
+    assert wag.imax==500
+    assert (hga.mu,hga.lambda_size,hga.alpha,hga.max_iterations)==(20,10,20,200000)
+    assert hga.vnd_objective=='ROUTE_CYCLE' and hga.direction_encoding=='EXPLICIT'
+    assert hga.vnd_max_passes is None and hga.vnd_candidate_cap is None
+    for _,kw in observed:
+        assert kw['time_limit']==float('inf') and kw['checkpoints']==() and kw['certify'] is False
+        assert kw['candidate_evaluator'] is runner.priority_schedule and kw['fixed_taskset'] is ts
+
+
+def test_scale_teacher_gnn_reads_new_csv_and_best_native_teacher(monkeypatch,tmp_path):
+    import importlib
+    runner=_teacher_runner(monkeypatch);gnn=importlib.import_module('run_gnn_vns_br')
+    monkeypatch.setattr(runner,'HISTORICAL_RESULTS',tmp_path/'history')
+    monkeypatch.setattr(runner,'RESULTS',tmp_path/'recent')
+    monkeypatch.setattr(runner,'TEACHER_RESULTS',tmp_path/'new')
+    monkeypatch.setattr(gnn,'TEACHER_RESULTS',runner.TEACHER_RESULTS)
+    for method in ('wag_vns','hga'):
+        runner.append_row(method,_teacher_row(runner,method=method,value=100),directory=runner.HISTORICAL_RESULTS)
+        runner.append_row(method,_teacher_row(runner,method=method,value=80),directory=runner.TEACHER_RESULTS)
+        runner.append_row(method,dict(_teacher_row(runner,method=method,value=1),iterations=1),directory=runner.TEACHER_RESULTS)
+        runner.append_row(method,dict(_teacher_row(runner,'validation_A',method,value=1),split='validation'),directory=runner.TEACHER_RESULTS)
+    teachers=gnn.read_training_teachers()
+    assert len(teachers)==2 and {float(row['native_cmax_s']) for row in teachers.values()}=={80.}
+
+
+def test_scale_teacher_incomplete_coverage_stops_before_labels_and_training(monkeypatch,tmp_path):
+    import importlib
+    import pytest
+    from types import SimpleNamespace
+    runner=_teacher_runner(monkeypatch);gnn=importlib.import_module('run_gnn_vns_br')
+    rows,originals=_scale_teacher_fixture()
+    monkeypatch.setattr(gnn,'ROOT',tmp_path)
+    monkeypatch.setattr(gnn,'scale3000_tasksets',lambda:(rows,originals))
+    def coverage(method,targets):
+        missing=[sorted(targets)[0]]
+        return {},dict(method=method,missing=missing,duplicate_complete_keys=[],invalid_feasible_teachers=[])
+    monkeypatch.setattr(gnn,'teacher_coverage',coverage)
+    def forbidden(*a,**kw):raise AssertionError('missing coverage reached labels/training')
+    monkeypatch.setattr(gnn,'build_supervision',forbidden)
+    monkeypatch.setattr(gnn,'fit_training_normalization',forbidden)
+    monkeypatch.setattr(gnn,'train_ranker',forbidden)
+    args=SimpleNamespace(weights=tmp_path/'new.pt',dataset='scale1000',layouts=None)
+    with pytest.raises(ValueError,match='no labels/training started'):
+        gnn.train(args)
+    assert not args.weights.exists()
+
+
+def test_scale_teacher_full_training_passes_all_3000_and_accepts_complete_deadlocks(monkeypatch,tmp_path):
+    import importlib
+    import pytest
+    from types import SimpleNamespace
+    runner=_teacher_runner(monkeypatch);gnn=importlib.import_module('run_gnn_vns_br')
+    rows,originals=_scale_teacher_fixture()
+    monkeypatch.setattr(gnn,'ROOT',tmp_path)
+    monkeypatch.setattr(gnn,'scale3000_tasksets',lambda:(rows,originals))
+    def coverage(method,targets):
+        assert len(targets)==(3000 if method=='wag_vns' else 2000)
+        return {name:dict(status='DEADLOCK') for name in targets},dict(method=method,missing=[],duplicate_complete_keys=[])
+    monkeypatch.setattr(gnn,'teacher_coverage',coverage)
+    def normalization(dataset,*,tasksets):
+        assert dataset=='scale1000' and len(tasksets)==3000
+        return gnn.FeatureConfig()
+    monkeypatch.setattr(gnn,'fit_training_normalization',normalization)
+    def supervision(**kwargs):
+        assert kwargs['layouts'] is None and len(kwargs['tasksets'])==3000
+        assert kwargs['label_workers']==56
+        return [(name,None,None) for name,_ in kwargs['tasksets']],{}
+    monkeypatch.setattr(gnn,'build_supervision',supervision)
+    def train(examples,**kwargs):
+        import torch
+        assert torch.get_num_threads()==56
+        assert len(examples)==3000 and len({e[0] for e in examples})==3000
+        assert kwargs==dict(seed=20261126,epochs=24,variant='full_gnn')
+        raise RuntimeError('verified training call without executing training')
+    monkeypatch.setattr(gnn,'train_ranker',train)
+    args=SimpleNamespace(weights=tmp_path/'new.pt',dataset='scale1000',layouts=None,
+                         training_seed=20261126,epochs=24,variant='full_gnn',label_workers=56,train_threads=56)
+    with pytest.raises(RuntimeError,match='verified training call'):
+        gnn.train(args)
+    assert not args.weights.exists()
+
+
+def test_scale_teacher_gnn_existing_checkpoint_is_loaded_before_skipping(monkeypatch,tmp_path,capsys):
+    import importlib
+    from types import SimpleNamespace
+    _teacher_runner(monkeypatch);gnn=importlib.import_module('run_gnn_vns_br')
+    monkeypatch.setattr(gnn,'ROOT',tmp_path)
+    path=tmp_path/'existing.pt';path.write_bytes(b'existing model')
+    observed=[]
+    monkeypatch.setattr(gnn,'load_model',lambda dataset,variant,**kwargs:observed.append((dataset,variant,kwargs)))
+    gnn.train(SimpleNamespace(weights=path,dataset='scale1000',variant='full_gnn'))
+    assert observed==[('scale1000','full_gnn',dict(path=path))]
+    assert 'BR_TRAIN_ALREADY_SAVED' in capsys.readouterr().out
+    assert path.read_bytes()==b'existing model'
+
+
+def test_scale_teacher_gnn_interrupted_checkpoint_is_preserved_and_not_skipped(monkeypatch,tmp_path):
+    import importlib
+    import pytest
+    from types import SimpleNamespace
+    _teacher_runner(monkeypatch);gnn=importlib.import_module('run_gnn_vns_br')
+    monkeypatch.setattr(gnn,'ROOT',tmp_path)
+    path=tmp_path/'partial.pt';path.write_bytes(b'incomplete checkpoint')
+    with pytest.raises(ValueError,match='existing checkpoint is incomplete or invalid; file kept unchanged'):
+        gnn.train(SimpleNamespace(weights=path,dataset='scale1000',variant='full_gnn'))
+    assert path.read_bytes()==b'incomplete checkpoint'
+
+
+def test_scale_teacher_parallel_results_are_parent_written_and_errors_remain_retryable(monkeypatch):
+    from concurrent.futures import Future
+    import pytest
+    runner=_teacher_runner(monkeypatch);rows,originals=_scale_teacher_fixture()
+    names={n for n,_ in rows};pending=sorted(names)[:2];saved=[];workers=[]
+    monkeypatch.setattr(runner,'scale3000_tasksets',lambda:(rows,originals))
+    def coverage(method,targets):
+        done=targets-set(pending)
+        done |= {r['layout_id'] for r in saved if runner.complete_budget(r,method)}
+        return {n:None for n in done},dict(method=method,missing=sorted(targets-done))
+    monkeypatch.setattr(runner,'teacher_coverage',coverage)
+    class Pool:
+        def __init__(self,max_workers):workers.append(max_workers)
+        def __enter__(self):return self
+        def __exit__(self,*args):return False
+        def submit(self,fn,item,**kwargs):
+            assert fn is runner.baseline_job and kwargs['purpose']=='scale3000_teachers'
+            future=Future()
+            if item[2]==pending[0]:future.set_exception(RuntimeError('worker failed'))
+            else:future.set_result(_teacher_row(runner,item[2],status='DEADLOCK'))
+            return future
+    monkeypatch.setattr(runner,'ProcessPoolExecutor',Pool)
+    monkeypatch.setattr(runner,'append_row',lambda method,row,**kwargs:saved.append(row))
+    with pytest.raises(RuntimeError,match='incomplete teacher coverage'):
+        runner.scale3000_teachers(('wag_vns',),workers=56)
+    assert workers==[56] and {r['status'] for r in saved}=={'ERROR','DEADLOCK'}
+    completed,summary=coverage('wag_vns',names)
+    assert summary['missing']==[pending[0]] and pending[1] in completed
+
+
+def test_scale_teacher_cli_uses_56_workers_without_starting_solves(monkeypatch):
+    import inspect
+    import sys
+    runner=_teacher_runner(monkeypatch)
+    assert inspect.signature(runner.scale3000_teachers).parameters['workers'].default==56
+    observed=[]
+    monkeypatch.setattr(runner,'scale3000_teachers',lambda methods,**kwargs:observed.append((methods,kwargs)))
+    monkeypatch.setattr(sys,'argv',['run_fixed_taskset_experiment.py','scale3000-teachers','--method','wag_vns','--check-only'])
+    runner.main()
+    assert observed==[(('wag_vns',),dict(workers=56,check_only=True))]
+
+
+def test_scale_teacher_gnn_requires_new_2000_coverage_after_old_1000_complete(monkeypatch,capsys):
+    import importlib
+    import json
+    import pytest
+    runner=_teacher_runner(monkeypatch);gnn=importlib.import_module('run_gnn_vns_br')
+    rows,originals=_scale_teacher_fixture()
+    ranked=sorted(rows,key=lambda item:(len(item[1].tasks),item[0]))
+    previous=set(originals)
+    for i in range(10):
+        group=[name for name,_ in ranked[i*300:(i+1)*300] if name not in originals]
+        previous.update(group[(2*k+1)*len(group)//192] for k in range(96))
+    assert len(previous)==1000
+    def coverage(method,targets):
+        done=set(targets) if method=='wag_vns' else previous
+        return {name:dict(status='DEADLOCK') for name in done},dict(method=method,target_layouts=len(targets),
+            complete_budget=len(done),missing=sorted(targets-done),duplicate_complete_keys=[])
+    monkeypatch.setattr(gnn,'teacher_coverage',coverage)
+    with pytest.raises(ValueError,match='no labels/training started'):
+        gnn.check_training_teachers(rows,originals)
+    summaries=[json.loads(line.split(' ',1)[1]) for line in capsys.readouterr().out.splitlines()
+               if line.startswith('BR_TEACHER_COVERAGE ')]
+    hga=next(s for s in summaries if s['method']=='hga')
+    assert hga['target_layouts']==2000 and hga['complete_budget']==1000 and len(hga['missing'])==1000
+
+
 def _solution():
     config = ScientificConfig()
     parents = (

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import contextmanager
 import csv
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 import io
 import json
 import math
@@ -19,23 +21,25 @@ sys.path.insert(0, str(ROOT / 'src'))
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
     os.environ[name] = '1'
-os.environ.setdefault('NUMBA_NUM_THREADS', '1')
+os.environ['NUMBA_NUM_THREADS'] = '1'
 
 import numpy as np
 import torch
-from numba import set_num_threads
+from numba import get_num_threads, set_num_threads
 
 from mrta_reference.scope import FORMAL_SCOPE_V2
 from mrta_reference.fixed_taskset import generate_taskset
 from mrta_reference.model import ParentWeld, ScheduleStatus
 from mrta_search.gnn_vns_br import (
     ACTION_FEATURES, EDGE_FEATURES, EDGE_RELATIONS, MODEL_VARIANTS, NODE_FEATURES, ROBOT_FEATURES,
-    BRConfig, FeatureConfig, FixedWorkspace,
+    BRConfig, FeatureConfig, FixedWorkspace, LocalGraph,
     candidate_actions, local_graph, make_ranker, ranking_pairs, run_gnn_vns_br, train_ranker,
 )
 from run_fixed_taskset_experiment import (
     CONFIG, FIELDS, LIMIT, REPORT, RESULTS, SEEDS, json_text, load_tasksets,
     read_rows as read_baselines, solution_record,
+    TEACHER_RESULTS, feasible_teacher, teacher_coverage, scale3000_tasksets, hga_training_selection,
+    restore_solution,
 )
 
 WEIGHTS = ROOT / 'models/gnn_vns_br_atomic_16d.pt'
@@ -65,11 +69,19 @@ def iter_tasksets(split, dataset='original'):
 
 
 def training_tasksets(dataset='original'):
-    original = {name: ts for name, ts in iter_tasksets('train')}
+    original = {}
+    for name, taskset in iter_tasksets('train'):
+        if name in original:
+            raise ValueError(f'duplicate original TRAIN layout: {name}')
+        original[name] = taskset
     yield from original.items()
     if dataset == 'original':
         return
+    seen = set()
     for name, taskset in iter_tasksets('train', dataset):
+        if name in seen:
+            raise ValueError(f'duplicate scale TRAIN layout: {name}')
+        seen.add(name)
         if name in original:
             if taskset != original[name]:
                 raise ValueError(f'scale TRAIN differs from the original layout with the same key: {name}')
@@ -77,10 +89,10 @@ def training_tasksets(dataset='original'):
         yield name, taskset
 
 
-def fit_training_normalization(dataset='scale1000'):
+def fit_training_normalization(dataset='scale1000', *, tasksets=None):
     """One global reference fitted from TRAIN geometry, without scheduling."""
     loads = [sum(CONFIG.process_time(t.length) for t in ts.tasks) / 4.
-             for _, ts in training_tasksets(dataset)]
+             for _, ts in (training_tasksets(dataset) if tasksets is None else tasksets)]
     if not loads:
         raise ValueError('TRAIN is empty')
     return FeatureConfig(time_ref=max(1., median(loads)))
@@ -110,27 +122,52 @@ def read_training_teachers(layouts=None):
     """Read completed saved teachers; never substitute another Cmax field."""
     teachers = {}
     for method in ('wag_vns', 'hga'):
-        for row in read_baselines(method, historical=True):
-            if (row.get('split') != 'train' or row.get('status') != 'FEASIBLE'
-                    or row.get('termination_reason') != 'ITERATION_LIMIT'
+        rows = [*read_baselines(method, historical=True), *read_baselines(method),
+                *read_baselines(method, directory=TEACHER_RESULTS)]
+        for row in rows:
+            if (not feasible_teacher(row,method)
                     or (layouts is not None and row.get('layout_id') not in layouts)):
                 continue
-            try:
-                value = float(row.get('native_cmax_s') or 'nan')
-                payload = json.loads(row.get('solution') or '{}')
-                routes, directions = payload['routes'], payload['directions']
-                complete = (len(routes) == len(directions) == 4 and any(routes)
-                            and all(len(a) == len(b) and all(bit in (0, 1) for bit in b)
-                                    for a, b in zip(routes, directions)))
-            except (ValueError, TypeError, KeyError):
-                continue
-            if not complete or not math.isfinite(value) or value <= 0:
-                continue
+            value = float(row['native_cmax_s'])
             key = row['layout_id'], method
             old = teachers.get(key)
             if old is None or value < float(old['native_cmax_s']):
                 teachers[key] = row
     return teachers
+
+
+def check_training_teachers(tasksets=None, original_ids=None):
+    """Validate full TRAIN coverage before creating labels or training a model."""
+    if tasksets is None:
+        tasksets, original_ids = scale3000_tasksets()
+    names = {name for name,_ in tasksets}
+    if len(tasksets) != 3000 or len(names) != 3000 or original_ids is None or len(original_ids) != 40:
+        raise ValueError('full training requires 3000 unique TRAIN layouts including the original 40')
+    targets = dict(wag_vns=names,hga=hga_training_selection(tasksets,original_ids))
+    by_name = dict(tasksets)
+    summaries, invalid = {}, {}
+    for method,selected in targets.items():
+        completed, summary = teacher_coverage(method,selected)
+        summary['original_completed'] = len(original_ids & completed.keys())
+        summary['invalid_feasible_teachers'] = sorted(name for name,row in completed.items()
+                if row['status']=='FEASIBLE' and not feasible_teacher(row,method))
+        for name,row in completed.items():
+            if row['status'] != 'FEASIBLE' or name in summary['invalid_feasible_teachers']:
+                continue
+            try:
+                # Existing canonicalization checks atom coverage/assignment;
+                # this is structural validation, with no scheduling call.
+                restore_solution(by_name[name],row)
+            except (ValueError,TypeError,KeyError,IndexError):
+                summary['invalid_feasible_teachers'].append(name)
+        summary['invalid_feasible_teachers'].sort()
+        summaries[method] = summary
+        print('BR_TEACHER_COVERAGE',json_text(summary),flush=True)
+        if summary['missing'] or summary['duplicate_complete_keys'] or summary['invalid_feasible_teachers']:
+            invalid[method] = {k:summary[k] for k in ('missing','duplicate_complete_keys','invalid_feasible_teachers')}
+    if invalid:
+        raise ValueError(f'incomplete or invalid TRAIN teacher coverage; no labels/training started: {json_text(invalid)}')
+    return summaries
 
 
 def read_results(dataset='original'):
@@ -166,22 +203,7 @@ def append_result(row, dataset='original'):
         stream.flush()
 
 
-def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig(),
-                      dataset='original', normalization=None, layouts=None, progress=print):
-    """Use TRAIN teachers, independent greedy starts, and one legal perturbation.
-
-    Candidate budgets and graph construction are identical to online search.
-    Labels stay in memory; no validation/test state is turned into a label.
-    """
-    rng = random.Random(seed)
-    normalization = normalization or fit_training_normalization(dataset)
-    # Materialize only an explicit selection, so unknown IDs fail before any
-    # teacher restoration, initialization or candidate scheduling takes place.
-    tasksets = selected_training_tasksets(dataset, layouts)
-    if layouts is not None:
-        tasksets = list(tasksets)
-    teachers = read_training_teachers(layouts)
-    examples = []
+def _supervision_stats(dataset, layouts, settings):
     stats = dict(source_split='train', dataset=dataset, teacher_solutions=0, greedy_initializations=0,
                  generated_states=0, states=0, candidate_labels=0, feasible_labels=0,
                  deadlock_labels=0, structural_infeasible_labels=0, numeric_failure_labels=0,
@@ -194,6 +216,21 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                  skipped_teachers={'wag_vns': 0, 'hga': 0},
                  teacher_state_statuses={status.value: 0 for status in ScheduleStatus},
                  native_evaluations=0, candidate_native_evaluations=0)
+    return stats
+
+
+def _build_supervision_serial(*, seed=20261126, states_per_source=2, settings=BRConfig(),
+                              dataset='original', normalization=None, layouts=None, progress=print,
+                              tasksets=None, teachers=None, allow_empty=False):
+    """The existing label algorithm, run locally on supplied TRAIN layouts."""
+    rng = random.Random(seed)
+    normalization = normalization or fit_training_normalization(dataset)
+    tasksets = selected_training_tasksets(dataset, layouts) if tasksets is None else tasksets
+    if layouts is not None:
+        tasksets = list(tasksets)
+    teachers = read_training_teachers(layouts) if teachers is None else teachers
+    examples = []
+    stats = _supervision_stats(dataset, layouts, settings)
     started = time.perf_counter()
     for name, taskset in tasksets:
         workspace = FixedWorkspace(taskset, CONFIG, normalization=normalization)
@@ -214,7 +251,9 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                 sources.append((method, restored))
                 stats['teacher_solutions'] += 1
                 stats['teacher_solutions_by_method'][method] += 1
-        greedy = workspace.initialize(rng, settings, time.perf_counter() + settings.time_limit)
+        # Offline labels use the same bounded construction attempts. Do not
+        # let worker startup/JIT contention change which attempts are made.
+        greedy = workspace.initialize(rng, settings, math.inf)
         if greedy is not None:
             sources.append(('greedy', greedy))
             stats['greedy_initializations'] += 1
@@ -259,14 +298,157 @@ def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig()
                 stats['pairs'] += len(pairs)
         stats['layouts'].append(name)
         stats['native_evaluations'] += workspace.evaluations
-        progress('BR_LABELS', name, {k:stats[k] for k in ('states','candidate_labels','pairs')},
-                 'elapsed_s', round(time.perf_counter() - started, 3))
+        if progress is not None:
+            progress('BR_LABELS', name, {k:stats[k] for k in ('states','candidate_labels','pairs')},
+                     'elapsed_s', round(time.perf_counter() - started, 3))
     stats['label_generation_s'] = time.perf_counter() - started
     stats['layout_records'] = len(stats['layouts'])
     stats['unique_layouts'] = len(set(stats['layouts']))
-    if not examples:
+    if not examples and not allow_empty:
         raise RuntimeError('no informative TRAIN labels were generated')
     return examples, stats
+
+
+@contextmanager
+def _torch_threads(count):
+    if count < 1:
+        raise ValueError('training threads must be positive')
+    previous = torch.get_num_threads()
+    torch.set_num_threads(count)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+def _initialize_label_worker():
+    set_num_threads(1)
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
+
+def _pack_label_examples(examples):
+    """Transfer ordinary NumPy arrays, avoiding many shared Tensor handles."""
+    packed = []
+    for name,graph,pairs in examples:
+        values = {}
+        for field in fields(graph):
+            value = getattr(graph,field.name)
+            values[field.name] = value.detach().cpu().numpy().copy() if isinstance(value,torch.Tensor) else value
+        packed.append((name,values,pairs.detach().cpu().numpy().copy()))
+    return packed
+
+
+def _unpack_label_examples(packed):
+    return [(name,LocalGraph(**{key:torch.from_numpy(value) if isinstance(value,np.ndarray) else value
+                              for key,value in values.items()}),torch.from_numpy(pairs))
+            for name,values,pairs in packed]
+
+
+def _label_layout_job(item):
+    name,taskset,seed,states_per_source,settings,dataset,normalization,teachers = item
+    examples,stats = _build_supervision_serial(seed=seed,states_per_source=states_per_source,
+        settings=settings,dataset=dataset,normalization=normalization,tasksets=[(name,taskset)],
+        teachers=teachers,progress=None,allow_empty=True)
+    stats.update(worker_pid=os.getpid(),worker_numba_threads=get_num_threads(),
+                 worker_torch_threads=torch.get_num_threads())
+    return name,_pack_label_examples(examples),stats
+
+
+def _merge_label_stats(total, detail):
+    for key in ('teacher_solutions','greedy_initializations','generated_states','states','candidate_labels',
+                'feasible_labels','deadlock_labels','structural_infeasible_labels','numeric_failure_labels',
+                'pairs','duplicate_states_skipped','uninformative_states','perturbed_states',
+                'native_evaluations','candidate_native_evaluations'):
+        total[key] += detail[key]
+    for key in ('state_sources','skipped_state_statuses','teacher_solutions_by_method',
+                'skipped_teachers','teacher_state_statuses'):
+        for name,value in detail[key].items():
+            total[key][name] += value
+
+
+def build_supervision(*, seed=20261126, states_per_source=2, settings=BRConfig(),
+                      dataset='original', normalization=None, layouts=None, progress=print,
+                      tasksets=None, label_workers=1):
+    """Generate TRAIN labels per layout, then restore the input layout order."""
+    if label_workers < 1 or (sys.platform == 'win32' and label_workers > 61):
+        raise ValueError('label workers must be positive and at most 61 on Windows')
+    normalization = normalization or fit_training_normalization(dataset)
+    tasksets = list(selected_training_tasksets(dataset,layouts) if tasksets is None else tasksets)
+    names = [name for name,_ in tasksets]
+    if len(names) != len(set(names)):
+        raise ValueError('duplicate TRAIN layout in supervision input')
+    if layouts is not None and (len(layouts) != len(set(layouts)) or set(names) != set(layouts)):
+        raise ValueError('supervision tasksets differ from selected TRAIN layouts')
+    teachers = read_training_teachers(layouts)
+    seeds = {name:seed+i for i,name in enumerate(sorted(names))}
+    jobs = [(name,taskset,seeds[name],states_per_source,settings,dataset,normalization,
+             {(name,method):teachers[name,method] for method in ('wag_vns','hga') if (name,method) in teachers})
+            for name,taskset in tasksets]
+    stats = _supervision_stats(dataset,layouts,settings)
+    workers = min(label_workers,len(jobs)) if jobs else 0
+    stats.update(label_workers_requested=label_workers,label_workers=workers,
+                 label_seed_rule='training_seed + zero-based index in sorted selected TRAIN layout IDs',
+                 label_training_seed=seed,offline_initialization_uses_attempt_budget=True)
+    started = time.perf_counter()
+    collected,worker_pids,worker_threads = {},set(),set()
+    def announce(*args):
+        if progress is not None:
+            progress(*args)
+    announce('BR_LABELS_START',dict(layouts=len(names),workers=workers,threads_per_worker=1))
+    def collect(result):
+        name,packed,detail = result
+        if name not in seeds or name in collected:
+            raise RuntimeError(f'unexpected/duplicate label result: {name}')
+        collected[name] = _unpack_label_examples(packed)
+        _merge_label_stats(stats,detail)
+        worker_pids.add(detail['worker_pid'])
+        worker_threads.add((detail['worker_numba_threads'],detail['worker_torch_threads']))
+        announce('BR_LABELS',name,dict(completed_layouts=len(collected),total_layouts=len(names),
+                 **{k:stats[k] for k in ('states','candidate_labels','pairs')}),
+                 'elapsed_s',round(time.perf_counter()-started,3))
+    if workers == 1:
+        previous_numba = get_num_threads()
+        set_num_threads(1)
+        try:
+            with _torch_threads(1):
+                for job in jobs:
+                    collect(_label_layout_job(job))
+        finally:
+            set_num_threads(previous_numba)
+    elif workers:
+        pool = ProcessPoolExecutor(max_workers=workers,initializer=_initialize_label_worker)
+        active = {}
+        remaining = iter(jobs)
+        try:
+            for _ in range(min(len(jobs),2*workers)):
+                job = next(remaining)
+                active[pool.submit(_label_layout_job,job)] = job[0]
+            while active:
+                done,_ = wait(active,timeout=10.,return_when=FIRST_COMPLETED)
+                if not done:
+                    announce('BR_LABELS_WAIT',dict(completed_layouts=len(collected),total_layouts=len(names),
+                             elapsed_s=round(time.perf_counter()-started,3)))
+                for future in done:
+                    name = active.pop(future)
+                    try:
+                        collect(future.result())
+                    except Exception as error:
+                        raise RuntimeError(f'TRAIN label generation failed for {name}: {error}') from error
+                    job = next(remaining,None)
+                    if job is not None:
+                        active[pool.submit(_label_layout_job,job)] = job[0]
+        finally:
+            for future in active:
+                future.cancel()
+            pool.shutdown(wait=True,cancel_futures=True)
+    examples = [example for name in names for example in collected[name]]
+    stats.update(layouts=names,layout_records=len(names),unique_layouts=len(set(names)),
+                 label_generation_s=time.perf_counter()-started,label_worker_pids=sorted(worker_pids),
+                 label_worker_threads=[dict(numba=n,torch=t) for n,t in sorted(worker_threads)])
+    if not examples:
+        raise RuntimeError('no informative TRAIN labels were generated')
+    return examples,stats
 
 
 def train(args):
@@ -275,30 +457,53 @@ def train(args):
     if not path.is_relative_to(ROOT):
         raise ValueError('model outputs must stay inside DRL')
     if path.exists():
-        check_model_features(torch.load(path, map_location='cpu', weights_only=False))
+        try:
+            load_model(args.dataset,args.variant,path=path)
+        except Exception as error:
+            raise ValueError(f'existing checkpoint is incomplete or invalid; file kept unchanged: {path}') from error
         print('BR_TRAIN_ALREADY_SAVED', str(path), flush=True)
         return
+    label_workers = getattr(args,'label_workers',1)
+    training_threads = getattr(args,'train_threads',1)
+    if label_workers < 1 or training_threads < 1 or (sys.platform == 'win32' and label_workers > 61):
+        raise ValueError('positive training threads and 1..61 Windows label workers are required')
     started = time.perf_counter()
     settings = BRConfig()
-    normalization = fit_training_normalization(args.dataset)
+    tasksets, coverage = None, None
+    if args.dataset == 'scale1000' and args.layouts is None:
+        tasksets, originals = scale3000_tasksets()
+        coverage = check_training_teachers(tasksets,originals)
+    print('BR_TRAIN_CONFIG',json_text(dict(label_workers=label_workers,threads_per_label_worker=1,
+          training_threads=training_threads,epochs=args.epochs,training_seed=args.training_seed)),flush=True)
+    normalization = fit_training_normalization(args.dataset,tasksets=tasksets)
     examples, data = build_supervision(seed=args.training_seed, settings=settings,
-                                      dataset=args.dataset, normalization=normalization, layouts=args.layouts)
+                                      dataset=args.dataset, normalization=normalization, layouts=args.layouts,
+                                      tasksets=tasksets,label_workers=label_workers)
     if args.layouts and {name for name, _, _ in examples} != set(args.layouts):
         raise ValueError('some selected TRAIN layouts produced no informative Pairwise examples')
+    if tasksets is not None:
+        missing = sorted({name for name,_ in tasksets}-{name for name,_,_ in examples})
+        if missing:
+            raise ValueError(f'TRAIN layouts without informative Pairwise examples: {missing}')
+        data['teacher_coverage'] = coverage
     print('BR_LABEL_SUMMARY', json_text(data), flush=True)
     variants = (args.variant,)
     models, learning = {}, {}
-    for variant in variants:
-        tick = time.perf_counter()
-        model, record = train_ranker(examples, seed=args.training_seed, epochs=args.epochs, variant=variant)
-        record['training_s'] = time.perf_counter() - tick
-        models[variant], learning[variant] = model.state_dict(), record
-        print('BR_MODEL_TRAINED', variant, json_text(record), flush=True)
+    # Label workers have fully exited before the single model uses CPU threads.
+    with _torch_threads(training_threads):
+        print('BR_TRAINING_START',json_text(dict(examples=len(examples),threads=torch.get_num_threads(),
+              epochs=args.epochs)),flush=True)
+        for variant in variants:
+            tick = time.perf_counter()
+            model, record = train_ranker(examples, seed=args.training_seed, epochs=args.epochs, variant=variant)
+            record['training_s'] = time.perf_counter() - tick
+            models[variant], learning[variant] = model.state_dict(), record
+            print('BR_MODEL_TRAINED', variant, json_text(record), flush=True)
     training = dict(data=data, seed=args.training_seed, epochs=args.epochs,
                     total_offline_s=time.perf_counter() - started,
                     training_s=sum(record['training_s'] for record in learning.values()),
                     validation_used_for_labels=False, test_used_for_labels=False,
-                    shared_supervision=True)
+                    shared_supervision=True,label_workers=label_workers,training_threads=training_threads)
     checkpoint = dict(training=training, settings=asdict(settings), node_features=NODE_FEATURES,
                       robot_features=ROBOT_FEATURES, edge_relations=EDGE_RELATIONS,
                       normalization=asdict(normalization),
@@ -589,10 +794,13 @@ def prepare(args):
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument('stage', choices=('prepare', 'train', 'validation', 'test', 'summary', 'smoke'))
+    parser.add_argument('stage', choices=('prepare', 'train', 'teacher-check', 'validation', 'test', 'summary', 'smoke'))
     parser.add_argument('--dataset', choices=('original', 'scale1000'), default='scale1000')
     parser.add_argument('--training-seed', type=int, default=20261126)
     parser.add_argument('--epochs', type=int, default=24)
+    parser.add_argument('--label-workers','--workers',dest='label_workers',type=int,default=56,
+                        help='parallel TRAIN label processes; each uses one thread (Windows: 1..61)')
+    parser.add_argument('--train-threads',type=int,default=56,help='CPU threads for the single GNN optimizer process')
     parser.add_argument('--variant', choices=MODEL_VARIANTS, default='full_gnn')
     parser.add_argument('--weights', type=Path, help='new atomic-model checkpoint; historical weights are incompatible')
     parser.add_argument('--layouts', nargs='+', help='distinct TRAIN layout IDs; omitted means all TRAIN for training')
@@ -602,6 +810,10 @@ def main():
     set_num_threads(1); torch.set_num_threads(1)
     if args.stage == 'prepare':
         prepare(args)
+    elif args.stage == 'teacher-check':
+        if args.dataset != 'scale1000' or args.layouts is not None:
+            parser.error('teacher-check validates full scale1000 TRAIN without --layouts')
+        check_training_teachers()
     elif args.stage == 'train':
         train(args)
     elif args.stage in ('validation', 'test'):
@@ -639,4 +851,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('BR_TRAIN_INTERRUPTED: in-memory progress was discarded; saved teachers/checkpoints are kept.',flush=True)
+        raise SystemExit(130)

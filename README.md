@@ -101,3 +101,66 @@ M1也可沿已有原子边界迁移合并作业的端部原子，再按新归属
 新VALIDATION：Full GNN的B32可行数为88/100，平均/中位Cmax为5839.28/5792.97秒，中位在线耗时5.70秒。
 Cmax仅汇总B32可行结果，运行时间包含失败运行；全部记录保存在新CSV。
 原始VALIDATION准入：未通过；已保存TEST记录0条。配对差异、初始改善、失败详情及训练记录见[现有实验报告](docs/FIXED_EUCLIDEAN_SPLIT_EXPERIMENT.md)。
+
+## 3000 TRAIN 教师与离线 HPC 入口
+
+`scripts/run_fixed_taskset_experiment.py scale3000-teachers --method wag_vns --workers 56`
+读取已有的 3000 个 TRAIN，固定拆分仍调用 `generate_taskset()`。HGA 使用
+`--method hga`，包含原始 40 个 TRAIN，按原子任务数排序分十层；每层保留旧的
+96 个非原始排样，再从未选排样中均匀补选 100 个，共 2000 个。旧的 1000 个选择
+完整保留，已有完整预算结果继续复用。`--method both` 顺序执行两个算法。
+WAG 保持 500 轮，HGA 保持 200000 个有效子代和 ROUTE_CYCLE VND；每个子进程
+及 NumPy/Numba/BLAS 线程数为 1。`--check-only` 只检查输入、选择和覆盖，不启动求解。
+教师批处理默认使用一个 ProcessPoolExecutor，最多 56 个进程并行，每进程 1 个计算线程。
+WAG 和 HGA 顺序执行；可用 `--workers` 在 1～61 范围内调整 Windows 并发。
+不使用多个进程池或处理器组绑定。
+
+结果保存到 `results/native_priority/scale3000_teachers/{wag_vns,hga}.csv`；必要时续写
+`wag_vns_002.csv` 等小于 100MB 的分片。父进程逐条写入并 flush，断点恢复先移除
+未写完的最后一行。按排样复用当前 adapter 的完整历史和已有原生结果，完整 DEADLOCK
+也跳过，ERROR/INCOMPLETE 可重试。不同历史 seed 优先选完整 FEASIBLE 中 native_cmax_s
+最低的记录。新排样 seed 为排序后的全体 TRAIN 序号加 20261110，两种算法一致。
+
+`scripts/run_gnn_vns_br.py teacher-check --dataset scale1000` 检查 WAG 3000/HGA 2000
+完整预算覆盖；缺失 ID、重复完成键或无效 FEASIBLE 教师会明确报错。完整训练使用
+`train --dataset scale1000 --variant full_gnn --epochs 24 --training-seed 20261126 --label-workers 56 --train-threads 56 --weights models/gnn_vns_br_atomic_16d_scale3000.pt`，
+不传 `--layouts`。训练前执行相同覆盖检查，合并历史、既有原生及新分片教师，
+只采用有限正 native_cmax_s、完整四机器人路线/方向和正确预算的 TRAIN FEASIBLE 方案。
+若某个 TRAIN 未产生有效 Pairwise 样本也会明确停止；不静默把全量训练缩为部分排样。
+网络、16 维动作、原生评价和当前监督方法保持不变；标签仍只存内存。
+
+监督样本按排样分给一个最多 56 进程的池，每个工作进程的 Numba/PyTorch/BLAS 线程为 1。
+父进程只读取一次 TRAIN 和教师，每次派发单个排样及其教师；图与比较对通过 NumPy 数组传回，
+按输入排样顺序汇总。标签池完全退出后，单个模型优化进程使用 56 个 CPU 线程。
+两项 CLI 默认均为 56，`--workers` 是 `--label-workers` 的别名；可单独降低 `--train-threads`。
+56 线程不保证比少量线程更快，尤其是小图；它不代表同时训练 56 份模型。
+
+标签随机种子为 training_seed 加所选 TRAIN layout_id 排序后的零基序号，
+使本版串行和并行标签一致；它与旧版共享一个全局串行随机流的样本不保证逐项一致。
+离线初始化保留原有最多 6 次构造尝试，不因工作进程启动/JIT 竞争耗时而提前截断；
+在线搜索的时间上限保持原样。每个排样完成即显示累计数量，等待时每 10 秒显示进度。
+工作进程失败会停止训练；Ctrl+C 取消待运行任务并等待在途任务清理。
+中途标签和优化器只在内存，最终模型保存前中断会从标签阶段重新开始，WAG/HGA CSV 继续复用。
+已有模型先由当前 load_model 读取后跳过，损坏或未写完的模型明确报错并保留原文件。
+
+本机仅运行针对性测试、少量排样的真实 Windows 多进程及单步优化验证，不启动全量
+基线或监督训练。离线交付见同级 `DRL_HPC_TRAIN_PACKAGE/README_HPC_CMD.md`。
+
+## HPC 完成结果回迁（2026-11-28）
+
+HPC 已完成的结果按用途复制到现有目录，迁移包内源文件保留，仅新增已确认必要的 4 个文件。
+
+|分类|本项目内文件|字节数|内容|
+|---|---|---:|---|
+|模型|models/gnn_vns_br_atomic_16d_scale3000.pt|279396|Full GNN 权重、归一化、训练设置和完整逐轮记录|
+|WAG 教师|results/native_priority/scale3000_teachers/wag_vns.csv|99974548|2781 个新增 TRAIN 结果|
+|WAG 教师续片|results/native_priority/scale3000_teachers/wag_vns_002.csv|6036181|167 个新增 TRAIN 结果，现有读取入口自动合并|
+|HGA 教师|results/native_priority/scale3000_teachers/hga.csv|66948552|1958 个新增 TRAIN 结果|
+
+4 个文件总计 173238677 字节，逐字节核对与源文件一致，单文件均小于 100000000 字节，保持原格式，无需压缩。
+TRAIN 数据与必要历史结果原已齐全，继续复用现有 52 个 WAG、42 个 HGA 结果。合并后 WAG 覆盖 3000 个、HGA 覆盖 2000 个 TRAIN，全部 FEASIBLE，DEADLOCK/INFEASIBLE/NUMERIC_FAILURE 均为 0，缺失和重复完成键均为空。
+
+模型完成 24 轮，保存内部留出损失最小的第 23 轮，参数数为 27993；2400 个 TRAIN 排样用于优化，600 个完整 TRAIN 排样内部留出，集合不交叉。共生成 14162 个监督图和 3622757 对比较。选中轮的训练损失为 0.2956300426，内部留出损失为 0.2999727236，内部留出 Pairwise 准确率为 86.7329%；这些指标不是 VALIDATION/TEST 泛化结果。
+HPC 总离线耗时 5493.740272 秒（约 91.56 分钟），其中模型训练 5177.084110 秒（约 86.28 分钟），使用 56 个标签进程、模型训练 56 线程。样本和优化器未另存文件，训练信息已包含在同一模型中。
+
+模型已通过本项目默认 `load_model('scale1000', 'full_gnn')` 读取，参数全部有限；教师由现有 `teacher-check --dataset scale1000` 入口检查覆盖、预算及路线结构，不重新运行 WAG/HGA 或全量训练。

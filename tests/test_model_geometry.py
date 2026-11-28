@@ -1212,27 +1212,120 @@ def test_br_teachers_require_native_cmax_complete_routes_and_train_status(monkey
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
     runner=importlib.import_module('run_gnn_vns_br')
     solution=json.dumps(dict(routes=[['a'],[],[],[]],directions=[[0],[],[],[]]))
-    valid=dict(split='train',layout_id='train_A',status='FEASIBLE',termination_reason='ITERATION_LIMIT',
+    valid=dict(split='train',layout_id='train_A',status='FEASIBLE',termination_reason='ITERATION_LIMIT',iterations='500',
                native_cmax_s='100',cmax_s='999',solution=solution)
     rows=[valid,dict(valid,native_cmax_s='200',cmax_s='1')]
     rows.extend(dict(valid,native_cmax_s=value) for value in ('','nan','inf','bad','0','-1'))
     rows.extend([dict(valid,status='DEADLOCK'),dict(valid,termination_reason='ERROR'),
                  dict(valid,split='validation',solution='do not parse'),dict(valid,split='test'),
                  dict(valid,solution='{}'),dict(valid,solution=json.dumps(dict(routes=[['a']],directions=[[0]])))])
-    monkeypatch.setattr(runner,'read_baselines',lambda *a,**k:rows)
+    monkeypatch.setattr(runner,'read_baselines',lambda method,**k:
+                        [dict(row,iterations='200000' if method=='hga' else row['iterations']) for row in rows])
     teachers=runner.read_training_teachers(['train_A'])
     assert len(teachers)==2 and all(float(row['native_cmax_s'])==100 for row in teachers.values())
 
 
-def test_br_train_cli_passes_explicit_layout_selection(monkeypatch):
+@pytest.mark.parametrize('extra,expected', [([], (56,56)),
+    (['--label-workers','2','--train-threads','8'], (2,8)), (['--workers','2'], (2,56))])
+def test_br_train_cli_passes_explicit_layout_selection(monkeypatch,extra,expected):
     import importlib,sys
     from pathlib import Path
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
     runner=importlib.import_module('run_gnn_vns_br');observed=[]
-    monkeypatch.setattr(sys,'argv',['run_gnn_vns_br.py','train','--dataset','scale1000','--layouts','train_A','train_B'])
+    monkeypatch.setattr(sys,'argv',['run_gnn_vns_br.py','train','--dataset','scale1000','--layouts','train_A','train_B',*extra])
     monkeypatch.setattr(runner,'train',lambda args:observed.append(args))
     runner.main()
     assert observed[0].layouts==['train_A','train_B'] and observed[0].variant=='full_gnn'
+    assert (observed[0].label_workers,observed[0].train_threads)==expected
+
+
+def test_br_parallel_supervision_matches_serial_samples_and_native_counts(monkeypatch):
+    import importlib,json
+    from dataclasses import fields
+    from pathlib import Path
+    import torch
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    w,state=_br_fixed_fixture()
+    tasksets=[(name,w.taskset) for name in ('train_B','train_A','train_D','train_C')]
+    payload=json.dumps(runner.solution_record(w.solution(state),state.bits))
+    teachers={(name,method):dict(solution=payload) for name,_ in tasksets for method in ('wag_vns','hga')}
+    reads=[]
+    def read(layouts):
+        reads.append(layouts)
+        return teachers
+    monkeypatch.setattr(runner,'read_training_teachers',read)
+    options=dict(seed=20261126,states_per_source=2,settings=runner.BRConfig(candidates=3,anchors=2,initial_attempts=1),
+                 normalization=w.normalization,tasksets=tasksets,progress=None)
+    serial,serial_stats=runner.build_supervision(**options,label_workers=1)
+    parallel,parallel_stats=runner.build_supervision(**options,label_workers=2)
+    assert reads==[None,None]
+    assert len(parallel)==len(serial)>0
+    assert parallel_stats['layouts']==[name for name,_ in tasksets]
+    assert {name for name,_,_ in parallel}=={name for name,_ in tasksets}
+    assert len(parallel_stats['label_worker_pids'])==2
+    assert parallel_stats['label_worker_threads']==[dict(numba=1,torch=1)]
+    for (name,a,pa),(other,b,pb) in zip(serial,parallel):
+        assert name==other and torch.equal(pa,pb)
+        for field in fields(a):
+            av,bv=getattr(a,field.name),getattr(b,field.name)
+            if isinstance(av,torch.Tensor):assert torch.equal(av,bv),field.name
+            else:assert av==bv,field.name
+    for key in ('states','candidate_labels','pairs','native_evaluations','candidate_native_evaluations',
+                'feasible_labels','deadlock_labels','state_sources','teacher_solutions_by_method'):
+        assert serial_stats[key]==parallel_stats[key],key
+
+
+def test_br_parallel_label_failure_cancels_queue_and_restores_training_threads(monkeypatch):
+    import importlib
+    from concurrent.futures import Future
+    from pathlib import Path
+    import torch
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    monkeypatch.setattr(runner,'read_training_teachers',lambda layouts:{})
+    queued=Future();closed=[]
+    class Pool:
+        def __init__(self,**kwargs):self.calls=0
+        def submit(self,*args):
+            self.calls+=1
+            if self.calls==1:
+                failed=Future();failed.set_exception(RuntimeError('native label failed'))
+                return failed
+            return queued
+        def shutdown(self,**kwargs):closed.append(kwargs)
+    monkeypatch.setattr(runner,'ProcessPoolExecutor',Pool)
+    with pytest.raises(RuntimeError,match='TRAIN label generation failed for train_A: native label failed'):
+        runner.build_supervision(tasksets=[('train_A',None),('train_B',None)],
+            normalization=runner.FeatureConfig(),label_workers=2,progress=None)
+    assert queued.cancelled() and closed==[dict(wait=True,cancel_futures=True)]
+    previous=torch.get_num_threads()
+    with pytest.raises(RuntimeError,match='optimizer failed'):
+        with runner._torch_threads(56):
+            assert torch.get_num_threads()==56
+            raise RuntimeError('optimizer failed')
+    assert torch.get_num_threads()==previous
+
+
+def test_br_cpu_56_threads_supports_finite_optimizer_step(monkeypatch):
+    import importlib,random
+    from pathlib import Path
+    import torch
+    from mrta_search.gnn_vns_br import BRConfig,candidate_actions,local_graph,ranking_pairs,train_ranker
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
+    runner=importlib.import_module('run_gnn_vns_br')
+    w,state=_br_fixed_fixture();rng=random.Random(4)
+    actions=candidate_actions(w,state,BRConfig(candidates=3),rng)
+    graph=local_graph(w,state,actions)
+    pairs=ranking_pairs([w.evaluate(a.routes,a.bits) for a in actions],rng)
+    assert len(pairs)>0
+    previous=torch.get_num_threads()
+    with runner._torch_threads(56):
+        assert torch.get_num_threads()==56
+        model,record=train_ranker([('train_A',graph,pairs)],epochs=1,progress=lambda *a:None)
+        assert record['selected_epoch']==1 and torch.isfinite(model(graph)).all()
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    assert torch.get_num_threads()==previous
 
 
 def _br_shared_robot_fixture():
@@ -1312,13 +1405,14 @@ def test_br_supervision_uses_online_budgets_greedy_states_and_train_only(monkeyp
     runner=importlib.import_module('run_gnn_vns_br')
     w,state=_br_fixed_fixture()
     payload=runner.solution_record(w.solution(state),state.bits)
-    teacher=dict(split='train',layout_id='train_A',status='FEASIBLE',termination_reason='ITERATION_LIMIT',
+    teacher=dict(split='train',layout_id='train_A',status='FEASIBLE',termination_reason='ITERATION_LIMIT',iterations='500',
                  native_cmax_s='100',solution=json.dumps(payload))
     forbidden=dict(teacher,split='validation',layout_id='validation_A',solution='must not parse')
     test=dict(teacher,split='test',layout_id='test_A',solution='must not parse')
     monkeypatch.setattr(runner,'iter_tasksets',lambda split,dataset='original':
         iter([('train_A',w.taskset)]) if split=='train' else (_ for _ in ()).throw(AssertionError('non-TRAIN read')))
-    monkeypatch.setattr(runner,'read_baselines',lambda method,**kwargs:[teacher,forbidden,test])
+    monkeypatch.setattr(runner,'read_baselines',lambda method,**kwargs:
+                        [dict(row,iterations='200000' if method=='hga' else '500') for row in (teacher,forbidden,test)])
     observed=[]
     def generate(workspace,current,settings,rng):
         observed.append((settings.alpha,settings.anchors,settings.candidates))

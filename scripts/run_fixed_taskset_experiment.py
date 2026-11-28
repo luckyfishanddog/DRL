@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 from dataclasses import asdict
+import io
 import json
 import math
 import os
@@ -18,7 +19,7 @@ sys.path.insert(0, str(ROOT/'src'))
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 for _name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
     os.environ[_name] = '1'
-os.environ.setdefault('NUMBA_NUM_THREADS','1')
+os.environ['NUMBA_NUM_THREADS'] = '1'
 
 from mrta_reference.fixed_taskset import FixedTaskset, generate_taskset, expand_routes, job_span
 from mrta_reference.model import ParentWeld, ScientificConfig
@@ -31,6 +32,9 @@ CONFIG = ScientificConfig()
 SEEDS = (20261110,20261111,20261112)
 HISTORICAL_RESULTS = ROOT/'results/fixed_euclidean_split'
 RESULTS = ROOT/'results/native_priority/fixed_euclidean_split'
+TEACHER_RESULTS = ROOT/'results/native_priority/scale3000_teachers'
+TRAIN_DATA = ROOT/'data/weld_layout'
+BASE_SEED = 20261110
 REPORT = ROOT/'docs/UNIFIED_NATIVE_CMAX_REPORT.md'
 LIMIT = 100_000_000
 FIELDS = ('split','layout_id','seed','method','status','cmax_s','native_cmax_s','runtime_s',
@@ -49,38 +53,250 @@ def write_text(path, text):
     path.write_text(text, encoding='utf-8')
 
 
-def read_rows(method, *, include_earlier_adapters=False, historical=False):
-    path = (HISTORICAL_RESULTS if historical else RESULTS)/f'{method}.csv'
-    if not path.exists():
-        return []
+def result_paths(method, directory):
+    """The primary CSV and ordinary size-limited continuation files."""
+    path = Path(directory)/f'{method}.csv'
+    return ([path] if path.exists() else []) + sorted(path.parent.glob(f'{method}_[0-9][0-9][0-9].csv'))
+
+
+def read_rows(method, *, include_earlier_adapters=False, historical=False, directory=None):
+    directory = directory if directory is not None else (HISTORICAL_RESULTS if historical else RESULTS)
     csv.field_size_limit(LIMIT)
-    import io
-    text = path.read_text(encoding='utf-8')
-    # WAG/HGA parents may append concurrently to different CSVs. Each JSON
-    # field is escaped onto one physical line; ignore a still-writing tail.
-    if text and not text.endswith('\n'):
-        text = text.rsplit('\n',1)[0]+'\n'
-    rows = list(csv.DictReader(io.StringIO(text)))
+    rows = []
+    for path in result_paths(method, directory):
+        saved = path.read_bytes()
+        # JSON strings contain escaped newlines. Ignore a partially written
+        # last physical row; append_row removes it before continuing.
+        if saved and not saved.endswith(b'\n'):
+            saved = saved[:saved.rfind(b'\n')+1]
+        text = saved.decode('utf-8')
+        rows.extend(csv.DictReader(io.StringIO(text)))
     if method in ('wag_vns','hga') and not include_earlier_adapters:
         adapter = WAG_INPUT_ADAPTER if method == 'wag_vns' else HGA_INPUT_ADAPTER
-        rows = [r for r in rows if json.loads(r['diagnostic']).get('input_adapter') == adapter]
+        selected = []
+        for row in rows:
+            try:
+                if json.loads(row.get('diagnostic') or '{}').get('input_adapter') == adapter:
+                    selected.append(row)
+            except (ValueError, TypeError, AttributeError):
+                continue
+        rows = selected
     return rows
 
 
-def append_row(method, row):
-    import io
-    path = RESULTS/f'{method}.csv'
+def append_row(method, row, *, directory=None):
+    directory = RESULTS if directory is None else Path(directory)
+    paths = result_paths(method, directory)
+    path = paths[-1] if paths else directory/f'{method}.csv'
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        with path.open('r+b') as stream:
+            stream.seek(0, os.SEEK_END)
+            end = stream.tell()
+            if end:
+                stream.seek(end-1)
+                if stream.read(1) != b'\n':
+                    # Only the interrupted final line is discarded.
+                    offset = end
+                    while offset:
+                        start = max(0, offset-65536)
+                        stream.seek(start)
+                        chunk = stream.read(offset-start)
+                        newline = chunk.rfind(b'\n')
+                        if newline >= 0:
+                            stream.truncate(start+newline+1)
+                            break
+                        offset = start
+                    else:
+                        stream.truncate(0)
     buffer = io.StringIO(newline='')
     writer = csv.DictWriter(buffer, fieldnames=FIELDS)
-    if not path.exists():
+    if not path.exists() or not path.stat().st_size:
         writer.writeheader()
     writer.writerow(row)
     text = buffer.getvalue()
     if (path.stat().st_size if path.exists() else 0)+len(text.encode('utf-8')) >= LIMIT:
-        raise ValueError(f'result file would exceed 100MB: {path}')
+        if directory != TEACHER_RESULTS:
+            raise ValueError(f'result file would exceed 100MB: {path}')
+        number = int(path.stem.rsplit('_',1)[1])+1 if path.stem != method else 2
+        if number > 999:
+            raise ValueError('too many result continuation files')
+        path = directory/f'{method}_{number:03d}.csv'
+        buffer = io.StringIO(newline='')
+        writer = csv.DictWriter(buffer, fieldnames=FIELDS)
+        writer.writeheader(); writer.writerow(row)
+        text = buffer.getvalue()
+        if len(text.encode('utf-8')) >= LIMIT:
+            raise ValueError(f'a single result row would exceed 100MB: {path}')
     with path.open('a', encoding='utf-8', newline='') as stream:
         stream.write(text); stream.flush()
+
+
+def _train_file(path):
+    layouts = {}
+    with path.open(encoding='utf-8') as stream:
+        for line in stream:
+            row = json.loads(line)
+            name = row['layout_id']
+            if name in layouts:
+                raise ValueError(f'duplicate TRAIN layout: {name} in {path}')
+            if row.get('split', 'train') != 'train':
+                raise ValueError(f'non-TRAIN layout in TRAIN input: {name}')
+            parents = tuple(ParentWeld(p['parent_id'],tuple(p['start']),tuple(p['end'])) for p in row['parents'])
+            layouts[name] = generate_taskset(parents, CONFIG)
+    return layouts
+
+
+def scale3000_tasksets():
+    """Read the two existing TRAIN files, using the unchanged fixed splitter."""
+    original = _train_file(TRAIN_DATA/'train.jsonl')
+    expanded = _train_file(TRAIN_DATA/'scale1000/train.jsonl')
+    if len(original) != 40 or len(expanded) != 3000:
+        raise ValueError(f'expected 40 original and 3000 expanded TRAIN layouts, got {len(original)}/{len(expanded)}')
+    for name, taskset in original.items():
+        if name not in expanded or expanded[name] != taskset:
+            raise ValueError(f'scale TRAIN differs from or omits original layout: {name}')
+    return list(expanded.items()), set(original)
+
+
+def hga_training_selection(tasksets, original_ids):
+    """Keep the previous 1000 layouts and add 100 from each size stratum."""
+    by_name = dict(tasksets)
+    if len(tasksets) != len(by_name) or len(by_name) != 3000 or len(original_ids) != 40 or not original_ids <= by_name.keys():
+        raise ValueError('HGA selection requires 3000 distinct TRAIN layouts including the 40 originals')
+    ranked = sorted(tasksets, key=lambda item: (len(item[1].tasks), item[0]))
+    chosen = set(original_ids)
+    for layer in range(10):
+        group = [name for name,_ in ranked[layer*len(ranked)//10:(layer+1)*len(ranked)//10]
+                 if name not in original_ids]
+        if len(group) < 196:
+            raise ValueError(f'HGA stratum {layer+1} has fewer than 196 non-original layouts')
+        # Preserve the previous 96 midpoint samples, including completed runs.
+        previous = {group[(2*i+1)*len(group)//192] for i in range(96)}
+        remaining = [name for name in group if name not in previous]
+        chosen.update(previous)
+        chosen.update(remaining[(2*i+1)*len(remaining)//200] for i in range(100))
+    if len(chosen) != 2000:
+        raise ValueError(f'expected 2000 distinct HGA layouts, got {len(chosen)}')
+    return chosen
+
+
+def complete_budget(row, method):
+    try:
+        return (row.get('split') == 'train'
+                and row.get('method', method) == method
+                and row.get('status') in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE')
+                and row.get('termination_reason') == 'ITERATION_LIMIT'
+                and int(row.get('iterations') or -1) == (500 if method == 'wag_vns' else 200000))
+    except (ValueError, TypeError):
+        return False
+
+
+def feasible_teacher(row, method):
+    """Saved native objective and complete four-robot genes; no evaluation."""
+    if not complete_budget(row, method) or row.get('status') != 'FEASIBLE':
+        return False
+    try:
+        value = float(row.get('native_cmax_s') or 'nan')
+        payload = json.loads(row.get('solution') or '{}')
+        routes, directions = payload['routes'], payload['directions']
+        flat = [job for route in routes for job in route]
+        return (math.isfinite(value) and value > 0 and len(routes) == len(directions) == 4
+                and bool(flat) and len(flat) == len(set(flat))
+                and all(isinstance(job,str) and job for job in flat)
+                and all(isinstance(route,list) and isinstance(bits,list) and len(route) == len(bits)
+                        and all(type(bit) is int and bit in (0,1) for bit in bits)
+                        for route,bits in zip(routes,directions)))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def best_completed_rows(method, rows, targets):
+    selected = {}
+    for row in rows:
+        name = row.get('layout_id')
+        if name not in targets or not complete_budget(row, method):
+            continue
+        previous = selected.get(name)
+        # A feasible saved native teacher wins across seeds and sources.
+        def score_of(item):
+            if feasible_teacher(item, method):
+                return (0,float(item['native_cmax_s']))
+            return (2 if item['status']=='FEASIBLE' else 1,0.)
+        score = score_of(row)
+        previous_score = score_of(previous) if previous is not None else (3,0.)
+        if previous is None or score < previous_score:
+            selected[name] = row
+    return selected
+
+
+def teacher_coverage(method, targets):
+    """Coverage by layout, independently of seed; DEADLOCK is complete."""
+    # Recent native runs are also history: do not repeat the completed probe.
+    history = [*read_rows(method, historical=True), *read_rows(method)]
+    fresh = read_rows(method, directory=TEACHER_RESULTS)
+    historical = best_completed_rows(method, history, targets)
+    completed = best_completed_rows(method, [*history,*fresh], targets)
+    counts = {status:sum(row['status'] == status for row in completed.values())
+              for status in ('FEASIBLE','DEADLOCK','INFEASIBLE','NUMERIC_FAILURE')}
+    failed = {row.get('layout_id') for row in [*history,*fresh]
+              if row.get('layout_id') in targets and not complete_budget(row,method)} - completed.keys()
+    summary = dict(method=method,target_layouts=len(targets),historical_reused=len(historical),
+                   new_completed=len(completed.keys()-historical.keys()),complete_budget=len(completed),
+                   **counts,valid_feasible_teachers=sum(feasible_teacher(r,method) for r in completed.values()),
+                   error_or_incomplete=len(failed),missing=sorted(targets-completed.keys()))
+    keys = [(r['layout_id'],r.get('seed')) for r in fresh
+            if r.get('layout_id') in targets and complete_budget(r,method)]
+    from collections import Counter
+    summary['duplicate_complete_keys'] = [list(k) for k,n in Counter(keys).items() if n>1]
+    return completed, summary
+
+
+def scale3000_teachers(methods=('wag_vns','hga'), *, workers=56, check_only=False):
+    if workers < 1:
+        raise ValueError('workers must be positive')
+    tasksets, originals = scale3000_tasksets()
+    by_name = dict(tasksets)
+    seeds = {name:BASE_SEED+i for i,name in enumerate(sorted(by_name))}
+    targets = dict(wag_vns=set(by_name), hga=hga_training_selection(tasksets,originals))
+    summaries = []
+    for method in methods:  # Sequential batches, each with single-thread workers.
+        completed, before = teacher_coverage(method, targets[method])
+        before['original_completed'] = len(originals & completed.keys())
+        before['new_runs_this_invocation'] = 0
+        pending = [(method,'train',name,by_name[name],seeds[name]) for name in sorted(targets[method]-completed.keys())]
+        print('TEACHER_BATCH',json_text(dict(**before,pending=len(pending),workers=workers)),flush=True)
+        if check_only:
+            summaries.append(before)
+            continue
+        errors = []
+        def save(row):
+            append_row(method,row,directory=TEACHER_RESULTS)
+            if not complete_budget(row,method):
+                errors.append(row['layout_id'])
+        if workers == 1:
+            for item in pending:
+                save(baseline_job(item,purpose='scale3000_teachers'))
+        elif pending:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(baseline_job,item,purpose='scale3000_teachers'):item for item in pending}
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        row = future.result()
+                    except Exception as error:
+                        row = dict(method=method,split='train',layout_id=item[2],seed=item[4],status='ERROR',
+                            termination_reason='ERROR',diagnostic=json_text(dict(error=repr(error),
+                            input_adapter=WAG_INPUT_ADAPTER if method=='wag_vns' else HGA_INPUT_ADAPTER)))
+                    save(row)
+        completed, after = teacher_coverage(method, targets[method])
+        after['original_completed'] = len(originals & completed.keys())
+        after['new_runs_this_invocation'] = len(pending)
+        print('TEACHER_BATCH_DONE',json_text(after),flush=True)
+        summaries.append(after)
+        if errors or after['missing']:
+            raise RuntimeError(f'{method}: incomplete teacher coverage; rerun to retry {sorted(set(errors)|set(after["missing"]))}')
+    return summaries
 
 
 def prepare():
@@ -268,19 +484,28 @@ def update_report():
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument('stage',choices=('prepare','baselines','benchmark','summary'))
-    parser.add_argument('--workers',type=int,default=4)
+    parser.add_argument('stage',choices=('prepare','baselines','benchmark','summary','scale3000-teachers'))
+    parser.add_argument('--workers',type=int,default=56)
     parser.add_argument('--method',choices=('wag_vns','hga','both'),default='both')
-    parser.add_argument('--split',choices=('train','validation','test','all'),default='all')
+    parser.add_argument('--split',choices=('train','validation','test','all'))
     parser.add_argument('--layout',default='train_03')
     parser.add_argument('--seed',type=int,default=20261111)
+    parser.add_argument('--check-only',action='store_true',help='TRAIN coverage/selection only; no baseline runs or writes')
     args = parser.parse_args()
+    if args.stage=='scale3000-teachers':
+        if args.split not in (None,'train'):
+            parser.error('scale3000-teachers reads TRAIN only')
+        scale3000_teachers(('wag_vns','hga') if args.method=='both' else (args.method,),
+                           workers=args.workers,check_only=args.check_only)
+        return
+    if args.check_only:
+        parser.error('--check-only is supported by scale3000-teachers')
     if args.stage=='benchmark':
         benchmark(('wag_vns','hga') if args.method=='both' else (args.method,),args.layout,args.seed)
     if args.stage in ('prepare','all'): prepare()
     if args.stage in ('baselines','all'):
         baselines(('wag_vns','hga') if args.method == 'both' else (args.method,),
-                  ('train','validation','test') if args.split == 'all' else (args.split,),args.workers)
+                  ('train','validation','test') if args.split in (None,'all') else (args.split,),args.workers)
     if args.stage in ('summary','all'):
         update_report()
         print(REPORT.read_text(encoding='utf-8').split('复现命令')[0],flush=True)
